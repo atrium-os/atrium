@@ -32,7 +32,7 @@ MKFS=/root/sealed/tessera-mkfs-sealed
 GC=/root/sealed/tessera-gc
 gate_begin tessera-commit-refusal 13
 
-g "test -x $MKFS && test -x $GC && command -v tessera-fsck >/dev/null && kldstat -q -m tessera_fs" \
+g "test -x $MKFS && test -x $GC && command -v tessera-fsck >/dev/null && kldstat -q -n tessera_fs.ko" \
     || gate_abort "needs tessera_fs loaded, /root/sealed and tessera-fsck (see the header)"
 g "kldload -n geom_nop" || gate_abort "geom_nop does not load"
 

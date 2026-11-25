@@ -13809,6 +13809,19 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		 * (tessera_unmount_impl) without tearing the tree. */
 		if (_ferr != 0) {
 			TPROF_ADD(TPROF_SB_FSYNC, _sbt);
+			/* The snapshot record put above names this
+			 * generation's roots, and it stays in the in-memory
+			 * snapshots tree, so the next commit makes it
+			 * durable. Every node of those trees allocated since
+			 * the last successful commit is still marked in the
+			 * epoch bitmap, and the epoch sweep would hand such a
+			 * node out again the moment a later COW supersedes
+			 * it. Close the epoch: those sectors then wait in
+			 * meta_pending, where the drain keeps whatever a
+			 * snapshot's walk pins. */
+			if (tmp_->meta_epoch_bm != NULL)
+				memset(tmp_->meta_epoch_bm, 0,
+				    tmp_->meta_pin_bitmap_bytes);
 			printf("tessera_fs: %s: delayed writes did not land "
 			    "(error %d); superblock generation %ju not "
 			    "committed\n",
