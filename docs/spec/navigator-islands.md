@@ -3208,9 +3208,12 @@ whole page, 256 MiB for parts):
     bundle on the Mac needs the same line).
 - **One pool.** The manifest declares `[resources.pool]` (weight 1, floor
   256 MiB), so `memfed --pools-from` budgets every engine as one share.
-  Frames and windows divide that share rather than add to it. Shipped
-  memfed doesn't run `--pools-from` yet: its jail needs the apps directory
-  mounted. Until then the pool is only declared.
+  Frames and windows divide that share rather than add to it. The shipped
+  memfed service names the same pool itself
+  (`--pool app-org-atrium-navigator-engine--:1:256` in
+  `51-atrium-memfed.toml`), so its jail needs no view of the apps
+  directory. jaild clamps every cap memfed sets to the jail's launch limit,
+  so the federation can only tighten a page's 1 GiB or a part's 256 MiB.
 - **What the person is told.** An engine that exits by itself (Limen's
   `ChildLost`, most often the RCTL kill; Limen can't tell which) ends with
   "the page's engine stopped; it may have used more memory than a live
@@ -3224,7 +3227,6 @@ whole page, 256 MiB for parts):
 - **Left for later.**
   - The engine's own cooperative trim when memoryd sends SIGINFO (drop
     caches before it is killed). That is engine-side, a Mac build.
-  - memfed `--pools-from` in the shipped service.
   - A Mac check: a fixture page that grows past 256 MiB keeps running up
     to 1 GiB and then falls back to the document lane, and a widget is
     still killed at 256 MiB.
@@ -3271,7 +3273,9 @@ live with its `pay.example` frame, run as root:
     sh navigator-i6-worker-check.sh PAGE_PID 1024 100 FRAME_PID
 
 `PAGE_MIB` is the installed engine manifest's `memory`. A frame's limit is
-always 256 MiB. For each engine (8 checks each, then 1 across them), the
+always 256 MiB. Stop memfed for the run: while it budgets the engine pool
+it may tighten these caps, and the check compares them exactly. Run it
+once with `PAGE_MIB` wrong (256) to see the memory check fail. For each engine (8 checks each, then 1 across them), the
 script checks:
 
 - its own `app-org-atrium-navigator-engine--` jail, with `ip4` and `ip6`
