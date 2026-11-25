@@ -84,6 +84,10 @@ enum Job {
     IconCheck { project: String, rel: String },
     /// `cargo atrium icon import` (`dry`: the preview).
     IconImport { project: String, src: String, dry: bool },
+    /// `opifex token agent` (the Package view's key).
+    PackageKey { project: String },
+    /// `cargo atrium bundle --sign --json` or `make bundle`.
+    PackageBuild { project: String },
 }
 
 /// Files that make a folder a project (its tasks, its composition).
@@ -144,6 +148,11 @@ pub struct Engine {
     rename_at: Option<(Who, PathBuf, usize, usize)>,
     /// Artifex's plugins (dev-tools.md §3.8).
     pub plugins: plugins::Host,
+    /// The install sheet's answer to the Package view's side-load, from
+    /// the thread that waits for the person.
+    trying: Option<(String, std::sync::mpsc::Receiver<crate::package::Try>)>,
+    /// Where the install sheet listens.
+    sheet: PathBuf,
     /// Every answer to the completion asked, merged; how many are still
     /// to come.
     merged: Vec<lsp::Completion>,
@@ -220,6 +229,8 @@ impl Engine {
             formatting: None,
             rename_at: None,
             plugins: plugins::Host::default(),
+            trying: None,
+            sheet: crate::package::sheet_socket(),
             merged: Vec::new(),
             merged_incomplete: false,
             completion_waiting: 0,
@@ -284,6 +295,9 @@ impl Engine {
                 }
                 if v == Main::Inspect {
                     self.ask_tree();
+                }
+                if v == Main::Package {
+                    self.load_package(s);
                 }
                 if v == Main::Plugins {
                     if let Err(e) = self.plugins.refresh() {
@@ -489,6 +503,9 @@ impl Engine {
                 self.plugins_open_all();
                 self.plugin_rows(s);
             }
+            Act::PackageKey => self.package_key(s),
+            Act::PackageBuild => self.package_build(s),
+            Act::PackageTry => self.package_try(s),
             Act::ClosePalette => {
                 s.palette = None;
                 self.palette.clear();
@@ -1350,6 +1367,124 @@ impl Engine {
                 self.follow_project(s);
             }
         }
+    }
+
+    /// The Package view's project: the active project's, read again (a
+    /// bundle made this session is kept).
+    fn load_package(&mut self, s: &mut State) {
+        let Some(c) = &s.composition else {
+            s.package = None;
+            return;
+        };
+        let p = c.project.clone();
+        let dir = if p.is_empty() { self.root.clone() } else { self.root.join(&p) };
+        let mut fresh = crate::package::Package::read(&p, &dir);
+        if let Some(old) = s.package.take().filter(|o| o.project == p) {
+            if old.key == crate::package::Key::Making {
+                fresh.key = old.key;
+            } else if let (crate::package::Key::None, crate::package::Key::Failed(_)) = (&fresh.key, &old.key) {
+                fresh.key = old.key;
+            }
+            fresh.build = old.build;
+            fresh.tried = old.tried;
+        }
+        s.package = Some(fresh);
+    }
+
+    fn package_key(&mut self, s: &mut State) {
+        let Some(pk) = &mut s.package else { return };
+        if pk.key == crate::package::Key::Making {
+            return;
+        }
+        pk.key = crate::package::Key::Making;
+        let project = pk.project.clone();
+        if !self.start_job(Job::PackageKey { project: project.clone() }, &crate::package::key_argv(), &project, s) {
+            if let Some(pk) = &mut s.package {
+                pk.key = crate::package::Key::Failed("can't run opifex in the workspace".into());
+            }
+        }
+    }
+
+    fn package_build(&mut self, s: &mut State) {
+        let Some(pk) = &mut s.package else { return };
+        let (Some(b), true) = (pk.builder.clone(), pk.ready()) else { return };
+        if pk.build == crate::package::Build::Running {
+            return;
+        }
+        pk.build = crate::package::Build::Running;
+        pk.tried = crate::package::Try::Idle;
+        let project = pk.project.clone();
+        s.output = format!("$ {}\n", crate::package::bundle_argv(&b).join(" "));
+        if !self.start_job(Job::PackageBuild { project: project.clone() }, &crate::package::bundle_argv(&b), &project, s) {
+            if let Some(pk) = &mut s.package {
+                pk.build = crate::package::Build::Failed("can't run the build in the workspace".into());
+            }
+        }
+    }
+
+    /// Hand the bundle made to the install sheet, which shows the person
+    /// what it is and installs it only with their press and only when a
+    /// publisher key this computer trusts signed it (opifex.md §7.4).
+    fn package_try(&mut self, s: &mut State) {
+        let Some(pk) = &mut s.package else { return };
+        let crate::package::Build::Done(b) = &pk.build else { return };
+        if self.trying.is_some() {
+            return;
+        }
+        let path = self.root.join(&b.insula);
+        if !crate::exec::inside(&self.root, &path) {
+            return;
+        }
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                pk.tried = crate::package::Try::Failed(format!("{}: {e}", b.insula));
+                return;
+            }
+        };
+        pk.tried = crate::package::Try::Asking;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dirty = self.dirty.clone();
+        let sheet = self.sheet.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::package::side_load(&sheet, &file));
+            if let Some(d) = dirty {
+                d.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        self.trying = Some((pk.project.clone(), rx));
+    }
+
+    fn take_tried(&mut self, s: &mut State) {
+        let Some((project, rx)) = &self.trying else { return };
+        let got = match rx.try_recv() {
+            Ok(t) => t,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => crate::package::Try::Failed("the install sheet didn't answer".into()),
+        };
+        if let Some(pk) = s.package.as_mut().filter(|p| &p.project == project) {
+            pk.tried = got;
+        }
+        self.trying = None;
+    }
+
+    /// What `cargo atrium bundle --json` answered, as files in `work`.
+    fn built(&self, project: &str, v: &serde_json::Value) -> Result<crate::package::Built, String> {
+        let remote = self.remote_root.as_deref().ok_or("where the workspace's work is isn't known yet")?;
+        let insula = v["insula"].as_str().ok_or("it made no .insula (no opifex in the workspace?)")?;
+        let insula = crate::package::in_work(insula, remote, project).ok_or("the .insula isn't in the workspace's work")?;
+        let tree = v["tree"].as_str().and_then(|t| crate::package::in_work(t, remote, project)).unwrap_or_default();
+        let bytes = std::fs::metadata(self.root.join(&insula)).map_err(|e| format!("{insula}: {e}"))?.len();
+        let content = std::fs::read_to_string(self.root.join(&tree).join("atrium.toml")).map(|m| crate::package::content_of(&m)).unwrap_or_default();
+        Ok(crate::package::Built {
+            insula,
+            tree,
+            arch: v["arch"].as_str().unwrap_or("").chars().take(16).collect(),
+            signed: v["signed"] == true,
+            files: v["files"].as_array().map_or(0, Vec::len),
+            bytes,
+            content,
+        })
     }
 
     fn check(&mut self, s: &mut State) {
@@ -2316,6 +2451,7 @@ impl Engine {
         let now = Instant::now();
         self.crash_input(s);
         self.take_pictures(s);
+        self.take_tried(s);
         // The active file: edits into its tree, colours, the server.
         let (mut typed, mut edited) = (None, false);
         if let Some(i) = self.active {
@@ -2532,6 +2668,32 @@ impl Engine {
                             s.note = Some((format!("Can't move it: {e}"), true));
                         }
                     }
+                }
+                Job::PackageKey { project } => {
+                    let dir = if project.is_empty() { self.root.clone() } else { self.root.join(&project) };
+                    if let Some(pk) = s.package.as_mut().filter(|p| p.project == project) {
+                        pk.key = match crate::package::key_in(&dir) {
+                            crate::package::Key::None => crate::package::Key::Failed(crate::package::last_words(&buf)),
+                            k => k,
+                        };
+                    }
+                }
+                Job::PackageBuild { project } => {
+                    s.output.push_str(&String::from_utf8_lossy(&buf[..buf.len().min(OUTPUT_MAX)]));
+                    let built = crate::package::read_bundle(&buf).and_then(|v| self.built(&project, &v));
+                    if let Some(pk) = s.package.as_mut().filter(|p| p.project == project) {
+                        match built {
+                            Ok(b) => {
+                                s.note = Some((format!("Made {}", b.insula.rsplit('/').next().unwrap_or("")), false));
+                                pk.build = crate::package::Build::Done(b);
+                            }
+                            Err(e) => {
+                                s.note = Some((format!("The bundle: {e}"), true));
+                                pk.build = crate::package::Build::Failed(e);
+                            }
+                        }
+                    }
+                    self.tree.refresh();
                 }
                 Job::IconCheck { project, rel } => {
                     if let Some(a) = s.assets.as_mut().filter(|a| a.project == project) {
@@ -3070,6 +3232,87 @@ mod tests {
         let mut s = State::default();
         e.list(&mut s);
         (d, e, s)
+    }
+
+    #[test]
+    fn package_names_the_key_makes_the_bundle_and_asks_the_sheet() {
+        use crate::package::{Build, Key, Try};
+        let (d, mut e, mut s) = setup("package");
+        let p = d.join("proj/app");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("atrium.toml"), "[app]\nid = \"org.example.hi\"\nname = \"Hi\"\nversion = \"1.2.0\"\nentry = \"bin/hi\"\n").unwrap();
+        std::fs::write(p.join("hi.c"), "int main(void) { return 0; }\n").unwrap();
+        // A stand-in for the SDK's `make bundle`: what cargo atrium bundle
+        // --json prints (the .insula relative to the project, as make
+        // bundle names it), and the files it names.
+        let mk = concat!(
+            "bundle:\n",
+            "\t@echo \"$(BUNDLE_FLAGS)\" > flags\n",
+            "\t@echo building\n",
+            "\t@mkdir -p out/t && printf '[app]\\nid = \"org.example.hi\"\\n[bundle]\\ncontent = \"sha256:abcdef\"\\n' > out/t/atrium.toml && printf INSB > out/t.insula\n",
+            "\t@printf '{\\n  \"ok\": true,\\n  \"arch\": \"amd64\",\\n  \"tree\": \"%s/out/t\",\\n  \"insula\": \"out/t.insula\",\\n  \"signed\": true,\\n  \"files\": [\"bin/hi\", \"atrium.toml\"]\\n}\\n' \"$$(pwd -P)\"\n",
+        );
+        std::fs::write(p.join("Makefile"), mk).unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("app/hi.c".into()), &mut s);
+        e.wait_jobs(&mut s);
+        assert!(s.composition.is_some(), "an app project");
+        assert!(crate::ui::strip(&s).iter().any(|v| v.0 == "Package"));
+        e.act(Act::View(Main::Package), &mut s);
+        let pk = s.package.clone().unwrap();
+        assert_eq!((pk.id.as_str(), pk.version.as_str(), pk.key.clone()), ("org.example.hi", "1.2.0", Key::None));
+        // Not ready without a key: the build isn't started.
+        e.act(Act::PackageBuild, &mut s);
+        assert_eq!(s.package.as_ref().unwrap().build, Build::Idle);
+        // No opifex here: the tool's own words come back.
+        e.act(Act::PackageKey, &mut s);
+        assert_eq!(s.package.as_ref().unwrap().key, Key::Making);
+        e.wait_jobs(&mut s);
+        let k = s.package.as_ref().unwrap().key.clone();
+        assert!(matches!(&k, Key::Failed(w) if w.contains("opifex")), "{k:?}");
+        // The key file as opifex token agent writes it.
+        std::fs::create_dir_all(p.join(".atrium")).unwrap();
+        std::fs::write(p.join(crate::package::KEY_FILE), "atrium-agent-key = 1\npublic = \"ecdsa-sha2-nistp256 AAAA hi apps\"\n").unwrap();
+        e.act(Act::View(Main::Package), &mut s);
+        assert_eq!(s.package.as_ref().unwrap().key, Key::Found("Arca key \"hi apps\"".into()));
+        e.act(Act::PackageBuild, &mut s);
+        assert_eq!(s.package.as_ref().unwrap().build, Build::Running);
+        e.wait_jobs(&mut s);
+        let Build::Done(b) = s.package.as_ref().unwrap().build.clone() else { panic!("{:?} {}", s.package.as_ref().unwrap().build, s.output) };
+        assert_eq!((b.insula.as_str(), b.tree.as_str(), b.arch.as_str(), b.signed, b.files, b.bytes, b.content.as_str()),
+                   ("app/out/t.insula", "app/out/t", "amd64", true, 2, 4, "sha256:abcdef"));
+        assert_eq!(std::fs::read_to_string(p.join("flags")).unwrap().trim(), "--sign .atrium/publisher.key --json");
+        assert!(s.output.contains("building"), "the build shows: {}", s.output);
+        // The install sheet: a stand-in answers; it got the file itself.
+        let sock = d.join("sheet.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let t = std::thread::spawn(move || {
+            use std::io::Write;
+            use std::os::fd::AsRawFd;
+            let (c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let r = atrium_fdpass::recv(c.as_raw_fd(), &mut buf, 1).unwrap();
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut std::fs::File::from(r.fds.into_iter().next().unwrap()), &mut body).unwrap();
+            (&c).write_all(b"{\"Failed\":{\"why\":\"not signed by a key on the side-load list\"}}\n").unwrap();
+            body
+        });
+        e.sheet = sock;
+        e.act(Act::PackageTry, &mut s);
+        assert_eq!(s.package.as_ref().unwrap().tried, Try::Asking);
+        let until = Instant::now() + Duration::from_secs(10);
+        while s.package.as_ref().unwrap().tried == Try::Asking && Instant::now() < until {
+            e.tick(&mut s);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(s.package.as_ref().unwrap().tried, Try::Failed("not signed by a key on the side-load list".into()));
+        assert_eq!(t.join().unwrap(), "INSB");
+        // A dev. id: not ready, whatever the key.
+        std::fs::write(p.join("atrium.toml"), "[app]\nid = \"dev.hi\"\nversion = \"1\"\n").unwrap();
+        e.act(Act::View(Main::Package), &mut s);
+        assert!(!s.package.as_ref().unwrap().ready());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

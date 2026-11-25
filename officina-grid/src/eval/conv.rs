@@ -381,3 +381,60 @@ pub(super) fn isformula(c: &Ctx, a: &[Expr]) -> Ev {
 pub(super) fn isnontext(c: &Ctx, a: &[Expr]) -> Ev {
     Ev::V(Value::Bool(!matches!(c.scalar(&a[0]), Value::Str(_))))
 }
+
+/// CELL(info_type, [reference]): "address", "col", "row", "contents",
+/// "type" (b blank, l text, v anything else) and "filename" (empty: a
+/// document never reveals where it is stored) of the reference's top-left
+/// cell, or of the formula's own cell. Other info types are #VALUE!.
+pub(super) fn cell(c: &Ctx, a: &[Expr]) -> Ev {
+    let kind = tri!(text(c, &a[0])).to_ascii_lowercase();
+    let (sheet, row, col) = match given(a, 1) {
+        Some(arg) => {
+            let r = tri!(rect_arg(c, arg));
+            (r.sheet, r.r0, r.c0)
+        }
+        None => (c.sheet, c.row, c.col),
+    };
+    match kind.as_str() {
+        "address" => {
+            let mut out = String::new();
+            if sheet != c.sheet {
+                crate::formula::print::push_sheet_name(&c.wb.sheet_name(sheet), &mut out);
+                out.push('!');
+            }
+            out.push('$');
+            out.push_str(&crate::addr::col_name(col));
+            out.push('$');
+            out.push_str(&(row + 1).to_string());
+            s(&out)
+        }
+        "col" => n(f64::from(col) + 1.0),
+        "row" => n(f64::from(row) + 1.0),
+        "contents" => match c.wb.value(sheet, row, col) {
+            Value::Empty => n(0.0),
+            v => Ev::V(v),
+        },
+        "type" => s(match c.wb.value(sheet, row, col) {
+            Value::Empty => "b",
+            Value::Str(_) => "l",
+            _ => "v",
+        }),
+        "filename" => s(""),
+        _ => Ev::err(ErrorKind::Value),
+    }
+}
+
+/// INFO(type_text): "numfile" (the sheet count), "recalc", "release",
+/// "system", "osversion", and "directory" (empty, as for CELL's filename).
+/// Other types are #VALUE!.
+pub(super) fn info(c: &Ctx, a: &[Expr]) -> Ev {
+    match tri!(text(c, &a[0])).to_ascii_lowercase().as_str() {
+        "numfile" => n(c.wb.sheet_count() as f64),
+        "recalc" => s("Automatic"),
+        "release" => s("16.0"),
+        "system" => s("pcdos"),
+        "osversion" => s("Atrium"),
+        "directory" => s(""),
+        _ => Ev::err(ErrorKind::Value),
+    }
+}

@@ -26,6 +26,8 @@ pub enum Main {
     Inspect,
     /// The installed plugins, switched on or off for this workspace.
     Plugins,
+    /// The project made into a signed bundle, tried, described (§3.9).
+    Package,
 }
 
 /// The preview pane's width (Move into a worker).
@@ -730,6 +732,110 @@ pub fn plugin_row_tops(rows: &[crate::ui::PluginRow]) -> Vec<(f32, f32)> {
         y += rh + em(10.0);
         at
     }).collect()
+}
+
+/// The Package view's step cards: each one's top below the view's top.
+/// Its button is 22 below a card's top, at the Plugins view's x.
+pub const PACKAGE_CARD: f32 = 88.0;
+pub fn package_card_top(i: usize) -> f32 {
+    em(80.0) + i as f32 * em(PACKAGE_CARD + 8.0)
+}
+
+fn bytes_label(n: u64) -> String {
+    match n {
+        0..=999 => format!("{n} bytes"),
+        1_000..=999_999 => format!("{:.0} kB", n as f64 / 1e3),
+        _ => format!("{:.1} MB", n as f64 / 1e6),
+    }
+}
+
+/// The Package view (dev-tools.md §3.9): the app, its signing key, the
+/// bundle, trying it here, and publishing.
+pub fn package(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
+    use crate::package::{Build, Key, Try};
+    let t = ctx.theme;
+    let (x0, y0) = (area.x(), area.y());
+    let w = area.w().min(em(760.0));
+    text(ctx, x0 + em(24.0), y0 + em(30.0), "Package", type_size::LG, Weight::Semibold, t.text_primary());
+    let Some(p) = &s.package else {
+        text(ctx, x0 + em(24.0), y0 + em(54.0), "Open a file of an app project (one with atrium.toml) to package it.", type_size::SM, Weight::Regular, t.text_secondary());
+        return;
+    };
+    let shown = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
+    text(ctx, x0 + em(24.0), y0 + em(54.0), &format!("Make {shown} into a signed bundle, try it on this computer, then publish it."),
+         type_size::SM, Weight::Regular, t.text_secondary());
+    let lw = w - em(250.0);
+    let card = |ctx: &mut Ctx, i: usize, title: &str| -> f32 {
+        let y = y0 + package_card_top(i);
+        ctx.add(Node::Rect { rect: Rect::new(x0 + em(16.0), y, w - em(32.0), em(PACKAGE_CARD)), fill: t.bg_surface(), radius: radius::MD });
+        text(ctx, x0 + em(32.0), y + em(20.0), &format!("{}  {title}", i + 1), type_size::MD, Weight::Medium, t.text_primary());
+        y
+    };
+    let line = |ctx: &mut Ctx, y: f32, s: &str, bad: bool| {
+        para(ctx, x0 + em(52.0), y, s, lw, type_size::SM, Weight::Regular, if bad { t.danger_fg() } else { t.text_secondary() }, 2);
+    };
+    let button = |ctx: &mut Ctx, y: f32, key: u64, b: Button| {
+        ctx.key(key);
+        b.at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).render(ctx);
+    };
+
+    // 1. The app.
+    let y = card(ctx, 0, "The app");
+    line(ctx, y + em(44.0), &format!("{}  version {}", if p.id.is_empty() { "(no id)" } else { &p.id }, if p.version.is_empty() { "?" } else { &p.version }), false);
+    match p.problems().first() {
+        Some(why) => line(ctx, y + em(68.0), why, true),
+        None => line(ctx, y + em(68.0), "Its manifest is ready for a bundle.", false),
+    }
+
+    // 2. The signing key.
+    let y = card(ctx, 1, "Signing key");
+    let (said, bad) = match &p.key {
+        Key::None => ("None yet. Make a P-256 key in Settings, Keys, and let this workspace use it; its private half stays in Arca.".to_string(), false),
+        Key::Making => ("Asking the workspace's key agent…".to_string(), false),
+        Key::Found(k) => (format!("Signs with {k} ({})", crate::package::KEY_FILE), false),
+        Key::Failed(why) => (why.clone(), true),
+    };
+    line(ctx, y + em(44.0), &said, bad);
+    if p.key != Key::Making {
+        let label = if matches!(p.key, Key::Found(_)) { "Name it again" } else { "Use my Arca key" };
+        button(ctx, y, 8700, Button::secondary(label).on_click(plain(q, Act::PackageKey)));
+    }
+
+    // 3. The bundle.
+    let y = card(ctx, 2, "Bundle");
+    match &p.build {
+        Build::Idle => line(ctx, y + em(44.0), "Builds a release, carries the libraries it needs, packs every file into the index and signs it.", false),
+        Build::Running => line(ctx, y + em(44.0), "Building and signing… (the Output panel shows the build)", false),
+        Build::Done(b) => {
+            let name = b.insula.rsplit('/').next().unwrap_or("");
+            line(ctx, y + em(44.0), &format!("{name}, {}, {} files, {}", bytes_label(b.bytes), b.files, if b.signed { "signed" } else { "NOT signed" }), !b.signed);
+            line(ctx, y + em(68.0), &format!("{} · content {}", b.arch, b.content.get(..23).unwrap_or(&b.content)), false);
+        }
+        Build::Failed(why) => line(ctx, y + em(44.0), why, true),
+    }
+    if p.ready() && p.build != Build::Running {
+        let label = if matches!(p.build, Build::Done(_)) { "Make it again" } else { "Make the bundle" };
+        button(ctx, y, 8701, Button::primary(label).on_click(plain(q, Act::PackageBuild)));
+    }
+
+    // 4. Trying it here.
+    let y = card(ctx, 3, "Try it on this computer");
+    let (said, bad) = match &p.tried {
+        Try::Idle => ("The install sheet shows what it asks for; it installs only when this computer trusts your key (Settings, Apps, side-load keys).".to_string(), false),
+        Try::Asking => ("The install sheet is up: answer it there.".to_string(), false),
+        Try::Installed => (format!("Installed {} for you.", p.id), false),
+        Try::Declined => ("Not installed: the sheet was declined.".to_string(), false),
+        Try::Failed(why) => (why.clone(), true),
+    };
+    line(ctx, y + em(44.0), &said, bad);
+    if matches!(p.build, Build::Done(_)) && p.tried != Try::Asking {
+        button(ctx, y, 8702, Button::secondary("Install…").on_click(plain(q, Act::PackageTry)));
+    }
+
+    // 5. Publishing.
+    let y = card(ctx, 4, "Publish");
+    line(ctx, y + em(44.0), "In a catalog of your own: opifex catalog add <catalog> <bundle> --arch <a> --archive <.insula> --url <where you host it>, then sign a new head.", false);
+    line(ctx, y + em(68.0), &format!("The public key to register: {}", crate::package::PUB_FILE), false);
 }
 
 pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {

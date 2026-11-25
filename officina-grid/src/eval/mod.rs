@@ -13,10 +13,14 @@ pub mod dates;
 pub mod funcs;
 pub mod ifcache;
 mod fin;
+mod bonds;
 mod conv;
+mod dist;
+mod linest;
 mod more;
 mod stats;
 mod refs;
+mod special;
 mod textafter;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};

@@ -265,3 +265,213 @@ pub(super) fn db(c: &Ctx, a: &[Expr]) -> Ev {
     }
     n(book * rate)
 }
+
+// More cash-flow, rate and depreciation functions (§16.137).
+
+/// Cash flows with their dates (whole days), for XNPV and XIRR: the same
+/// count of each, no date before the first.
+fn dated(c: &Ctx, a: &[Expr]) -> Result<(Vec<f64>, Vec<f64>), ErrorKind> {
+    let values = flows(c, &a[..1])?;
+    let dates: Vec<f64> = flows(c, &a[1..2])?.into_iter().map(f64::trunc).collect();
+    if values.len() != dates.len() || values.is_empty() {
+        return Err(ErrorKind::Num);
+    }
+    if dates.iter().any(|&d| d < dates[0] || !c.wb.date_system().contains(d)) {
+        return Err(ErrorKind::Num);
+    }
+    Ok((values, dates))
+}
+fn xnpv_of(r: f64, values: &[f64], dates: &[f64]) -> f64 {
+    values.iter().zip(dates).map(|(v, d)| v / (1.0 + r).powf((d - dates[0]) / 365.0)).sum()
+}
+/// XNPV(rate, values, dates).
+pub(super) fn xnpv(c: &Ctx, a: &[Expr]) -> Ev {
+    let r = tri!(arg(c, a, 0, 0.0));
+    let (values, dates) = tri!(dated(c, &a[1..]));
+    if r <= -1.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    n(xnpv_of(r, &values, &dates))
+}
+/// XIRR(values, dates, [guess]).
+pub(super) fn xirr(c: &Ctx, a: &[Expr]) -> Ev {
+    let (values, dates) = tri!(dated(c, a));
+    let guess = tri!(arg(c, a, 2, 0.1));
+    if !values.iter().any(|&x| x > 0.0) || !values.iter().any(|&x| x < 0.0) {
+        return Ev::err(ErrorKind::Num);
+    }
+    match solve(guess, |r| xnpv_of(r, &values, &dates)) {
+        Some(r) => n(r),
+        None => Ev::err(ErrorKind::Num),
+    }
+}
+/// MIRR(values, finance_rate, reinvest_rate): outflows financed at one
+/// rate, inflows reinvested at the other.
+pub(super) fn mirr(c: &Ctx, a: &[Expr]) -> Ev {
+    let v = tri!(flows(c, &a[..1]));
+    let (fr, rr) = (tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)));
+    let count = v.len() as f64;
+    if count < 2.0 || fr <= -1.0 || rr <= -1.0 {
+        return Ev::err(ErrorKind::Div0);
+    }
+    let pos: Vec<f64> = v.iter().map(|&x| x.max(0.0)).collect();
+    let neg: Vec<f64> = v.iter().map(|&x| x.min(0.0)).collect();
+    let (gain, cost) = (npv_of(rr, &pos), npv_of(fr, &neg));
+    if gain == 0.0 || cost == 0.0 {
+        return Ev::err(ErrorKind::Div0);
+    }
+    n((-gain * (1.0 + rr).powf(count) / (cost * (1.0 + fr))).powf(1.0 / (count - 1.0)) - 1.0)
+}
+
+/// CUMIPMT and CUMPRINC(rate, nper, pv, start_period, end_period, type).
+fn cumulative(c: &Ctx, a: &[Expr], principal: bool) -> Ev {
+    let (r, nper, pv) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)).trunc(), tri!(arg(c, a, 2, 0.0)));
+    let (start, end, t) = (tri!(arg(c, a, 3, 0.0)).trunc(), tri!(arg(c, a, 4, 0.0)).trunc(), tri!(arg(c, a, 5, -1.0)));
+    if r <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1.0 || end < start || end > nper || !(t == 0.0 || t == 1.0) {
+        return Ev::err(ErrorKind::Num);
+    }
+    if end - start > 1e6 {
+        return Ev::err(ErrorKind::Limit);
+    }
+    let pmt = pmt_of(r, nper, pv, 0.0, t);
+    let mut sum = 0.0;
+    let mut p = start;
+    while p <= end {
+        let interest = ipmt_of(r, p, nper, pv, 0.0, t);
+        sum += if principal { pmt - interest } else { interest };
+        p += 1.0;
+    }
+    n(sum)
+}
+pub(super) fn cumipmt(c: &Ctx, a: &[Expr]) -> Ev {
+    cumulative(c, a, false)
+}
+pub(super) fn cumprinc(c: &Ctx, a: &[Expr]) -> Ev {
+    cumulative(c, a, true)
+}
+
+/// EFFECT(nominal_rate, npery).
+pub(super) fn effect(c: &Ctx, a: &[Expr]) -> Ev {
+    let (r, p) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)).trunc());
+    if r <= 0.0 || p < 1.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    n((1.0 + r / p).powf(p) - 1.0)
+}
+/// NOMINAL(effect_rate, npery).
+pub(super) fn nominal(c: &Ctx, a: &[Expr]) -> Ev {
+    let (r, p) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)).trunc());
+    if r <= 0.0 || p < 1.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    n(p * ((1.0 + r).powf(1.0 / p) - 1.0))
+}
+/// FVSCHEDULE(principal, schedule): blanks in the schedule are 0; text is
+/// #VALUE!.
+pub(super) fn fvschedule(c: &Ctx, a: &[Expr]) -> Ev {
+    let mut x = tri!(arg(c, a, 0, 0.0));
+    let rates = match c.to_array(c.eval(&a[1])) {
+        Ok(r) => r,
+        Err(k) => return Ev::err(k),
+    };
+    for v in &rates.vals {
+        match v {
+            Value::Num(r) => x *= 1.0 + r,
+            Value::Empty => {}
+            Value::Err(k) => return Ev::err(*k),
+            _ => return Ev::err(ErrorKind::Value),
+        }
+    }
+    n(x)
+}
+/// PDURATION(rate, pv, fv): periods for pv to grow to fv.
+pub(super) fn pduration(c: &Ctx, a: &[Expr]) -> Ev {
+    let (r, pv, fv) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)));
+    if r <= 0.0 || pv <= 0.0 || fv <= 0.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    n((fv.ln() - pv.ln()) / r.ln_1p())
+}
+/// RRI(nper, pv, fv): the equivalent rate of growth.
+pub(super) fn rri(c: &Ctx, a: &[Expr]) -> Ev {
+    let (p, pv, fv) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)));
+    if p <= 0.0 || pv == 0.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    n((fv / pv).powf(1.0 / p) - 1.0)
+}
+/// ISPMT(rate, per, nper, pv): interest in a period of an even-principal
+/// loan.
+pub(super) fn ispmt(c: &Ctx, a: &[Expr]) -> Ev {
+    let (r, per, nper, pv) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)), tri!(arg(c, a, 3, 0.0)));
+    if nper == 0.0 {
+        return Ev::err(ErrorKind::Div0);
+    }
+    n(pv * r * (per / nper - 1.0))
+}
+/// The power of ten just above `fraction` (16 gives 100).
+fn fraction_scale(fraction: f64) -> f64 {
+    10f64.powf(fraction.log10().floor() + 1.0)
+}
+/// DOLLARDE(fractional_dollar, fraction): 1.02 in sixteenths is 1.125.
+pub(super) fn dollarde(c: &Ctx, a: &[Expr]) -> Ev {
+    let (x, f) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)).trunc());
+    if f < 0.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    if f == 0.0 {
+        return Ev::err(ErrorKind::Div0);
+    }
+    let whole = x.trunc();
+    n(whole + (x - whole) * fraction_scale(f) / f)
+}
+/// DOLLARFR(decimal_dollar, fraction): the inverse of DOLLARDE.
+pub(super) fn dollarfr(c: &Ctx, a: &[Expr]) -> Ev {
+    let (x, f) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)).trunc());
+    if f < 0.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    if f == 0.0 {
+        return Ev::err(ErrorKind::Div0);
+    }
+    let whole = x.trunc();
+    n(whole + (x - whole) * f / fraction_scale(f))
+}
+
+/// VDB(cost, salvage, life, start_period, end_period, [factor],
+/// [no_switch]): declining-balance depreciation between two (possibly
+/// fractional) points, switching to straight line for the remaining life
+/// when that is larger unless `no_switch`. A partial period gets its share
+/// of that period's depreciation.
+pub(super) fn vdb(c: &Ctx, a: &[Expr]) -> Ev {
+    let (cost, salvage, life) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)));
+    let (start, end, factor) = (tri!(arg(c, a, 3, 0.0)), tri!(arg(c, a, 4, 0.0)), tri!(arg(c, a, 5, 2.0)));
+    let no_switch = match a.get(6) {
+        Some(x) if !missing(x) => tri!(super::to_bool(&c.scalar(x))),
+        _ => false,
+    };
+    if cost < 0.0 || salvage < 0.0 || life <= 0.0 || start < 0.0 || end < start || end > life || factor <= 0.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    if end > 1e6 {
+        return Ev::err(ErrorKind::Limit);
+    }
+    let rate = (factor / life).min(1.0);
+    let mut book = cost;
+    let mut straight = false;
+    let mut sum = 0.0;
+    let mut i = 0.0;
+    while i < end {
+        let ddb = (book * rate).min(book - salvage).max(0.0);
+        let sl = ((book - salvage) / (life - i).max(1.0)).max(0.0);
+        if !no_switch && (straight || sl > ddb) {
+            straight = true;
+        }
+        let dep = if straight { sl } else { ddb };
+        let overlap = (end.min(i + 1.0) - start.max(i)).max(0.0);
+        sum += dep * overlap;
+        book -= dep;
+        i += 1.0;
+    }
+    n(sum)
+}

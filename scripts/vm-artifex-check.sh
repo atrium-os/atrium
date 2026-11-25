@@ -182,6 +182,9 @@ for x in md-links:$MDL todo-lens:$TODO words:$WRD; do
   O=$B/b-\$id; mkdir -p \$O/bin; cp $B/\$n \$O/bin/; cp $B/\$n.toml \$O/atrium.toml
   sign \$O; opifex install \$O >/dev/null
 done
+# The install sheet's socket directory: jaild mounts it into Artifex's jail,
+# and on a real system opifex-sheet's service makes it.
+mkdir -p /atrium/sockets/opifex-sheet
 # limend, the embed broker, as _limen (vm-embeds-check.sh does the same):
 # it lists the plugins to Artifex and starts them through portcullisd.
 install -m 0755 $B/limend /usr/local/bin/limend
@@ -760,6 +763,57 @@ if V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_proj test -x /atri
     GAP=8 press 700 640
 else
     echo "  (no app project, or no lldb-dap in proj (CDEV= a c-dev layer with it): skipped)"
+fi
+
+echo "=== Package (dev-tools.md §3.9)"
+# The c-app project made into a signed bundle from the Package view: the
+# key step asks opifex in the workspace (no Arca key granted here, so its
+# own words come back), a key file stands in for the Arca one, Make the
+# bundle runs make bundle (cargo-atrium from the Rust layer) and signs it,
+# and Install hands the .insula to the install sheet's socket (no sheet
+# runs in this check: Artifex says so).
+if want package && V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
+    pkg() { state | sed -n 's/.* pkg=\(.*\) dmsgs=.*/\1/p'; }
+    # Each step's button (views.rs: package_card_top, 96 apart from 80,
+    # 22 down), at the Plugins view's x.
+    pbtn() { press 757 $((74 + 80 + 96 * $1 + 22)); }
+    ROW=$(rows | grep -n '^app/app.c$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'tabs=\[[^]]*app/app.c\]' 20 || bad "app.c: $(state)"
+    V "rm -rf $W/proj/work/app/.atrium"
+    pal "package" "Package the app" && waitstate 'view=Package' 20 && waitstate 'pkg=Some(("none", "idle", "Idle"))' 20 \
+        && ok "the palette shows the Package view: no key, no bundle" || bad "package view: $(pkg)"
+    shot artifex-package-1-view
+    pbtn 1
+    waitstate 'pkg=Some(("failed ' 120 && ok "the key step asks opifex in the workspace: $(pkg | grep -o 'failed [^"]*' | cut -c1-90)" \
+        || bad "key: $(pkg)"
+    # A key file standing in for the Arca one (opifex --sign takes either),
+    # owned as the key step's .atrium is: the workspace's uid and group.
+    K=$W/proj/work/app/.atrium
+    V "mkdir -p $K && openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $K/publisher.key && openssl ec -in $K/publisher.key -pubout -out $K/publisher.pem 2>/dev/null && chown \$(stat -f %u:%g $K) $K/publisher.key $K/publisher.pem && chmod 0640 $K/publisher.key"
+    check "the stand-in key file is there" "1" "$(V "test -s $K/publisher.key && echo 1")"
+    # The palette's keys go to the editor: back to Files first.
+    press 64 100; waitstate 'view=Code' 20 || bad "files: $(state)"
+    pal "package" "Package the app" && waitstate 'pkg=Some(("found a key file", "idle"' 20 && ok "it finds the key file" || bad "key file: $(pkg)"
+    pbtn 2
+    waitstate 'pkg=Some(("found a key file", "\(running\|done\|failed\)' 20 || bad "build: $(pkg)"
+    waitstate 'pkg=Some(("found a key file", "\(done\|failed\)' 900
+    waitstate 'pkg=Some(("found a key file", "done [^ ]*.insula [0-9]* signed=true files=[1-9]' 5 \
+        && ok "Make the bundle builds, packs and signs it: $(pkg | grep -o 'done [^"]*')" || bad "bundle: $(pkg) $(state | grep -o 'note=[^)]*')"
+    shot artifex-package-2-built
+    INS=$(V "ls $W/proj/work/app/bundle/*.insula $W/proj/work/app/target/atrium-bundle/*.insula 2>/dev/null | head -1")
+    TREE=${INS%.insula}
+    check "the bundle's manifest names its content index" "1" "$(V "grep -c '^content = \"sha256:' $TREE/atrium.toml")"
+    check "and is signed" "1" "$(V "test -s $TREE/atrium.toml.sig && echo 1")"
+    pbtn 3
+    # The trace's Debug form escapes the answer's quotes: Failed(\"...\").
+    waitstate 'pkg=Some((.*"Failed(\\"[^\\]*install sheet' 60 && ok "Install hands it to the install sheet's socket (none runs here: $(pkg | grep -o 'Failed(\\"[^\\]*' | cut -c10-80))" \
+        || bad "install: $(pkg)"
+    check "the sheet's socket is in Artifex's jail" "1" "$(V "p=\$(pgrep -x artifex | head -1); r=\$(jls -j \$(ps -o jid= -p \$p) path); test -d \$r/atrium/sockets/opifex-sheet && echo 1")"
+    press 64 100
+    waitstate 'view=Code' 20 || bad "files: $(state)"
+else
+    echo "  (no app project or no cargo-atrium in proj (RUST= the Rust layer), or SKIP has package: skipped)"
 fi
 
 echo "=== Inspect a dev app (a Pergola dev build)"

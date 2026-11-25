@@ -2,9 +2,12 @@
 //! (navigator-ui.md §15.3 check 2), against the installed portcullisd.
 //!
 //! Starts a Navigator engine the way limend does (as `_limen`, through its
-//! worker rule) and asks for its memory on the connection that holds it:
+//! worker rule, serving a running app instance: portcullisd starts an
+//! engine only for one) and asks for its memory on the connection that
+//! holds it. The instance is `LIMEN_PROBE_SERVES` (a uid), else the running
+//! navigatord's. Stage it outside `/root`, which `_limen` cannot enter:
 //!
-//!   su -m _limen -c limen-usage-probe
+//!   su -m _limen -c /opt/navigator-live/limen-usage-probe
 //!
 //! Checks: the first ask is answered with a use above 0 and the part cap,
 //! a second ask at once is refused (one a second), one asked after the gap
@@ -21,6 +24,15 @@ fn jail_exists(name: &str) -> bool {
     Command::new("jls").args(["-j", name, "jid"]).output().is_ok_and(|o| o.status.success())
 }
 
+/// The uid the engine serves: `LIMEN_PROBE_SERVES`, else navigatord's.
+fn serves() -> Option<u32> {
+    if let Ok(v) = std::env::var("LIMEN_PROBE_SERVES") { return v.trim().parse().ok(); }
+    let pids = Command::new("pgrep").args(["-x", "navigatord"]).output().ok()?;
+    let pid = String::from_utf8_lossy(&pids.stdout).split_whitespace().next()?.to_string();
+    let uid = Command::new("ps").args(["-o", "uid=", "-p", &pid]).output().ok()?;
+    String::from_utf8_lossy(&uid.stdout).trim().parse().ok()
+}
+
 fn main() {
     let mut failed = 0;
     let mut ran = 0;
@@ -34,8 +46,12 @@ fn main() {
     let jail = format!("app-org-atrium-navigator-engine--limen-{embed:016x}");
     let mut p = limen::launch::Portcullis::new(std::env::var("LIMEN_USER").unwrap_or_else(|_| "_limen".into()));
     let (ours, theirs) = UnixStream::pair().expect("socketpair");
-    match p.launch(limen::catalogue::NAVIGATOR_ENGINE, embed, theirs) {
-        Ok(uid) => println!("engine started as uid {uid} in {jail}"),
+    let Some(parent) = serves() else {
+        println!("FAIL no app instance to serve: set LIMEN_PROBE_SERVES or run a Navigator");
+        std::process::exit(1);
+    };
+    match p.launch_for(limen::catalogue::NAVIGATOR_ENGINE, embed, theirs, parent) {
+        Ok(uid) => println!("engine started as uid {uid} in {jail}, serving uid {parent}"),
         Err(e) => {
             println!("FAIL the engine did not start: {e}");
             std::process::exit(1);

@@ -1776,8 +1776,10 @@ Scrinium, navigatord and navigator-ui from main at 690b26a72 or later):
 2. The usage ask is rate-limited: two `InstanceUsage` asks less than a second apart on
    one engine connection get one answer and one `Error` ("too soon"), and the engine jail
    still goes when limend hangs up. The client is `limen-usage-probe` (limen's examples),
-   run as `_limen` on the installed guest with no limend change: `su -m _limen -c
-   limen-usage-probe`. It starts an engine through limend's worker rule and checks an
+   run as `_limen` on the installed guest with no limend change, staged outside `/root`:
+   `su -m _limen -c /opt/navigator-live/limen-usage-probe`. It starts an engine through
+   limend's worker rule, serving a running app instance (portcullisd starts an engine only
+   for one: `LIMEN_PROBE_SERVES=<uid>`, else the running navigatord's uid), and checks an
    answer above 0 with the part cap (256 MiB), a refusal at once, an answer after 1.1 s
    (the positive control), and the jail gone within 10 s of hanging up.
 3. Save a download (as I6.4), open the Downloads list, and press the `show=` point the
@@ -1802,7 +1804,12 @@ limend refused the delegated navigator-ui connection's `picker` request (`NOT_PR
 That connection may now ask for a picker, but may send it only `ToChild::Show`: an `Open`,
 or any `SEND_FD` to it, is refused, so no file can come back to the UI. Host test:
 `delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine`. Checks 2 and 4
-now have their clients (above); they wait for a Mac run.
+now have their clients (above). Mac run at e696d6036: check 3 passed on the installed
+Tessera guest (Files opened on Downloads with report.csv selected), check 1's log line is
+there, and the tag no longer covers the prompt. The show probe got 3 of 6: one ask's
+message was read by the next ask, so each spent the press before its own. Each ask now
+names its own file and spends only its own message. The usage probe was refused because
+it asked for an engine serving no app instance; it now serves one.
 
 The Mac run also showed frescod's "live code" tag, drawn in a pill just above the island,
 covering the prompt row's file name (the island started right under the row). While the

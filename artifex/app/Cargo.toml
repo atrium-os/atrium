@@ -27,6 +27,8 @@ atrium-worker = { path = "../../sdk/atrium-worker" }
 serde_json = "1"
 toml = "0.8"
 libc = "0.2"
+# The Package view hands the install sheet a descriptor (opifex.md §7.4).
+atrium-fdpass = { path = "../../atrium-fdpass" }
 
 [dev-dependencies]
 # The dock's own check, to prove what the icon editor writes is drawn.

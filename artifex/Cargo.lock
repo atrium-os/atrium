@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "artifex-syntax",
  "atrium-assets",
+ "atrium-fdpass",
  "atrium-icon",
  "atrium-worker",
  "fresco-protocol",

@@ -4,6 +4,7 @@
 //! Each follows Excel's documented results, errors included.
 
 use super::funcs::each_num;
+use super::dates::DateSystem;
 use super::{to_text, Ctx, Ev};
 use crate::formula::{BinOp, Expr};
 use crate::value::{ErrorKind, Value};
@@ -700,33 +701,48 @@ pub(super) fn fixed_text(x: f64, d: i32, commas: bool) -> String {
 pub(super) fn yearfrac(c: &Ctx, a: &[Expr]) -> Ev {
     let (s, t) = (tri!(num(c, &a[0])), tri!(num(c, &a[1])));
     let basis = tri!(opt_num(c, a, 2, 0.0)).trunc();
-    let (mut s, mut p) = tri!(day_of(c, s));
-    let (mut t, mut q) = tri!(day_of(c, t));
-    if s > t {
-        std::mem::swap(&mut s, &mut t);
-        std::mem::swap(&mut p, &mut q);
+    let (s, _) = tri!(day_of(c, s));
+    let (t, _) = tri!(day_of(c, t));
+    if basis.fract() != 0.0 || !(0.0..=4.0).contains(&basis) {
+        return e(ErrorKind::Num);
     }
-    let ((y1, m1, mut d1), (y2, m2, mut d2)) = (p, q);
-    let system = c.wb.date_system();
-    let month_last = |day: f64| system.month_end(day, 0.0).is_some_and(|last| last == day);
-    let days360 = |d1: i64, d2: i64| ((y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1)) as f64 / 360.0;
-    let r = match basis as i32 {
-        _ if basis.fract() != 0.0 => return e(ErrorKind::Num),
-        0 => {
-            if d1 == 31 && d2 == 31 {
-                (d1, d2) = (30, 30);
-            } else if d1 == 31 {
-                d1 = 30;
-            } else if d1 == 30 && d2 == 31 {
-                d2 = 30;
-            } else if m1 == 2 && m2 == 2 && month_last(s) && month_last(t) {
-                (d1, d2) = (30, 30);
-            } else if m1 == 2 && month_last(s) {
-                d1 = 30;
-            }
-            days360(d1, d2)
+    match year_frac(c.wb.date_system(), s.min(t), s.max(t), basis as i32) {
+        Some(r) => n(r),
+        None => e(ErrorKind::Num),
+    }
+}
+
+/// Days from `s` to `t` (whole-day serials, s ≤ t) on a 30/360 count: the
+/// US (NASD) rules with their February month-ends, or the European ones.
+pub(super) fn days_360(system: DateSystem, s: f64, t: f64, european: bool) -> Option<f64> {
+    let (y1, m1, mut d1) = system.ymd(s)?;
+    let (y2, m2, mut d2) = system.ymd(t)?;
+    if european {
+        (d1, d2) = (d1.min(30), d2.min(30));
+    } else {
+        let month_last = |day: f64| system.month_end(day, 0.0).is_some_and(|last| last == day);
+        if d1 == 31 && d2 == 31 {
+            (d1, d2) = (30, 30);
+        } else if d1 == 31 {
+            d1 = 30;
+        } else if d1 == 30 && d2 == 31 {
+            d2 = 30;
+        } else if m1 == 2 && m2 == 2 && month_last(s) && month_last(t) {
+            (d1, d2) = (30, 30);
+        } else if m1 == 2 && month_last(s) {
+            d1 = 30;
         }
+    }
+    Some(((y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1)) as f64)
+}
+
+/// YEARFRAC's fraction of a year from `s` to `t` (s ≤ t) on `basis` 0–4.
+pub(super) fn year_frac(system: DateSystem, s: f64, t: f64, basis: i32) -> Option<f64> {
+    Some(match basis {
+        0 => days_360(system, s, t, false)? / 360.0,
         1 => {
+            let (y1, m1, d1) = system.ymd(s)?;
+            let (y2, m2, d2) = system.ymd(t)?;
             let leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
             let within_year = y1 == y2 || (y1 + 1 == y2 && (m1, d1) >= (m2, d2));
             if within_year {
@@ -734,16 +750,16 @@ pub(super) fn yearfrac(c: &Ctx, a: &[Expr]) -> Ev {
                 let year = if (y1 == y2 && leap(y1)) || feb29 { 366.0 } else { 365.0 };
                 (t - s) / year
             } else {
-                let (Some(first), Some(after)) = (system.date(y1 as f64, 1.0, 1.0), system.date((y2 + 1) as f64, 1.0, 1.0)) else { return e(ErrorKind::Num) };
+                let first = system.date(y1 as f64, 1.0, 1.0)?;
+                let after = system.date((y2 + 1) as f64, 1.0, 1.0)?;
                 (t - s) / ((after - first) / (y2 - y1 + 1) as f64)
             }
         }
         2 => (t - s) / 360.0,
         3 => (t - s) / 365.0,
-        4 => days360(d1.min(30), d2.min(30)),
-        _ => return e(ErrorKind::Num),
-    };
-    n(r)
+        4 => days_360(system, s, t, true)? / 360.0,
+        _ => return None,
+    })
 }
 
 pub(super) fn sinh(c: &Ctx, a: &[Expr]) -> Ev {

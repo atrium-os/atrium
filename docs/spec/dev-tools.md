@@ -734,6 +734,57 @@ and switches it on, checks its jail, its count and its exit.
 - D30: network only to the hosts the manifest names, shown when it's
   switched on. Recommended.
 
+### 3.9 Packaging an app from Artifex (Shankar, 2026-11-26)
+
+Asked for by Shankar after the release review: the steps from a project to
+something installable were all built (`cargo atrium bundle --sign`,
+`make bundle`, Arca-held P-256 publisher keys through `opifex token
+agent`, the install sheet's side-load, `opifex catalog add`), but only as
+terminal commands. Artifex's **Package** view (the strip's package icon,
+shown for an app project, and "Package the app" in the palette) walks
+them in five cards:
+
+1. **The app**: its id and version, and what stops a real install (a
+   `dev.` id, no version, nothing to build with).
+2. **Signing key**: "Use my Arca key" runs `opifex token agent --out
+   .atrium/publisher.key --pub .atrium/publisher.pem` in the workspace.
+   The agent offers only keys the person granted that workspace, the key
+   file holds only the public half's name, and the private half never
+   leaves Arca. Any key file opifex takes works (a PEM, a token).
+   opifex's own words come back when it fails, e.g. no P-256 key granted.
+3. **Bundle**: `cargo atrium bundle --sign .atrium/publisher.key --json`
+   (a Cargo project) or `make bundle BUNDLE_FLAGS=…` (a Makefile). The
+   build shows in the Output panel. Artifex reads only the JSON result,
+   follows only paths inside `work` (a relative one is the project's, as
+   `make bundle` names `bundle/<id>-<version>-<arch>.insula`), and shows
+   the `.insula`, its size,
+   the file count, whether it's signed, and the content hash the signed
+   manifest names.
+4. **Try it on this computer**: Artifex opens the `.insula` and hands the
+   install sheet the descriptor (`Ask::SideLoad`, `atrium-fdpass`), as
+   Scrinium does for a double-clicked bundle. The sheet shows the person
+   what it asks for and installs it only with their press, and only when
+   a key on the side-load list (Settings) signed it. A `workspace-exec`
+   app's jail now has the sheet's socket (portcullis-jail). Artifex waits
+   for the answer off the UI thread and shows Installed, Declined, or the
+   sheet's reason.
+5. **Publish**: the `opifex catalog add` line for a catalog of one's own,
+   and the public key file to register. Atrium's catalog takes only
+   `org.atrium.*` releases signed by the platform key (opifex.md §10).
+
+Built 2026-11-26: `artifex/app/src/package.rs`, `views::package`, the
+engine's `PackageKey`/`PackageBuild`/`PackageTry`, and the trace's `pkg=`.
+Host tests cover the cards and a whole flow against a stand-in `make
+bundle` and a stand-in sheet. `vm-artifex-check.sh` has a "Package"
+section (needs the Rust layer for cargo-atrium): the key step's refusal
+with no Arca key granted, a key file, a signed bundle from the c-app
+template, and Install reaching the sheet's socket. Run 2026-11-26 on the
+amd64 cloud VM (inspect, newproject, fuzz, assets and lsp skipped): 82 ok,
+1 failed; the failure was the check's own pattern for the sheet's answer
+(the trace escapes its quotes), fixed and matched against that run's line.
+Artifex's jail now mounts `/atrium/sockets/opifex-sheet`, so that directory
+must exist on the host (the sheet's service makes it; the check makes it).
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today
