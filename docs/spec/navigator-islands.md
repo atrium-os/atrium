@@ -3307,6 +3307,49 @@ engine binary: `scripts/navigator-i5-worker-audit.sh UNSTRIPPED SHA256` on
 the Mac (interpreter entry points, no LibJS or LibWasm JIT symbols). The
 Mac run is next, together with the memory limits from the second part.
 
+#### I6.6 Mac run on arm64 Tessera, 2026-11-25
+
+This ran on a fresh disposable guest under J2. navigatord, navigator-ui
+and limend were built at 1880b673e. The engine was rebuilt at 6cbae2cb3,
+with sha256 `6899a3de…55a7`, and installed with the repo's manifest
+(`memory = "1G"`, `[resources.pool]`). Evidence is in
+`~/atrium-vm/evidence/navigator-i6-6-20261125/` on the Mac. jaild logged
+no WARNs. memfed was not running on this base.
+
+- **D8.** "Always for this site" ran the page and wrote
+  `https://app.example` to the persona's `live-origins` (0600, the
+  Navigator app's uid).
+  - A new recorded trail opened the page live with no press ("runs live,
+    as chosen for its site"). An Unrecorded trail opened it in the
+    document lane.
+  - The chip's "Ask before running this site live" emptied the list. The
+    page already running kept running, and the next open asked again.
+- **Worker check.** With the page and its `pay.example` frame running,
+  `navigator-i6-worker-check.sh PAGE 1024 100 FRAME` passed 17 of 17: the
+  page at 1024 MiB, the frame at 256 MiB.
+  - The same run with `PAGE_MIB` 256 failed, as it should: 16 ok and 1
+    failed (the page's memoryuse check), exit 1.
+- **Binary audit.** `navigator-i5-worker-audit.sh` passed on the
+  installed engine: both interpreter entry points present, no JIT
+  symbols.
+- **Memory.** This used a copy of the fixture with Grow buttons, which
+  hold touched 8 MiB chunks (kept with the evidence).
+  - The frame, a part with the same 256 MiB limit as a widget, was killed
+    just as it crossed 256 MiB. A diagnostic RCTL `log` rule fired at
+    255 MiB for its pid first. The page ran on, and navigatord logged
+    that the frame ended.
+  - The page grew to 614 MiB under its 1 GiB limit and kept running.
+- **Ctrl+A.** The select-all branch compiled against the pinned LibWeb
+  with no change. `LocalNavigable::select_all` already prefers the active
+  input target over the document. In the sign-in field, Ctrl+A then
+  "zz" replaced "ana" completely. (The fixture has no password field.)
+  No selection highlight showed on screen between the two keys.
+- **Seen on the way.** The document lane draws the iframe's box black.
+  The run-live prompt's text runs under "Not now". On `/route/1`, a
+  `pushState` alias of the fixture, `same-site-api` failed its CORS check;
+  on `/app.html` it passes. The first run after a fixture-server restart
+  stopped with `CourierRefused("Http")`, and the retry ran.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
