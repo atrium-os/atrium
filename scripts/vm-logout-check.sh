@@ -34,7 +34,12 @@
 #      reports them Locked, and (key groups only) root can't read the
 #      overlay images;
 #   6. they log in again; Work's probe runs again and its counter went on
-#      from the first run (the overlay came back with its data).
+#      from the first run (the overlay came back with its data);
+#   7. (overlay volumes only) a root process outside their uids holds Work's
+#      overlay open and has just written a file into it; at logout
+#      portcullisd forces the unmount while the key is still loaded
+#      ("forcing unmount"), nothing stays mounted, Arca locks, and at the
+#      next login the file reads back (the forced unmount's flush landed).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ARCH=${ARCH:-aarch64}
@@ -240,6 +245,30 @@ launch work; LW2=$(probe_line $B/probe-work.log); echo "  $LW2"
 RUNS2=$(field "$LW2" runs); RUNS2=${RUNS2#runs=}
 check "Work's counter went on" "$((${RUNS1:-0} + 1))" "${RUNS2:-none}"
 check "…from the remounted overlay" yes "$(mounted_under | grep -qx "$WORK" && echo yes || echo no)"
+
+echo "=== 7. something outside their uids holds an overlay at logout"
+if [ "$(V "df -T $WORK 2>/dev/null | awk 'NR==2 {print \$2}'")" = tessera ]; then
+    V "daemon -f sh -c 'cd $WORK && jot -w held-by-root-%06d 20000 > held-by-root.txt && exec sleep 600'"
+    sleep 2
+    HSUM=$(V "md5 -q $WORK/held-by-root.txt")
+    check "a root process holds Work's overlay" yes "$(V "fstat -f $WORK 2>/dev/null | grep -q sleep && echo yes || echo no")"
+    V "cp $LOG $LOG.before"
+    r=$(ost '{"op":"logout"}')
+    check "ostiarius: no active session" '{"status":"ok","active":null}' "$r"
+    check "portcullisd forced the held overlay's unmount" yes \
+        "$(V "diff $LOG.before $LOG | grep -q '$U logging out: forcing unmount of: .*persona-apps/work' && echo yes || echo no")"
+    check "…and then had every overlay unmounted" yes \
+        "$(V "diff $LOG.before $LOG | grep -q '$U logging out: .* overlays unmounted' && echo yes || echo no")"
+    check "nothing mounted under ~$U/.atrium" "" "$(mounted_under)"
+    check "Arca reports them locked" 02 "$(arca_state)"
+    V "pkill -f 'sleep 600'" >/dev/null 2>&1
+    r=$(ost '{"op":"login","user":"'"$U"'","password":"'"$PW"'","frontend":"cli"}')
+    check "ostiarius: $U again" '{"status":"ok","active":"'"$U"'"}' "$r"
+    launch work; probe_line $B/probe-work.log >/dev/null
+    check "the file written just before logout reads back" "$HSUM" "$(V "md5 -q $WORK/held-by-root.txt 2>&1")"
+else
+    skip "held overlay: Work's overlay is not a Tessera volume here"
+fi
 
 echo "=== cleanup"
 ost '{"op":"logout"}' >/dev/null

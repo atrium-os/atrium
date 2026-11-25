@@ -926,7 +926,10 @@ atrium-volumes not in `ARCA_SERVICES`) folders that were never encrypted
 stay plain. arcad's calls run in a child as `_volumes-vk` (65053), named
 `atrium-volumes` in `ARCA_SERVICES`. Logout: ostiarius stops the person's
 apps, then locks Arca, which drops their group keys (the kernel flushes as
-each goes). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
+each goes). portcullisd unmounts the person's overlays before that
+(SessionEnded); one that something outside their uids still holds after
+five seconds is unmounted with `umount -f` while the key is still loaded,
+so its flush lands (`scripts/vm-logout-check.sh` 7). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
 atrium-volumes only, key-group keys only, no second verification since
 portcullisd had Sigillum verify the removal) deletes the item and drops
 the key, then `GROUP_ERASE`; if a folder is still in use the erase waits

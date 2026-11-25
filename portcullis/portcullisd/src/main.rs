@@ -4200,6 +4200,14 @@ fn session_ended(user: &str) -> Response {
         }
         thread::sleep(std::time::Duration::from_millis(250));
     }
+    // Something outside the person's uids still holds an overlay (a root
+    // shell's cwd, a stuck reader). Arca locks next whatever this answers,
+    // and a mounted overlay's writes are dropped once its key goes, so force
+    // the unmount now, while its flush can still land.
+    if !busy.is_empty() {
+        eprintln!("portcullisd: {user} logging out: forcing unmount of: {}", busy.join("; "));
+        busy = portcullis_overlay::teardown_person_forced(user);
+    }
     if busy.is_empty() {
         eprintln!("portcullisd: {user} logging out: {} app uid(s) stopped, overlays unmounted", uids.len());
         Response::Ok
