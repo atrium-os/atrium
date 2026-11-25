@@ -1,0 +1,24 @@
+[package]
+name = "limen-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+limen = { path = ".." }
+
+[[bin]]
+name = "web_island"
+path = "fuzz_targets/web_island.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]

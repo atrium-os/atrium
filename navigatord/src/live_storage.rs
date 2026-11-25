@@ -362,3 +362,35 @@ mod tests {
         assert!(Key::of(None, "https://[::1]/").is_none());
     }
 }
+
+/// A live page's storage batches and loaded stores, fuzzed (I6.6): never a
+/// panic, and what is taken encodes back to the same bytes.
+#[cfg(test)]
+mod storage_fuzz {
+    use super::*;
+
+    #[test]
+    fn hostile_batches_and_stores_are_refused_or_read_back_exactly() {
+        let mut s: u64 = 0x51_7cc1_b727_220a;
+        let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let honest = encode_ops(&[Op::Set("k".into(), "v".into()), Op::Append("k".into(), "w".into()), Op::Remove("j".into()), Op::Clear]);
+        let (mut ops_taken, mut maps_taken) = (0, 0);
+        for _ in 0..50_000 {
+            let mut b = honest.clone();
+            for _ in 0..1 + next() % 4 {
+                let at = (next() as usize) % (b.len() + 1);
+                match next() % 3 {
+                    0 => b.truncate(at),
+                    1 => b.insert(at, next() as u8),
+                    _ => if at < b.len() { b[at] = next() as u8 },
+                }
+            }
+            if let Some(ops) = decode_ops(&b) { ops_taken += 1; assert_eq!(encode_ops(&ops), b); }
+            if let Some(map) = decode(&b) {
+                maps_taken += 1;
+                assert!(size(&map) <= QUOTA && map.len() <= ITEMS_MAX);
+            }
+        }
+        assert!(ops_taken > 100 && maps_taken > 0, "{ops_taken} {maps_taken}");
+    }
+}

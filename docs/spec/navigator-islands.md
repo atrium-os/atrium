@@ -3229,6 +3229,38 @@ whole page, 256 MiB for parts):
     to 1 GiB and then falls back to the document lane, and a widget is
     still killed at 256 MiB.
 
+#### I6.6 as built (2026-11-25, third part: the channel fuzzed)
+
+Every message an engine or a fetcher sends is hostile. Each is now fuzzed
+in two ways:
+
+- **cargo-fuzz targets** (`cargo fuzz run <target>` from the fuzz
+  directory, nightly):
+  - `limen/fuzz` `web_island`: frames fed in order to one `Lifecycle`, so
+    every state sees hostile reports. This covers I6.2 to I6.4's
+    `Navigate`, `UrlChanged`, `Submit`, `Copy`, `Paste` and `PickFile`,
+    plus the control messages (`Pasted`, `FilePicked`, `UnloadAnswer`,
+    `ChapterSeek`, `PageSize`). A report that is taken must re-encode
+    and read the same, and only a report an honest engine could send is
+    taken.
+  - `nuntius/fuzz` `wire`: `Request` and `WireEvent`, including I6.5's
+    `Cors`, with the same round-trip check.
+  - First runs, 2026-11-25, cloud x86_64, 60 s each: `web_island` made
+    1,741,318 runs and `wire` 3,495,519, with no crash.
+- **Seeded mutation tests in `cargo test`**, so every build runs them.
+  Each mutates an honest message, and each asserts that enough cases are
+  still taken that the bounds are really exercised.
+  - navigatord `live_page::channel_fuzz`: 20,000 reporter addresses
+    (frame asks, messages, refusals, downloads). Whatever is taken is in
+    bounds.
+  - navigatord `live_page::channel_fuzz`: 80,000 mailbox operations from
+    a hostile page and frames. Queues stay at `QUEUE_MAX` or less,
+    messages at `MESSAGE_MAX` or less, and the JSON always parses.
+  - navigatord `live_page::channel_fuzz`: 5,000 hostile documents. Each
+    still gets the reporter script.
+  - navigatord `live_storage::storage_fuzz`: 50,000 storage batches and
+    stores. A batch that is taken encodes back to its own bytes.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
