@@ -520,12 +520,28 @@ root-owned config: `plain_app_data = true` in `/etc/atrium/volumes.policy.toml`.
 portcullisd then logs it on every launch and passes it on to the app (A2). A product
 image ships without the opt-out.
 
+Two refinements (review):
+- **Who decides "has key groups" is the kernel**, not the config. portcullisd asks
+  `TESSERA_IOC_GROUP_INFO` on the person's `~/.atrium`. If the kernel reports a key
+  group there, `plain_app_data` is ignored and logged as ignored. A dev config copied
+  onto a product image then cannot switch encryption off.
+- **Migration (the first login after E6).** atrium-volumes answers `waiting` for folders
+  in use that it will move at the next login. For Personal, a launch with `waiting`
+  folders goes ahead for that one login, with A2's plain-store fact and line. A named
+  persona's launch is refused while its folders are waiting. This is a new persona's
+  first use, with nothing to migrate, so refusing costs nothing. A second login that
+  still reports `waiting` for Personal refuses like any other failure.
+
 **A2. Ask the kernel, and tell Mail.** `TESSERA_IOC_GROUP_INFO` already answers, for a
 directory, its quota domain, the domain's key group and whether the group is open
 (unjailed root only). Two uses:
 - After `ensure_app_data`, portcullisd asks it about the app's data folder, and refuses
   the launch unless the folder is in the expected group and the group is open. This is
   the A1 check done against the kernel, not against atrium-volumes' reply.
+  portcullisd opens the folder with `O_DIRECTORY | O_NOFOLLOW` and asks on that
+  descriptor, never by path. The overlay belongs to the app's uid, so a link planted
+  in it on an earlier run must not redirect the question. The descriptor it checked
+  is the one whose path it mounts.
 - portcullisd passes the verified answer to the app as a read-only launch fact (sealed,
   or plain under the opt-out). The SDK exposes it as `atrium_sdk::storage::sealed()`.
 
@@ -545,9 +561,17 @@ no device. So the answer comes from portcullisd, which asked the kernel.
   requires.
 - Rejected alternative: no swap at all. It's simpler, but a desktop with 8 GB and a
   browser needs swap.
+- Atrium's swap is a file on the internal Tessera volume, not a partition. So the
+  shape is `md` over the swap file with GELI one-time on top (fstab
+  `md99.eli none swap sw,file=/var/swap,late`). The gate must grep the swap file's
+  blocks on the raw device, not the `md` device.
+- The compressed-RAM tier (atrium-zram, atrium-memory-pressure.md) is RAM and is
+  fine. If it ever gains writeback to a backing device, that device is swap and needs
+  the same one-time key.
 
-**A4. No core dumps from apps (jaild).** Every app jail gets `RLIMIT_CORE=0` (hard),
-not only filtered jails. The only exception is a debug launch (`allow_proc_debug`),
+**A4. No core dumps from apps (jaild).** Every app jail, and every worker and one-shot
+jail started for an app (Mail's parse, sync and office-copy workers hold the same
+plaintext), gets `RLIMIT_CORE=0` (hard), not only filtered jails. The only exception is a debug launch (`allow_proc_debug`),
 which already accepts that its memory is exposed. Mail keeps decrypted mail in memory
 and should never dump it.
 
@@ -566,6 +590,11 @@ Two negative controls show that the probes work:
 - A run under the `plain_app_data` opt-out finds the marker on the device, and Mail
   shows the plain-store line and refuses to sync the Work account.
 
+The marker is a long random token in each of the four places, and the attachment is
+stored uncompressed. If Tessera compresses or packs blobs, a short marker could be
+missed even in plain text. The plain-store control proves the grep finds it in this
+layout, and the gate fails if that control does not find it.
+
 **Not proposed:** evicting the whole store at screen lock (a while-unlocked class). That
 would stop background sync, which writes new mail while the screen is locked. If it is
 wanted later, the right shape is a Tessera "complete unless open" class: writes allowed
@@ -580,7 +609,8 @@ work, not Mail's.
 4. A5 last, because it needs all of the above.
 
 Decisions for Shankar:
-- D-at-rest-1: fail closed for Personal too, not only named personas. Recommended yes.
+- D-at-rest-1: fail closed for Personal too, not only named personas, with the one-login
+  migration allowance in A1. Recommended yes.
 - D-at-rest-2: GELI one-time swap. Recommended yes.
 - D-at-rest-3: refuse to sync a named persona's account into a plain store.
   Recommended yes.
