@@ -2876,6 +2876,65 @@ changed. File input, printing and the clipboard are the second part.
    `/app.html` through the jar after the POST, where I6.3 made two (the
    document lane's own fetch of the trail entry is separate).
 
+#### I6.4 as built (2026-11-25, second part: file input)
+
+navigatord and Limen host-tested; the engine glue is written and builds
+on the Mac.
+
+- **The ask.** LibWeb asks its page client for a file picker
+  (`page_did_request_file_picker`); `EditorPage` sends
+  `Report::PickFile` (one file, read-only, whatever the input's `accept`
+  or `multiple` said). If it can't, the input closes empty.
+- **The picker.** navigatord, which holds the island's Limen connection,
+  requests Limen's `picker` role over the UI's window (a Scrinium sheet
+  frescod places and frames; the page under it gets no input meanwhile)
+  and opens it with `Filter::file()`, titled "Choose a file for
+  <host>". One picker at a time, and none within 2 s of the last one
+  ending (a page can't hold the picker up over the window; a second ask
+  is answered empty and named in the popover). The picker's `File`
+  message brings a read-only descriptor; navigatord reads at most 8 MiB
+  (one live resource) and takes only the first file.
+- **The answer.** When the picker says `Done`, `Cancelled` or `Failed`, or
+  goes away, navigatord sends the engine the control message
+  `FilePicked::Chosen { name }` or `FilePicked::Cancelled` ('F'; Limen
+  takes it only while the page runs). The bytes wait for one GET of
+  `LIVE_FILE` (`https://live-page.atrium.invalid/picked-file`) on the
+  fetch channel, then are gone. The engine never learns a folder or a
+  path, and no file but the picked one reaches it.
+- **Engine glue** (Mac: check against the pinned LibWeb, the signatures
+  are written from memory): `EditorPage::page_did_request_file_picker`
+  calls `navigator_live_pick_file`; `navigator_page_pointer` returns 6
+  on `FilePicked`, and `drive_page` takes it with
+  `navigator_take_file_picked`, GETs `LIVE_FILE` with
+  `navigator_live_get`, and calls `Page::file_picker_closed` with one
+  `HTML::SelectedFile { name, bytes }` or none.
+
+**Gate (Mac)**, on `app.html` run live:
+
+1. Press the file input: Scrinium's sheet opens over the window, titled
+   "Choose a file for app.example". Pick a text file: `file-input` passes
+   with its name, size and first bytes, and `#file-out` shows them.
+2. Press it again and Cancel: no new check line, and the input is empty.
+3. A script that clicks the input twice at once (in the console of the
+   fixture, or a second press within 2 s of the sheet closing): the
+   second is answered empty, and the popover names "a file picker asked
+   for again at once".
+
+#### Printing and the clipboard (I6.4, still to build)
+
+- **Printing.** `window.print()` and the Print command on a live page
+  print the trail entry's document-lane rendering through the existing
+  path (the page child writes the PDF in its jail, Prelum's sheet takes
+  it), so a page printed while it runs prints what its address shows, not
+  its live state. Printing the live state needs the engine to paint to a
+  PDF, which is its own step.
+- **Clipboard.** Copy is the engine's to report (`Report::Copy` with the
+  text, bounded) and the UI's to write through Tabula with the press
+  that made it. Paste needs frescod's activation token for a press that
+  went to the island to reach the UI or the engine: today a token is
+  minted for, and spent by, the window's owner. That is a Fresco change
+  (tabula.md §2) and comes first.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
@@ -3824,4 +3883,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4's first part](#i64-as-built-2026-11-25-first-part-downloads-and-refusals) (downloads from links, forms and scripts; refused APIs answered at once and named in the popover) is host-tested and waits for its gate.
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4's first part](#i64-as-built-2026-11-25-first-part-downloads-and-refusals) (downloads from links, forms and scripts; refused APIs answered at once and named in the popover) and [second part](#i64-as-built-2026-11-25-second-part-file-input) (file input through Scrinium's picker) are host-tested and wait for their gates.

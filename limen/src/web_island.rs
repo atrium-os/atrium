@@ -33,6 +33,46 @@ pub const LIVE_REFUSED: &str = "https://live-page.atrium.invalid/refused";
 /// which has none of these APIs' backends, is what refuses.
 pub const LIVE_REPORTER: &str = "https://live-page.atrium.invalid/reporter.js";
 
+/// The file the person picked for a whole page's [`Report::PickFile`]
+/// (I6.4): its bytes are a GET of this address, once, after
+/// [`FilePicked::Chosen`].
+pub const LIVE_FILE: &str = "https://live-page.atrium.invalid/picked-file";
+/// The longest name a [`FilePicked`] carries.
+pub const PICKED_NAME_MAX: usize = 255;
+
+/// navigatord's answer to [`Report::PickFile`], a control message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilePicked {
+    /// The person picked a file named `name` (no folder); its bytes wait
+    /// at [`LIVE_FILE`].
+    Chosen { name: String },
+    /// The person cancelled, or the picker could not open.
+    Cancelled,
+}
+
+impl FilePicked {
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Cancelled => Some(vec![b'F', 0]),
+            Self::Chosen { name } if Self::name_ok(name) => Some([&[b'F', 1][..], name.as_bytes()].concat()),
+            Self::Chosen { .. } => None,
+        }
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [b'F', 0] => Some(Self::Cancelled),
+            [b'F', 1, name @ ..] => {
+                let name = std::str::from_utf8(name).ok()?;
+                Self::name_ok(name).then(|| Self::Chosen { name: name.to_string() })
+            }
+            _ => None,
+        }
+    }
+    fn name_ok(name: &str) -> bool {
+        !name.is_empty() && name.len() <= PICKED_NAME_MAX && !name.chars().any(|c| c.is_control() || c == '/')
+    }
+}
+
 /// A web API a whole page asked for that I6 refuses (navigator-islands.md
 /// "What the page can reach"), so the popover can say what the page was
 /// refused; nothing is refused silently.
@@ -116,6 +156,10 @@ pub enum Report<'a> {
     /// `application/x-www-form-urlencoded`. Never sent by the engine;
     /// navigatord sends it through the page's jar and opens the answer.
     Submit { url: &'a str, body: &'a [u8] },
+    /// The page asked for a file (`<input type=file>`, I6.4): one file,
+    /// read-only. navigatord opens Scrinium's picker over the window and
+    /// answers with [`FilePicked`]; the engine never sees a folder.
+    PickFile,
 }
 
 /// An address an engine may report: plain HTTPS, bounded, printable.
@@ -130,7 +174,7 @@ impl Report<'_> {
                 !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))),
             Self::Title(text) => text.len() <= 256 && !text.chars().any(char::is_control),
             Self::Resize { width, height } => (1..=16384).contains(width) && (1..=16384).contains(height),
-            Self::Ended(_) | Self::MediaReady => true,
+            Self::Ended(_) | Self::MediaReady | Self::PickFile => true,
             Self::BeforeUnload { query } => *query != 0,
             Self::Navigate(url) | Self::UrlChanged(url) => reportable(url),
             Self::Submit { url, body } => reportable(url) && body.len() <= FORM_MAX && body.iter().all(u8::is_ascii_graphic),
@@ -223,7 +267,7 @@ impl Lifecycle {
     pub fn accepts_control(&mut self, bytes: &[u8], media_ready: bool) -> bool {
         if let Some(answer) = UnloadAnswer::decode(bytes) { return self.answer(answer); }
         let running = matches!(self, Self::Running { .. });
-        if PageSize::decode(bytes).is_some() { return running; }
+        if PageSize::decode(bytes).is_some() || FilePicked::decode(bytes).is_some() { return running; }
         media_ready && running && ChapterSeek::decode(bytes).is_some()
     }
 
@@ -240,7 +284,7 @@ impl Lifecycle {
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
             (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
-            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. }) => running,
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. } | Report::PickFile) => running,
             (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
             (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,
@@ -329,6 +373,26 @@ mod tests {
         let mut state = Lifecycle::Running { last_query: 0 };
         assert!(state.accepts_control(&size.encode(), false));
         assert!(!Lifecycle::Ended.accepts_control(&size.encode(), true));
+    }
+
+    #[test]
+    fn a_picked_file_is_one_name_and_taken_only_while_running() {
+        let chosen = FilePicked::Chosen { name: "notes.txt".into() };
+        assert_eq!(FilePicked::decode(&chosen.encode().unwrap()), Some(chosen.clone()));
+        assert_eq!(FilePicked::decode(&FilePicked::Cancelled.encode().unwrap()), Some(FilePicked::Cancelled));
+        for bad in ["", "a/b", "a\nb", &"x".repeat(PICKED_NAME_MAX + 1)] {
+            assert!(FilePicked::Chosen { name: bad.into() }.encode().is_none(), "{bad:?}");
+        }
+        assert!(FilePicked::decode(&[b'F', 2]).is_none());
+        assert!(FilePicked::decode(&[b'F', 1, 0xff]).is_none(), "not UTF-8");
+        assert!(FilePicked::decode(&[b'F', 0, 0]).is_none());
+        let wire = chosen.encode().unwrap();
+        assert!(!Lifecycle::default().accepts_control(&wire, false), "not before the page started");
+        assert!(Lifecycle::Running { last_query: 0 }.accepts_control(&wire, false));
+        // The request itself is a report the running page may make.
+        let ask = Report::PickFile.encode().unwrap();
+        assert!(Lifecycle::default().receive(&ask).is_none());
+        assert_eq!(Lifecycle::Running { last_query: 0 }.receive(&ask), Some(Report::PickFile));
     }
 
     #[test]

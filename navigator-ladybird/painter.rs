@@ -960,6 +960,8 @@ pub mod host {
         chapter_seconds: Option<f64>,
         /// The page area navigatord placed a whole live page in (I6.2).
         page_size: Option<(u16, u16)>,
+        /// navigatord's answer to the page's file input (I6.4).
+        file_picked: Option<limen::web_island::FilePicked>,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -1123,6 +1125,42 @@ pub mod host {
         let Ok(url) = std::str::from_utf8(url) else { return false };
         let Some(bytes) = (Report::Submit { url, body }).encode() else { return false };
         child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
+    /// A whole live page's file input asked for a file (I6.4): navigatord
+    /// opens Scrinium's picker over the window and answers with
+    /// `FilePicked` (action 6 of `navigator_page_pointer`). False when it
+    /// could not be asked: the input is closed with no file.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_live_pick_file(state: &SceneState) -> bool {
+        let Some((child, embed, _)) = &state.embed else { return false };
+        let Some(bytes) = limen::web_island::Report::PickFile.encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
+    /// navigatord's answer to the file input: -1 none waiting, 0 no file
+    /// (cancelled), 1 a file named in `name` (`name_len` bytes, UTF-8, no
+    /// folder), whose bytes are one GET of `LIVE_FILE`.
+    ///
+    /// # Safety
+    /// `name` is writable for `cap` bytes and `name_len` is writable.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_take_file_picked(state: &mut SceneState, name: *mut u8, cap: usize, name_len: *mut usize) -> i32 {
+        use limen::web_island::FilePicked;
+        if name.is_null() || name_len.is_null() { return -1; }
+        match state.file_picked.take() {
+            None => -1,
+            Some(FilePicked::Cancelled) => 0,
+            Some(FilePicked::Chosen { name: n }) if n.len() <= cap => {
+                // SAFETY: `name` has room for `cap` bytes, and `n` is no longer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(n.as_ptr(), name, n.len());
+                    *name_len = n.len();
+                }
+                1
+            }
+            Some(FilePicked::Chosen { .. }) => 0,
+        }
     }
 
     #[unsafe(no_mangle)]
@@ -1526,6 +1564,10 @@ pub mod host {
                     if let Some(size) = limen::web_island::PageSize::decode(&bytes) {
                         state.page_size = Some((size.width(), size.height()));
                         return 5;
+                    }
+                    if let Some(picked) = limen::web_island::FilePicked::decode(&bytes) {
+                        state.file_picked = Some(picked);
+                        return 6;
                     }
                 }
                 Err(_) => return -1,

@@ -8,12 +8,14 @@
 #ifdef ATRIUM_I6_PAGE
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/SelectedFile.h>
 #endif
 
 struct NavigatorScene;
 #ifdef ATRIUM_I6_PAGE
 extern "C" bool navigator_live_propose(NavigatorScene*, u8 const*, size_t);
 extern "C" bool navigator_live_submit(NavigatorScene*, u8 const*, size_t, u8 const*, size_t);
+extern "C" bool navigator_live_pick_file(NavigatorScene*);
 #endif
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" bool navigator_vpn_script_submit(u8 const*, size_t);
@@ -106,6 +108,16 @@ public:
         }
         warnln("live page: navigation to {} refused (top-level={} get={} same-document={})", url.serialize(),
             target == Web::NavigationTarget::TopLevel, get, same_document);
+    }
+    // A file input (I6.4): navigatord opens Scrinium's picker over the
+    // window, and the answer comes back through drive_page (action 6).
+    // One file, read-only, whatever the input asked for.
+    void page_did_request_file_picker(Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles) override
+    {
+        if (!island_scene || !navigator_live_pick_file(island_scene)) {
+            warnln("live page: the file picker could not be asked for");
+            m_page->file_picker_closed({});
+        }
     }
 #endif
 #ifdef ATRIUM_MAIL_PAGE
