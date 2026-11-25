@@ -43,6 +43,9 @@ struct State {
     building: Vec<Drawn>,
     /// The frame last ended: what the IDE sees.
     shown: Vec<Drawn>,
+    /// Device pixels per point in the window being drawn: the app draws
+    /// in device pixels, the IDE is told points.
+    scale: f32,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -90,7 +93,7 @@ pub fn attach() {
         return;
     }
     if let Some(link) = Link::from_env() {
-        *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(State { link, building: Vec::new(), shown: Vec::new() });
+        *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(State { link, building: Vec::new(), shown: Vec::new(), scale: 1.0 });
         ON.store(true, Ordering::Release);
     } else {
         NEXT_SITE.with(|s| s.set(None));
@@ -111,12 +114,14 @@ pub fn record(id: u32, kind: &'static str, rect: [f32; 4], detail: impl FnOnce()
     }
 }
 
-/// The frame starts: forget the last one's nodes being built.
-pub fn begin() {
+/// The frame starts in a window of `scale` device pixels a point: forget
+/// the nodes being built.
+pub fn begin(scale: f32) {
     attach();
     NEXT_SITE.with(|s| s.set(None));
     if let Some(st) = STATE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         st.building.clear();
+        st.scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     }
 }
 
@@ -174,7 +179,7 @@ pub fn serve() {
         match a {
             Ask::Tree => {
                 st.link.following = true;
-                let items = items(&st.shown);
+                let items = items(&st.shown, st.scale);
                 st.link.send(&Tell::Tree(items));
             }
             Ask::Pick(on) => st.link.picking = on,
@@ -184,8 +189,9 @@ pub fn serve() {
     }
 }
 
-/// A press at (`x`, `y`) in device pixels: the inspector's when it waits
-/// for one (then the app's events never see it, as for any press).
+/// A press at (`x`, `y`) in device pixels, as the app's nodes are: the
+/// inspector's when it waits for one (the app's events never carry
+/// presses either way).
 pub fn press(x: f32, y: f32) {
     if !ON.load(Ordering::Acquire) {
         return;
@@ -209,14 +215,15 @@ pub fn pick(nodes: &[Drawn], x: f32, y: f32) -> Option<u32> {
     }).map(|d| d.id)
 }
 
-/// The frame as the IDE lists it: flat, in drawing order.
-pub fn items(nodes: &[Drawn]) -> Vec<Item> {
+/// The frame as the IDE lists it: flat, in drawing order, in points (the
+/// nodes are in device pixels, `scale` a point).
+pub fn items(nodes: &[Drawn], scale: f32) -> Vec<Item> {
     nodes.iter().take(MAX_ITEMS).map(|d| Item {
         id: d.id,
         parent: None,
         depth: 0,
         kind: d.kind.into(),
-        rect: (d.rect[2] > 0.0 && d.rect[3] > 0.0).then_some(d.rect),
+        rect: (d.rect[2] > 0.0 && d.rect[3] > 0.0).then(|| d.rect.map(|v| v / scale)),
         detail: d.detail.clone(),
         site: d.site.as_ref().map(|(f, l)| Site { file: f.clone(), line: *l, col: 0 }),
     }).collect()
@@ -251,9 +258,10 @@ mod tests {
         assert_eq!(pick(&nodes, 15.0, 15.0), Some(2));
         assert_eq!(pick(&nodes, 50.0, 50.0), Some(1));
         assert_eq!(pick(&nodes, 150.0, 50.0), None);
-        let items = items(&nodes);
+        let items = items(&nodes, 1.0);
         assert_eq!(items[1].site.as_ref().map(|s| (s.file.as_str(), s.line)), Some(("app.c", 2)));
         assert!(items.iter().all(|i| i.depth == 0 && i.parent.is_none()));
+        assert_eq!(super::items(&nodes, 2.0)[1].rect, Some([5.0, 5.0, 10.0, 10.0]), "device pixels told as points");
     }
 
     #[test]

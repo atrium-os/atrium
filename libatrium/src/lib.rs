@@ -1220,7 +1220,7 @@ pub extern "C" fn atrium_window_fill_rect(
     with_fresco_conn(|conn| {
         conn.set_default_window(window_id as u16);
         if conn.scene_frame_begin().is_err() { return ATRIUM_ERR_FRESCO_RPC; }
-        inspect::begin();
+        inspect::begin(conn.window_scale(window_id));
         if conn.scene_node_rect(1, fresco_protocol::RectParams {
             x, y, w, h, r, g, b, a, radius: 0.0,
         }).is_err() { return ATRIUM_ERR_FRESCO_RPC; }
@@ -1281,16 +1281,18 @@ pub extern "C" fn atrium_window_frame_begin(window_id: u32) -> c_int {
     if guard.is_some() {
         return ATRIUM_ERR_FRESCO_RPC;
     }
+    let mut scale = 1.0;
     let rc = with_fresco_conn(|conn| {
         conn.set_default_window(window_id as u16);
         if conn.scene_frame_begin().is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
+        scale = conn.window_scale(window_id);
         0
     });
     if rc == 0 {
         *guard = Some(window_id);
-        inspect::begin();
+        inspect::begin(scale);
     }
     rc
 }

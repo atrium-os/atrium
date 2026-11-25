@@ -451,8 +451,9 @@ A, then B.
   name only while an IDE listens, and records nothing otherwise. A press
   while Pick waits picks the last-drawn node under it; Highlight and
   Bounds are drawn as thin rects with ids from `0xFFFF0000` just before
-  the frame ends, and are never listed. Boxes are in the window's device
-  pixels, which C apps draw in.
+  the frame ends, and are never listed. C apps draw in device pixels;
+  the IDE is told points, as from Pergola (libatrium divides by the
+  window's scale).
 - The wire (`Ask`, `Tell`, the framing and the app's end of the socket)
   is its own crate, `atrium-inspect`, which Pergola, libatrium and
   Artifex share.
