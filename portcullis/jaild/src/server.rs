@@ -792,6 +792,8 @@ fn handle_remove(
             }
         }
     }
+    info!("jaild: RemoveJail {} (jid {}): removed", name.as_deref().or(rule_name.as_deref()).unwrap_or("?"),
+          kernel_jid.map_or("none".to_string(), |j| j.to_string()));
 
     /* A FUSE mount jaild made for the jail: forced, since its server is gone
      * (or going) and a reader may still hold a file open on it. */

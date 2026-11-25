@@ -1357,7 +1357,7 @@ fn run_one_jail(
     }
     /* ★★ A dying jail pins its root; unmount only once it is gone. */
     portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
-    let _ = umount(&jail_path.join("dev"));
+    unmount_dev_left(jail_path);
     /* A non-zero exit is the caller's to read: the setup phase fails on it,
      * the runtime phase passes it through. */
     status.map(portcullisd::jaild_jail::exit_code)
@@ -1390,7 +1390,7 @@ pub fn remove_persistent(name: &str, jail_path: &Path) {
         eprintln!("portcullisd: remove {name}: {e}");
     }
     portcullis_mounts::wait_jail_gone(name, portcullis_mounts::JAIL_GONE_TIMEOUT);
-    let _ = umount(&jail_path.join("dev"));
+    unmount_dev_left(jail_path);
     full_teardown(jail_path, None);
 }
 
@@ -1754,6 +1754,22 @@ pub fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("{cmd} {args:?} failed: {st}")));
     }
     Ok(())
+}
+
+/// A jail's devfs is jaild's, and RemoveJail unmounts it; a jail still
+/// dying past jaild's short retries can keep it busy. Unmount it here
+/// only when it is still a mount (its device differs from the root's),
+/// and say so: that is jaild's miss.
+fn unmount_dev_left(jail_path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let dev = jail_path.join("dev");
+    let (Ok(root), Ok(d)) = (fs::symlink_metadata(jail_path), fs::symlink_metadata(&dev)) else { return };
+    if d.is_dir() && d.dev() != root.dev() {
+        eprintln!("portcullisd: {} was still mounted after RemoveJail; unmounting it", dev.display());
+        if let Err(e) = umount(&dev) {
+            eprintln!("portcullisd: {e}");
+        }
+    }
 }
 
 fn umount(p: &Path) -> std::io::Result<()> {
