@@ -1775,14 +1775,24 @@ Scrinium, navigatord and navigator-ui from main at 690b26a72 or later):
    `memoryuse` rule, and N is within a mebibyte of `rctl -u`'s `memoryuse`.
 2. The usage ask is rate-limited: two `InstanceUsage` asks less than a second apart on
    one engine connection get one answer and one `Error` ("too soon"), and the engine jail
-   still goes when limend hangs up.
+   still goes when limend hangs up. The client is `limen-usage-probe` (limen's examples),
+   run as `_limen` on the installed guest with no limend change: `su -m _limen -c
+   limen-usage-probe`. It starts an engine through limend's worker rule and checks an
+   answer above 0 with the part cap (256 MiB), a refusal at once, an answer after 1.1 s
+   (the positive control), and the jail gone within 10 s of hanging up.
 3. Save a download (as I6.4), open the Downloads list, and press the `show=` point the
    trace gives for it. Scrinium logs `showing a file in home:downloads`, a Files window
    comes up on Downloads with that file selected, and navigator-ui logs `Files is showing
    the download`. In a Work window the place is `persona:work:downloads`.
 4. Ask Show with a press that was already spent, or none (a test client sending
    `ToChild::Show` with a stale token): limend logs frescod's refusal, Scrinium answers
-   `Failed` ("needs your press"), and no Files window opens.
+   `Failed` ("needs your press"), and no Files window opens. The client is
+   `limen-show-probe`: limend's code in process against the real frescod, as `_limen`
+   (SHOW's consumer), playing the parent and a stand-in Files. It checks that no press and
+   a made-up press are refused, that a click on its window gives a press spent once (the
+   positive control), and that the same press again is refused. `navigator-live-vm.sh`
+   runs it, clicking where it prints `PRESS x y`. Scrinium's own `Failed` answer is the
+   host test `show_in_files_opens_the_personas_folder_on_the_file`'s.
 The trace line's `show=` field gives each "Show in Files" button's centre, by download id.
 
 Mac results, 2026-11-25 (690b26a72, f74f059d2): check 1 passed. The popover read "Memory: 99
@@ -1792,6 +1802,9 @@ limend refused the delegated navigator-ui connection's `picker` request (`NOT_PR
 That connection may now ask for a picker, but may send it only `ToChild::Show`: an `Open`,
 or any `SEND_FD` to it, is refused, so no file can come back to the UI. Host test:
 `delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine`. Checks 2 and 4
-need a test client that holds an engine's connection or sends a stale press; until one
-exists, host tests cover them (portcullisd's watcher cannot run on a Linux host;
-`files_spends_the_parents_press_for_show_in_files_once` covers 4).
+now have their clients (above); they wait for a Mac run.
+
+The Mac run also showed frescod's "live code" tag, drawn in a pill just above the island,
+covering the prompt row's file name (the island started right under the row). While the
+page on screen runs live, navigator-ui now leaves a 22 pt band (`TAG_BAND`, in points since
+frescod draws the tag at the display scale) between its rows and the island for the tag.

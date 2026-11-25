@@ -58,7 +58,7 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb forum-wm "--bin forum-wm"
     xb navigator-ui "--bin navigator-ui"
     xb navigator-page "--bin navigator-page"
-    xb limen "--example limend-dev"
+    xb limen "--example limend-dev --example limen-show-probe"
     xb navigator-prerender "--bin prerender"
     xb navigatord "--bin navigatord"
     xb atrium-open "--example link-serve"
@@ -70,7 +70,7 @@ R="$TARGET/release"
 g "pkill -x frescod; pkill -x navigator-ui; pkill -x forum-wm; pkill -x limend-dev; pkill -x navigatord; pkill -x navigator-page; sleep 1; rm -rf $S; mkdir -p $D $S /var/run/atrium; chmod 777 $S; true"
 for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-renderer" "$ROOT/forum-wm/target/$R/forum-wm" \
          "$ROOT/navigator-ui/target/$R/navigator-ui" "$ROOT/navigator-page/target/$R/navigator-page" \
-         "$ROOT/limen/target/$R/examples/limend-dev" "$ROOT/navigator-prerender/target/$R/prerender" \
+         "$ROOT/limen/target/$R/examples/limend-dev" "$ROOT/limen/target/$R/examples/limen-show-probe" "$ROOT/navigator-prerender/target/$R/prerender" \
          "$ROOT/navigatord/target/$R/navigatord" "$ROOT/atrium-open/target/$R/examples/link-serve"; do
     h=$(sha256sum "$b" | cut -d' ' -f1)
     [ "$h" = "$(g "sha256 -q $D/$(basename "$b") 2>/dev/null || true")" ] && continue
@@ -452,6 +452,22 @@ until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' \
 g "grep -q 'a link from another app: a new trail' $S/ui11.log" && ok "…as a link from another app" || bad "ui11: $(g "grep -v trace $S/ui11.log | tail -3")"
 shot live-17-incoming
 g "pkill -x navigator-ui; pkill -x link-serve; sleep 2; true"
+
+echo "=== Show in Files spends only a live press (navigator-ui.md §15.3 check 4)"
+# limen-show-probe plays the parent and a stand-in Files against this
+# frescod, as _limen (frescod's `show` consumer); it prints PRESS x y once
+# its window is up, and the click there is its positive control.
+if g "id _limen >/dev/null 2>&1"; then
+    g "rm -f $S/show.log; daemon -f -o $S/show.log su -m _limen -c 'env FRESCO_SOCKET=$S/fresco.sock $D/limen-show-probe' </dev/null"
+    i=0; while [ $i -lt 30 ] && ! g "grep -q '^PRESS ' $S/show.log"; do sleep 1; i=$((i+1)); done
+    P=$(g "grep '^PRESS ' $S/show.log | head -1 | cut -d' ' -f2-")
+    if [ -n "$P" ]; then press ${P% *} ${P#* }; fi
+    i=0; while [ $i -lt 30 ] && ! g "grep -qE '^(all passed|[0-9]+ FAILED)' $S/show.log"; do sleep 1; i=$((i+1)); done
+    g "grep -q '^all passed' $S/show.log" && ok "no press, a made-up press and a spent press are refused; a live one is spent once" \
+        || bad "show probe: $(g "cat $S/show.log")"
+else
+    bad "no _limen user on the guest for the show probe"
+fi
 
 echo "=== logs"
 for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 ui10 ui11 navigatord2 navigatord3; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done

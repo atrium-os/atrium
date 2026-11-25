@@ -51,3 +51,11 @@ path = "examples/limend_dev.rs"
 [[example]]
 name = "limen-view-probe"
 path = "examples/view_probe.rs"
+
+[[example]]
+name = "limen-show-probe"
+path = "examples/show_probe.rs"
+
+[[example]]
+name = "limen-usage-probe"
+path = "examples/usage_probe.rs"
