@@ -34,6 +34,21 @@ fn frozen_panes_round_trip_through_xlsx_and_ods() {
     assert_eq!(all(&back), all(&wb));
 }
 
+#[test]
+fn each_sheets_zoom_round_trips_through_xlsx_and_the_native_file() {
+    let mut wb = book();
+    wb.sheet_mut(1).zoom = 150;
+    wb.sheet_mut(3).zoom = 75;
+    let zooms = |wb: &Workbook| (0..wb.sheet_count() as u16).map(|s| wb.sheet(s).zoom).collect::<Vec<_>>();
+    let x = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+    assert_eq!(zooms(&back), vec![100, 150, 100, 75, 100]);
+    assert_eq!(all(&back), all(&wb), "frozen panes stay with a zoom");
+    let n = officina_grid::native::save_to_vec(&wb);
+    let back = officina_grid::native::load(&n).unwrap();
+    assert_eq!(zooms(&back), vec![100, 150, 100, 75, 100]);
+}
+
 /// LibreOffice opens our file with a view (tests/lo_view.py, under Xvfb)
 /// and saves it as the other format; we read that. Headless conversion has
 /// no view and drops view settings, so this needs Xvfb and Python's `uno`.

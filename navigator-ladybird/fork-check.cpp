@@ -3,7 +3,7 @@
 #include "EditorPage.h"
 #include "PinnedFonts.h"
 #include <LibCore/EventLoop.h>
-#include <LibGfx/SystemTheme.h>
+#include "EnginePalette.h"
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <sys/wait.h>
@@ -45,9 +45,9 @@ static int render()
     Core::EventLoop loop;
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
-    auto theme = Core::AnonymousBuffer::create_with_size(sizeof(Gfx::SystemTheme));
-    if (theme.is_error()) return 1;
-    auto client = Navigator::EditorPage::create(Gfx::Palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.release_value())));
+    auto palette = Navigator::engine_palette();
+    if (palette.is_error()) return 1;
+    auto client = Navigator::EditorPage::create(palette.release_value());
     auto result = client->load_fixture({ editor, sizeof(editor) }, false);
     if (result.is_error()) {
         warnln("fork-check editor: {}", result.error());

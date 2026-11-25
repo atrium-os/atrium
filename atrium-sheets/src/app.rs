@@ -31,8 +31,8 @@ pub const TOOLBAR_H: f32 = 48.0;
 pub const FORMULA_H: f32 = 30.0;
 pub const STATUS_H: f32 = 26.0;
 /// The zoom's range, in percent, as Excel's.
-pub const MIN_ZOOM: u16 = 10;
-pub const MAX_ZOOM: u16 = 400;
+pub const MIN_ZOOM: u16 = officina_grid::book::ZOOM_MIN;
+pub const MAX_ZOOM: u16 = officina_grid::book::ZOOM_MAX;
 /// One Zoom In or Zoom Out step, in percent.
 pub const ZOOM_STEP: u16 = 10;
 /// The toolbar's Format Painter button.
@@ -411,8 +411,14 @@ pub struct Sheets {
     /// The Rotation Angle bar is open, with its field.
     pub angling: Mutable<bool>,
     pub angle_text: Mutable<TextEdit>,
+    /// The Text to Columns at… bar, and what it splits at.
+    pub splitting: Mutable<bool>,
+    pub split_text: Mutable<TextEdit>,
     /// The bar renames this Name Manager row rather than naming the selection.
     pub name_rename: Mutable<Option<usize>>,
+    /// The name bar changes what the name `name_rename` holds refers to,
+    /// rather than renaming it.
+    pub name_refers: Mutable<bool>,
     pub name_text: Mutable<TextEdit>,
     /// The exact-size bar: sheet, rows (else columns), first and last.
     pub size_bar: Mutable<Option<(u16, bool, u32, u32)>>,
@@ -442,7 +448,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(false), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1154,7 +1160,7 @@ impl Sheets {
 
     /// The view's zoom in percent: rows, columns and cell text scale by it.
     pub fn zoom_percent(&self) -> u16 {
-        (self.source.zoom.get() * 100.0).round() as u16
+        (self.source.zoom_factor() * 100.0).round() as u16
     }
 
     /// Zooms to `percent` (kept to 10–400 %), keeping each pane's top-left
@@ -1162,7 +1168,7 @@ impl Sheets {
     pub fn set_zoom(&self, percent: u16) {
         use pergola::widgets::GridSource;
         let z = f64::from(percent.clamp(MIN_ZOOM, MAX_ZOOM)) / 100.0;
-        let old = self.source.zoom.get();
+        let old = self.source.zoom_factor();
         if (z - old).abs() < 1e-9 {
             return;
         }
@@ -1176,7 +1182,12 @@ impl Sheets {
             let fx = (x - self.source.col_left(c)) / old;
             (r, c, fy, fx)
         }).collect();
-        self.source.zoom.set(z);
+        {
+            let mut d = self.doc.borrow_mut();
+            let sheet = d.sheet;
+            // Whole percents in 10..=400, so the cast holds.
+            d.wb.sheet_mut(sheet).zoom = (z * 100.0).round() as u16;
+        }
         for (scroll, (r, c, fy, fx)) in scrolls.iter().zip(tops) {
             let mut st = scroll.get();
             st.physics.stop();
@@ -1199,7 +1210,7 @@ impl Sheets {
         let sel = self.grid.get_cloned().selection();
         let (w, h) = self.size.get();
         let rect = Self::grid_rect(w, h);
-        let old = self.source.zoom.get();
+        let old = self.source.zoom_factor();
         let (sw, sh) = ((self.source.col_left(sel.c1 + 1) - self.source.col_left(sel.c0)) / old, (self.source.row_top(sel.r1 + 1) - self.source.row_top(sel.r0)) / old);
         let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::grid_view::HEADER_H - 16.0).max(40.0));
         let fit = (bw / sw.max(1.0)).min(bh / sh.max(1.0)) * 100.0;
@@ -1334,6 +1345,7 @@ impl Sheets {
         self.sorting.set(false);
         self.seeking.set(false);
         self.angling.set(false);
+        self.splitting.set(false);
         self.color_bar.set(None);
     }
 
@@ -1730,6 +1742,7 @@ impl Sheets {
                 let typed = self.name_text.get_cloned().text().to_string();
                 let sel = self.grid.get_cloned().selection();
                 let res = match self.name_rename.get() {
+                    Some(i) if self.name_refers.get() => crate::data::edit_name_refers(&mut self.doc.borrow_mut(), i, &typed),
                     Some(i) => crate::data::rename_name(&mut self.doc.borrow_mut(), i, &typed),
                     None => crate::data::define_name(&mut self.doc.borrow_mut(), sel, &typed),
                 };
@@ -1744,19 +1757,23 @@ impl Sheets {
                 }
                 self.changed();
             }
-            TabCmd::SortDone | TabCmd::AngleDone => {
-                let sort = c == TabCmd::SortDone;
-                let typed = if sort { self.sort_text.get_cloned() } else { self.angle_text.get_cloned() }.text().to_string();
+            TabCmd::SortDone | TabCmd::AngleDone | TabCmd::SplitDone => {
+                let typed = match c {
+                    TabCmd::SortDone => self.sort_text.get_cloned(),
+                    TabCmd::AngleDone => self.angle_text.get_cloned(),
+                    _ => self.split_text.get_cloned(),
+                }.text().to_string();
                 let g = self.grid.get_cloned();
-                let res = if sort {
-                    crate::data::custom_sort(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed)
-                } else {
-                    crate::format::set_angle(&mut self.doc.borrow_mut(), g.selection(), &typed)
+                let res = match c {
+                    TabCmd::SortDone => crate::data::custom_sort(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
+                    TabCmd::AngleDone => crate::format::set_angle(&mut self.doc.borrow_mut(), g.selection(), &typed),
+                    _ => crate::data::text_to_columns_at(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
                 };
                 match res {
                     Ok(m) => {
                         self.sorting.set(false);
                         self.angling.set(false);
+                        self.splitting.set(false);
                         self.rev.set(self.rev.get().wrapping_add(1));
                         self.set_status(m);
                     }
@@ -1782,9 +1799,10 @@ impl Sheets {
                 self.seeking.set(false);
                 self.changed();
             }
-            TabCmd::SortCancel | TabCmd::AngleCancel => {
+            TabCmd::SortCancel | TabCmd::AngleCancel | TabCmd::SplitCancel => {
                 self.sorting.set(false);
                 self.angling.set(false);
+                self.splitting.set(false);
                 self.changed();
             }
             TabCmd::NameCancel => {
@@ -2169,6 +2187,17 @@ impl Sheets {
             ctx.add(Node::Text { rect: Rect::new(294.0 + fw, y + 6.0, 260.0, 18.0), content: "the value, then the cell to change".into(), style: crate::tabs::style(t.text_secondary(), false) });
             return;
         }
+        if self.splitting.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: "Split at".into(), style: st });
+            let fw = 160.0;
+            let cmds = self.cmds.clone();
+            TextField::new(self.split_text.clone()).key(0x5348_5350).placeholder("comma, tab, - …").autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SplitDone))).render(ctx);
+            Button::primary("Split").at(112.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::SplitDone)).render(ctx);
+            Button::secondary("Cancel").at(184.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitCancel)).render(ctx);
+            ctx.add(Node::Text { rect: Rect::new(264.0 + fw, y + 6.0, 320.0, 18.0), content: "a name (comma, tab, space…) or the characters; empty finds one".into(), style: crate::tabs::style(t.text_secondary(), false) });
+            return;
+        }
         if self.sorting.get() || self.angling.get() {
             let sort = self.sorting.get();
             let st = crate::tabs::style(t.text_primary(), true);
@@ -2189,6 +2218,7 @@ impl Sheets {
             let st = crate::tabs::style(t.text_primary(), true);
             let sel = self.grid.get_cloned().selection();
             let label = match self.name_rename.get() {
+                Some(i) if self.name_refers.get() => format!("{} refers to", crate::data::name_rows(&self.doc.borrow().wb).get(i).map_or(String::new(), |r| crate::data::shown_name(&r.name).to_string())),
                 Some(i) => format!("Rename {} to", crate::data::name_rows(&self.doc.borrow().wb).get(i).map_or(String::new(), |r| crate::data::shown_name(&r.name).to_string())),
                 None => format!("Name {}", range_name(sel)),
             };
@@ -2196,7 +2226,7 @@ impl Sheets {
             let fw = (w - 160.0 - 170.0).clamp(120.0, 320.0);
             let cmds = self.cmds.clone();
             TextField::new(self.name_text.clone()).key(0x5348_4e4d).autofocus(true).placeholder("Prices, Tax_rate…").at(152.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::NameDone))).render(ctx);
-            Button::primary(if self.name_rename.get().is_some() { "Rename" } else { "Name" }).at(160.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::NameDone)).render(ctx);
+            Button::primary(match (self.name_rename.get().is_some(), self.name_refers.get()) { (true, true) => "Change", (true, false) => "Rename", _ => "Name" }).at(160.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::NameDone)).render(ctx);
             Button::secondary("Cancel").at(232.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::NameCancel)).render(ctx);
             return;
         }
@@ -2451,12 +2481,14 @@ impl Sheets {
                 // edge one of theirs, all of them take the size.
                 GridAction::ResizeCol { col, width } => {
                     let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
-                    doc.borrow_mut().size_preview(false, lo, hi, width / src.zoom.get());
+                    let width = width / src.zoom_factor();
+                    doc.borrow_mut().size_preview(false, lo, hi, width);
                     rev.set(rev.get().wrapping_add(1));
                 }
                 GridAction::ResizeRow { row, height } => {
                     let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
-                    doc.borrow_mut().size_preview(true, lo, hi, height / src.zoom.get());
+                    let height = height / src.zoom_factor();
+                    doc.borrow_mut().size_preview(true, lo, hi, height);
                     rev.set(rev.get().wrapping_add(1));
                 }
                 // A double-click on the fill handle: down along the data beside it.
@@ -2478,7 +2510,7 @@ impl Sheets {
                 GridAction::PasteSpecial => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::PasteSpecial)),
                 // Ctrl+wheel or a pinch: the zoom times `f`.
                 GridAction::Zoom(f) => {
-                    let p = (src.zoom.get() * f64::from(f) * 100.0).round().clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)) as u16;
+                    let p = (src.zoom_factor() * f64::from(f) * 100.0).round().clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)) as u16;
                     cmds.lock().unwrap().push(Cmd::Zoom(p));
                 }
                 GridAction::Selected(_) => cmds.lock().unwrap().push(Cmd::Selected),
@@ -3034,7 +3066,10 @@ impl View for Sheets {
                 let now = if fp.cond == 0 { "Pick values" } else { crate::data::FILTER_CONDS[fp.cond] };
                 MenuButton::new(now.to_string(), self.filter_cond_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterCond(i))).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).render(ctx);
             }
-            if fp.cond > 0 {
+            if !crate::data::filter_cond_typed(fp.cond) && fp.cond > 0 {
+                let note = if fp.cond == 16 { "Rows with numbers above the column's average." } else { "Rows with numbers below the column's average." };
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 84.0, FILTER_W - 24.0, 18.0), content: note.into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            } else if fp.cond > 0 {
                 let between = fp.cond == 7;
                 let fw = if between { (FILTER_W - 52.0) / 2.0 } else { FILTER_W - 24.0 };
                 let hint = match fp.cond { 8..=11 => "How many (or what percent)", 12..=15 => "Text", _ => "Number or text" };
@@ -3117,7 +3152,8 @@ impl View for Sheets {
                 if r.refers.chars().count() > 60 {
                     refers.push('…');
                 }
-                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0 + FILTER_ROW_H, FILTER_W - 24.0, 18.0), content: format!("={refers}"), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0 + FILTER_ROW_H, FILTER_W - 100.0, 18.0), content: format!("={refers}"), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                Button::secondary("Edit").at(x0 + FILTER_W - 84.0, y + 2.0 + FILTER_ROW_H).width(72.0).on_click(push(Cmd::Names(NamesCmd::Edit(i)))).render(ctx);
                 Button::secondary("Rename").at(x0 + FILTER_W - 236.0, y + 2.0).width(72.0).on_click(push(Cmd::Names(NamesCmd::Rename(i)))).render(ctx);
                 Button::secondary("Go").at(x0 + FILTER_W - 156.0, y + 2.0).width(64.0).on_click(push(Cmd::Names(NamesCmd::Go(i)))).render(ctx);
                 Button::secondary("Delete").at(x0 + FILTER_W - 84.0, y + 2.0).width(72.0).on_click(push(Cmd::Names(NamesCmd::Delete(i)))).render(ctx);
@@ -3783,6 +3819,13 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::TextToColumnsAt) => {
+                    self.close_bars();
+                    self.split_text.set(TextEdit::new(""));
+                    self.splitting.set(true);
+                    self.changed();
+                    false
+                }
                 Cmd::Format(crate::format::FormatCmd::Angle) => {
                     self.close_bars();
                     let deg = { let d = self.doc.borrow(); let (r, c) = self.grid.get_cloned().cursor; d.wb.style(officina_grid::CellAddr::new(d.sheet, r, c)).rotation };
@@ -3978,6 +4021,20 @@ impl Sheets {
                         ed.select_all();
                         self.name_text.set(ed);
                         self.name_rename.set(Some(i));
+                        self.name_refers.set(false);
+                        self.naming.set(true);
+                    }
+                    self.changed();
+                    false
+                }
+                Cmd::Names(crate::data::NamesCmd::Edit(i)) => {
+                    let refers = crate::data::name_rows(&self.doc.borrow().wb).get(i).map(|r| r.refers.clone());
+                    if let Some(refers) = refers {
+                        let mut ed = TextEdit::new(&format!("={}", refers.trim_start_matches('=')));
+                        ed.select_all();
+                        self.name_text.set(ed);
+                        self.name_rename.set(Some(i));
+                        self.name_refers.set(true);
                         self.naming.set(true);
                     }
                     self.changed();
@@ -5931,8 +5988,19 @@ mod tests {
         assert!(["Between", "and", "Numbers compare as numbers, other text as text."].iter().all(|w| texts.iter().any(|t| t == w)), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "Select All"));
         assert!(filter_cond(10, "150", "").is_err() && filter_cond(3, "", "").is_err());
+        // Above and below the average (5.25) take nothing typed.
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowAll));
+        s.take_cmds();
+        cond(&s, 1, 16, "", "");
+        assert_eq!(hidden(&s), [1, 4], "{}", s.doc.borrow().status);
+        cond(&s, 1, 17, "", "");
+        assert_eq!(hidden(&s), [2, 3]);
+        assert!(!crate::data::filter_cond_typed(16) && crate::data::filter_cond_typed(3));
+        let x = officina_convert::xlsx::write(&s.doc.borrow().wb, Vec::new()).unwrap();
+        let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+        assert_eq!(back.sheet(0).filter.as_ref().map(|f| f.conds.clone()), Some(vec![(1, officina_grid::filter::Cond::Average { below: true })]));
         // Each condition the panel makes reads back as itself.
-        for (k, a, b) in [(1, "4", ""), (2, "pear", ""), (4, "2.5", ""), (6, "x", ""), (7, "1", "9"), (8, "3", ""), (11, "10", ""), (12, "a", ""), (13, "b", ""), (14, "c", ""), (15, "d", "")] {
+        for (k, a, b) in [(1, "4", ""), (2, "pear", ""), (4, "2.5", ""), (6, "x", ""), (7, "1", "9"), (8, "3", ""), (11, "10", ""), (12, "a", ""), (13, "b", ""), (14, "c", ""), (15, "d", ""), (16, "", ""), (17, "", "")] {
             assert_eq!(cond_fields(&filter_cond(k, a, b).unwrap()), Some((k, a.to_string(), b.to_string())), "{k}");
         }
     }
@@ -5953,6 +6021,27 @@ mod tests {
             let t = d.wb.table_at(0, 1, 1).unwrap();
             assert!(t.totals && t.rect.r1 == 3);
         }
+        // Each total cell takes another function, shown checked in the menu.
+        select(&s, (3, 2), (3, 2));
+        let totals = |s: &Sheets| crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), s.grid.get_cloned().cursor).into_iter().filter(|(m, _)| m.label.starts_with("Total: ")).map(|(m, _)| (m.label.clone(), m.mark == pergola::widgets::Mark::Radio(true))).collect::<Vec<_>>();
+        assert_eq!(totals(&s).len(), crate::data::TOTAL_FUNCTIONS.len());
+        assert!(totals(&s).contains(&("Total: Sum".into(), true)));
+        assert_eq!(data(&s, DataCmd::TotalFn(1)), "Average of Price's shown rows.");
+        assert_eq!(shown(&s, 3, 2), "15");
+        assert!(totals(&s).contains(&("Total: Average".into(), true)) && totals(&s).contains(&("Total: Sum".into(), false)));
+        data(&s, DataCmd::TotalFn(4));
+        assert_eq!(shown(&s, 3, 2), "20");
+        data(&s, DataCmd::TotalFn(2));
+        assert_eq!(shown(&s, 3, 2), "2");
+        data(&s, DataCmd::TotalFn(0));
+        assert_eq!(shown(&s, 3, 2), "");
+        assert!(totals(&s).contains(&("Total: None".into(), true)));
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(shown(&s, 3, 2), "2");
+        // Only in the total row.
+        select(&s, (1, 2), (1, 2));
+        assert!(totals(&s).is_empty() && data(&s, DataCmd::TotalFn(1)).contains("total row first"));
+        select(&s, (1, 1), (1, 1));
         assert!(data(&s, DataCmd::TotalRow).contains("no total row"));
         assert_eq!(shown(&s, 3, 1), "");
         assert!(!s.doc.borrow().wb.table_at(0, 1, 1).unwrap().totals);
@@ -7016,6 +7105,32 @@ mod tests {
         // Two columns selected: refused.
         select(&s, (0, 0), (0, 1));
         assert!(data(&s, DataCmd::TextToColumns).contains("one column"));
+        // Text to Columns at…: a bar takes a delimiter, by name or as typed.
+        let s = sheets_of(b"x\n");
+        for (r, t) in ["ab-cd-ef", "a-b; c", "plain"].iter().enumerate() {
+            assert!(s.doc.borrow_mut().type_into(r as u32, 0, t));
+        }
+        select(&s, (0, 0), (2, 0));
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::TextToColumnsAt));
+        s.take_cmds();
+        assert!(s.splitting.get());
+        s.split_text.set(TextEdit::new("/"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+        s.take_cmds();
+        assert!(s.splitting.get() && s.doc.borrow().status.contains("no “/” to split at"), "{}", s.doc.borrow().status);
+        s.split_text.set(TextEdit::new("-"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+        s.take_cmds();
+        assert!(!s.splitting.get(), "{}", s.doc.borrow().status);
+        assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2), shown(&s, 1, 0), shown(&s, 1, 1), shown(&s, 2, 0)], ["ab", "cd", "ef", "a", "b; c", "plain"]);
+        // Names, and limits.
+        let s = sheets_of(b"x\n");
+        assert!(s.doc.borrow_mut().type_into(0, 0, "p;q,r"));
+        select(&s, (0, 0), (0, 0));
+        assert!(crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), CellRange { r0: 0, c0: 0, r1: 0, c1: 0 }, (0, 0), "123456789").unwrap_err().contains("up to 8"));
+        let msg = crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), CellRange { r0: 0, c0: 0, r1: 0, c1: 0 }, (0, 0), "Commas").unwrap();
+        assert!(msg.contains("at commas into 2 columns"), "{msg}");
+        assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1)], ["p;q", "r"]);
     }
 
     #[test]
@@ -7829,6 +7944,45 @@ mod tests {
     }
 
     #[test]
+    fn a_name_s_reference_is_edited_in_the_name_manager() {
+        use crate::data::NamesCmd;
+        let s = sheets_of(b"1,2\n3,4\n");
+        {
+            let mut d = s.doc.borrow_mut();
+            let own = d.wb.sheet_name(0);
+            d.wb.define_name("Block", None, &format!("='{own}'!$A$1:$A$2")).unwrap();
+            d.type_into(3, 0, "=SUM(Block)");
+            d.wb.recalc();
+        }
+        assert_eq!(shown(&s, 3, 0), "4");
+        let i = crate::data::name_rows(&s.doc.borrow().wb).iter().position(|r| r.name == "Block").unwrap();
+        s.cmds.lock().unwrap().push(Cmd::Names(NamesCmd::Edit(i)));
+        s.take_cmds();
+        assert!(s.naming.get() && s.name_refers.get() && s.name_rename.get() == Some(i));
+        assert!(s.name_text.get_cloned().text().starts_with('='));
+        let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Block refers to")));
+        // Without its =, and the formulas using it follow.
+        let own = s.doc.borrow().wb.sheet_name(0);
+        s.name_text.set(TextEdit::new(&format!("'{own}'!$B$1:$B$2")));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::NameDone));
+        s.take_cmds();
+        assert!(!s.naming.get(), "{}", s.doc.borrow().status);
+        assert!(s.doc.borrow().status.starts_with("Block now refers to"), "{}", s.doc.borrow().status);
+        assert_eq!(shown(&s, 3, 0), "6");
+        // A constant, and one undo step back.
+        assert!(crate::data::edit_name_refers(&mut s.doc.borrow_mut(), i, "=10").is_ok());
+        assert_eq!(shown(&s, 3, 0), "10");
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(shown(&s, 3, 0), "6");
+        assert!(crate::data::edit_name_refers(&mut s.doc.borrow_mut(), i, " ").is_err());
+        // Rename still renames.
+        s.cmds.lock().unwrap().push(Cmd::Names(NamesCmd::Rename(i)));
+        s.take_cmds();
+        assert!(!s.name_refers.get());
+    }
+
+    #[test]
     fn renaming_a_name_rewrites_the_formulas_and_names_using_it() {
         use crate::data::NamesCmd;
         let s = sheets_of(b"1,2\n3,4\n");
@@ -8274,6 +8428,14 @@ mod tests {
         let z = s.zoom_percent();
         assert!(z > 100, "{z}");
         assert_eq!((s.scroll.get().physics.y, s.scroll.get().physics_x.y), (s.source.row_top(1), 0.0));
+        // Each sheet keeps its own zoom, and the file keeps it.
+        s.doc.borrow_mut().run("Add", vec![officina_grid::ops::GridOp::add_sheet("Two".into())]);
+        s.show_sheet(1);
+        assert_eq!(s.zoom_percent(), 100);
+        run(Cmd::Zoom(75));
+        s.show_sheet(0);
+        assert_eq!(s.zoom_percent(), z);
+        assert_eq!(s.doc.borrow().wb.sheet(1).zoom, 75);
         // The status bar shows the percent; the toolbar has Format Painter.
         let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
         let has = |t: &str| tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == t));

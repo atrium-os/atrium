@@ -1,0 +1,14 @@
+[package]
+name = "todo-lens"
+description = "A sample Artifex plugin: TODOs in the open files, in a panel of its own (dev-tools.md §3.8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+atrium-artifex-ext = { path = "../../../sdk/atrium-artifex-ext" }
+limen = { path = "../../../limen" }
+pergola = { path = "../../../pergola" }
+fresco-protocol = { path = "../../../fresco-protocol" }
+fresco-client = { path = "../../../fresco-client" }

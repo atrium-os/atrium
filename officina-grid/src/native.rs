@@ -27,6 +27,7 @@
 //! | 22 | FREEZE_FROM | panes frozen with the view scrolled: count; per sheet, its index, first frozen row and column |
 //! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, a plain note, styled note or thread |
+//! | 29 | ZOOM | sheets' view zoom other than 100 %: count; per sheet, its index and percent (10–400) |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -63,6 +64,7 @@ pub const PICTURE: u16 = 25;
 pub const SHEET_IDENTITIES: u16 = 26;
 pub const OUTLINES: u16 = 27;
 pub const HIDDEN_SHEETS: u16 = 28;
+pub const ZOOM: u16 = 29;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -355,6 +357,16 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u16(i as u16);
         }
         c.add(HIDDEN_SHEETS, &w.into_bytes())?;
+    }
+    let zoomed: Vec<(usize, u16)> = wb.sheets.iter().enumerate().filter(|(_, sh)| sh.zoom != 100).map(|(i, sh)| (i, sh.zoom.clamp(crate::book::ZOOM_MIN, crate::book::ZOOM_MAX))).collect();
+    if !zoomed.is_empty() {
+        let mut w = Writer::new();
+        w.var(zoomed.len() as u64);
+        for (i, z) in zoomed {
+            w.u16(i as u16);
+            w.u16(z);
+        }
+        c.add(ZOOM, &w.into_bytes())?;
     }
     let tabs: Vec<(usize, u32)> = wb.sheets.iter().enumerate().filter_map(|(i, sh)| sh.tab_color.map(|c| (i, c))).collect();
     if !tabs.is_empty() {
@@ -960,6 +972,22 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     }
     if wb.sheets.iter().all(|s| s.sheet_hidden) {
         return Err(LoadError::Bad("every sheet hidden"));
+    }
+    for i in of(ZOOM) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n > wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("more zoomed sheets than sheets"));
+        }
+        for _ in 0..n {
+            let (s, z) = (r.u16()? as usize, r.u16()?);
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("a zoom for a sheet that does not exist")) };
+            if !(crate::book::ZOOM_MIN..=crate::book::ZOOM_MAX).contains(&z) || z == 100 || sh.zoom != 100 {
+                return Err(LoadError::Bad("a sheet's zoom"));
+            }
+            sh.zoom = z;
+        }
+        done(&r)?;
     }
 
     for i in of(TAB_COLORS) {

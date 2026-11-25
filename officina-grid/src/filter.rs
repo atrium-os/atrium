@@ -29,6 +29,9 @@ pub enum Cond {
     /// `= <> < <= > >=`; two joined by and (`true`) or or.
     Compare(Vec<(String, f64)>, bool),
     Rank(Rank),
+    /// Numbers above (`below`: below) the average of the column's numbers
+    /// in the filter's range, as Excel's Above and Below Average.
+    Average { below: bool },
     Calendar(CalendarSelection),
     DynamicDate(DynamicDate),
     Appearance(AppearanceFilter),
@@ -297,6 +300,10 @@ impl Cond {
                 w.u8(9);
                 expr.encode(w);
             }
+            Cond::Average { below } => {
+                w.u8(10);
+                w.u8(u8::from(*below));
+            }
         }
     }
 
@@ -346,6 +353,11 @@ impl Cond {
             6 => Cond::Calendar(CalendarSelection::decode(r)?),
             7 => Cond::DynamicDate(DynamicDate::decode(r)?),
             8 => Cond::Appearance(AppearanceFilter::decode(r)?),
+            10 => match r.u8()? {
+                0 => Cond::Average { below: false },
+                1 => Cond::Average { below: true },
+                _ => return Err(WireError::Invalid("average filter")),
+            },
             9 if expressions => {
                 let mut remaining = MAX_FILTER_NODES;
                 Cond::Expression(Box::new(FilterExpr::decode(r, 0, &mut remaining)?))
@@ -359,6 +371,7 @@ impl Cond {
     fn prepare(&self, wb: &Workbook, rect: Rect, first: u32, col: u32) -> Prepared<'_> {
         match self {
             Self::Rank(rank) => Prepared::Rank(wb.rank_cutoff(rect, first, col, *rank)),
+            Self::Average { .. } => Prepared::Rank(wb.column_average(rect, first, col)),
             Self::Custom(tests, _) => Prepared::Custom(tests.iter().map(Test::prepare).collect()),
             Self::Calendar(selection) => Prepared::Calendar(selection.prepare()),
             Self::Expression(expr) => Prepared::Expression(Box::new(expr.prepare(wb, rect, first, rect.c0))),
@@ -426,6 +439,10 @@ impl Cond {
             Cond::Rank(rank) => {
                 let (Value::Num(x), Prepared::Rank(Some(y))) = (wb.get(addr), prepared) else { return false };
                 x.is_finite() && if rank.bottom { x <= *y } else { x >= *y }
+            }
+            Cond::Average { below } => {
+                let (Value::Num(x), Prepared::Rank(Some(y))) = (wb.get(addr), prepared) else { return false };
+                x.is_finite() && if *below { x < *y } else { x > *y }
             }
         }
     }
@@ -547,6 +564,25 @@ impl Workbook {
 
     /// The cutoff over the numeric data rows before intersecting other column
     /// conditions. All values tied at the cutoff are kept.
+    /// The average of the finite numbers in column `col` from row `first`
+    /// to the range's end (None: no numbers).
+    fn column_average(&self, rect: Rect, first: u32, col: u32) -> Option<f64> {
+        if first > rect.r1 {
+            return None;
+        }
+        let (mut sum, mut n) = (0.0f64, 0u64);
+        let column = Rect { r0: first, c0: col, c1: col, ..rect };
+        self.each(&column, &mut |_, _, value| {
+            if let Value::Num(x) = value {
+                if x.is_finite() {
+                    sum += x;
+                    n += 1;
+                }
+            }
+        });
+        (n > 0).then(|| sum / n as f64)
+    }
+
     fn rank_cutoff(&self, rect: Rect, first: u32, col: u32, rank: Rank) -> Option<f64> {
         if first > rect.r1 {
             return None;
@@ -767,6 +803,32 @@ mod tests {
 
         GridOp::decode(&undo.encode()).unwrap().apply(&mut wb);
         assert_eq!(wb.filter_state(0), previous);
+    }
+
+    #[test]
+    fn average_filter_keeps_numbers_above_or_below_and_is_saved() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        // Average of 2, 4, 9 and the text is 5: text is no number and goes.
+        for (r, v) in [Value::Num(2.0), Value::Num(4.0), Value::str("n/a"), Value::Num(9.0)].into_iter().enumerate() {
+            wb.set_value(CellAddr::new(0, r as u32 + 1, 0), v);
+        }
+        let rect = Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 0 };
+        for (below, hidden) in [(false, vec![(1, 3)]), (true, vec![(3, 4)])] {
+            let f = AutoFilter { rect, conds: vec![(0, Cond::Average { below })] };
+            wb.replace_filter(wb.filtered(0, Some(f.clone())));
+            assert_eq!(wb.sheet(0).hidden, hidden, "below {below}");
+            let reopened = crate::native::load(&crate::native::save_to_vec(&wb)).unwrap();
+            assert_eq!(reopened.filter_state(0), wb.filter_state(0));
+            let undo = GridOp::Filter(wb.filtered(0, Some(f))).apply(&mut wb);
+            assert!(GridOp::decode(&undo.encode()).is_ok());
+        }
+        // A bad flag is refused.
+        let mut w = Writer::new();
+        w.u8(10);
+        w.u8(2);
+        let bytes = w.into_bytes();
+        assert!(Cond::decode(&mut Reader::new(&bytes), false).is_err());
     }
 
     #[test]

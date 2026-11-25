@@ -63,6 +63,10 @@ pub struct Sheet {
     /// The width each hidden column (width 0) had, for showing it again as
     /// it was: (column, px), sorted. Files keep it with the column.
     pub hidden_widths: Vec<(u32, f64)>,
+    /// The view's zoom in percent ([`ZOOM_MIN`]..=[`ZOOM_MAX`], 100 as
+    /// made). A view setting kept with the sheet, as Excel keeps it; not
+    /// an undo step.
+    pub zoom: u16,
     pub(crate) outlines: [crate::outline::Outline; 2],
     pub(crate) axis_ids: [crate::axis_ids::AxisIds; 2],
 }
@@ -73,7 +77,7 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), outlines: Default::default(), axis_ids: Default::default() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, outlines: Default::default(), axis_ids: Default::default() }
     }
     pub fn outline(&self, axis: crate::shift::Axis) -> &crate::outline::Outline {
         &self.outlines[axis.index()]
@@ -1140,6 +1144,10 @@ impl Workbook {
 
 /// Whether `from` can be the first frozen row and column of panes frozen
 /// at `freeze`: on each axis, 0, or less than the first unfrozen one.
+/// A sheet's zoom range, in percent, as Excel's.
+pub const ZOOM_MIN: u16 = 10;
+pub const ZOOM_MAX: u16 = 400;
+
 pub fn freeze_from_fits(freeze: (u32, u32), from: (u32, u32)) -> bool {
     (from.0 == 0 || from.0 < freeze.0) && (from.1 == 0 || from.1 < freeze.1)
 }

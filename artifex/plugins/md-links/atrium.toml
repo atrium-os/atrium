@@ -1,0 +1,21 @@
+# A sample Artifex plugin (docs/spec/dev-tools.md §3.8): it marks Markdown
+# links that go nowhere (an anchor no heading has, an empty target, a
+# reference never defined) and offers the closest heading as a fix. It sees
+# only the Markdown files the person opens in Artifex.
+[app]
+id          = "org.atrium.sample.md-links"
+name        = "Markdown links"
+version     = "0.1.0"
+entry       = "bin/md-links"
+description = "Marks Markdown links that go nowhere."
+icon        = "link"
+
+[capabilities]
+network = "none"
+
+[roles]
+implements = ["editor-extension"]
+
+[roles.editor-extension]
+languages = ["markdown"]
+commands  = ["md-links.check"]

@@ -31,9 +31,6 @@ pub struct SheetSource {
     /// The cell whose comment is shown beside it (the cursor's, while not
     /// editing); the window sets it each frame.
     pub note_at: std::cell::Cell<Option<(u32, u32)>>,
-    /// The view's zoom (1: 100 %): rows, columns and cell text scale by it;
-    /// the sheet keeps its sizes at 100 %.
-    pub zoom: std::cell::Cell<f64>,
 }
 
 type ViewKey = (u16, u64, usize, usize, usize, usize, usize, usize, usize, u64);
@@ -41,8 +38,15 @@ type ColViewKey = (u16, u64, usize, usize, usize, u64);
 type ChartKey = (u16, u32, u32, u64, bool);
 
 impl SheetSource {
+    /// The sheet on screen's zoom (1: 100 %): rows, columns and cell text
+    /// scale by it; the sheet keeps its sizes at 100 %. 1 while the
+    /// document is being changed (callers read it before borrowing).
+    pub fn zoom_factor(&self) -> f64 {
+        self.doc.try_borrow().map_or(1.0, |d| f64::from(d.wb.sheet(d.sheet).zoom) / 100.0)
+    }
+
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None), zoom: std::cell::Cell::new(1.0) }
+        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None) }
     }
 
     /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
@@ -470,7 +474,7 @@ impl SheetSource {
         let sheet = self.doc.borrow().sheet;
         let corner = |x: f64, y: f64| {
             let (r, c) = (self.row_at(y.max(0.0)), self.col_at(x.max(0.0)));
-            let z = self.zoom.get();
+            let z = self.zoom_factor();
             (r, c, ((x - self.col_left(c)) / z * 72.0 / 96.0).max(0.0) as f32, ((y - self.row_top(r)) / z * 72.0 / 96.0).max(0.0) as f32)
         };
         officina_grid::charts::Anchor { sheet, from: corner(at[0], at[1]), to: corner(at[0] + at[2], at[1] + at[3]) }
@@ -870,7 +874,7 @@ impl GridSource for SheetSource {
                 continue;
             }
             // Offsets are points; the grid is in px.
-            let z = self.zoom.get();
+            let z = self.zoom_factor();
             let x0 = self.col_left(a.from.1) + a.from.2 as f64 * 96.0 / 72.0 * z;
             let y0 = self.row_top(a.from.0) + a.from.3 as f64 * 96.0 / 72.0 * z;
             let x1 = self.col_left(a.to.1) + a.to.2 as f64 * 96.0 / 72.0 * z;
@@ -926,22 +930,22 @@ impl GridSource for SheetSource {
         MIN_COLS.max(c.max(end).saturating_add(26)).min(MAX_COLS)
     }
     fn row_top(&self, r: u32) -> f64 {
-        self.rows_view(|s| s.offset(r)) * self.zoom.get()
+        self.rows_view(|s| s.offset(r)) * self.zoom_factor()
     }
     fn row_at(&self, y: f64) -> u32 {
         let rows = self.rows();
-        let z = self.zoom.get();
+        let z = self.zoom_factor();
         self.rows_view(|s| s.index_at((y / z).max(0.0))).min(rows - 1)
     }
     fn col_left(&self, c: u32) -> f64 {
-        self.cols_view(|s| s.offset(c)) * self.zoom.get()
+        self.cols_view(|s| s.offset(c)) * self.zoom_factor()
     }
     fn col_at(&self, x: f64) -> u32 {
-        let z = self.zoom.get();
+        let z = self.zoom_factor();
         self.cols_view(|s| s.index_at((x / z).max(0.0))).min(self.cols() - 1)
     }
     fn zoom(&self) -> f32 {
-        self.zoom.get() as f32
+        self.zoom_factor() as f32
     }
     fn outline_control(&self, rows: bool, at: u32) -> Option<(u32, u32, bool)> {
         let d = self.doc.borrow();
@@ -967,7 +971,7 @@ impl GridSource for SheetSource {
         if rows { self.rows_view(control) } else { self.cols_view(control) }
     }
     fn cell(&self, r: u32, c: u32) -> Option<CellView> {
-        let z = self.zoom.get() as f32;
+        let z = self.zoom_factor() as f32;
         let mut cv = self.cell_at_100(r, c)?;
         if z != 1.0 {
             cv.size = Some(cv.size.unwrap_or(pergola::theme::type_size::SM) * z);

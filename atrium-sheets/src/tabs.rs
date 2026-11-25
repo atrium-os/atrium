@@ -94,6 +94,9 @@ pub enum TabCmd {
     /// The Rotation Angle bar's field submitted; closed.
     AngleDone,
     AngleCancel,
+    /// The Text to Columns at… bar's field submitted; closed.
+    SplitDone,
+    SplitCancel,
     /// The Define Name bar's field submitted; closed.
     NameDone,
     NameCancel,

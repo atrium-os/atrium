@@ -1,0 +1,17 @@
+[package]
+name = "md-links"
+description = "A sample Artifex plugin: Markdown links that go nowhere, as warnings, with fixes (dev-tools.md §3.8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+atrium-artifex-ext = { path = "../../../sdk/atrium-artifex-ext" }
+
+[dev-dependencies]
+# The whole path in one process tree: limend's own code, Artifex's plugin
+# host, and this program as the plugin.
+artifex = { path = "../../app" }
+limen = { path = "../../../limen" }
+aqueduct = { path = "../../../aqueduct" }
