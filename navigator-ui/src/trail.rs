@@ -883,7 +883,9 @@ impl TrailStore {
         if index >= self.earlier.len() {
             return false;
         }
-        let t = self.earlier.remove(index).trail;
+        let mut t = self.earlier.remove(index).trail;
+        // It keeps its pin only while the tiles have room.
+        t.pinned &= self.trails.iter().filter(|o| o.pinned).count() < PINNED_MAX;
         self.trails.push(t);
         self.current = self.trails.len() - 1;
         self.touch();
@@ -1403,5 +1405,30 @@ mod asked_tests {
         assert_eq!(r.path[1], 3, "the later page stands for them");
         assert_eq!(t.current, Some(*r.path.last().unwrap()));
         assert!(t.matches("b.exa") && t.matches("") && !t.matches("zzz"));
+    }
+
+    #[test]
+    fn a_pinned_trail_brought_back_keeps_its_pin_only_if_there_is_room() {
+        let sp = |u: &str| PageSpec { url: u.into(), title: u.into(), search: None, facts: Facts::green(""), media: Media::None };
+        let mut s = TrailStore::default();
+        for i in 0..PINNED_MAX {
+            s.new_trail(false);
+            s.follow(sp(&format!("https://p{i}.example/")));
+            assert!(s.toggle_pin(s.current));
+        }
+        s.put_away(1);
+        s.new_trail(false);
+        s.follow(sp("https://q.example/"));
+        assert!(s.toggle_pin(s.current), "a tile came free");
+        assert!(s.bring_back(0));
+        assert_eq!(s.trails.iter().filter(|t| t.pinned).count(), PINNED_MAX);
+        assert!(!s.trail().pinned, "brought back unpinned: the tiles are full");
+        // With room, it comes back pinned.
+        let p = s.trails.iter().position(|t| t.pinned).unwrap();
+        s.select(p);
+        s.put_away(2);
+        assert_eq!(s.trails.iter().filter(|t| t.pinned).count(), PINNED_MAX - 1);
+        assert!(s.bring_back(0));
+        assert!(s.trail().pinned);
     }
 }
