@@ -94,6 +94,12 @@ pub struct Spec {
     /// own `memory`. Set only by portcullisd, from the caller's installed
     /// manifest; the app's capabilities are never consulted for it.
     pub worker: Option<String>,
+    /// ★ The app's settings pane (curia.md §15): run `[roles.app-settings]
+    /// entry` in place of the app's, with NO capability of the app's, and
+    /// this folder (the app's data in one persona, its overlay) mounted
+    /// read-write at [`PANE_DATA`]. Set only by portcullisd, for limend,
+    /// for the settings app.
+    pub pane: Option<PathBuf>,
     /// The caller's persona's route domain (vpn.md §5.4, V2): a networked
     /// worker's epair goes in this routing table, as its caller's does, so a
     /// Work app's helper leaves by Work's tunnel too. Set only by
@@ -251,6 +257,27 @@ pub fn as_worker(m: &mut portcullis_toml::Manifest, name: &str) -> Result<(), St
     Ok(())
 }
 
+/// Where a settings pane finds its app's data (`ATRIUM_PANE_DATA`).
+pub const PANE_DATA: &str = "/app-data";
+
+/// The app's manifest made into its settings pane's: the pane's entry, no
+/// capability, the app's `[resources]` but its storage, and no workers or
+/// setup. What the jail is built from, after the signature check of the
+/// whole bundle (the entry is in the same signed tree).
+pub fn as_pane(m: &mut portcullis_toml::Manifest) -> Result<(), String> {
+    let Some(entry) = m.roles.as_ref().and_then(|r| r.app_settings.as_ref()).map(|s| s.entry.clone()) else {
+        return Err(format!("{} has no [roles.app-settings]", m.app.id));
+    };
+    m.app.entry = entry;
+    if let Some(b) = m.bundle.as_mut() { b.entry = None; }
+    m.capabilities = Default::default();
+    if let Some(r) = m.resources.as_mut() { r.storage = None; r.files = None; }
+    m.setup = None;
+    m.supervision = None;
+    m.workers.clear();
+    Ok(())
+}
+
 pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
     run_with_fds(spec, stdio, Vec::new())
 }
@@ -324,6 +351,10 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     if let Some(name) = &spec.worker {
         if let Err(e) = as_worker(&mut manifest, name) { return OneShot::Refused(e) }
     }
+    if spec.pane.is_some() {
+        if spec.worker.is_some() { return OneShot::Refused("a worker or a pane, not both".into()) }
+        if let Err(e) = as_pane(&mut manifest) { return OneShot::Refused(e) }
+    }
 
     // ★ The jaild-lane name: jaild-valid by construction, and the last
     // component of the root — jaild trusts a one-shot's entry only when its
@@ -380,10 +411,15 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     // devfs grants; a
     // capability needing more would otherwise run without it and report
     // success.
-    let mounts = match jaild_mounts(&jc, &jail_path) {
+    let mut mounts = match jaild_mounts(&jc, &jail_path) {
         Ok(m) => m,
         Err(e) => return OneShot::Refused(e),
     };
+    if let Some(data) = &spec.pane {
+        mounts.push(jaild::protocol::MountSpec { noexec: true,
+            source: data.to_string_lossy().into_owned(), dest: PANE_DATA.into(),
+            kind: jaild::protocol::MountKind::RwNullfs, size_mb: None, owner: None });
+    }
 
     // ★★ A LIVE JAIL WITH THIS NAME IS A REFUSAL, NOT SOMETHING TO CLEAN UP.
     //
@@ -488,7 +524,9 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
             path:  entry.clone(),
             argv:  vec![entry],
             env:   clean_env(&pw).into_iter().chain(spec.extra_env.iter()
-                       .map(|(k, v)| jaild::protocol::EnvPair { key: k.clone(), value: v.clone() })).collect(),
+                       .map(|(k, v)| jaild::protocol::EnvPair { key: k.clone(), value: v.clone() }))
+                       .chain(spec.pane.as_ref().map(|_| jaild::protocol::EnvPair { key: "ATRIUM_PANE_DATA".into(), value: PANE_DATA.into() }))
+                       .collect(),
             uid:   pw.uid,
             gid:   pw.gid,
             stdio: true,
@@ -1022,5 +1060,25 @@ mod limit_tests {
         assert_eq!(parse_mib("1"), Some(1));
         assert_eq!(parse_mib("lots"), None);
         assert!(resolve_limits(Some(&res(Some("lots"), None)), None, None, false, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    #[test]
+    fn a_pane_runs_its_own_entry_with_no_capability_of_the_apps() {
+        let text = "[app]\nid = \"org.example.web\"\nname = \"Web\"\nversion = \"1\"\nentry = \"bin/web\"\n\
+                    [bundle]\nentry = \"bin/web\"\n\
+                    [capabilities]\nnetwork = \"full\"\ngraphics = \"window\"\n\
+                    [resources]\nmemory = \"1G\"\nstorage = \"2G\"\n\
+                    [roles]\nimplements = [\"app-settings\"]\n[roles.app-settings]\nentry = \"bin/web-settings\"\n";
+        let mut m = portcullis_toml::Manifest::from_str(text).unwrap();
+        super::as_pane(&mut m).unwrap();
+        assert_eq!(m.entry(), "bin/web-settings");
+        assert!(m.capabilities.network.is_none() && m.capabilities.graphics.is_none());
+        let r = m.resources.as_ref().unwrap();
+        assert_eq!((r.memory.as_deref(), r.storage.as_deref()), (Some("1G"), None));
+        let mut none = portcullis_toml::Manifest::from_str(&text.replace("\"app-settings\"", "").replace("[roles.app-settings]\nentry = \"bin/web-settings\"\n", "")).unwrap();
+        assert!(super::as_pane(&mut none).is_err(), "no pane, nothing run");
     }
 }

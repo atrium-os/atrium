@@ -84,7 +84,14 @@ impl Installed {
     /// its installed manifest implements the role, and a dev build only
     /// for the person whose workspace made it.
     pub fn may_target(&self, person: &str, app: &str) -> bool {
-        (!app.starts_with("dev.") || app.starts_with(&format!("dev.{person}."))) && self.implements(app, "share-target")
+        self.may_provide(person, app, "share-target")
+    }
+
+    /// Whether `app` provides `role` for `person`: its installed manifest
+    /// implements the role, and a dev build only for the person whose
+    /// workspace made it.
+    pub fn may_provide(&self, person: &str, app: &str, role: &str) -> bool {
+        (!app.starts_with("dev.") || app.starts_with(&format!("dev.{person}."))) && self.implements(app, role)
     }
 
     /// The `share-target`s for `person` that take one of `mimes`, by app id,

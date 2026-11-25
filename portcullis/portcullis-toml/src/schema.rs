@@ -99,6 +99,20 @@ pub struct RolesSection {
     /// share sheet (share-sheet.md §4).
     #[serde(rename = "share-target")]
     pub share_target: Option<ShareTargetSection>,
+    /// `[roles.app-settings]`: the app's own settings pane, in Settings
+    /// (curia.md §15).
+    #[serde(rename = "app-settings")]
+    pub app_settings: Option<AppSettingsSection>,
+}
+
+/// `[roles.app-settings]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppSettingsSection {
+    /// Its program, a path in the bundle: run as the app's own uid in a
+    /// persona, with that persona's data of the app's at `/app-data` and no
+    /// capability of the app's.
+    pub entry: String,
 }
 
 /// `[roles.share-target]`.

@@ -133,6 +133,7 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
         cpu_pct,
         extra_env: vec![],
         worker: None,
+        pane: None,
         // The CLI's own lane: the host's table.
         fib: None,
         // ★★ Never from the environment. This path needs root, and `$USER`

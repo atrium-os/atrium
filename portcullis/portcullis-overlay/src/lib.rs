@@ -302,9 +302,21 @@ pub fn person_places(person: &str) -> Vec<Place> {
 /// the images are in their key groups, E6). The ones that stay mounted
 /// (busy), by place.
 pub fn teardown_person(person: &str) -> Vec<String> {
+    teardown_person_with(person, false)
+}
+
+/// [`teardown_person`] with `umount -f`: the last pass at logout, for an
+/// overlay something outside the person's uids still holds. It runs while
+/// the person's keys are still loaded, so the volume's unmount flush can
+/// still write; once the keys go, a write into a mounted overlay is dropped.
+pub fn teardown_person_forced(person: &str) -> Vec<String> {
+    teardown_person_with(person, true)
+}
+
+fn teardown_person_with(person: &str, force: bool) -> Vec<String> {
     let mut busy = Vec::new();
     for pl in person_places(person) {
-        if let Err(e) = teardown(&pl) {
+        if let Err(e) = teardown_with(&pl, force) {
             busy.push(format!("{}: {e}", pl.dir.display()));
         }
     }
@@ -477,6 +489,21 @@ fn attach(img: &Path) -> Result<String, String> {
 fn detach(unit: &str) {
     let _ = Command::new("mdconfig").args(["-d", "-u", unit.trim_start_matches("md")])
         .status();
+}
+
+/// Detach `unit`, with `-o force` when `force`; an error says why it stayed.
+fn detach_checked(unit: &str, force: bool) -> Result<(), String> {
+    let mut c = Command::new("mdconfig");
+    c.args(["-d", "-u", unit.trim_start_matches("md")]);
+    if force {
+        c.args(["-o", "force"]);
+    }
+    let out = c.output().map_err(|e| format!("mdconfig -d {unit}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("mdconfig -d {unit}: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
 }
 
 /// Step 0 of launch (`portcullis.md` §4.2): make sure the app's overlay volume
@@ -666,17 +693,34 @@ pub fn ensure_mounted(pl: &Place, app_id: &str, quota_bytes: u64) -> Result<Back
 /// image file alone — the app's state is in there. Used when the app is
 /// uninstalled with its overlay kept, and as the first half of [`destroy`].
 pub fn teardown(pl: &Place) -> Result<(), String> {
-    let dir = &pl.dir;
-    let Some(device) = mounted_volume(pl) else { return Ok(()) };
+    teardown_with(pl, false)
+}
 
-    let st = Command::new("umount").arg(&dir).status();
+fn teardown_with(pl: &Place, force: bool) -> Result<(), String> {
+    let dir = &pl.dir;
+    let Some(device) = mounted_volume(pl) else {
+        // Unmounted, but an earlier pass may have left the image's md
+        // attached; its backing file must not stay open past the key.
+        return match existing_md(&pl.img) {
+            Some(unit) => detach_checked(&unit, force)
+                .map_err(|e| format!("{} unmounted but its md stays: {e}", dir.display())),
+            None => Ok(()),
+        };
+    };
+
+    let mut umount = Command::new("umount");
+    if force {
+        umount.arg("-f");
+    }
+    let st = umount.arg(dir).status();
     match st {
         Ok(s) if s.success() => {}
         Ok(s)  => return Err(format!("umount {}: exited {s}", dir.display())),
         Err(e) => return Err(format!("umount {}: {e}", dir.display())),
     }
     if let Some(unit) = device.strip_prefix("/dev/") {
-        detach(unit);
+        detach_checked(unit, force)
+            .map_err(|e| format!("{} unmounted but its md stays: {e}", dir.display()))?;
     }
     Ok(())
 }

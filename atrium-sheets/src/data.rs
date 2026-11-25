@@ -147,6 +147,10 @@ pub enum DataCmd {
     MergeAcross,
     /// Formulas shown as typed in their cells instead of their values (not saved).
     ShowFormulas,
+    /// The cells the cursor's formula reads (Ctrl+[).
+    Precedents,
+    /// The formulas that read the cursor's cell (Ctrl+]).
+    Dependents,
     /// Every formula calculated again (F9; random numbers and the time change).
     CalculateNow,
     /// This sheet's formulas calculated again (Shift+F9).
@@ -433,7 +437,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
         (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }).shortcut("Ctrl+K"), Some(DataCmd::Link)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Remove Links" } else { "Remove Link" }).enabled(links_in(wb, s, sel).next().is_some()), Some(DataCmd::RemoveLinks)),
-        (MenuItem::new("Choose from List…").enabled(wb.validation_at(CellAddr::new(s, row, col)).is_some_and(|v| v.allow == officina_grid::validation::Allow::List)).separated(), Some(DataCmd::ChooseFromList)),
+        (MenuItem::new("Pick from List…").shortcut("Alt+Down").enabled(wb.validation_at(CellAddr::new(s, row, col)).is_some_and(|v| v.allow == officina_grid::validation::Allow::List) || !column_entries(wb, s, row, col).is_empty()).separated(), Some(DataCmd::ChooseFromList)),
         if wb.sheet(s).freeze != (0, 0) {
             (MenuItem::new("Unfreeze Panes").separated(), Some(DataCmd::Unfreeze))
         } else {
@@ -468,6 +472,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
         (MenuItem::new("Show Formulas").checked(d.show_formulas).shortcut("Ctrl+`"), Some(DataCmd::ShowFormulas)),
+        (MenuItem::new("Go to Precedents").shortcut("Ctrl+[").enabled(wb.group_at(s, row, col).is_some()), Some(DataCmd::Precedents)),
+        (MenuItem::new("Go to Dependents").shortcut("Ctrl+]"), Some(DataCmd::Dependents)),
         (MenuItem::new("Insert Function…").shortcut("Shift+F3"), Some(DataCmd::InsertFunction)),
         (MenuItem::new("Paste Name…").shortcut("F3").enabled(!paste_names(d).is_empty()), Some(DataCmd::PasteName)),
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
@@ -732,6 +738,8 @@ pub fn key_cmd(k: char, sel: CellRange, rows: u32, cols: u32) -> Option<DataCmd>
         't' | 'l' => DataCmd::FormatAsTable,
         'L' => DataCmd::Filter,
         'k' => DataCmd::Link,
+        '[' => DataCmd::Precedents,
+        ']' => DataCmd::Dependents,
         _ => return None,
     })
 }
@@ -1061,6 +1069,89 @@ pub fn paste_names(d: &Doc) -> Vec<String> {
     v.sort_by_key(|n| n.to_lowercase());
     v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     v
+}
+
+/// The most dependents Ctrl+] lists.
+pub const MAX_DEPENDENTS: usize = 1000;
+
+/// Excel's Ctrl+[: the areas the formula at (`row`, `col`) reads directly,
+/// each once, in the order the formula has them (names and tables included).
+pub fn precedents(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Vec<Rect> {
+    let Some(g) = wb.group_at(sheet, row, col) else { return Vec::new() };
+    let mut out: Vec<Rect> = Vec::new();
+    for r in wb.group(g).fps.iter().filter_map(|fp| fp.at(row)) {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Excel's Ctrl+]: the formula cells that read (`row`, `col`) directly, in
+/// sheet and then column and row order, at most `max`.
+pub fn dependents(wb: &Workbook, sheet: u16, row: u32, col: u32, max: usize) -> Vec<CellAddr> {
+    let mut out: Vec<CellAddr> = Vec::new();
+    for (_, g) in wb.groups() {
+        for fp in g.fps.iter().filter(|fp| fp.sheet == sheet && fp.c0 <= col && col <= fp.c1) {
+            if let Some((lo, hi)) = fp.affected(g.r0, g.r1, row, row) {
+                // A Slide footprint covers rows by offset; check each row's own area.
+                for r in lo..=hi {
+                    if out.len() > 4 * max {
+                        break;
+                    }
+                    if fp.at(r).is_some_and(|a| a.r0 <= row && row <= a.r1) {
+                        out.push(CellAddr::new(g.sheet, r, g.col));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|a| (a.sheet, a.col, a.row));
+    out.dedup();
+    out.truncate(max);
+    out
+}
+
+/// The most cells AutoComplete and Pick From List read each way from the cell.
+pub const MAX_ENTRY_LOOK: u32 = 10_000;
+
+/// The text entries of the column's list around (`row`, `col`): the filled
+/// cells next to it above and below, as Excel's AutoComplete and Pick From
+/// Drop-down List read them. Each once (ignoring case), in sheet order.
+pub fn column_entries(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Vec<String> {
+    let filled = |r: u32| match wb.value(sheet, r, col) {
+        Value::Empty => false,
+        Value::Str(t) => !t.is_empty(),
+        _ => true,
+    };
+    let (mut top, mut bottom) = (row, row);
+    while top > 0 && row - top < MAX_ENTRY_LOOK && filled(top - 1) {
+        top -= 1;
+    }
+    let last = wb.extent(sheet).0.saturating_sub(1);
+    while bottom < last && bottom - row < MAX_ENTRY_LOOK && filled(bottom + 1) {
+        bottom += 1;
+    }
+    let mut seen = std::collections::HashSet::new();
+    (top..=bottom)
+        .filter(|&r| r != row)
+        .filter_map(|r| match wb.value(sheet, r, col) {
+            Value::Str(t) if !t.is_empty() && seen.insert(t.to_lowercase()) => Some(t.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AutoComplete: the one entry that `typed` begins (ignoring case) and is
+/// longer than. None when there is no such entry, or more than one.
+pub fn complete_entry(entries: &[String], typed: &str) -> Option<String> {
+    let t = typed.to_lowercase();
+    if t.is_empty() || t.starts_with('=') || t.parse::<f64>().is_ok() {
+        return None;
+    }
+    let mut hits = entries.iter().filter(|e| e.chars().count() > typed.chars().count() && e.to_lowercase().starts_with(&t));
+    let one = hits.next()?;
+    hits.next().is_none().then(|| one.clone())
 }
 
 /// Every function a formula can call, sorted, without internal ones.
@@ -2189,7 +2280,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.recalc();
             Ok(if cmd == DataCmd::CalculateNow { "Calculated every sheet.".into() } else { "Calculated this sheet.".into() })
         }
-        DataCmd::InsertFunction | DataCmd::PasteName => Ok(String::new()),
+        DataCmd::InsertFunction | DataCmd::PasteName | DataCmd::Precedents | DataCmd::Dependents => Ok(String::new()),
         DataCmd::ShowFormulas => {
             d.show_formulas = !d.show_formulas;
             Ok(if d.show_formulas { "Formulas are shown in their cells.".into() } else { "Values are shown in their cells.".into() })

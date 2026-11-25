@@ -232,6 +232,24 @@ pub enum Request {
         persona: Option<String>,
     },
 
+    /// ★ limend only: `app_id`'s own settings pane (curia.md §15) for the
+    /// settings app's instance `serves` (the embed's parent, whose uid
+    /// limend has from its peer credentials), in `persona` of that
+    /// instance's person ("personal" or a named one). portcullisd starts it
+    /// only when `serves` is a launched app holding `app-grants`, the
+    /// persona is the person's, and `app_id`'s installed manifest has
+    /// `[roles.app-settings]`. It runs that entry as the app's own uid in
+    /// the persona, in a one-shot jail with no capability of the app's and
+    /// the app's data there at `/app-data`. The handoff is `ExecInstance`'s,
+    /// answered `ReadyForFdsAs` with that uid; the jail goes when limend
+    /// hangs up.
+    ExecSettingsPane {
+        app_id:   String,
+        instance: Option<String>,
+        serves:   u32,
+        persona:  String,
+    },
+
     /// ★ One of the caller's own workers (app-composition.md §4.1,
     /// dev-tools-plan.md M5): `worker` names a `[[workers]]` entry of the
     /// caller's INSTALLED manifest, the caller being the launched app its
@@ -827,6 +845,10 @@ pub struct AccessEntry {
     /// The restricted capabilities it asks for: only the system grants
     /// these, so Settings can't approve it.
     pub restricted: Vec<String>,
+    /// It has a settings pane of its own (`[roles.app-settings]`), which
+    /// Settings shows inside its window (curia.md §15).
+    #[serde(default)]
+    pub settings: bool,
 }
 
 

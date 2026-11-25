@@ -74,6 +74,15 @@ pub trait Launcher: Send {
         let _ = (app_id, embed, channel, parent_uid);
         Err(format!("this launcher starts nothing in another persona ({persona})"))
     }
+    /// `app_id`'s own settings pane (curia.md §15) for Settings running as
+    /// `parent_uid`, in `persona` of its person: the app's settings entry,
+    /// as the app's own uid in that persona, with its data and nothing else
+    /// of its manifest's. The launcher's authority decides whether the
+    /// parent may; one that can't ask refuses.
+    fn launch_settings(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
+        let _ = (app_id, embed, channel, parent_uid);
+        Err(format!("this launcher starts no settings panes ({persona})"))
+    }
     /// Start the fixed Navigator engine with its private fetch transport.
     /// `memory_mb`: a tighter memory limit than the engine manifest's (a
     /// part of a page, [`crate::web_island::PART_MEMORY_MB`]); `None` for a
@@ -119,6 +128,10 @@ pub type EmbedCheck = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// `share-target` for that person (its installed manifest implements the
 /// role; a dev build only for its own person).
 pub type TargetCheck = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// (person, app id) → whether the app has a settings pane for that person
+/// (its installed manifest implements `app-settings`; a dev build only for
+/// its own person).
+pub type PaneCheck = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 type ConnId = u64;
 
@@ -275,6 +288,8 @@ pub struct Shared {
     embed_check: Mutex<Option<EmbedCheck>>,
     /// Without one (tests), the share sheet may choose any app.
     target_check: Mutex<Option<TargetCheck>>,
+    /// Without one (tests), any app has a settings pane.
+    pane_check: Mutex<Option<PaneCheck>>,
 }
 
 impl Shared {
@@ -297,6 +312,7 @@ impl Shared {
             standby_delay: Mutex::new(STANDBY_REFILL_DELAY),
             embed_check: Mutex::new(None),
             target_check: Mutex::new(None),
+            pane_check: Mutex::new(None),
         })
     }
 
@@ -348,6 +364,12 @@ impl Shared {
     /// manifests' `[roles] implements` ([`crate::manifests::Installed::may_target`]).
     pub fn set_target_check(&self, c: TargetCheck) {
         *self.target_check.lock().unwrap() = Some(c);
+    }
+
+    /// Which apps have a settings pane: limend's is the installed
+    /// manifests' `[roles] implements` ([`crate::manifests::Installed::may_provide`]).
+    pub fn set_pane_check(&self, c: PaneCheck) {
+        *self.pane_check.lock().unwrap() = Some(c);
     }
 
     /// Live embeds (tests and logs).
@@ -430,7 +452,12 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
     }
     let r = (|| -> Result<Reply, Reply> {
         match opc {
-            op::REQUEST => request(shared, conn, uid, de(payload)?, None),
+            op::REQUEST => request(shared, conn, uid, de(payload)?, Via::Plain),
+            op::REQUEST_APP_SETTINGS => {
+                let a: proto::AppSettings = de(payload)?;
+                request(shared, conn, uid, proto::Request { role: "app-settings".into(), window: a.window, z: a.z },
+                        Via::Pane { app: a.app, persona: a.persona })
+            }
             op::REQUEST_SMIME_PICKER => {
                 let (sheet, window) = de(payload)?;
                 request_smime_picker(shared, conn, uid, sheet, window)
@@ -438,12 +465,12 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             op::REQUEST_ISLAND => {
                 let (window, z) = de(payload)?;
                 crate::start_trace("limend", "request-island", &format!("uid={uid}"));
-                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, Some(Island::Part))
+                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, Via::Island(Island::Part))
             }
             op::REQUEST_PAGE_ISLAND => {
                 let (window, z) = de(payload)?;
                 crate::start_trace("limend", "request-page-island", &format!("uid={uid}"));
-                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, Some(Island::Page))
+                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, Via::Island(Island::Page))
             }
             op::PLACE => {
                 let p: proto::Place = de(payload)?;
@@ -518,7 +545,19 @@ enum Island {
     Page,
 }
 
-fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, island: Option<Island>) -> Result<Reply, Reply> {
+/// How a request came: which op, and what it named.
+enum Via {
+    /// `REQUEST`.
+    Plain,
+    /// `REQUEST_ISLAND` or `REQUEST_PAGE_ISLAND`.
+    Island(Island),
+    /// `REQUEST_APP_SETTINGS`: the app and persona Curia named.
+    Pane { app: String, persona: String },
+}
+
+fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, via: Via) -> Result<Reply, Reply> {
+    let island = match via { Via::Island(i) => Some(i), _ => None };
+    let pane = match via { Via::Pane { app, persona } => Some((app, persona)), _ => None };
     let with_fetch = island.is_some();
     let refuse = |reason| Err(Reply::Refused { reason });
     let print_pin = req.role == "credential"
@@ -541,10 +580,23 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, is
     };
     // A chosen role needs no `embeds` of its own: the choice can only come
     // from a share sheet the parent opened, which did need it.
-    if let (Provider::System(_) | Provider::Worker(_) | Provider::User, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
+    if let (Provider::System(_) | Provider::Worker(_) | Provider::User | Provider::Named, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
         if !print_pin && !check(&app, role.name) {
             eprintln!("limend: {app} (uid {uid}) may not embed {}: not in its manifest's embeds", role.name);
             return refuse(refusal::NOT_EMBEDDABLE);
+        }
+    }
+    // A pane: only Settings asks, only through its own op, and only for an
+    // app that has one for this person; the launcher decides the persona.
+    if (role.provider == Provider::Named) != pane.is_some() {
+        return refuse(refusal::NO_PROVIDER);
+    }
+    if let Some((named, persona)) = &pane {
+        let ok = app == catalogue::CURIA && crate::manifests::plausible_id(named) && plausible_persona(persona)
+            && shared.pane_check.lock().unwrap().as_ref().is_none_or(|check| check(&user, named));
+        if !ok {
+            eprintln!("limend: {app} (uid {uid}) asked for {named:?}'s settings in {persona:?}: refused");
+            return refuse(refusal::NO_PANE);
         }
     }
     let mut st = shared.state.lock().unwrap();
@@ -566,6 +618,11 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, is
         sheet.role.name == "mail-sign-in" && sheet.child_uid == uid && sheet.child_window == Some(req.window)
     ) {
         return refuse(refusal::NOT_PROVIDER);
+    }
+    // One pane per Settings window: a new one replaces the last (Curia
+    // detaches it first).
+    if pane.is_some() && st.embeds.values().any(|e| e.role.name == "app-settings" && e.parent_window == req.window) {
+        return refuse(refusal::TOO_MANY);
     }
     if role.name == "print" {
         // One print sheet per window, and a window that keeps opening it
@@ -600,9 +657,10 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, is
             Some(&(c, u)) => (c, u, false),
             None => return refuse(refusal::NO_PROVIDER),
         },
-        Provider::Worker(_) | Provider::User | Provider::Chosen => {
+        Provider::Worker(_) | Provider::User | Provider::Chosen | Provider::Named => {
             let provider = match role.provider {
                 Provider::Worker(app) => Some((app.to_string(), None)),
+                Provider::Named => pane.clone().map(|(a, p)| (a, Some(p))),
                 Provider::Chosen => match st.choices.remove(&conn) {
                     Some((app, persona, at)) if at.elapsed() <= Duration::from_millis(catalogue::CHOICE_MS) => Some((app, persona)),
                     _ => None,
@@ -640,6 +698,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, is
             } else {
                 let theirs = theirs.expect("a cold launch has a channel");
                 match &persona {
+                    Some(p) if pane.is_some() => shared.launcher.lock().unwrap().launch_settings(&provider, embed, theirs, uid, p),
                     Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
                     None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
                 }

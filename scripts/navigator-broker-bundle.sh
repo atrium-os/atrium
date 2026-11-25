@@ -3,7 +3,10 @@
 # bundle (org.atrium.navigator, docs/spec/navigator-ui.md §2.3a, J2). Runs
 # IN the FreeBSD guest:
 #
-#   sh navigator-broker-bundle.sh <navigatord binary> <navigatord.conf> <signing key.pem> [opifex]
+#   sh navigator-broker-bundle.sh <navigatord binary> <navigatord.conf> <signing key.pem> [opifex] [navigator-settings]
+#
+# With a navigator-settings binary, the bundle has the Navigator's pane in
+# Settings ([roles.app-settings], curia.md §15): Sites that run live.
 #
 # A person launches it (portcullisd's Launch), so it runs as the Navigator's
 # per-app uid for that person, in the Navigator's jail. Its restricted
@@ -13,13 +16,25 @@
 # through fetcher jails. A jail gets no environment of its caller's, so its
 # settings are etc/navigatord.conf in the bundle.
 set -e
-BIN=$1 CONF=$2 KEY=$3 OPIFEX=${4:-./opifex}
+BIN=$1 CONF=$2 KEY=$3 OPIFEX=${4:-./opifex} PANE=${5:-}
 [ -x "$BIN" ] && [ -f "$CONF" ] && [ -f "$KEY" ] || { echo "usage: $0 <navigatord> <navigatord.conf> <key.pem> [opifex]"; exit 2; }
 APP=org.atrium.navigator
 B=/root/navigator-broker-bundle
 rm -rf $B && mkdir -p $B/bin $B/etc
 cp "$BIN" $B/bin/navigatord
 cp "$CONF" $B/etc/navigatord.conf
+ROLES=
+if [ -n "$PANE" ]; then
+    cp "$PANE" $B/bin/navigator-settings
+    ROLES='
+# Its own pane in Settings: run as the Navigator in a persona, with its data
+# there and no capability of its own (curia.md §15).
+[roles]
+implements = ["app-settings"]
+
+[roles.app-settings]
+entry = "bin/navigator-settings"'
+fi
 cat > $B/atrium.toml <<T
 [app]
 id = "$APP"
@@ -45,6 +60,7 @@ schemes = ["http", "https"]
 [resources]
 memory = "1G"
 cpu = 100
+$ROLES
 T
 openssl dgst -sha256 -sign "$KEY" -out $B/atrium.toml.sig $B/atrium.toml
 "$OPIFEX" install $B

@@ -34,7 +34,13 @@
 #      reports them Locked, and (key groups only) root can't read the
 #      overlay images;
 #   6. they log in again; Work's probe runs again and its counter went on
-#      from the first run (the overlay came back with its data).
+#      from the first run (the overlay came back with its data);
+#   7. (overlay volumes only, HELD_ROUNDS=20 rounds) a root process outside
+#      their uids keeps appending to a file in Work's overlay through the
+#      logout; portcullisd forces the unmount while the key is still loaded
+#      ("forcing unmount"), nothing stays mounted or attached, the guest
+#      stays up, and at the next login the image checks clean and the file
+#      reads back with that round's lines.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ARCH=${ARCH:-aarch64}
@@ -240,6 +246,54 @@ launch work; LW2=$(probe_line $B/probe-work.log); echo "  $LW2"
 RUNS2=$(field "$LW2" runs); RUNS2=${RUNS2#runs=}
 check "Work's counter went on" "$((${RUNS1:-0} + 1))" "${RUNS2:-none}"
 check "…from the remounted overlay" yes "$(mounted_under | grep -qx "$WORK" && echo yes || echo no)"
+
+echo "=== 7. something outside their uids writes into an overlay at logout"
+# A root writer (not one of their uids, so logout doesn't end it) keeps
+# appending to a file in Work's overlay through the logout, HELD_ROUNDS
+# times: the forced unmount revokes an open file with content staged, which
+# is the race with md's in-flight writes that once panicked in
+# g_vfs_strategy. Each round: forced and then unmounted, no md left on the
+# image, the guest still up (same boot), and at the next login the image
+# checks clean and the file reads back non-empty.
+HELD_ROUNDS=${HELD_ROUNDS:-20}
+if [ "$(V "df -T $WORK 2>/dev/null | awk 'NR==2 {print \$2}'")" = tessera ]; then
+    FSCK=$(V "command -v tessera-fsck" 2>/dev/null)
+    BOOT0=$(V "sysctl -n kern.boottime")
+    forced=0; unmounted=0; noleft=0; clean=0; reads=0; up=0
+    n=0; while [ $n -lt $HELD_ROUNDS ]; do
+        n=$((n+1))
+        V "daemon -f sh -c 'cd $WORK && while :; do echo held-by-root-$n-\$(date +%s) >> held.txt; done'"
+        sleep 2
+        V "cp $LOG $LOG.before"
+        ost '{"op":"logout"}' >/dev/null
+        V "pkill -f 'held-by-root-$n-'" >/dev/null 2>&1
+        [ "$(V "sysctl -n kern.boottime" 2>/dev/null)" = "$BOOT0" ] && up=$((up+1)) || { bad "round $n: the guest rebooted or is gone (panic?)"; break; }
+        V "diff $LOG.before $LOG | grep -q '$U logging out: forcing unmount of: .*persona-apps/work'" && forced=$((forced+1))
+        V "diff $LOG.before $LOG | grep -q '$U logging out: .* overlays unmounted'" && unmounted=$((unmounted+1))
+        [ -z "$(mounted_under)" ] && [ -z "$(V "mdconfig -lv | grep -F '$WORK.img'")" ] && noleft=$((noleft+1))
+        ost '{"op":"login","user":"'"$U"'","password":"'"$PW"'","frontend":"cli"}' >/dev/null
+        if [ -n "$FSCK" ]; then
+            md=$(V "mdconfig -a -t vnode -f $WORK.img" 2>/dev/null)
+            r=$(V "$FSCK /dev/$md 2>&1"); V "mdconfig -d -u ${md#md}" >/dev/null 2>&1
+            [ "$(printf '%s\n' "$r" | grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|torn|bad root')" = 0 ] \
+                && clean=$((clean+1)) || echo "  round $n fsck: $(printf '%s' "$r" | tail -3 | tr '\n' ';')"
+        fi
+        launch work; probe_line $B/probe-work.log >/dev/null
+        V "test -s $WORK/held.txt && grep -q 'held-by-root-$n-' $WORK/held.txt" && reads=$((reads+1))
+    done
+    check "the guest stayed up through every round" "$HELD_ROUNDS" "$up"
+    check "portcullisd forced the held overlay's unmount, every round" "$HELD_ROUNDS" "$forced"
+    check "…and then had every overlay unmounted" "$HELD_ROUNDS" "$unmounted"
+    check "…with no md left on Work's image" "$HELD_ROUNDS" "$noleft"
+    if [ -n "$FSCK" ]; then
+        check "Work's overlay checks clean at the next login" "$HELD_ROUNDS" "$clean"
+    else
+        skip "fsck: no tessera-fsck on the guest"
+    fi
+    check "the writer's file reads back, with that round's lines" "$HELD_ROUNDS" "$reads"
+else
+    skip "held overlay: Work's overlay is not a Tessera volume here"
+fi
 
 echo "=== cleanup"
 ost '{"op":"logout"}' >/dev/null

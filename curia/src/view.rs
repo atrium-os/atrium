@@ -1169,6 +1169,22 @@ impl CuriaView {
         let p = self.apps.get_cloned();
         let t = ctx.theme;
         let mut y = em(20.0);
+        // An app's own settings (curia.md §15): its pane, in the page.
+        if let Some(pane) = &p.pane {
+            let pg = self.apps.clone();
+            button(ctx, x0, y + em(2.0), "Back to Apps", Look::Ghost, true, move || with_apps(&pg, AppsPage::close_settings));
+            y += em(44.0);
+            text(ctx, x0, y + em(16.0), &pane.name, type_size::XL, Weight::Semibold, t.text_primary());
+            y += em(40.0);
+            text(ctx, x0, y + em(8.0), &format!("Its own settings, for {}", apps::persona_name(&pane.persona)), type_size::SM, Weight::Regular, t.text_secondary());
+            y += em(28.0);
+            if !pane.up {
+                text(ctx, x0, y + em(10.0), "Opening…", type_size::SM, Weight::Regular, t.text_tertiary());
+            }
+            let id = ctx.add(Node::Rect { rect: Rect::new(x0, y, apps::PANE_W.min(pw), apps::PANE_H.min((h - y).max(0.0))), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, apps::PANE_SLOT);
+            return;
+        }
         text(ctx, x0, y + em(16.0), "Apps", type_size::XL, Weight::Semibold, t.text_primary());
         y += em(48.0);
         match &p.list {
@@ -1216,6 +1232,13 @@ impl CuriaView {
                     button(ctx, bx, by, l, Look::Secondary, !busy && p.busy.is_none(), move || with_apps(&pg, |a| a.remove(&id)));
                     bx -= em(8.0);
                 }
+                if e.settings {
+                    let l = "Settings";
+                    bx -= width(l, type_size::SM, Weight::Medium) + em(24.0);
+                    let (pg, id) = (self.apps.clone(), e.id.clone());
+                    button(ctx, bx, by, l, Look::Secondary, true, move || with_apps(&pg, |a| a.open_settings(&id)));
+                    bx -= em(8.0);
+                }
                 if apps::can_allow(e) {
                     let l = if busy { "Allowing…" } else { "Allow" };
                     bx -= width(l, type_size::SM, Weight::Medium) + em(24.0);
@@ -1241,6 +1264,22 @@ impl CuriaView {
                     let (pg, id) = (self.apps.clone(), e.id.clone());
                     button(ctx, bx, y, l, Look::Danger, true, move || with_apps(&pg, |a| a.remove(&id)));
                     y += em(38.0);
+                }
+                // Settings asks which persona's first.
+                if p.pane_pick.as_deref() == Some(e.id.as_str()) {
+                    text(ctx, em(40.0), y + em(15.0), "Open its settings for", type_size::SM, Weight::Regular, t.text_primary());
+                    let mut bx = em(40.0) + width("Open its settings for", type_size::SM, Weight::Regular) + em(12.0);
+                    for persona in std::iter::once("personal".to_string()).chain(p.named().iter().map(|(n, _)| n.clone())) {
+                        let l = apps::persona_name(&persona);
+                        let (pg, id) = (self.apps.clone(), e.id.clone());
+                        button(ctx, bx, y, &l, Look::Secondary, true, move || with_apps(&pg, |a| a.settings_in(&id, &persona)));
+                        bx += width(&l, type_size::SM, Weight::Medium) + em(24.0) + em(8.0);
+                    }
+                    y += em(38.0);
+                }
+                if let Some((_, why)) = p.pane_note.as_ref().filter(|(a, _)| *a == e.id) {
+                    text(ctx, em(40.0), y + em(12.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                    y += em(28.0);
                 }
                 if let Some((_, why)) = p.note.as_ref().filter(|(a, _)| *a == e.id) {
                     text(ctx, em(40.0), y + em(12.0), why, type_size::SM, Weight::Regular, t.danger_fg());
@@ -1988,7 +2027,7 @@ mod tests {
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
-        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted };
+        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted, settings: false };
         with_apps(&v.apps, |p| {
             p.apply(Got::List(Ok(vec![
                 e("org.atrium.player", "Player", Some(AccessBy::You), vec![], Some("2026-11-15T09:00:00Z".into()), vec![]),

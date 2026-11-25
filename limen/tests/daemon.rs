@@ -27,6 +27,8 @@ const W_APP: WindowToken = [1; 16];
 const W_OTHER: WindowToken = [2; 16];
 const W_ARCA: WindowToken = [3; 16];
 const W_VIEWER: WindowToken = [4; 16];
+const CURIA_UID: u32 = 2100;
+const W_CURIA: WindowToken = [11; 16];
 
 /// frescod: window tokens → owner uids; records binds.
 #[derive(Clone, Default)]
@@ -92,6 +94,15 @@ impl Launcher for Launch {
         }
         self.launch(app, embed, ch)
     }
+    /// A settings pane: this stand-in for portcullisd starts one in the
+    /// person's Personal or Work, and has no School.
+    fn launch_settings(&mut self, app: &str, embed: EmbedId, ch: UnixStream, parent: u32, persona: &str) -> Result<u32, String> {
+        assert_eq!(parent, CURIA_UID);
+        if !["personal", "work"].contains(&persona) {
+            return Err(format!("no persona {persona}"));
+        }
+        self.launch(app, embed, ch)
+    }
     fn end(&mut self, embed: EmbedId) { self.1.lock().unwrap().push(embed) }
 }
 
@@ -116,6 +127,7 @@ impl World {
             g.0.insert(W_SHEET, SHARE_UID);
             g.0.insert(W_NOTES, NOTES_UID);
             g.0.insert(W_PRINT, PRELUM_UID);
+            g.0.insert(W_CURIA, CURIA_UID);
         }
         let (tx, rx) = mpsc::channel();
         let ended = Arc::new(Mutex::new(Vec::new()));
@@ -129,6 +141,7 @@ impl World {
             SCRINIUM_UID => Some(("ana".into(), catalogue::SCRINIUM.into())),
             SHARE_UID => Some(("ana".into(), catalogue::SHARE.into())),
             PRELUM_UID => Some(("ana".into(), catalogue::PRELUM.into())),
+            CURIA_UID => Some(("ana".into(), catalogue::CURIA.into())),
             _ => None,
         });
         let defaults = Box::new(|_: &str, role: &str| match role {
@@ -804,6 +817,45 @@ fn a_share_target_is_only_ever_the_app_the_person_chose_in_the_parents_share_she
     notes.emit(t, limen::share_target::ToParent::Accepted.encode()).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Message { embed: t, bytes: limen::share_target::ToParent::Accepted.encode() });
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn only_settings_opens_an_apps_own_pane_and_the_launcher_decides_the_persona() {
+    let w = World::new();
+    w.shared.set_pane_check(Box::new(|person: &str, app: &str| person == "ana" && app == "org.example.notes"));
+    let mut curia = w.parent(CURIA_UID);
+    let mut app = w.parent(APP);
+    // Only Curia, and only through its own op.
+    assert_eq!(refused(app.request_app_settings(W_APP, "org.example.notes", "personal")), refusal::NO_PANE);
+    assert_eq!(refused(curia.request("app-settings", W_CURIA)), refusal::NO_PROVIDER);
+    // Only an app with a pane, and only names limend can check.
+    assert_eq!(refused(curia.request_app_settings(W_CURIA, "org.example.player", "personal")), refusal::NO_PANE);
+    assert_eq!(refused(curia.request_app_settings(W_CURIA, "../org.example.notes", "personal")), refusal::NO_PANE);
+    assert_eq!(refused(curia.request_app_settings(W_CURIA, "org.example.notes", "Work!")), refusal::NO_PANE);
+    assert_eq!(refused(curia.request_app_settings(W_CURIA, "org.example.notes", "")), refusal::NO_PANE);
+
+    // The pane goes to the launcher in the persona named: Personal, which
+    // a share's launch would refuse, so it went the settings way.
+    let e = curia.request_app_settings(W_CURIA, "org.example.notes", "personal").unwrap();
+    let (spawned, mut pane) = w.spawned();
+    assert_eq!(e, spawned);
+    assert_eq!(next_c(&mut pane), ChildEvent::Attach { embed: e, role: "app-settings".into(), parent_app: catalogue::CURIA.into(), parent_uid: CURIA_UID });
+    // One pane per Settings window.
+    assert_eq!(refused(curia.request_app_settings(W_CURIA, "org.example.notes", "work")), refusal::TOO_MANY);
+    pane.ready(e, W_NOTES).unwrap();
+    curia.place(e, RECT).unwrap();
+    assert_eq!(next_p(&mut curia), ParentEvent::Attached { embed: e });
+    assert!(w.fresco.binds().iter().any(|b| b.0 == W_CURIA && b.1 == W_NOTES && b.2 == SlotKind::Plain));
+    curia.detach(e).unwrap();
+    assert_eq!(next_p(&mut curia), ParentEvent::Detached { embed: e });
+
+    let e = curia.request_app_settings(W_CURIA, "org.example.notes", "work").unwrap();
+    let (spawned, _pane) = w.spawned();
+    assert_eq!(e, spawned);
+    curia.detach(e).unwrap();
+    assert_eq!(next_p(&mut curia), ParentEvent::Detached { embed: e });
+    // A persona the launcher won't start it in: nothing starts.
+    assert_eq!(refused(curia.request_app_settings(W_CURIA, "org.example.notes", "school")), refusal::LAUNCH_FAILED);
 }
 
 #[test]

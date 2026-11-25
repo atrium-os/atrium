@@ -4,6 +4,7 @@
 # /root/sealed:
 #
 #   MODULES=tessera_fs.ko sh scripts/tessera-sealed-vm.sh deploy
+#   scripts/vssh kldload /root/sealed/tessera_fs.ko   # deploy only copies it
 #   sh scripts/stoa-at-rest-vm.sh
 #
 # A plain Tessera image on a memory disk holds the home of a test person
@@ -56,7 +57,7 @@ xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release -
 xb portcullis "-p portcullisd --bin portcullisd"
 xb stoa "-p stoa --bin stoad --bin stoactl"
 V "test -c /dev/tesserakeys && test -x $KL && test -x $MKFS && test -x $QS" ||
-    gate_abort "needs tessera_fs and /root/sealed (MODULES=tessera_fs.ko sh scripts/tessera-sealed-vm.sh deploy)"
+    gate_abort "needs tessera_fs loaded and /root/sealed (tessera-sealed-vm.sh deploy, then kldload /root/sealed/tessera_fs.ko)"
 
 echo "=== setup"
 stop_all() { V "pkill -f 'portcullisd --socket $PSOCK'; pkill -f 'stoad-rest'; sleep 1; true" >/dev/null 2>&1; }

@@ -34,6 +34,7 @@ pub fn entry(m: &Manifest, hash: &str, user: &Policy, system: Result<&Policy, &i
     AccessEntry {
         yours: user.grants.get(&id).map(|g| g.granted_at.clone()),
         restricted: m.capabilities.restricted().into_iter().map(String::from).collect(),
+        settings: m.roles.as_ref().is_some_and(|r| r.app_settings.is_some() && r.implements.iter().any(|n| n == "app-settings")),
         id,
         name,
         by,

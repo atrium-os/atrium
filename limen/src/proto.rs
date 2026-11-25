@@ -31,6 +31,9 @@ pub mod op {
     /// [`REQUEST_ISLAND`], with the engine manifest's memory limit rather
     /// than a part's (navigator-islands.md I6.6).
     pub const REQUEST_PAGE_ISLAND: u16 = 0x0a;
+    /// Curia only: [`AppSettings`], an app's own settings pane in the
+    /// persona Curia names (curia.md §15).
+    pub const REQUEST_APP_SETTINGS: u16 = 0x0b;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;
@@ -73,6 +76,9 @@ pub mod refusal {
     /// `CHOOSE`: the app doesn't implement `share-target` for the parent's
     /// person.
     pub const NOT_A_TARGET: u8 = 16;
+    /// `REQUEST_APP_SETTINGS`: the parent isn't Curia, or the app doesn't
+    /// implement `app-settings` for the parent's person.
+    pub const NO_PANE: u8 = 17;
 }
 
 pub type EmbedId = u64;
@@ -91,6 +97,16 @@ pub struct Request {
     /// document's video above the doc-viewer). Credential slots are above
     /// every plain one whatever this says.
     pub z: u8,
+}
+
+/// Curia asks for `app`'s settings pane (`app-settings`) in `persona` of
+/// its person ("personal" or a named one), into its window `window`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub window: WindowToken,
+    pub z: u8,
+    pub app: String,
+    pub persona: String,
 }
 
 /// The slot's rect in the parent window's surface pixels; `None` hides it.

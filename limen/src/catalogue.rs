@@ -33,6 +33,10 @@ pub enum Provider {
     /// The app the person chose for this parent in the share sheet, just
     /// now (share-sheet.md §3): no default, nothing else.
     Chosen,
+    /// The app the parent names, in its persona (`REQUEST_APP_SETTINGS`,
+    /// curia.md §15): only Curia, and only an app whose installed manifest
+    /// implements the role. Never from a plain `REQUEST`.
+    Named,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +69,8 @@ pub const SHARE: &str = "org.atrium.share";
 /// How long the person's choice in the share sheet waits for the parent's
 /// `share-target` request.
 pub const CHOICE_MS: u64 = 30_000;
+/// Curia, the Settings app: the only parent of an `app-settings` pane.
+pub const CURIA: &str = "org.atrium.curia";
 /// Prelum's print sheet (printing.md §5): prelum-sheet, as `_prelum-sheet`.
 pub const PRELUM: &str = "org.atrium.prelum";
 
@@ -91,6 +97,8 @@ pub const ROLES: &[Role] = &[
     Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     // The PDF comes with Print; Save as PDF goes back read-only.
+    // An app's own settings, inside Curia's Apps page (curia.md §15).
+    Role { name: "app-settings", provider: Provider::Named, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     Role { name: "print", provider: Provider::System(PRELUM), slot: SlotKind::Sheet { w: 760, h: 540 }, takes_fd: true, returns_fd: true },
 ];
 

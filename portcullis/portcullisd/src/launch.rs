@@ -675,35 +675,12 @@ fn launch_inner(
             .map_err(|e| LaunchError::Failed("document", e.to_string()))?;
         upper.clone()
     } else {
-        let overlay_quota = manifest.resources.as_ref()
-            .and_then(|r| r.storage.as_deref())
-            .and_then(portcullis_overlay::parse_size)
-            .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
         // The person's app data in their key group (E6), before it mounts.
         if portcullis_overlay::home_of(user).is_some() {
             app_run.app_data = Some(portcullisd::home::ensure_app_data(user, persona)
                 .map_err(|m| LaunchError::Failed("app data", m))?);
         }
-        // The person's own overlay, in their home (homes.md §3).
-        let place = match persona {
-            None => portcullis_overlay::place(Some(user), app_id),
-            Some(p) => portcullis_overlay::persona_place(user, app_id, p).ok_or_else(||
-                LaunchError::Failed("overlay", format!("no home place for {user}'s {p} instance of {app_id}")))?,
-        };
-        let overlay_dir = place.dir.clone();
-        let backing = portcullis_overlay::ensure_mounted(&place, app_id, overlay_quota)
-            .map_err(|m| LaunchError::Failed("mount", m))?;
-        if backing == portcullis_overlay::Backing::Directory {
-            /* No volume, so the structural mitigation is not in place. Fall back
-             * to the behavioural one: a per-directory dedup domain on `deferred`,
-             * which costs a full write per duplicate but keeps the observable
-             * free-space number content-independent. */
-            fs::create_dir_all(&overlay_dir)
-                .map_err(|e| LaunchError::Failed("mount",
-                         format!("create {}: {e}", overlay_dir.display())))?;
-            arm_overlay_dedup(&overlay_dir)?;
-        }
-        overlay_dir
+        mount_overlay(user, app_id, persona, &manifest)?
     };
     /* homes.md §2: the overlay is the app uid's, 0700. Inside the jail it is
      * the union's root, so the app can make its own /var, /tmp and $HOME
@@ -1737,6 +1714,75 @@ fn is_tessera(dir: &Path) -> bool {
     let name: Vec<u8> = sfs.f_fstypename.iter()
         .take_while(|&&ch| ch != 0).map(|&ch| ch as u8).collect();
     name == b"tessera"
+}
+
+/// The app's own overlay for `user` in `persona` (homes.md §3), mounted:
+/// its quota-scoped volume, or a directory with dedup armed where there is
+/// none. Stays mounted across launches.
+fn mount_overlay(user: &str, app_id: &str, persona: Option<&str>, manifest: &Manifest) -> Result<PathBuf, LaunchError> {
+    let overlay_quota = manifest.resources.as_ref()
+        .and_then(|r| r.storage.as_deref())
+        .and_then(portcullis_overlay::parse_size)
+        .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
+    // The person's own overlay, in their home (homes.md §3).
+    let place = match persona {
+        None => portcullis_overlay::place(Some(user), app_id),
+        Some(p) => portcullis_overlay::persona_place(user, app_id, p).ok_or_else(||
+            LaunchError::Failed("overlay", format!("no home place for {user}'s {p} instance of {app_id}")))?,
+    };
+    let overlay_dir = place.dir.clone();
+    let backing = portcullis_overlay::ensure_mounted(&place, app_id, overlay_quota)
+        .map_err(|m| LaunchError::Failed("mount", m))?;
+    if backing == portcullis_overlay::Backing::Directory {
+        /* No volume, so the structural mitigation is not in place. Fall back
+         * to the behavioural one: a per-directory dedup domain on `deferred`,
+         * which costs a full write per duplicate but keeps the observable
+         * free-space number content-independent. */
+        fs::create_dir_all(&overlay_dir)
+            .map_err(|e| LaunchError::Failed("mount",
+                     format!("create {}: {e}", overlay_dir.display())))?;
+        arm_overlay_dedup(&overlay_dir)?;
+    }
+    Ok(overlay_dir)
+}
+
+/// What a settings pane (curia.md §15) of `app_id` for `person` in
+/// `persona` runs as and sees: the app's own uid and account in that
+/// persona (the same publisher's binding as its launches), and its data
+/// folder, the overlay, mounted and the app uid's at 0700. Refused unless
+/// the installed, signed manifest has `[roles.app-settings]`.
+pub fn settings_pane(person: &str, app_id: &str, persona: Option<&str>) -> Result<(u32, String, PathBuf), LaunchError> {
+    if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) || !portcullis_overlay::plain_segment(app_id) {
+        return Err(LaunchError::Failed("persona", "invalid persona or app name".into()));
+    }
+    let tree = PathBuf::from(APPS_DIR).join(app_id);
+    let text = fs::read_to_string(tree.join("atrium.toml"))
+        .map_err(|e| LaunchError::Failed("manifest", format!("{app_id}: {e}")))?;
+    let publisher = crate::manifest_trust::verify_publisher(&tree, &text)
+        .map_err(|m| LaunchError::Failed("signature", m))?;
+    let manifest = Manifest::from_str(&text)
+        .map_err(|e| LaunchError::Failed("manifest", format!("{app_id}: {e:?}")))?;
+    let report = portcullis_toml::validate(&manifest);
+    if !report.is_ok() {
+        return Err(LaunchError::Failed("manifest", report.errors.join("; ")));
+    }
+    if manifest.roles.as_ref().and_then(|r| r.app_settings.as_ref()).is_none() {
+        return Err(LaunchError::Failed("manifest", format!("{app_id} has no settings pane ([roles.app-settings])")));
+    }
+    if persona.is_some() {
+        if let Some(why) = not_instanced_manifest(&manifest) {
+            return Err(LaunchError::Failed("persona", format!("{app_id} runs once for every persona: {why}")));
+        }
+    }
+    let (uid, name) = resolve_launch_uid(person, app_id, publisher.as_ref(), persona, None)?;
+    if portcullis_overlay::home_of(person).is_some() {
+        portcullisd::home::ensure_app_data(person, persona).map_err(|m| LaunchError::Failed("app data", m))?;
+    }
+    let dir = mount_overlay(person, app_id, persona, &manifest)?;
+    std::os::unix::fs::chown(&dir, Some(uid), Some(uid))
+        .and_then(|_| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
+        .map_err(|e| LaunchError::Failed("mount", format!("own {}: {e}", dir.display())))?;
+    Ok((uid, name, dir))
 }
 
 fn arm_overlay_dedup(overlay_dir: &Path) -> Result<(), LaunchError> {

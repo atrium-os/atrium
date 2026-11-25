@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "The origins a persona runs live every time (navigator-islands.md D8): navigatord's check and the Settings pane's list, one parser, lock and atomic write."
+description = "The origins a persona runs live every time (navigator-islands.md D8): navigatord's check and the Settings pane's list, one parser and one lock."
 
 [dependencies]
 url = "2"

@@ -767,6 +767,10 @@ impl GridSource for SheetSource {
     fn fills(&self) -> bool {
         true
     }
+    fn complete(&self, r: u32, c: u32, prefix: &str) -> Option<String> {
+        let d = self.doc.borrow();
+        crate::data::complete_entry(&crate::data::column_entries(&d.wb, d.sheet, r, c), prefix)
+    }
     fn now_text(&self, time: bool) -> Option<String> {
         let (y, mo, d, h, mi) = local_now()?;
         Some(if time { format!("{h:02}:{mi:02}") } else { format!("{y:04}-{mo:02}-{d:02}") })
