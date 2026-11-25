@@ -4946,6 +4946,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Tab now reaches the grid.** The App used to take Tab for focus traversal, so the grid's Tab handling never ran. The grid now claims Tab (`takes_tab`): Tab moves one cell right and Shift+Tab one cell left, and in the editor Tab enters the cell and moves right. Ctrl+Tab still moves focus out of the grid.
 - Tests: `formula_autocomplete_finishes_one_function_or_name` (Sheets) and `typing_completes_from_the_source_and_the_next_key_replaces_it` (pergola, extended). All 152 Sheets and 240 pergola lib tests pass.
 
+### 16.123 Tab-then-Enter rows and F8 Extend Selection (2026-11-25)
+
+- **Tab, then Enter.** After entering a row of cells with Tab, Enter goes to the next row in the column where the Tabs began, as in Excel, so a table can be typed row by row. Tab outside the editor counts as part of the run. Typing and editing keep the run going. An arrow key, a click, Shift+Tab or Escape ends it (`GridState::tab_from`).
+- **F8** turns Extend Selection on. Arrows, Page keys and Home then extend the selection as if Shift were held. F8 again or Escape turns it off, and typing into a cell ends it. The status bar shows "Extend Selection" in the place where Excel shows it (`GridState::extending`).
+- Excel also moves the active cell *inside* a selection with Enter and Tab. The grid's active cell is always a corner of its one selection range, so that is not done. Ctrl+. (§16.116) visits the corners instead.
+- Tests: `enter_after_tabs_goes_to_the_next_row_where_they_began` and `f8_extends_the_selection_until_pressed_again_or_escape` (pergola), and `the_status_bar_shows_extend_selection_while_f8_is_on` (Sheets). All 153 Sheets and 242 pergola lib tests pass. `doc::tests::a_slow_edit_hands_the_window_back_and_greys_what_is_not_done` failed once while two builds ran at the same time. It is timing-based and passed on the rerun.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

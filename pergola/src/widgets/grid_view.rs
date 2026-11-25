@@ -501,6 +501,11 @@ pub struct GridState {
     entering: bool,
     /// The editor's selected tail is an AutoComplete guess, made by the last key.
     guess: bool,
+    /// The column a run of Tabs started in: Enter goes on to the next row
+    /// there, as in Excel. Any other move ends the run.
+    tab_from: Option<u32>,
+    /// F8's Extend Selection: moves extend the selection as with Shift held.
+    extend: bool,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -519,6 +524,10 @@ impl GridState {
     /// While the editor is open: whether it is entering (started by typing:
     /// arrows finish the entry, Excel's "Enter") or editing (arrows move the
     /// caret, Excel's "Edit"). None when it is closed.
+    /// Whether F8's Extend Selection is on (the app shows it in its status bar).
+    pub fn extending(&self) -> bool {
+        self.extend
+    }
     pub fn edit_mode(&self) -> Option<EditMode> {
         self.edit.as_ref().map(|_| if self.entering { EditMode::Enter } else { EditMode::Edit })
     }
@@ -529,6 +538,7 @@ impl GridState {
     pub fn select(&mut self, r: u32, c: u32) {
         self.anchor = (r, c);
         self.cursor = (r, c);
+        self.tab_from = None;
     }
 }
 
@@ -2658,12 +2668,14 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
     // How wide the editor's lines may run (a wrapping cell's width).
     let wrap = editor_wrap(src, g);
     let guessed = std::mem::take(&mut g.guess);
+    let tab_run = g.tab_from.take();
     if let Some(ed) = &mut g.edit {
         if guessed && ed.text().starts_with('=') && ed.has_selection() {
             match key {
                 // Tab takes a formula's guess and goes on editing.
                 Key::Tab if !m.shift => {
                     ed.set_caret(ed.text().len(), false);
+                    g.tab_from = tab_run;
                     return true;
                 }
                 // A typed key replaces it, Backspace and Delete remove it.
@@ -2755,15 +2767,31 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 finish(g, st, if key == Key::Up { -1 } else { 1 }, 0);
                 return true;
             }
+            // Enter after a run of Tabs: the next row, where the run began.
+            Key::Enter if !m.shift && tab_run.is_some() => {
+                let c0 = tab_run.unwrap_or(g.cursor.1);
+                commit(g, act);
+                let below = step(g.cursor, 1, 0);
+                let to = step((below.0, c0), 0, 0);
+                g.select(to.0, to.1);
+                reveal(src, geom, st, to);
+                return true;
+            }
             Key::Enter => {
                 finish(g, st, if m.shift { -1 } else { 1 }, 0);
                 return true;
             }
             Key::Tab => {
+                let from = g.cursor.1;
                 finish(g, st, 0, if m.shift { -1 } else { 1 });
+                if !m.shift {
+                    g.tab_from = Some(tab_run.unwrap_or(from));
+                }
                 return true;
             }
             _ => {
+                // Typing and moving within the entry keep the Tab run.
+                g.tab_from = tab_run;
                 return match ed.key(key, m, chars) {
                     KeyOutcome::Changed => {
                         if key == Key::Char && !(m.ctrl || m.meta || m.alt) {
@@ -2825,8 +2853,12 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         Key::Home => Some(past_hidden(src, g.cursor, (g.cursor.0, 0), 0, 1)),
         Key::End if cmd => Some(src.last_used()),
         Key::Tab => {
+            let from = g.cursor.1;
             let to = step(g.cursor, 0, if m.shift { -1 } else { 1 });
             g.select(to.0, to.1);
+            if !m.shift {
+                g.tab_from = Some(tab_run.unwrap_or(from));
+            }
             reveal(src, geom, st, to);
             return true;
         }
@@ -2836,6 +2868,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             g.anchor = g.cursor;
             g.edit = Some(ed);
             g.entering = false;
+            g.extend = false;
             return true;
         }
         // Ctrl+Backspace: back to the active cell; Shift+Backspace: only it selected.
@@ -2886,6 +2919,15 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
         Key::Char if m.alt && !cmd && chars == "=" && src.fills() => {
             send(GridAction::AutoSum(g.selection()));
+            return true;
+        }
+        // F8: Extend Selection on or off; Escape turns it off.
+        Key::F(8) if !cmd && !m.alt && !m.shift => {
+            g.extend = !g.extend;
+            return true;
+        }
+        Key::Escape if g.extend => {
+            g.extend = false;
             return true;
         }
         Key::F(5) if !cmd && !m.alt => {
@@ -2977,6 +3019,8 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             ed.insert(chars);
             g.guess = complete(src, g.cursor, &mut ed);
             g.edit = Some(ed);
+            g.tab_from = tab_run;
+            g.extend = false;
             g.entering = true;
             reveal(src, geom, st, g.cursor);
             return true;
@@ -2984,7 +3028,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         _ => None,
     };
     let Some(to) = to else { return false };
-    if m.shift {
+    if m.shift || g.extend {
         g.cursor = to;
     } else {
         g.select(to.0, to.1);
@@ -3999,6 +4043,78 @@ mod tests {
         let c = state.get_cloned().cursor;
         key(&mut app, Key::Tab, "", none);
         assert_eq!(state.get_cloned().cursor, (c.0, c.1 + 1));
+    }
+
+    #[test]
+    fn f8_extends_the_selection_until_pressed_again_or_escape() {
+        let (mut app, _, _, state, _) = host(100, 30);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 5.0, HEADER_H + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        let mut g = state.get_cloned();
+        g.select(2, 2);
+        state.set(g);
+        let none = Modifiers::default();
+        key(&mut app, Key::F(8), "", none);
+        assert!(state.get_cloned().extending());
+        key(&mut app, Key::Down, "", none);
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 2, c0: 2, r1: 3, c1: 3 });
+        // F8 again: arrows move again.
+        key(&mut app, Key::F(8), "", none);
+        key(&mut app, Key::Down, "", none);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 4, c0: 3, r1: 4, c1: 3 });
+        // Escape turns it off too; typing ends it and edits the active cell.
+        key(&mut app, Key::F(8), "", none);
+        key(&mut app, Key::Escape, "", none);
+        assert!(!state.get_cloned().extending());
+        key(&mut app, Key::F(8), "", none);
+        key(&mut app, Key::Char, "x", none);
+        assert!(!state.get_cloned().extending());
+        assert!(state.get_cloned().edit.is_some());
+    }
+
+    #[test]
+    fn enter_after_tabs_goes_to_the_next_row_where_they_began() {
+        let (mut app, _, _, state, log) = host(100, 30);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 5.0, HEADER_H + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        let mut g = state.get_cloned();
+        g.select(2, 1);
+        state.set(g);
+        let none = Modifiers::default();
+        // Type, Tab, type, Tab, type, Enter: row 4 at column B.
+        for (ch, k) in [("a", Key::Tab), ("b", Key::Tab), ("c", Key::Enter)] {
+            key(&mut app, Key::Char, ch, none);
+            key(&mut app, k, "", none);
+        }
+        assert_eq!(state.get_cloned().cursor, (3, 1));
+        let commits: Vec<(u32, u32)> = log.borrow().iter().filter_map(|a| match a { GridAction::Commit { row, col, .. } => Some((*row, *col)), _ => None }).collect();
+        assert_eq!(commits, [(2, 1), (2, 2), (2, 3)]);
+        // The run carries on from there; Tab outside the editor counts too.
+        key(&mut app, Key::Tab, "", none);
+        key(&mut app, Key::Char, "d", none);
+        key(&mut app, Key::Enter, "", none);
+        assert_eq!(state.get_cloned().cursor, (4, 1));
+        // An arrow ends the run: Enter then goes straight down.
+        key(&mut app, Key::Tab, "", none);
+        key(&mut app, Key::Right, "", none);
+        key(&mut app, Key::Char, "e", none);
+        key(&mut app, Key::Enter, "", none);
+        assert_eq!(state.get_cloned().cursor, (5, 3));
+        // So does a click.
+        key(&mut app, Key::Tab, "", none);
+        let mut g = state.get_cloned();
+        g.select(10, 5);
+        state.set(g);
+        key(&mut app, Key::Char, "f", none);
+        key(&mut app, Key::Enter, "", none);
+        assert_eq!(state.get_cloned().cursor, (11, 5));
     }
 
     #[test]
