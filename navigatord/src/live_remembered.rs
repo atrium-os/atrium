@@ -6,8 +6,11 @@
 //!
 //! The list is a file under navigatord's store directory, on the persona's
 //! encrypted volume, so it is per persona and goes with it (Tessera E5).
-//! It is read again on every check, so another window of the same persona
-//! sees a change at once. Without a store it is kept in memory only.
+//! It is read again on every check, so another window of the same persona,
+//! served by another navigatord, sees a change at once. A change holds an
+//! exclusive lock on a sibling file from its read to its write, so a revoke
+//! in one navigatord and a remember in another can't lose either. Without
+//! a store it is kept in memory only.
 //! A file that doesn't read as a list of origins counts as empty: an
 //! unreadable list never runs anything unasked.
 
@@ -57,6 +60,27 @@ impl Remembered {
         })
     }
 
+    /// Change the list under the lock: no other navigatord's change lands
+    /// between this read and this write.
+    fn change(&mut self, f: impl FnOnce(&mut Vec<String>) -> bool) -> Result<(), String> {
+        let _lock = match &self.file {
+            None => None,
+            Some(file) => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let name = format!(".{}.lock", file.file_name().and_then(|n| n.to_str()).unwrap_or("live-origins"));
+                let path = file.with_file_name(name);
+                if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?; }
+                let l = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                l.lock().map_err(|e| format!("{}: {e}", path.display()))?;
+                Some(l)
+            }
+        };
+        let mut list = self.load();
+        if !f(&mut list) { return Ok(()); }
+        self.save(list)
+    }
+
     fn save(&mut self, list: Vec<String>) -> Result<(), String> {
         match &self.file {
             None => { self.memory = list; Ok(()) }
@@ -77,21 +101,22 @@ impl Remembered {
     /// Remember the origin of the page at `url`: last, so it is the newest.
     pub fn remember(&mut self, url: &str) -> Result<(), String> {
         let o = crate::origin(url).filter(|o| origin_ok(o)).ok_or("not an HTTPS origin")?;
-        let mut list = self.load();
-        list.retain(|x| *x != o);
-        list.push(o);
-        if list.len() > REMEMBERED_MAX { list.drain(..list.len() - REMEMBERED_MAX); }
-        self.save(list)
+        self.change(|list| {
+            list.retain(|x| *x != o);
+            list.push(o);
+            if list.len() > REMEMBERED_MAX { list.drain(..list.len() - REMEMBERED_MAX); }
+            true
+        })
     }
 
     /// Ask again before running the page at `url`'s origin live.
     pub fn forget(&mut self, url: &str) -> Result<(), String> {
         let Some(o) = crate::origin(url) else { return Ok(()) };
-        let mut list = self.load();
-        let before = list.len();
-        list.retain(|x| *x != o);
-        if list.len() == before { return Ok(()); }
-        self.save(list)
+        self.change(|list| {
+            let before = list.len();
+            list.retain(|x| *x != o);
+            list.len() != before
+        })
     }
 }
 
@@ -129,6 +154,27 @@ mod tests {
         assert!(!b.holds("https://app.example/app.html"));
         assert!(a.remember("http://app.example/").is_err());
         assert!(a.remember("not a url").is_err());
+    }
+
+    #[test]
+    fn changes_from_two_navigatords_at_once_are_none_of_them_lost() {
+        let d = Dir::new("race");
+        let file = d.0.join("live-origins");
+        let threads: Vec<_> = (0..8).map(|t| {
+            let file = file.clone();
+            std::thread::spawn(move || {
+                let mut m = Remembered::new(Some(file));
+                for i in 0..10 { m.remember(&format!("https://t{t}-{i}.example/")).unwrap(); }
+                for i in 0..10 { if i % 2 == 0 { m.forget(&format!("https://t{t}-{i}.example/")).unwrap(); } }
+            })
+        }).collect();
+        for t in threads { t.join().unwrap(); }
+        let m = Remembered::new(Some(file));
+        for t in 0..8 {
+            for i in 0..10 {
+                assert_eq!(m.holds(&format!("https://t{t}-{i}.example/")), i % 2 == 1, "t{t}-{i}");
+            }
+        }
     }
 
     #[test]
