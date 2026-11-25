@@ -4960,6 +4960,12 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - Numbers use the General format (up to 15 significant digits). Excel uses the first cell's format and also leaves out rows a filter hides; Sheets does neither yet.
 - Test: `the_status_bar_sums_up_the_selection`. All 154 Sheets lib tests pass.
 
+### 16.125 Status bar summary: formats, filtered rows, and a choice of summaries (2026-11-25)
+
+- This closes the two gaps noted in §16.124. The results show in the number format of the top-left number in the selection, so a currency column sums as currency. If that format gives nothing or only `#`, General is used instead. Rows hidden by a filter (an AutoFilter or a table's) are left out, as in Excel. `Sheet::row_filtered` is now public in officina-grid, and `Workbook::formatted_as` shows any value through a cell's format.
+- A press on the summary opens a menu, as Excel's right-click on the status bar does. It offers **Average**, **Count**, **Numerical Count**, **Minimum**, **Maximum** and **Sum**, each with a check mark. Average, Count and Sum are on by default (`data::STATS_DEFAULT`). The choice holds for the window's session and is not saved in the workbook.
+- Test: `the_status_bar_sums_up_the_selection`, extended to cover the format, a filter and the menu. All 154 Sheets and 122 officina-grid lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

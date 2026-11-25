@@ -488,7 +488,8 @@ impl Sheet {
         contains_row(&self.hidden, r) || contains_row(&self.table_hidden, r) || self.outline(crate::shift::Axis::Rows).hides(r)
     }
 
-    pub(crate) fn row_filtered(&self, row: u32) -> bool {
+    /// Whether a filter (an AutoFilter or a table's) hides row `row`.
+    pub fn row_filtered(&self, row: u32) -> bool {
         contains_row(&self.table_hidden, row) || self.filter.as_ref().is_some_and(|filter| {
             row > filter.rect.r0 && row <= filter.rect.r1 && contains_row(&self.hidden, row)
         })
