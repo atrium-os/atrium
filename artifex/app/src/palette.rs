@@ -41,6 +41,7 @@ pub fn own() -> Vec<Entry> {
         e(Act::Panel(Panel::Output), "Show the output", "Ctrl+J"),
         e(Act::Panel(Panel::Problems), "Show the problems", "Ctrl+Shift+M"),
         e(Act::View(Main::Plugins), "Show the plugins", ""),
+        e(Act::View(Main::Package), "Package the app", ""),
         e(Act::CloseTab(usize::MAX), "Close the tab", "Ctrl+W"),
     ]
 }

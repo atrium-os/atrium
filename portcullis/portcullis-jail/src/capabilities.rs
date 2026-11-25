@@ -61,10 +61,12 @@ pub fn apply_all(
         // dispensatord's media socket (device-assignment.md §6.6).
         apply_socket("removable-media.sock", jc, opts);
     }
-    if caps.removable_files == Some(true) {
+    if caps.removable_files == Some(true) || caps.workspace_exec == Some(true) {
         // The install sheet's: the file manager hands it a double-clicked
-        // `.insula` as a descriptor (opifex.md §7.4). Asking only shows
-        // the person the sheet; it installs nothing by itself.
+        // `.insula` as a descriptor, an IDE the bundle it just made
+        // (opifex.md §7.4, dev-tools.md §3.9). Asking only shows the person
+        // the sheet; it installs nothing by itself, and only what a
+        // publisher key on the side-load list signed.
         apply_socket("opifex-sheet", jc, opts);
     }
     if caps.arca_courier == Some(true) && caps.navigator_broker != Some(true) {
@@ -433,6 +435,19 @@ mod tests {
 
     fn jc() -> JailConfig {
         JailConfig::new("test".into(), PathBuf::from("/var/lib/atrium/jails/test"))
+    }
+
+    #[test]
+    fn an_ide_reaches_the_install_sheet_and_a_plain_app_does_not() {
+        let sheet = PathBuf::from("/atrium/sockets/opifex-sheet");
+        let mut caps = Capabilities::default();
+        let mut j = jc();
+        apply_all(&caps, &mut j, &opts()).unwrap();
+        assert!(!j.mounts.iter().any(|m| m.src == sheet));
+        caps.workspace_exec = Some(true);
+        let mut j = jc();
+        apply_all(&caps, &mut j, &opts()).unwrap();
+        assert!(j.mounts.iter().any(|m| m.src == sheet), "{:?}", j.mounts);
     }
 
     #[test]

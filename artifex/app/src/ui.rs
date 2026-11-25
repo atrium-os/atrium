@@ -187,6 +187,12 @@ pub enum Act {
     PluginRestart(String),
     /// Allow a plugin that asks to read this workspace, or take it back.
     PluginRead(String, bool),
+    /// The Package view: name the person's Arca key in the project.
+    PackageKey,
+    /// Build, pack and sign the bundle.
+    PackageBuild,
+    /// Ask the install sheet to install the bundle made.
+    PackageTry,
 }
 
 /// The debugger as the window shows it.
@@ -346,6 +352,8 @@ pub struct State {
     pub plugin_panels: Vec<(String, String)>,
     /// The Plugins view's rows.
     pub plugin_rows: Vec<PluginRow>,
+    /// The Package view's project.
+    pub package: Option<crate::package::Package>,
 }
 
 /// An installed plugin as the Plugins view shows it.
@@ -543,6 +551,7 @@ pub fn strip(s: &State) -> Vec<(&'static str, char, Act, bool, usize)> {
     }
     if s.composition.is_some() {
         views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
+        views.push(("Package", phosphor::PACKAGE, Act::View(Main::Package), s.view == Main::Package, 0));
     }
     let stopped = s.plugin_rows.iter().filter(|r| r.stopped).count();
     views.push(("Plugins", phosphor::PUZZLE_PIECE, Act::View(Main::Plugins), s.view == Main::Plugins, stopped));
@@ -729,6 +738,7 @@ impl View for ArtifexView {
                 Main::Assets => crate::views::assets(ctx, &s, q, area),
                 Main::Inspect => crate::views::inspect(ctx, &s, q, area),
                 Main::Plugins => crate::views::plugins(ctx, &s, q, area),
+                Main::Package => crate::views::package(ctx, &s, q, area),
                 Main::Code => {}
             }
             ctx.pop();

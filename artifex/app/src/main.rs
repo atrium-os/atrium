@@ -150,7 +150,7 @@ fn main() {
         }
         if trace {
             let strip: Vec<&str> = artifex::ui::strip(&s).into_iter().map(|v| v.0).collect();
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?} menu={:?} tip={:?} refs={} rename={:?} palette={:?} strip=[{}] plugins=[{}] ptops=[{}] ppanels=[{}] dmsgs=[{}]",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?} menu={:?} tip={:?} refs={} rename={:?} palette={:?} strip=[{}] plugins=[{}] ptops=[{}] ppanels=[{}] pkg={:?} dmsgs=[{}]",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -198,6 +198,14 @@ fn main() {
                 // Each row's top in the view, for a check's presses.
                 artifex::views::plugin_row_tops(&s.plugin_rows).iter().map(|t| format!("{:.0}", t.0)).collect::<Vec<_>>().join(","),
                 s.plugin_panels.iter().map(|p| p.1.as_str()).collect::<Vec<_>>().join(","),
+                // The Package view: (key, bundle, tried), short.
+                s.package.as_ref().map(|p| (
+                    match &p.key { artifex::package::Key::None => "none".to_string(), artifex::package::Key::Making => "making".into(),
+                        artifex::package::Key::Found(k) => format!("found {k}"), artifex::package::Key::Failed(e) => format!("failed {e}") },
+                    match &p.build { artifex::package::Build::Idle => "idle".to_string(), artifex::package::Build::Running => "running".into(),
+                        artifex::package::Build::Done(b) => format!("done {} {} signed={} files={}", b.insula.rsplit('/').next().unwrap_or(""), b.bytes, b.signed, b.files),
+                        artifex::package::Build::Failed(e) => format!("failed {e}") },
+                    format!("{:?}", p.tried))),
                 // The active file's marks: line and message.
                 s.diags.iter().map(|d| format!("{}:{}", d.0 + 1, d.2.chars().take(80).collect::<String>())).collect::<Vec<_>>().join("|"));
             if line != traced {
