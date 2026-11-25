@@ -139,6 +139,9 @@ pub fn dir_for(stoad_uid: u32, uid: u32, person: &str, persona: &str) -> Result<
     let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
     let home = fs::canonicalize(&home).map_err(|e| format!("{}: {e}", home.display()))?;
     let parent = open_parent(&home, persona, 0)?;
+    // Nothing is made in a folder outside an open key group: asked first,
+    // and again on what was made.
+    sealed(&parent)?;
     let top = dir_at(&parent, DIR, 0, 0o700)?;
     let fd = dir_at(&top, SESSIONS, stoad_uid, 0o700)?;
     sealed(&fd)?;
