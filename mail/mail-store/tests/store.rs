@@ -273,3 +273,25 @@ fn calendar_delivery_survives_restart_hydration_and_racing_receipts() {
         .unwrap();
     assert_eq!(s.pending_calendar(0).unwrap()[0].0, later);
 }
+
+#[test]
+fn an_index_whose_creation_was_cut_short_is_created_again() {
+    let d = tempfile::tempdir().unwrap();
+    // What a process stopped inside redb's create leaves: the file sized and
+    // partly written, the magic number (written last) still zero.
+    std::fs::write(d.path().join("index.redb"), vec![0u8; 1 << 20]).unwrap();
+    let s = Store::open(d.path()).expect("an unborn index is recreated");
+    let a = s.add_account("priya@example.org").unwrap();
+    drop(s);
+    let s = Store::open(d.path()).unwrap();
+    assert!(s.accounts().unwrap().iter().any(|(id, _)| *id == a));
+}
+
+#[test]
+fn an_index_with_other_bytes_and_no_magic_is_refused_and_kept() {
+    let d = tempfile::tempdir().unwrap();
+    let junk = b"not a redb file, but maybe one damaged at the start".repeat(100);
+    std::fs::write(d.path().join("index.redb"), &junk).unwrap();
+    assert!(Store::open(d.path()).is_err());
+    assert_eq!(std::fs::read(d.path().join("index.redb")).unwrap(), junk);
+}

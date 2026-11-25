@@ -256,6 +256,37 @@ pub struct Store {
     jmap_imports: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
+/// redb writes its magic number last, after the new file's header and
+/// allocator state are flushed, so a file whose magic bytes are still zero
+/// never held a committed transaction: a process stopped while creating it
+/// left it, and `Database::create` refuses it forever. Such a file is removed
+/// so the index is created again. Anything else without the magic is left
+/// for `Database::create` to refuse: it may be a damaged index with data.
+fn discard_unborn_index(path: &Path) -> Result<()> {
+    use std::io::Read as _;
+    const MAGIC_LEN: usize = 9;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut head = [0u8; MAGIC_LEN];
+    let mut got = 0;
+    while got < MAGIC_LEN {
+        match f.read(&mut head[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    // An empty file is one redb initialises itself.
+    if got == 0 || head[..got].iter().any(|b| *b != 0) {
+        return Ok(());
+    }
+    drop(f);
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 /// Newest first: the key sorts ascending, so it is the date reversed.
 fn date_key(date: i64) -> u64 {
     (i64::MAX - date.max(0)) as u64
@@ -265,7 +296,9 @@ impl Store {
     /// Open (or create) the store in `dir`: `index.redb` and `blobs/`.
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir.join("blobs"))?;
-        let db = Database::create(dir.join("index.redb"))?;
+        let index = dir.join("index.redb");
+        discard_unborn_index(&index)?;
+        let db = Database::create(&index)?;
         let tx = db.begin_write()?;
         {
             tx.open_table(META)?;
