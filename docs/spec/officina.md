@@ -4966,6 +4966,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - A press on the summary opens a menu, as Excel's right-click on the status bar does. It offers **Average**, **Count**, **Numerical Count**, **Minimum**, **Maximum** and **Sum**, each with a check mark. Average, Count and Sum are on by default (`data::STATS_DEFAULT`). The choice holds for the window's session and is not saved in the workbook.
 - Test: `the_status_bar_sums_up_the_selection`, extended to cover the format, a filter and the menu. All 154 Sheets and 122 officina-grid lib tests pass.
 
+### 16.126 Format Painter (2026-11-25)
+
+- **Format Painter** is in the cell menu. It takes the selection's formats; the next cells selected with the pointer (a press, a drag, or a column or row header) get them. Over a bigger selection the formats repeat as many whole times as fit, as Excel does. Values and formulas stay. The paint is one undo step and turns the painter off.
+- Choosing Format Painter again while it is on keeps it on (Excel's double-click). It then paints each selection until **Escape** turns it off.
+- pergola's grid now sends `GridAction::Selected(range)` when a press in the cells or the headers ends. Sheets turns that into `Cmd::Selected`, which paints only while the painter is on. `data::paint_formats` uses the clipboard's Paste Formats path on a private copy (`Clip::take`), so the user's clipboard is untouched. At most `MAX_PAINT_TILES` (4,096) copies are made.
+- Tests: `format_painter_paints_the_next_selection_once_or_until_escape` (Sheets) and the drag and header tests (pergola), which now check that `Selected` comes once at the end of a press. All 155 Sheets and 242 pergola lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
