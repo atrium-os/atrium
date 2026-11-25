@@ -67,6 +67,7 @@ fn main() {
     let trace = std::env::var_os("ARTIFEX_TRACE").is_some() || std::path::Path::new("/.trace").exists();
     let mut traced = String::new();
     let mut failed = false;
+    let mut limen_tried = false;
     loop {
         match win.step(&mut app, Some(Duration::from_millis(30))) {
             Ok(StepResult::Closed) => break,
@@ -109,6 +110,17 @@ fn main() {
         if !was_renaming {
             if let Some(old) = &s.renaming {
                 rename_field.set(TextEdit::new(old));
+            }
+        }
+        // Plugins reach limend once one is switched on and frescod has
+        // named the window (its embed token).
+        if !limen_tried && !engine.plugins.on.is_empty() {
+            if let Some(token) = win.embed_token() {
+                limen_tried = true;
+                match artifex::plugins::LimenLink::connect(token) {
+                    Ok(link) => engine.set_plugin_link(Box::new(link)),
+                    Err(e) => eprintln!("artifex: plugins: limend: {e}"),
+                }
             }
         }
         engine.tick(&mut s);

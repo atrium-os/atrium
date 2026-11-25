@@ -19,6 +19,7 @@ use crate::assist;
 use crate::dap;
 use crate::exec::{Exec, Proc};
 use crate::lsp;
+use crate::plugins;
 use crate::tasks::{self, Severity};
 use crate::tree::{self, Tree};
 use crate::ui::{Act, Debug, DocCells, Main, Panel, State, Tab};
@@ -138,8 +139,27 @@ pub struct Engine {
     tip_at: Option<(PathBuf, usize)>,
     /// Formatting asked for: file, its buffer's version, save after, when.
     formatting: Option<(PathBuf, u64, bool, Instant)>,
-    /// A rename being named: file, line, column (server encoding).
-    rename_at: Option<(PathBuf, usize, usize)>,
+    /// A rename being named: who answers, file, line, column (its encoding).
+    rename_at: Option<(Who, PathBuf, usize, usize)>,
+    /// Artifex's plugins (dev-tools.md §3.8).
+    pub plugins: plugins::Host,
+    /// Every answer to the completion asked, merged; how many are still
+    /// to come.
+    merged: Vec<lsp::Completion>,
+    merged_incomplete: bool,
+    completion_waiting: usize,
+    /// The quick fixes offered so far, each with its encoding; how many
+    /// answers are still to come.
+    fixes: Vec<(lsp::Action, lsp::Encoding)>,
+    fixes_waiting: usize,
+}
+
+/// Who answers a request that takes one answer: the file's workspace
+/// server, else the first plugin for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Who {
+    Server(&'static str),
+    Plugin(plugins::Id),
 }
 
 fn title_of(rel: &str) -> String {
@@ -195,6 +215,12 @@ impl Engine {
             tip_at: None,
             formatting: None,
             rename_at: None,
+            plugins: plugins::Host::default(),
+            merged: Vec::new(),
+            merged_incomplete: false,
+            completion_waiting: 0,
+            fixes: Vec::new(),
+            fixes_waiting: 0,
         }
     }
 
@@ -379,9 +405,9 @@ impl Engine {
             Act::MenuPick(i) => self.menu_pick(i, s),
             Act::MenuClose => self.close_popup(s),
             Act::References => {
-                if let Some((key, path, line, _, c)) = self.synced(s, false) {
-                    if let Some(srv) = self.servers.get_mut(key) {
-                        srv.client.references(&path, line, c);
+                if let Some((who, path, line, _, c)) = self.synced(s, false) {
+                    if let Some(client) = self.client_of(who) {
+                        client.references(&path, line, c);
                     }
                 }
             }
@@ -398,19 +424,27 @@ impl Engine {
                 self.rename_at = None;
             }
             Act::QuickFix => {
-                if let Some((key, path, line, col, _)) = self.synced(s, false) {
-                    // The caret's whole line: the fixes for what's marked on it.
+                if let Some((_, path, line, col, _)) = self.synced(s, false) {
+                    // The caret's whole line: the fixes for what's marked on
+                    // it, from every client for the file.
                     let len = self.active_doc().map(|d| d.buffer.get_cloned().line_text(line)).unwrap_or_default();
-                    if let Some(srv) = self.servers.get_mut(key) {
-                        let end = srv.client.encoding.from_char(&len, len.chars().count());
-                        srv.client.code_actions(&path, ((line, 0), (line, end)));
+                    self.fixes.clear();
+                    self.fixes_waiting = 0;
+                    for (who, _) in self.all_synced(s) {
+                        if let Some(client) = self.client_of(who) {
+                            let end = client.encoding.from_char(&len, len.chars().count());
+                            client.code_actions(&path, ((line, 0), (line, end)));
+                            self.fixes_waiting += 1;
+                        }
+                    }
+                    if self.fixes_waiting > 0 {
                         self.fixing = Some((path, line, col));
                     }
                 }
             }
             Act::Format => {
-                if let Some((key, path, ..)) = self.synced(s, false) {
-                    self.ask_format(key, path, false);
+                if let Some((who, path, ..)) = self.synced(s, false) {
+                    self.ask_format(who, path, false);
                 }
             }
             Act::Task(i) => self.run_task(i, s),
@@ -1279,6 +1313,7 @@ impl Engine {
         self.remote_root = None;
         self.ws = Some(ws.to_string());
         self.root = root.clone();
+        self.plugins.reset(&root, ws);
         self.tree = Tree::new(root.clone());
         s.ws = Some(ws.to_string());
         s.git = None;
@@ -1364,6 +1399,8 @@ impl Engine {
         self.tree.reveal(rel);
         if let Some(l) = lang {
             self.lsp_open(l, &path, &text);
+            let version = self.docs.last().map_or(0, |d| d.cells.buffer.get_cloned().version());
+            self.plugins.open(lsp::language_id(l), &path, version, &text);
         }
     }
 
@@ -1382,6 +1419,7 @@ impl Engine {
         if let Some(srv) = d.lang.and_then(lsp::server_for).and_then(|(k, _)| self.servers.get_mut(k)) {
             srv.client.did_close(&d.cells.path);
         }
+        self.plugins.close(&d.cells.path);
         self.active = match self.active {
             _ if self.docs.is_empty() => None,
             Some(a) if a > i => Some(a - 1),
@@ -1407,6 +1445,9 @@ impl Engine {
                     srv.client.did_change(&path, &text);
                     srv.client.did_save(&path);
                 }
+                let version = self.docs[i].cells.buffer.get_cloned().version();
+                self.plugins.change(&path, version, &text);
+                self.plugins.saved(&path);
                 self.next_git = Instant::now();
                 self.tree.refresh();
                 if title_of(&self.docs[i].rel) == "atrium.toml" || PROJECT_FILES.contains(&title_of(&self.docs[i].rel).as_str()) {
@@ -1702,60 +1743,98 @@ impl Engine {
         }
     }
 
-    /// The active file's server, told the text the caret is in: its key,
-    /// the file, the caret's line and char column, and that column in the
-    /// server's encoding. `quiet`: say nothing when there's none.
-    fn synced(&mut self, s: &mut State, quiet: bool) -> Option<(&'static str, PathBuf, usize, usize, usize)> {
+    /// The active file's server, told the text the caret is in, else its
+    /// first plugin: who, the file, the caret's line and char column, and
+    /// that column in its encoding. Every plugin for the file is told the
+    /// text too. `quiet`: say nothing when there's none.
+    fn synced(&mut self, s: &mut State, quiet: bool) -> Option<(Who, PathBuf, usize, usize, usize)> {
         let i = self.active?;
         let d = self.docs.get(i)?;
-        let mut say = |m: &str| if !quiet { s.note = Some((m.into(), true)) };
-        let Some((key, _)) = d.lang.and_then(lsp::server_for) else {
-            say("No language server for this file");
-            return None;
-        };
         let b = d.cells.buffer.get_cloned();
         let (line, col) = b.line_col(b.primary().head);
         let path = d.cells.path.clone();
         let sent = d.lsp_sent;
-        let Some(srv) = self.servers.get_mut(key).filter(|v| v.client.is_ready() && v.client.is_open(&path)) else {
-            say("The language server isn't running yet");
-            return None;
-        };
-        if sent != b.version() {
-            srv.client.did_change(&path, &b.to_string());
-            self.docs[i].lsp_sent = b.version();
+        let key = d.lang.and_then(lsp::server_for).map(|(k, _)| k);
+        self.plugins.change(&path, b.version(), &b.to_string());
+        if let Some(srv) = key.and_then(|k| self.servers.get_mut(k)).filter(|v| v.client.is_ready() && v.client.is_open(&path)) {
+            if sent != b.version() {
+                srv.client.did_change(&path, &b.to_string());
+                self.docs[i].lsp_sent = b.version();
+            }
+            let c = srv.client.encoding.from_char(&b.line_text(line), col);
+            return Some((Who::Server(key?), path, line, col, c));
         }
-        let c = srv.client.encoding.from_char(&b.line_text(line), col);
-        Some((key, path, line, col, c))
+        if let Some(&id) = self.plugins.serving(&path).first() {
+            let enc = self.plugins.run(id)?.client.encoding;
+            return Some((Who::Plugin(id), path, line, col, enc.from_char(&b.line_text(line), col)));
+        }
+        if !quiet {
+            let m = if key.is_none() { "No language server for this file" } else { "The language server isn't running yet" };
+            s.note = Some((m.into(), true));
+        }
+        None
+    }
+
+    fn client_of(&mut self, who: Who) -> Option<&mut lsp::Client> {
+        match who {
+            Who::Server(k) => self.servers.get_mut(k).map(|v| &mut v.client),
+            Who::Plugin(id) => self.plugins.run_mut(id).map(|r| &mut r.client),
+        }
+    }
+
+    /// Every client for the active file (its server, then its plugins),
+    /// told its text: each with the caret's column in its encoding.
+    fn all_synced(&mut self, s: &mut State) -> Vec<(Who, usize)> {
+        let Some((first, path, line, col, c)) = self.synced(s, true) else { return Vec::new() };
+        let text = self.active_doc().map(|d| d.buffer.get_cloned().line_text(line)).unwrap_or_default();
+        let mut v = vec![(first, c)];
+        for id in self.plugins.serving(&path) {
+            if Who::Plugin(id) != first {
+                if let Some(r) = self.plugins.run(id) {
+                    v.push((Who::Plugin(id), r.client.encoding.from_char(&text, col)));
+                }
+            }
+        }
+        v
     }
 
     fn ask_server(&mut self, definition: bool, s: &mut State) {
-        let Some((key, path, line, _, c)) = self.synced(s, false) else { return };
-        let Some(srv) = self.servers.get_mut(key) else { return };
+        let Some((who, path, line, _, c)) = self.synced(s, false) else { return };
+        let Some(client) = self.client_of(who) else { return };
         if definition {
-            srv.client.definition(&path, line, c);
+            client.definition(&path, line, c);
         } else {
-            srv.client.hover(&path, line, c);
+            client.hover(&path, line, c);
         }
     }
 
     /// Ask for completions at the caret: `trigger` is the character typed
     /// that asked, `explicit` when the person asked (Ctrl+Space).
+    /// Every client for the file is asked; their answers are merged.
     fn ask_completion(&mut self, trigger: Option<char>, explicit: bool, s: &mut State) {
-        let Some((key, path, line, col, c)) = self.synced(s, !explicit) else { return };
+        let Some((_, path, line, col, _)) = self.synced(s, !explicit) else { return };
         let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
         let start = assist::word_start(&d.cells.buffer.get_cloned().line_text(line), col);
-        if let Some(srv) = self.servers.get_mut(key) {
-            srv.client.completion(&path, line, c, trigger);
+        let all = self.all_synced(s);
+        self.merged.clear();
+        self.merged_incomplete = false;
+        self.completion_waiting = 0;
+        for (who, c) in all {
+            if let Some(client) = self.client_of(who) {
+                client.completion(&path, line, c, trigger);
+                self.completion_waiting += 1;
+            }
+        }
+        if self.completion_waiting > 0 {
             self.asked = Some((path, line, start, explicit));
         }
     }
 
-    fn ask_format(&mut self, key: &'static str, path: PathBuf, save: bool) -> bool {
+    fn ask_format(&mut self, who: Who, path: PathBuf, save: bool) -> bool {
         let Some(d) = self.docs.iter().find(|d| d.cells.path == path) else { return false };
         let b = d.cells.buffer.get_cloned();
-        let Some(srv) = self.servers.get_mut(key) else { return false };
-        srv.client.format(&path, b.tab_width.max(1), !b.use_tabs);
+        let Some(client) = self.client_of(who) else { return false };
+        client.format(&path, b.tab_width.max(1), !b.use_tabs);
         self.formatting = Some((path, b.version(), save, Instant::now()));
         true
     }
@@ -1773,13 +1852,13 @@ impl Engine {
             return false;
         }
         match self.synced(s, true) {
-            Some((key, path, ..)) => self.ask_format(key, path, true),
+            Some((who, path, ..)) => self.ask_format(who, path, true),
             None => false,
         }
     }
 
     fn start_rename(&mut self, s: &mut State) {
-        let Some((_, path, line, col, c)) = self.synced(s, false) else { return };
+        let Some((who, path, line, col, c)) = self.synced(s, false) else { return };
         let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
         let text: Vec<char> = d.cells.buffer.get_cloned().line_text(line).chars().collect();
         let from = assist::word_start(&text.iter().collect::<String>(), col);
@@ -1791,19 +1870,18 @@ impl Engine {
         }
         self.close_popup(s);
         s.renaming = Some(word);
-        self.rename_at = Some((path, line, c));
+        self.rename_at = Some((who, path, line, c));
     }
 
     fn rename(&mut self, name: &str, s: &mut State) {
-        let Some((path, line, c)) = self.rename_at.take() else { return };
+        let Some((who, path, line, c)) = self.rename_at.take() else { return };
         s.renaming = None;
         if name.is_empty() || name.chars().count() > 200 || !name.chars().all(assist::is_word) {
             s.note = Some((format!("{name:?} isn't a name"), true));
             return;
         }
-        let key = self.docs.iter().find(|d| d.cells.path == path).and_then(|d| d.lang).and_then(lsp::server_for).map(|(k, _)| k);
-        match key.and_then(|k| self.servers.get_mut(k)) {
-            Some(srv) => srv.client.rename(&path, line, c, name),
+        match self.client_of(who) {
+            Some(client) => client.rename(&path, line, c, name),
             None => s.note = Some(("The language server isn't running".into(), true)),
         }
     }
@@ -1837,9 +1915,13 @@ impl Engine {
         s.tip = None;
     }
 
+    /// The encoding of the file's first client: its server, else its
+    /// first plugin.
     fn encoding_of(&self, path: &Path) -> lsp::Encoding {
         self.docs.iter().find(|d| d.cells.path == path).and_then(|d| d.lang).and_then(lsp::server_for)
-            .and_then(|(k, _)| self.servers.get(k)).map(|v| v.client.encoding).unwrap_or(lsp::Encoding::Utf16)
+            .and_then(|(k, _)| self.servers.get(k)).filter(|v| v.client.is_ready()).map(|v| v.client.encoding)
+            .or_else(|| self.plugins.serving(path).first().and_then(|&id| self.plugins.run(id)).map(|r| r.client.encoding))
+            .unwrap_or(lsp::Encoding::Utf16)
     }
 
     /// Accept the menu's `i`th row.
@@ -1862,7 +1944,8 @@ impl Engine {
             }
             assist::Offer::Actions(actions) => {
                 let a = &actions[k];
-                let enc = self.encoding_of(&p.path);
+                // Each fix in the encoding of whoever offered it.
+                let enc = self.fixes.get(k).map_or_else(|| self.encoding_of(&p.path), |f| f.1);
                 self.apply_edits(&a.title, a.edits.clone(), enc, s);
             }
         }
@@ -1913,6 +1996,7 @@ impl Engine {
                         srv.client.did_change(&path, &b.to_string());
                     }
                 }
+                self.plugins.change(&path, b.version(), &b.to_string());
                 d.lsp_sent = b.version();
                 d.cells.buffer.set(b);
             }
@@ -1976,10 +2060,19 @@ impl Engine {
         }
         let Some(c) = typed.filter(|_| edited && one) else { return };
         let before = text.chars().nth(col.wrapping_sub(2));
-        let (trigs, sigs) = match lang.and_then(lsp::server_for).and_then(|(k, _)| self.servers.get(k)) {
+        let (mut trigs, sigs) = match lang.and_then(lsp::server_for).and_then(|(k, _)| self.servers.get(k)) {
             Some(v) => (v.client.completion_triggers.clone(), v.client.signature_triggers.clone()),
-            None => return,
+            None => (Vec::new(), Vec::new()),
         };
+        // And what the file's plugins open completion with.
+        for id in self.plugins.serving(&path) {
+            if let Some(r) = self.plugins.run(id) {
+                trigs.extend(r.client.completion_triggers.iter().copied());
+            }
+        }
+        if trigs.is_empty() && sigs.is_empty() && self.plugins.serving(&path).is_empty() {
+            return;
+        }
         if self.popup.is_none() {
             let trigger = trigs.contains(&c) && match c {
                 '.' => true,
@@ -1995,16 +2088,17 @@ impl Engine {
             }
         }
         if sigs.contains(&c) {
-            if let Some((key, path, line, _, cc)) = self.synced(s, true) {
-                if let Some(srv) = self.servers.get_mut(key) {
-                    srv.client.signature_help(&path, line, cc);
+            if let Some((who, path, line, _, cc)) = self.synced(s, true) {
+                if let Some(client) = self.client_of(who) {
+                    client.signature_help(&path, line, cc);
                 }
             }
         }
     }
 
     /// What a server answered, beyond what `read_servers` handles itself.
-    fn answered(&mut self, e: lsp::Event, enc: lsp::Encoding, s: &mut State) {
+    /// `from`: the plugin's name when a plugin answered.
+    fn answered(&mut self, e: lsp::Event, enc: lsp::Encoding, from: Option<String>, s: &mut State) {
         let here = self.active.and_then(|i| self.docs.get(i)).map(|d| {
             let b = d.cells.buffer.get_cloned();
             let (l, c) = b.line_col(b.primary().head);
@@ -2018,12 +2112,29 @@ impl Engine {
                 if ap != path || al != line || ast != start {
                     return;
                 }
+                self.completion_waiting = self.completion_waiting.saturating_sub(1);
+                // One menu for every answer, in the encoding of the file's
+                // first client (the one `menu_pick` applies with).
+                let to = self.encoding_of(&path);
+                for mut c in items {
+                    if enc != to {
+                        c.range = c.range.filter(|r| r.0 .0 == line && r.1 .0 == line)
+                            .map(|((l, a), (_, b))| ((l, to.from_char(&text, enc.to_char(&text, a))), (l, to.from_char(&text, enc.to_char(&text, b)))));
+                    }
+                    if let Some(name) = &from {
+                        c.detail = if c.detail.is_empty() { name.clone() } else { format!("{} · {name}", c.detail) };
+                    }
+                    if self.merged.len() < lsp::MAX_COMPLETIONS {
+                        self.merged.push(c);
+                    }
+                }
+                self.merged_incomplete |= incomplete;
                 let typed: String = text.chars().skip(start).take(col - start).collect();
                 self.close_popup(s);
-                self.popup = assist::Popup::completions(path, line, start, items, incomplete, &typed);
+                self.popup = assist::Popup::completions(path, line, start, self.merged.clone(), self.merged_incomplete, &typed);
                 if self.popup.is_some() {
                     self.show_popup(s);
-                } else if explicit {
+                } else if explicit && self.completion_waiting == 0 {
                     s.note = Some(("No completions here".into(), false));
                 }
             }
@@ -2063,14 +2174,26 @@ impl Engine {
             }
             lsp::Event::Actions(actions) => {
                 let Some((path, line, col, _)) = here else { return };
-                if self.fixing.take() != Some((path.clone(), line, col)) {
+                if self.fixing != Some((path.clone(), line, col)) {
                     return;
                 }
+                self.fixes_waiting = self.fixes_waiting.saturating_sub(1);
+                if self.fixes_waiting == 0 {
+                    self.fixing = None;
+                }
+                for mut a in actions {
+                    if let Some(name) = &from {
+                        a.title = format!("{} ({name})", a.title);
+                    }
+                    if self.fixes.len() < lsp::MAX_LOCATIONS {
+                        self.fixes.push((a, enc));
+                    }
+                }
                 self.close_popup(s);
-                self.popup = assist::Popup::actions(path, line, col, actions);
+                self.popup = assist::Popup::actions(path, line, col, self.fixes.iter().map(|f| f.0.clone()).collect());
                 if self.popup.is_some() {
                     self.show_popup(s);
-                } else {
+                } else if self.fixes_waiting == 0 {
                     s.note = Some(("No quick fixes here".into(), false));
                 }
             }
@@ -2146,6 +2269,7 @@ impl Engine {
                         srv.client.did_change(&d.cells.path, &b.to_string());
                     }
                 }
+                self.plugins.change(&d.cells.path, b.version(), &b.to_string());
                 d.lsp_sent = b.version();
             }
             let (l, c) = b.line_col(b.primary().head);
@@ -2461,7 +2585,7 @@ impl Engine {
                                 lsp::Event::Definition(None) => s.note = Some(("No definition found".into(), false)),
                                 lsp::Event::Hover(h) => s.hover = h,
                                 lsp::Event::Message(m) => s.note = Some((m, true)),
-                                e => later.push((e, srv.client.encoding)),
+                                e => later.push((e, srv.client.encoding, None)),
                             }
                         }
                     }
@@ -2481,8 +2605,20 @@ impl Engine {
             self.servers.remove(k);
             self.no_server.push(k);
         }
-        for (e, enc) in later {
-            self.answered(e, enc, s);
+        for (id, e) in self.plugins.pump() {
+            let Some(r) = self.plugins.run(id) else { continue };
+            let (name, enc) = (r.info.name.clone(), r.client.encoding);
+            match e {
+                lsp::Event::Ready | lsp::Event::Diagnostics(_) => {}
+                lsp::Event::Definition(Some((p, l, c))) => jumps.push((p, l, c, enc)),
+                lsp::Event::Definition(None) => s.note = Some(("No definition found".into(), false)),
+                lsp::Event::Hover(h) => s.hover = h,
+                lsp::Event::Message(m) => s.note = Some((format!("{name}: {m}"), true)),
+                e => later.push((e, enc, Some(name))),
+            }
+        }
+        for (e, enc, from) in later {
+            self.answered(e, enc, from, s);
         }
         for (p, l, c, enc) in jumps {
             if let Some(rel) = tree::relative(&self.root, &p) {
@@ -2499,6 +2635,16 @@ impl Engine {
         // The status line's server is the active file's.
         let lsp = self.active.and_then(|i| self.docs.get(i)).and_then(|d| d.lang).and_then(lsp::server_for)
             .and_then(|(k, _)| self.lsp_status.get(k)).cloned();
+        // And what the file's plugins say of themselves.
+        let mine = self.active.and_then(|i| self.docs.get(i)).map(|d| {
+            let ids = self.plugins.serving(&d.cells.path);
+            ids.iter().filter_map(|&id| self.plugins.run(id)).filter(|r| !r.status.is_empty())
+                .map(|r| format!("{}: {}", r.info.name, r.status)).collect::<Vec<_>>().join(" · ")
+        }).filter(|t| !t.is_empty());
+        let lsp = match (lsp, mine) {
+            (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+            (a, b) => a.or(b),
+        };
         if s.lsp != lsp {
             s.lsp = lsp;
         }
@@ -2515,6 +2661,17 @@ impl Engine {
                     _ => continue,
                 };
                 diags.push((g.start.0, sev, g.message.clone()));
+            }
+        }
+        for id in self.plugins.serving(&d.cells.path) {
+            let Some(r) = self.plugins.run(id) else { continue };
+            for g in r.client.diagnostics.get(&d.cells.path).into_iter().flatten() {
+                let sev = match g.severity {
+                    lsp::Severity::Error => Severity::Error,
+                    lsp::Severity::Warning => Severity::Warning,
+                    _ => continue,
+                };
+                diags.push((g.start.0, sev, format!("{} ({})", g.message, r.info.name)));
             }
         }
         let cwd = s.project.clone();
@@ -2556,6 +2713,24 @@ impl Engine {
         }
     }
 
+    /// Plugins reach limend through `link`; the files open now go to
+    /// those for their languages.
+    pub fn set_plugin_link(&mut self, link: Box<dyn plugins::Link>) {
+        self.plugins.set_link(link);
+        self.plugins_open_all();
+    }
+
+    /// Start the switched-on plugins for the open files' languages and
+    /// tell them the files (after the list or the link changed).
+    fn plugins_open_all(&mut self) {
+        for d in &self.docs {
+            if let Some(l) = d.lang {
+                let b = d.cells.buffer.get_cloned();
+                self.plugins.open(lsp::language_id(l), &d.cells.path, b.version(), &b.to_string());
+            }
+        }
+    }
+
     /// Ask every server to stop (the app is closing).
     pub fn shutdown(&mut self) {
         for srv in self.servers.values_mut() {
@@ -2563,6 +2738,7 @@ impl Engine {
             let out = srv.client.take_output();
             srv.proc.write(&out);
         }
+        self.plugins.stop_all();
     }
 
     #[cfg(test)]
@@ -3593,6 +3769,60 @@ mod tests {
         let at = b.at_line_col(line, col);
         b.set_caret(at, false);
         doc.buffer.set(b);
+    }
+
+    #[test]
+    fn a_plugin_answers_beside_the_server_and_its_answers_are_merged() {
+        if std::process::Command::new("python3").arg("-c").arg("").status().map_or(true, |s| !s.success()) {
+            return;
+        }
+        let (d, mut e, mut s) = setup("plugins");
+        let bin = d.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("pylsp"), include_str!("../tests/fixtures/fake_lsp.py")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("pylsp"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
+        std::fs::write(d.join("plugin.py"), include_str!("../tests/fixtures/fake_plugin.py")).unwrap();
+        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec![], panel: None, workspace_read: false };
+        e.plugins.on = vec![todo];
+        e.set_plugin_link(Box::new(plugins::testing::Stdio::new(&d.join("plugin.py"))));
+        std::fs::write(d.join("proj/app.py"), "import os\n\ndef main():\n\tprint('hi')  # TODO say more\n\t\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("app.py".into()), &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.lsp.as_deref() == Some("fake")), "{:?}", s.lsp);
+        // Its diagnostics show with the server's, marked with its name.
+        assert!(tick_until(&mut e, &mut s, |s| !s.diags.is_empty()), "{:?}", e.plugins.stopped);
+        assert_eq!(s.diags, vec![(3, Severity::Warning, "TODO left here (TODO lens)".to_string())]);
+        // It runs for Markdown, which has no server, on its own.
+        e.act(Act::Open("src/notes.md".into()), &mut s);
+        assert_eq!(e.plugins.runs.len(), 1, "one instance for both languages");
+        type_in(&mut e, &mut s, "TODO ");
+        assert!(tick_until(&mut e, &mut s, |s| s.diags.len() == 1), "{:?}", s.diags);
+        e.act(Act::Open("app.py".into()), &mut s);
+        e.tick(&mut s);
+
+        // One completion menu with both answers; its row says whose.
+        let doc = e.active_doc().unwrap();
+        caret_to(&e, 4, 1);
+        type_in(&mut e, &mut s, "pr");
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.as_ref().is_some_and(|m| m.0 == 3)), "{:?}", s.menu);
+        let rows: Vec<String> = doc.menu.get_cloned().unwrap().items.iter().map(|i| format!("{} {}", i.0, i.1)).collect();
+        assert!(rows.iter().any(|r| r.starts_with("prune_todo") && r.contains("todo · TODO lens")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.starts_with("print ")), "{rows:?}");
+        e.act(Act::MenuClose, &mut s);
+
+        // Quick fixes from both, each applied in its own way.
+        caret_to(&e, 3, 2);
+        e.act(Act::QuickFix, &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.as_ref().is_some_and(|m| m.0 == 2)), "{:?}", s.menu);
+        let rows: Vec<String> = doc.menu.get_cloned().unwrap().items.iter().map(|i| i.0.clone()).collect();
+        assert_eq!(rows, vec!["Add a comment".to_string(), "Take the TODO out (TODO lens)".to_string()]);
+        e.act(Act::MenuPick(1), &mut s);
+        e.tick(&mut s);
+        assert_eq!(doc.buffer.get_cloned().line_text(3), "\tprint('hi')  # DONE say more");
+        assert!(tick_until(&mut e, &mut s, |s| s.diags.is_empty()), "the plugin saw the edit: {:?}", s.diags);
     }
 
     #[test]

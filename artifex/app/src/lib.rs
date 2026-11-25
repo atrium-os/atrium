@@ -17,6 +17,7 @@ pub mod git;
 pub mod iconedit;
 pub mod inspector;
 pub mod lsp;
+pub mod plugins;
 pub mod tasks;
 pub mod tree;
 pub mod ui;

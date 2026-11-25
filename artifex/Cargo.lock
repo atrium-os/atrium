@@ -42,6 +42,7 @@ dependencies = [
  "atrium-worker",
  "fresco-protocol",
  "libc",
+ "limen",
  "pergola",
  "portcullis-ipc",
  "serde_json",

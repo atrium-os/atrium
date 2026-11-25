@@ -625,6 +625,16 @@ parts of ≤60 KiB joined up to 4 MiB, bounds), limend's
 installed manifests for the parent's person, one of each per window;
 limen.md §2.7), `[roles.editor-extension]` in portcullis-toml, and
 `embeds = ["editor-extension"]` in Artifex's manifest.
+P2 (2026-11-25): `artifex::plugins::Host` starts the switched-on
+plugins for an open file's language through a `Link` (limend's
+`LimenLink` in the app), gives each its own LSP client with
+`artifex:///` URIs, and stops one that breaks the framing (the reason is
+kept, and it isn't started again until Restart). The engine merges
+completions (rows marked with the plugin's name, ranges recoded to the
+file's first client's encoding), quick fixes (each applied in its own
+encoding) and diagnostics; definition, hover, references, rename,
+signature help and formatting go to the workspace's server, else the
+first plugin. Tested with a scripted plugin beside the scripted server.
 
 **Decisions.**
 
