@@ -120,7 +120,7 @@ The single biggest lever. The guide's first page is this table:
 | WebKit, an HTML or Markdown renderer | Limen **`doc-viewer`** (navigator-normalize in a jail) | Limen role | yes |
 | ffmpeg, a video player | Limen **`media-player`** | Limen role | yes |
 | poppler, pdfium | Limen **`pdf-viewer`** | Limen role | yes |
-| libpng, libjpeg, image crates | an **image decode service** (navigator-image in a worker, already used by the Navigator and Officina) | new role or service | the code is; the service isn't (C6) |
+| libpng, libjpeg, image crates | the **image decoder** `org.atrium.image-decode` (navigator-image in a jail of its own per call, as `_imagedec`); the SDK's `atrium_assets::image(name, w, h)` / `decode(file, w, h)` | `decoders = ["image"]` | yes (C6, dev-tools.md §3.5 step 3) |
 | a terminal widget | Terminal as a Limen embed | role | partly |
 | a fonts / text-shaping library | the system text stack (server-side shaping in frescod) | `graphics` | yes |
 
@@ -135,6 +135,13 @@ To make it reachable (all small, all needed before anyone can follow the guide):
   app may request listed (`embeds = ["picker", "doc-viewer", "media-player"]`); the
   consent diff names them (C7);
 - **`arca`** as an app capability for its API, scoped to the app's own items (C8);
+- **`decoders`** (C6, built 2026-11-25): `decoders = ["image"]` mounts portcullisd's
+  worker-call socket, where `SystemWorker { name }` starts the system's decoder for
+  that name (`portcullis_ipc::SYSTEM_WORKERS`) in a one-shot jail with no capability,
+  as the system worker rule's uid, never the app's. It asks no consent: the decoder
+  holds nothing, and the app gives it only the file it sends. portcullisd refuses it
+  to a worker and to an app whose installed manifest doesn't name it. Checked by
+  `scripts/vm-image-decode-check.sh`;
 - the Nuntius **C ABI** (nuntius.md step 5), and `libatrium` gaining fetch, picker,
   embed and Arca calls, so C apps have the same level 1.
 

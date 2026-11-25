@@ -803,11 +803,7 @@ pub fn delete(owner: &str, name: &str) -> Result<(), String> {
 }
 
 pub fn running_jid(owner: &str, name: &str) -> Option<i32> {
-    let out = Command::new("jls").args(["-j", &jail_name(owner, name), "jid"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    jaild::ffi::jail_id_by_name(&jail_name(owner, name))
 }
 
 /// What a console needs to start a shell in a running workspace.
@@ -1017,10 +1013,7 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
         portcullisd::route_domain::for_persona(owner, Some(&r.persona)).map_err(|e| fail(e))?
     } else { None };
     jc.route_fib = fib;
-    // Nothing runs at creation (the entry is `true`), and the workspace's
-    // account has no home on the host for jail(8) to change to: it runs as
-    // the jail's root, in /root.
-    jc.set("exec.jail_user", portcullis_jail::Value::String("root".into()));
+    // Nothing runs at creation: jaild makes it empty.
     // ★ Debugging its own processes (lldb on a test binary): this jail only;
     // the host keeps security.bsd.unprivileged_proc_debug=0, and with
     // see_other_uids=0 a workspace reaches nothing but its own uid.
@@ -1058,7 +1051,8 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
         jc.add_mount(src, &jp.join(at.trim_start_matches('/')), "nullfs", &["ro"]);
     }
     launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
-    launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
+    launch::create_persistent(&jc, &jp, jaild::protocol::JailClass::Develop { owner: owner.into() }, launch::DEVELOP_CLASS)
+        .map_err(|e| fail(format!("{e:?}")))?;
     let jid = running_jid(owner, name).ok_or_else(|| fail(format!("workspace {name} did not start")))?;
     for id in crate::dev::bundles_of(owner, name) {
         show_bundle(owner, name, &id);
@@ -1066,8 +1060,8 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     if r.network == "registries" {
         // ★ Before anything runs in it: the port is the proxy's, not
         // something the workspace could bind first.
-        if let Err(e) = egress::start(&jail_name(owner, name), jid, &r.egress_hosts(), fib) {
-            launch::remove_persistent(&jail_name(owner, name), &jp, false);
+        if let Err(e) = egress::start(&jail_name(owner, name), &r.egress_hosts(), fib) {
+            launch::remove_persistent(&jail_name(owner, name), &jp);
             return Err(format!("its registries proxy: {e}"));
         }
     }
@@ -1115,14 +1109,7 @@ pub fn stop(owner: &str, name: &str) {
     if running_jid(owner, name).is_none() {
         return;
     }
-    let (home, gid) = match person(owner) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let networked = root_dir(&home, gid).ok()
-        .and_then(|d| load(&d.join(name)))
-        .is_some_and(|r| r.network == "outbound");
-    launch::remove_persistent(&jail_name(owner, name), &jail_path(owner, name), networked);
+    launch::remove_persistent(&jail_name(owner, name), &jail_path(owner, name));
     egress::stop(&jail_name(owner, name));
     crate::ssh_agent::close(owner, name);
     eprintln!("portcullisd: workspace {name} of {owner} stopped");

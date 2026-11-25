@@ -244,6 +244,14 @@ pub fn validate(m: &Manifest) -> Report {
 }
 
 fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
+    /* decoders: the system's decoders, by name (app-composition.md C6). */
+    if let Some(d) = &c.decoders {
+        for n in d {
+            if n.is_empty() || n.len() > 32 || !n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                r.errors.push(format!("{ctx}.decoders {n:?}: a decoder name, `a-z 0-9 -`"));
+            }
+        }
+    }
     /* embeds: Limen role names (app-composition.md §3, C7). */
     if let Some(e) = &c.embeds {
         for n in e {

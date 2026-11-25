@@ -1,0 +1,11 @@
+[package]
+name = "atrium-assets"
+description = "An Atrium app's pictures: decoded by the system's image decoder, outside the app (dev-tools.md §3.5, app-composition.md C6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+atrium-message = { path = "../atrium-message", version = "0.1.0" }
+atrium-worker = { path = "../atrium-worker", version = "0.1.0" }

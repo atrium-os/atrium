@@ -94,6 +94,14 @@ pub enum Act {
     SelectCrash(usize),
     /// Fill the window right of the strip with a view.
     View(Main),
+    /// Show an asset in the Assets view.
+    SelectAsset(usize),
+    /// Import SVG: list the project's SVGs to pick from.
+    ImportSvg,
+    /// Ask cargo atrium what importing this one (of the list) would do.
+    ImportFrom(usize),
+    /// The import preview's answer.
+    ConfirmImport(bool),
 }
 
 /// The debugger as the window shows it.
@@ -191,6 +199,8 @@ pub struct State {
     /// path, bytes) once read.
     pub crash: usize,
     pub crash_bytes: Option<(String, Vec<u8>)>,
+    /// The Assets view: the project's `assets/` and an import under way.
+    pub assets: Option<crate::assets::Assets>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -414,6 +424,9 @@ impl View for ArtifexView {
             if let Some(f) = &s.fuzz {
                 views.push(("Fuzz", phosphor::LIGHTNING, Act::View(Main::Fuzz), s.view == Main::Fuzz, f.crashes.len()));
             }
+            if s.composition.is_some() {
+                views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
+            }
             if s.debug.is_some() {
                 views.push(("Debug", phosphor::BUG, Act::Panel(Panel::Debug), code && s.panel_open && s.panel == Panel::Debug, 0));
             }
@@ -447,6 +460,7 @@ impl View for ArtifexView {
             match s.view {
                 Main::Fuzz => crate::views::fuzz(ctx, &s, q, area),
                 Main::Composition => crate::views::composition(ctx, &s, q, area),
+                Main::Assets => crate::views::assets(ctx, &s, q, area),
                 Main::Code => {}
             }
             ctx.pop();

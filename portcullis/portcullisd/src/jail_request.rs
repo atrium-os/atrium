@@ -9,7 +9,6 @@
 //! and the system call class (jaild resolves it from its own policy).
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use jaild::protocol::{
     CreateJailRequest, DeviceClass, EnvPair, ExecSpec, JailClass, MountKind, MountSpec,
@@ -30,6 +29,9 @@ pub struct RunAs {
     pub env:    Vec<EnvPair>,
     /// The caller's stdin, stdout and stderr ride on the request.
     pub stdio:  bool,
+    /// Where the entry starts, inside the jail (an app's: its account's
+    /// home). `None`: the root.
+    pub cwd:    Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,9 +198,6 @@ pub fn to_create_request(jc: &JailConfig, parts: RequestParts) -> Result<CreateJ
     }
 
     /* Network. */
-    if jc.routed_net_attached {
-        return refuse("the network was attached for jail(8); jaild builds its own".into());
-    }
     if jc.route_fib.is_some() && jc.needs_routed_net.is_none() {
         return refuse("a route domain without a routed network".into());
     }
@@ -226,16 +225,16 @@ pub fn to_create_request(jc: &JailConfig, parts: RequestParts) -> Result<CreateJ
         Some(r) => {
             let Some(e) = entry else { return refuse("an exec with no exec.start".into()) };
             let path = entry_path(&e)?;
-            let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string();
-            let mut argv = vec![name];
+            // argv[0] is the path, as a shell or jail(8) gives it: what ps
+            // and pkill -f show.
+            let mut argv = vec![path.clone()];
             argv.extend(r.args);
-            Some(ExecSpec {
+            Some(ExecSpec { cwd: r.cwd,
                 path, argv, env: r.env, uid: r.uid, gid: r.gid, groups: r.groups,
                 stdio: r.stdio, listen: Vec::new(), ready: false,
             })
         }
-        /* The entry of an empty jail returned at once under jail(8); jaild
-         * runs nothing in it at all. */
+        /* An empty jail: jaild runs nothing in it. */
         None => None,
     };
 
@@ -268,6 +267,7 @@ pub fn to_create_request(jc: &JailConfig, parts: RequestParts) -> Result<CreateJ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn repo() -> PathBuf {
@@ -314,7 +314,7 @@ mod tests {
     fn app_parts(app_id: &str) -> RequestParts {
         RequestParts {
             class: JailClass::App { owner: "alice".into(), app_id: app_id.into(), debug: false },
-            run: Some(RunAs { uid: 2001, gid: 2001, groups: vec![], args: vec![], env: vec![], stdio: true }),
+            run: Some(RunAs { uid: 2001, gid: 2001, groups: vec![], args: vec![], env: vec![], stdio: true, cwd: None }),
             grants: None,
             syscall_profile: None,
         }
@@ -329,10 +329,9 @@ mod tests {
         assert!(all.len() >= 15, "only {} manifests found", all.len());
         let mut refused = Vec::new();
         for (at, m) in &all {
-            let Some(name) = portcullis_jail::jaild_instance_name(&m.app.id, None) else { continue };
-            let mut jc = portcullis_jail::build(m, &opts(&name))
+            // The name and root portcullisd gives an app's jail.
+            let jc = portcullis_jail::build(m, &opts(&m.app.id))
                 .unwrap_or_else(|e| panic!("{}: build: {e}", at.display()));
-            jc.name = name.clone();
             let req = to_create_request(&jc, app_parts(&m.app.id))
                 .unwrap_or_else(|e| panic!("{}: {e}", at.display()));
             assert_eq!(req.mounts.len(), jc.mounts.len(), "{}", at.display());
@@ -357,9 +356,7 @@ mod tests {
     fn sheets() -> JailConfig {
         let (_, m) = manifests().into_iter()
             .find(|(p, _)| p.ends_with("atrium-sheets/atrium.toml")).expect("the Sheets manifest");
-        let mut jc = portcullis_jail::build(&m, &opts("app-sheets--0")).expect("build");
-        jc.name = "app-sheets--0".into();
-        jc
+        portcullis_jail::build(&m, &opts("org.atrium.sheets")).expect("build")
     }
 
     #[test]
@@ -431,11 +428,6 @@ mod tests {
         assert!(r.mounts.last().unwrap().noexec);
 
         let mut jc = sheets();
-        jc.needs_routed_net = Some("02:00:00:00:00:01".into());
-        jc.routed_net_attached = true;
-        assert!(to_create_request(&jc, parts()).unwrap_err().contains("attached"));
-
-        let mut jc = sheets();
         jc.route_fib = Some(3);
         assert!(to_create_request(&jc, parts()).unwrap_err().contains("route domain"));
 
@@ -456,7 +448,7 @@ mod tests {
         let r = to_create_request(&sheets(), p).unwrap();
         let e = r.exec.unwrap();
         assert_eq!(e.argv[1..], ["--persona".to_string(), "work; rm -rf /".to_string()]);
-        assert_eq!(e.argv[0], Path::new(&e.path).file_name().unwrap().to_str().unwrap());
+        assert_eq!(e.argv[0], e.path, "argv[0] is the path, as ps shows it");
     }
 
     #[test]

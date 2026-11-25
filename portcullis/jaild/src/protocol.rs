@@ -585,6 +585,10 @@ pub struct ExecSpec {
     /// an `app` class jail, the owner's files groups. Empty: exactly `{gid}`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<u32>,
+    /// The directory the entry starts in, inside the jail, entered after the
+    /// privilege drop; `None` is the jail's root. Absolute, no `..`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// The highest routing table a jail's epair may be put in: atrium-net's

@@ -11,6 +11,11 @@ use std::path::{Component, Path};
 
 /// Largest bundle icon read. An icon is a few shapes; this is generous.
 pub const MAX_ICON_BYTES: u64 = 32 * 1024;
+/// The dock draws an icon as at most this many filled shapes (forum-dock's
+/// bundle_icon), of at most this many points in all; Artifex's import and
+/// icon editor keep to the same numbers (atrium-icon).
+pub const MAX_ICON_SHAPES: usize = 64;
+pub const MAX_ICON_POINTS: usize = 8192;
 
 /// `icon` names a file in the bundle (rather than the system set): it ends in
 /// `.svg` and is a plain relative path of ordinary names.

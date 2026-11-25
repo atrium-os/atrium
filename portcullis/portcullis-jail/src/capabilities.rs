@@ -385,9 +385,8 @@ pub fn apply_network(net: NetworkCap, jc: &mut JailConfig) {
         NetworkCap::Full => {
             /* ★★ An own stack with a point-to-point epair from jaild (network.md
              * §0) — NOT `vnet = inherit`, which put the app on the host's stack
-             * where it could read the real MACs and reach the host. The epair is
-             * attached by whoever runs jail -c (it needs jaild); until then the
-             * config is refused. The MAC is filled in by build(). */
+             * where it could read the real MACs and reach the host. jaild builds
+             * the epair from the request. The MAC is filled in by build(). */
             jc.set("vnet", Value::Symbolic("new".into()));
             jc.set("allow.raw_sockets", Value::Bool(false));
             jc.needs_routed_net = Some(String::new());

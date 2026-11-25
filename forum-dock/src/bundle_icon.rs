@@ -14,8 +14,8 @@ use navigator_svg::vector::{self, Paint};
 
 /// An icon is a few shapes: these are far above any real icon and far below
 /// what would cost a frame.
-pub const MAX_FILLS: usize = 64;
-pub const MAX_POINTS: usize = 8192;
+pub const MAX_FILLS: usize = portcullis_toml::icon::MAX_ICON_SHAPES;
+pub const MAX_POINTS: usize = portcullis_toml::icon::MAX_ICON_POINTS;
 
 /// An icon in its own viewport space.
 #[derive(Debug, Clone, PartialEq)]

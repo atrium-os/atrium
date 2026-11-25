@@ -21,7 +21,7 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -199,7 +199,6 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Run `argv` in workspace `name` (started if it isn't) as its uid, in
 /// `~/work/<cwd>`.
 pub fn exec(owner: &str, name: &str, argv: &[String], cwd: &str) -> Result<Started, String> {
-    use std::ffi::CString;
     if argv.is_empty() || argv.len() > 4096 {
         return Err("no command".into());
     }
@@ -207,65 +206,52 @@ pub fn exec(owner: &str, name: &str, argv: &[String], cwd: &str) -> Result<Start
         return Err(format!("{cwd:?} is not a folder in work"));
     }
     let r = workspace::start(owner, name)?;
-    let c = |v: &str| CString::new(v).map_err(|_| "a NUL in the command".to_string());
-    let args: Vec<CString> = argv.iter().map(|a| c(a)).collect::<Result<_, _>>()?;
     // The workspace's PATH: its toolchain layers, then the base.
-    let path_var = r.env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(workspace::BASE_PATH).to_string();
-    let path: &str = &path_var;
-    // Where argv[0] is tried: as given if it has a `/`, else along PATH.
-    let tries: Vec<CString> = if argv[0].contains('/') {
-        vec![args[0].clone()]
-    } else {
-        path.split(':').map(|d| c(&format!("{d}/{}", argv[0]))).collect::<Result<_, _>>()?
-    };
+    let path = r.env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(workspace::BASE_PATH).to_string();
     let mut env = vec![
-        c(&format!("HOME={}", r.home))?,
-        c(&format!("USER={owner}"))?,
-        c("TERM=dumb")?,
-        c(&format!("ATRIUM_WORKSPACE={name}"))?,
+        format!("HOME={}", r.home),
+        format!("USER={owner}"),
+        "TERM=dumb".to_string(),
+        format!("ATRIUM_WORKSPACE={name}"),
+        format!("PATH={path}"),
     ];
-    env.push(c(&format!("PATH={path}"))?);
-    for e in r.env.iter().filter(|e| !e.starts_with("PATH=")) {
-        env.push(c(e)?);
-    }
+    env.extend(r.env.iter().filter(|e| !e.starts_with("PATH=")).cloned());
     let dir = if cwd.is_empty() { format!("{}/work", r.home) } else { format!("{}/work/{}", r.home, cwd.trim_end_matches('/')) };
-    let dir = c(&dir)?;
-    let mut argp: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
-    argp.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
-    envp.push(std::ptr::null());
-    let groups: [libc::gid_t; 2] = [r.gid as libc::gid_t, r.files as libc::gid_t];
+    /* The shell finds argv[0] along the workspace's PATH (or as given, with
+     * a `/`), and exits 127 when it isn't there. */
+    let mut sh_argv = vec!["sh".to_string(), "-c".into(), "exec \"$0\" \"$@\"".into()];
+    sh_argv.extend(argv.iter().cloned());
+    start_in(&workspace::jail_name(owner, name), sh_argv, env,
+             Some(jaild::protocol::ExecIdentity { uid: r.uid, gid: r.gid, groups: vec![r.files] }), dir, 0o002)
+}
+
+/// Run `/bin/sh` with `argv` in workspace jail `jail` through jaild, on
+/// fresh pipes: as `identity` (the jail's root when `None`), in `dir`.
+fn start_in(jail: &str, argv: Vec<String>, env: Vec<String>, identity: Option<jaild::protocol::ExecIdentity>,
+            dir: String, umask: u32) -> Result<Started, String> {
+    let env = env.into_iter().map(|e| {
+        let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
+        jaild::protocol::EnvPair { key: k.into(), value: v.into() }
+    }).collect();
     let (in_r, in_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
     let (out_r, out_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
-    let pd = jaild::ffi::pdfork().map_err(|e| format!("pdfork: {e}"))?;
-    if pd.pid == 0 {
-        // ====== child: nothing that allocates or locks from here on ======
-        // SAFETY: async-signal-safe calls only, on what was made above.
-        unsafe {
-            if libc::dup2(in_r.as_raw_fd(), 0) < 0 || libc::dup2(out_w.as_raw_fd(), 1) < 0 || libc::dup2(out_w.as_raw_fd(), 2) < 0 {
-                libc::_exit(101)
-            }
-            libc::setsid();
-            if libc::jail_attach(r.jid) != 0 { libc::_exit(102) }
-            if libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) != 0 || libc::setgid(r.gid) != 0 || libc::setuid(r.uid) != 0 {
-                libc::_exit(104)
-            }
-            if libc::getuid() != r.uid || libc::geteuid() != r.uid || libc::getgid() != r.gid || libc::setuid(0) == 0 {
-                libc::_exit(105)
-            }
-            // After the drop: a folder the workspace can't enter isn't entered.
-            if libc::chdir(dir.as_ptr()) != 0 { libc::_exit(103) }
-            libc::umask(0o002);
-            for t in &tries {
-                libc::execve(t.as_ptr(), argp.as_ptr(), envp.as_ptr());
-            }
-            libc::_exit(127)
-        }
-    }
-    drop((in_r, out_w));
-    // SAFETY: pdfork's descriptor, ours alone.
-    let procdesc = unsafe { OwnedFd::from_raw_fd(pd.procdesc_fd) };
-    Ok((pd.pid, procdesc, in_w, out_r))
+    let err_w = out_w.try_clone().map_err(|e| format!("dup: {e}"))?;
+    let req = jaild::protocol::ExecInJailRequest {
+        name: jail.into(),
+        path: "/bin/sh".into(),
+        argv,
+        env,
+        want_root: identity.is_none(),
+        cols: 0,
+        rows: 0,
+        identity,
+        cwd: Some(dir),
+        umask: Some(umask),
+        stdio: true,
+    };
+    let (run, _) = portcullisd::jaild_jail::exec_in(req, Some([in_r, out_w, err_w]))?;
+    let pid = run.pid;
+    Ok((pid, run.into_procdesc(), in_w, out_r))
 }
 
 /// `pkg`'s subcommands a workspace may run as its jail's root
@@ -300,54 +286,20 @@ pub fn check_pkg_argv(argv: &[String]) -> Result<(), String> {
 /// has no rc to do it), so what pkg put in `/usr/local/lib` is found. The
 /// output ends with `pkg: exit <status>`.
 pub fn admin(owner: &str, name: &str, argv: &[String]) -> Result<Started, String> {
-    use std::ffi::CString;
     check_pkg_argv(argv)?;
-    let r = workspace::start(owner, name)?;
-    let c = |v: &str| CString::new(v).map_err(|_| "a NUL in the command".to_string());
-    let sh = c("/bin/sh")?;
-    let mut args = vec![c("/bin/sh")?, c("-c")?,
-                        c("/usr/sbin/pkg \"$@\"; s=$?; /sbin/ldconfig -elf /lib /usr/lib /usr/local/lib; echo \"pkg: exit $s\"; exit $s")?, c("pkg")?];
-    for a in &argv[1..] {
-        args.push(c(a)?);
-    }
-    let env = [
-        c("HOME=/root")?, c("USER=root")?, c("TERM=dumb")?,
-        c(&format!("PATH={}", workspace::BASE_PATH))?,
-        c(&format!("ATRIUM_WORKSPACE={name}"))?,
+    workspace::start(owner, name)?;
+    let mut args = vec!["sh".to_string(), "-c".into(),
+                        "/usr/sbin/pkg \"$@\"; s=$?; /sbin/ldconfig -elf /lib /usr/lib /usr/local/lib; echo \"pkg: exit $s\"; exit $s".into(),
+                        "pkg".into()];
+    args.extend(argv[1..].iter().cloned());
+    let env = vec![
+        "HOME=/root".to_string(), "USER=root".into(), "TERM=dumb".into(),
+        format!("PATH={}", workspace::BASE_PATH),
+        format!("ATRIUM_WORKSPACE={name}"),
         // The press was the person's yes.
-        c("ASSUME_ALWAYS_YES=yes")?,
+        "ASSUME_ALWAYS_YES=yes".into(),
     ];
-    let dir = c("/root")?;
-    let mut argp: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
-    argp.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
-    envp.push(std::ptr::null());
-    let groups: [libc::gid_t; 1] = [0];
-    let (in_r, in_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
-    let (out_r, out_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
-    let pd = jaild::ffi::pdfork().map_err(|e| format!("pdfork: {e}"))?;
-    if pd.pid == 0 {
-        // ====== child: nothing that allocates or locks from here on ======
-        // SAFETY: async-signal-safe calls only, on what was made above.
-        unsafe {
-            if libc::dup2(in_r.as_raw_fd(), 0) < 0 || libc::dup2(out_w.as_raw_fd(), 1) < 0 || libc::dup2(out_w.as_raw_fd(), 2) < 0 {
-                libc::_exit(101)
-            }
-            libc::setsid();
-            if libc::jail_attach(r.jid) != 0 { libc::_exit(102) }
-            if libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) != 0 || libc::setgid(0) != 0 || libc::setuid(0) != 0 {
-                libc::_exit(104)
-            }
-            if libc::chdir(dir.as_ptr()) != 0 { libc::_exit(103) }
-            libc::umask(0o022);
-            libc::execve(sh.as_ptr(), argp.as_ptr(), envp.as_ptr());
-            libc::_exit(127)
-        }
-    }
-    drop((in_r, out_w));
-    // SAFETY: pdfork's descriptor, ours alone.
-    let procdesc = unsafe { OwnedFd::from_raw_fd(pd.procdesc_fd) };
-    Ok((pd.pid, procdesc, in_w, out_r))
+    start_in(&workspace::jail_name(owner, name), args, env, None, "/root".into(), 0o022)
 }
 
 #[cfg(test)]

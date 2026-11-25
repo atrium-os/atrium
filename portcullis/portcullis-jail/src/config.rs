@@ -1,18 +1,16 @@
-//! `JailConfig` — the structured form of a jail.conf section.
-//!
-//! Insertion-ordered for deterministic rendering (golden-file
-//! tests benefit from stable output).
+//! `JailConfig`: the jail an app's manifest builds, in jail(8)'s parameter
+//! names, which portcullisd maps to a jaild request (jail_request.rs).
+//! Insertion-ordered, so the mapping and its tests see a stable order.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     String(String),
     Bool(bool),
     Number(i64),
-    /// Symbolic / unquoted token (e.g. "disable", "inherit"). The
-    /// renderer emits these without surrounding quotes.
+    /// Symbolic token (e.g. "new", "disable", "inherit").
     Symbolic(String),
 }
 
@@ -52,16 +50,12 @@ pub struct JailConfig {
 
     /// ★ The `full` network capability's pending network (network.md §0):
     /// `Some(mac)` when this jail needs a point-to-point epair from jaild,
-    /// carrying the app's derived MAC. Not rendered — whoever runs `jail -c`
-    /// asks jaild for the allocation and calls [`JailConfig::attach_routed_net`];
-    /// a config still pending is refused (portcullis_mounts::ensure_network_ready),
-    /// never run on the host's stack.
+    /// carrying the app's derived MAC. jaild builds it from the request
+    /// (`NetworkConfig::Routed`), never the host's stack.
     pub needs_routed_net: Option<String>,
     /// The app's id and `network` spec for that network — what the launcher
     /// turns into jaild grants (network.md §0.1). Set by build() with the MAC.
     pub routed_net_spec: Option<(String, portcullis_toml::NetworkSpec)>,
-    /// Set by [`JailConfig::attach_routed_net`].
-    pub routed_net_attached: bool,
     /// The routing table jaild puts the network's host end in: a persona's
     /// VPN route domain (vpn.md §5.3), from atrium-net. `None`: the host's.
     pub route_fib: Option<u32>,
@@ -78,41 +72,8 @@ impl JailConfig {
             copies: Vec::new(),
             needs_routed_net: None,
             routed_net_spec: None,
-            routed_net_attached: false,
             route_fib: None,
         }
-    }
-
-    /// Give this jail the network jaild allocated for it. `exec.created` —
-    /// which jail(8) runs on the host after creation and before the app starts
-    /// — moves `epair_b` into the jail's vnet, then sets the derived MAC, the
-    /// address, its own loopback and the default route.
-    ///
-    /// ★ NOT `vnet.interface`: jail(8) moves that interface AFTER exec.created
-    /// (usr.sbin/jail/jail.c: IP_EXEC_CREATED, IP_ZFS_DATASET,
-    /// IP_VNET_INTERFACE, IP_EXEC_START), so configuring it from exec.created
-    /// failed with the interface not yet in the jail — measured.
-    ///
-    /// ★ Every command here is QUIET (`route -q`): jail(8) passes exec.created's
-    /// stdout through, and on the daemon lane that is the caller's pipe —
-    /// `route` printed "add net default: gateway …" into the app's output
-    /// (measured), the same corruption `jail -q` was added for.
-    ///
-    /// ★ And a 1 s MSL in the app's own stack (per-vnet; the host keeps 30 s):
-    /// TIME_WAIT in a stack that is destroyed at exit protects nothing, and it
-    /// kept the jail dying — root pinned — for 2×30 s (measured).
-    pub fn attach_routed_net(&mut self, epair_b: &str, app_addr: &str, host_addr: &str) -> Result<(), String> {
-        let Some(mac) = self.needs_routed_net.clone() else {
-            return Err(format!("jail {} did not ask for a network", self.name));
-        };
-        let n = self.name.clone();
-        self.set("exec.created", Value::String(format!(
-            "ifconfig {epair_b} vnet {n} && ifconfig -j {n} {epair_b} ether {mac} \
-             && ifconfig -j {n} {epair_b} inet {app_addr}/30 up \
-             && ifconfig -j {n} lo0 inet 127.0.0.1/8 up && route -q -j {n} add default {host_addr} \
-             && sysctl -j {n} net.inet.tcp.msl=1000 >/dev/null")));
-        self.routed_net_attached = true;
-        Ok(())
     }
 
     pub fn set(&mut self, key: &str, value: Value) -> &mut Self {

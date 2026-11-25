@@ -129,7 +129,7 @@ fn main() -> ExitCode {
                 mounts:        env_mounts_ro(),
                 devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
-                exec: Some(ExecSpec {
+                exec: Some(ExecSpec { cwd: None,
                     groups: vec![],
                     path: bin,
                     argv,

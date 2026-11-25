@@ -243,6 +243,52 @@ fn joined(rx: &mpsc::Receiver<Line>, wait: Duration) -> Res<()> {
     Err(Fail::new(status::FAILED, "timed out"))
 }
 
+/// The 802.1X profile fields of `e` on a remember line.
+fn eap_line(mut r: Line, e: &Enterprise) -> Line {
+    r = r.with("method", &e.method).with_hex("identity", e.identity.as_bytes()).with_hex("domain", e.domain.as_bytes());
+    if let Some(h) = &e.handle {
+        r = r.with_hex("handle", h);
+    }
+    if let Some(k) = &e.key {
+        r = r.with_hex("key", k);
+    }
+    if let Some(c) = &e.cert {
+        r = r.with_hex("cert", c);
+    }
+    if let Some(a) = &e.anonymous {
+        r = r.with_hex("anonymous", a.as_bytes());
+    }
+    if let Some(c) = &e.ca {
+        r = r.with_hex("ca", c);
+    }
+    if e.system_roots {
+        r = r.with("roots", "system");
+    }
+    r
+}
+
+/// The certificate a first sign-in stopped at, from aura-keys' `seen`.
+fn seen(v: &[Line]) -> Res<ServerSeen> {
+    let Some(l) = v.iter().find(|l| l.verb == "seen") else { return Err(Fail::new(status::FAILED, "nothing-seen")) };
+    let text = |k: &str| l.hex(k).map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
+    Ok(ServerSeen {
+        names: l.get("names").filter(|n| *n != "-").map(|n| n.split(',').take(16).map(str::to_string).collect()).unwrap_or_default(),
+        subject: text("subject"),
+        issuer: text("issuer"),
+        not_after: l.get("not_after").unwrap_or("").to_string(),
+        sha256: l.hex("top_sha256").filter(|h| h.len() == 32).ok_or_else(|| Fail::new(status::FAILED, "bad-seen"))?,
+    })
+}
+
+/// A new EAP-TLS key's id and certificate request, from aura-keys' `key`.
+fn key_request(v: &[Line]) -> Res<KeyRequest> {
+    let bad = || Fail::new(status::FAILED, "bad-key-answer");
+    let l = v.iter().find(|l| l.verb == "key").ok_or_else(bad)?;
+    let key = l.hex("id").and_then(|k| <[u8; 16]>::try_from(k.as_slice()).ok()).ok_or_else(bad)?;
+    let csr = l.hex("csr").filter(|c| c.first() == Some(&0x30) && c.len() <= 1024).ok_or_else(bad)?;
+    Ok(KeyRequest { key, csr })
+}
+
 impl Backend for Front {
     fn status(&self) -> Res<Status> {
         self.status_now()
@@ -296,55 +342,39 @@ impl Backend for Front {
 
     fn join_enterprise(&self, e: Enterprise) -> Res<()> {
         self.log(&format!("join 802.1X {:?} ({})", String::from_utf8_lossy(&e.ssid), e.method));
-        let mut r = Line::new("wifi-remember-eap")
-            .with_hex("ssid", &e.ssid)
-            .with("method", &e.method)
-            .with_hex("identity", e.identity.as_bytes())
-            .with_hex("domain", e.domain.as_bytes());
-        if let Some(h) = &e.handle {
-            r = r.with_hex("handle", h);
-        }
-        if let Some(k) = &e.key {
-            r = r.with_hex("key", k);
-        }
-        if let Some(c) = &e.cert {
-            r = r.with_hex("cert", c);
-        }
-        if let Some(a) = &e.anonymous {
-            r = r.with_hex("anonymous", a.as_bytes());
-        }
-        if let Some(c) = &e.ca {
-            r = r.with_hex("ca", c);
-        }
-        if e.system_roots {
-            r = r.with("roots", "system");
-        }
-        self.call(&r)?;
+        self.call(&eap_line(Line::new("wifi-remember-eap").with_hex("ssid", &e.ssid), &e))?;
         let rx = self.wait_lines();
         self.call(&Line::new("wifi-join").with_hex("ssid", &e.ssid))?;
         joined(&rx, ENTERPRISE_JOIN)
     }
 
     fn server_seen(&self, ssid: Vec<u8>) -> Res<ServerSeen> {
-        let v = self.call(&Line::new("wifi-eap-seen").with_hex("ssid", &ssid))?;
-        let Some(l) = v.iter().find(|l| l.verb == "seen") else { return Err(Fail::new(status::FAILED, "nothing-seen")) };
-        let text = |k: &str| l.hex(k).map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
-        Ok(ServerSeen {
-            names: l.get("names").filter(|n| *n != "-").map(|n| n.split(',').take(16).map(str::to_string).collect()).unwrap_or_default(),
-            subject: text("subject"),
-            issuer: text("issuer"),
-            not_after: l.get("not_after").unwrap_or("").to_string(),
-            sha256: l.hex("top_sha256").filter(|h| h.len() == 32).ok_or_else(|| Fail::new(status::FAILED, "bad-seen"))?,
-        })
+        seen(&self.call(&Line::new("wifi-eap-seen").with_hex("ssid", &ssid))?)
     }
 
     fn cert_request(&self, r: CertRequest) -> Res<KeyRequest> {
-        let v = self.call(&Line::new("wifi-eap-key").with_hex("ssid", &r.ssid).with_hex("cn", r.name.as_bytes()))?;
-        let bad = || Fail::new(status::FAILED, "bad-key-answer");
-        let l = v.iter().find(|l| l.verb == "key").ok_or_else(bad)?;
-        let key = l.hex("id").and_then(|k| <[u8; 16]>::try_from(k.as_slice()).ok()).ok_or_else(bad)?;
-        let csr = l.hex("csr").filter(|c| c.first() == Some(&0x30) && c.len() <= 1024).ok_or_else(bad)?;
-        Ok(KeyRequest { key, csr })
+        key_request(&self.call(&Line::new("wifi-eap-key").with_hex("ssid", &r.ssid).with_hex("cn", r.name.as_bytes()))?)
+    }
+
+    fn wired_sign_in(&self, e: Enterprise) -> Res<()> {
+        self.log(&format!("wired 802.1X ({})", e.method));
+        self.call(&eap_line(Line::new("wired-remember-eap"), &e)).map(|_| ())
+    }
+
+    fn wired_server_seen(&self) -> Res<ServerSeen> {
+        seen(&self.call(&Line::new("wired-eap-seen"))?)
+    }
+
+    fn wired_trust_server(&self) -> Res<()> {
+        self.call(&Line::new("wired-eap-trust")).map(|_| ())
+    }
+
+    fn wired_cert_request(&self, name: String) -> Res<KeyRequest> {
+        key_request(&self.call(&Line::new("wired-eap-key").with_hex("cn", name.as_bytes()))?)
+    }
+
+    fn wired_forget(&self) -> Res<()> {
+        self.call(&Line::new("wired-forget")).map(|_| ())
     }
 
     fn trust_server(&self, ssid: Vec<u8>) -> Res<()> {

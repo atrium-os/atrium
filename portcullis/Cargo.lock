@@ -218,16 +218,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atrium-session"
-version = "0.1.0"
-dependencies = [
- "libc",
- "portcullis-identity",
- "portcullis-jail",
- "portcullis-mounts",
-]
-
-[[package]]
 name = "atrium-types"
 version = "0.1.0"
 

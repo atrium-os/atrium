@@ -503,6 +503,9 @@ min_user_uid        = 1000
 max_user_uid        = 65000
 allowed_system_uids = [
     65055,   # _fasti: Calendar store service
+    65056,   # _imagedec: the system's image decoder, started per call by
+             # portcullisd (SystemWorker) under the system worker rule
+             # (image-decode-bundle.sh; app-composition.md C6)
     # Atrium's system uids sit above the user range and below nobody
     # (65534), clear of base and ports: 65 and 66, reserved here at first,
     # are FreeBSD's _dhcp and uucp.
@@ -567,6 +570,7 @@ allowed_system_uids = [
 [gid]
 allowed_system_gids = [
     65055,   # _fasti
+    65056,   # _imagedec
     # mirrors uid table
     65010,   # _frescod
     65011,   # _fresco-render
@@ -768,6 +772,35 @@ max_simultaneous_per_user = 32
 # §3.1) may be given read-write: <sockets_dir>/<name>, one directory per
 # service an app capability reaches (portcullis-jail apply_socket). A
 # portcullisd test checks every name it mounts is listed here.
+# Where a classed jail's root may be: an app's (and the console beside
+# it) under jails/, a workspace under its owner's, an empty console its
+# owner's own. {owner} is the request's class owner.
+class_roots = [
+    "/var/lib/atrium/jails/*",
+    "/var/lib/atrium/workspaces/{owner}/*",
+    "/var/lib/atrium/empty/{owner}",
+]
+# What portcullisd mounts into a classed jail beside its capabilities:
+# the owner's own files (folders, personas, workspaces' work, object cache,
+# Sheets recovery), document channels, and a workspace's or console's
+# tools and base system. Subtrees; `{owner}` is the class's owner.
+class_rw_subtrees = [
+    "/home/{owner}",
+    "/usr/home/{owner}",
+    "/atrium/sockets/opens",
+]
+class_ro_subtrees = [
+    "/var/run/atrium/fasti",
+    "/var/run/atrium/ide/{owner}",
+    "/atrium/sockets/ssh-agent",
+    "/var/lib/atrium/apps",
+    "/var/lib/atrium/debug",
+    "/var/lib/atrium/layers",
+    "/var/db/atrium/console",
+    "/var/db/atrium/workspace-bin",
+    "/bin", "/sbin", "/libexec",
+    "/usr/bin", "/usr/sbin", "/usr/include", "/usr/lib32", "/usr/libdata", "/usr/libexec", "/usr/share",
+]
 sockets_dir = "/atrium/sockets"
 sockets = [
     "aqueduct-gpu", "arca", "arca-courier", "audio", "audio-capture",

@@ -84,7 +84,7 @@ fn main() {
         mounts: vec![],
         devfs_ruleset: 0,
         network: NetworkConfig::Disable,
-        exec: Some(ExecSpec {
+        exec: Some(ExecSpec { cwd: None,
             groups: vec![],
             path: bin.clone(),
             argv,

@@ -225,7 +225,7 @@ impl Jailed {
             mounts,
             devfs_ruleset: DEVFS_RULESET,
             network,
-            exec: Some(ExecSpec { groups: vec![], path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
+            exec: Some(ExecSpec { cwd: None, groups: vec![], path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
             rctl,
             hostname: Some(name(uid)),
             hostid: Some(id.hostid),

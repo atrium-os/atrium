@@ -1,0 +1,20 @@
+[package]
+name = "atrium-image-decode"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The system's image decoder (app-composition.md C6, dev-tools.md §3.5): navigator-image's decoders in a jail of their own, for any app's pictures."
+
+[dependencies]
+atrium-assets = { path = "../sdk/atrium-assets" }
+atrium-worker = { path = "../sdk/atrium-worker" }
+navigator-image = { path = "../navigator-image" }
+# The strict SVG profile, for an SVG's own size before it is drawn.
+navigator-svg = { path = "../navigator-svg" }
+
+[profile.release]
+panic = "abort"
+
+[dev-dependencies]
+png = "0.17"

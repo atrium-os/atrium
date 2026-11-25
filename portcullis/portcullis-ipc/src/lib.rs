@@ -25,9 +25,8 @@ pub use fdpass::{recv_fds, send_fds, send_fds_with};
 
 /// Default socket path. Created by portcullisd at startup mode 0666
 /// (world-connectable); per-user authorization happens inside the
-/// daemon via getpeereid(2). Lives under /atrium/sockets/ so
-/// atrium-session's bind-mount of that directory exposes it to
-/// processes inside session jails without an extra mount entry.
+/// daemon via getpeereid(2). Lives under /atrium/sockets/, where
+/// jails reach it through their socket mounts.
 pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 
 /// The same socket under the per-service DIRECTORY convention:
@@ -46,9 +45,10 @@ pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 pub const SERVICE_SOCKET_PATH: &str = "/atrium/sockets/portcullis/portcullis.sock";
 
 /// ★ The worker-call socket (app-composition.md §4): mounted into the jail
-/// of an app that declares `[[workers]]`, and answering only `Hello` and
-/// `WorkerCall`, so declaring workers gives an app nothing else of
-/// portcullisd's.
+/// of an app that declares `[[workers]]` or `decoders`, and answering only
+/// `Hello`, `WorkerCall` (its own workers) and `SystemWorker` (the system's
+/// decoders it names, [`SYSTEM_WORKERS`]), so it gives an app nothing else
+/// of portcullisd's.
 pub const WORKERS_SOCKET_PATH: &str = "/atrium/sockets/workers/workers.sock";
 
 /// Where a client should look for portcullisd: the per-service path first (the
@@ -68,6 +68,21 @@ pub fn resolve_socket_path() -> Option<&'static str> {
 /// Clients send their version in `Request::Hello`; mismatched versions
 /// get `Response::ProtoMismatch` and the daemon closes the connection.
 pub const PROTO_VERSION: u32 = 1;
+
+/// The system's workers any app may call (`SystemWorker`;
+/// app-composition.md C6, dev-tools.md §3.5): name, the installed bundle
+/// that serves it. Each holds no capability and runs as its system worker
+/// rule's uid, in a one-shot jail per call.
+pub const SYSTEM_WORKERS: &[(&str, &str)] = &[("image", IMAGE_DECODE_APP)];
+
+/// The image decoder (`SystemWorker { name: "image" }`): navigator-image's
+/// decoders in a jail of their own.
+pub const IMAGE_DECODE_APP: &str = "org.atrium.image-decode";
+
+/// The bundle that serves the system worker `name`, if there is one.
+pub fn system_worker_app(name: &str) -> Option<&'static str> {
+    SYSTEM_WORKERS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
 
 /// The fetcher `OpenFetcher` starts (docs/spec/nuntius.md).
 pub const NUNTIUS_APP: &str = "org.atrium.nuntius";
@@ -229,6 +244,15 @@ pub enum Request {
     /// jail goes when the caller hangs up.
     WorkerCall {
         worker: String,
+    },
+
+    /// ★ One of the system's decoders ([`SYSTEM_WORKERS`]), for a launched
+    /// app (never a worker) whose INSTALLED manifest names it in
+    /// `decoders`: the system's installed bundle for `name`, in a
+    /// one-shot jail with no capability, as its system worker rule's uid,
+    /// never the caller's. The handoff is `WorkerCall`'s.
+    SystemWorker {
+        name: String,
     },
 
     /// ★ A fetcher of the caller's own: Nuntius (docs/spec/nuntius.md §2),

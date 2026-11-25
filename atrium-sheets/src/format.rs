@@ -148,6 +148,12 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
     v
 }
 
+/// Whether F4 repeats `c`: commands that change the selected cells (not
+/// those opening a bar or setting the border pen).
+pub fn repeatable(c: FormatCmd) -> bool {
+    !matches!(c, FormatCmd::Colors(_) | FormatCmd::Custom | FormatCmd::Angle | FormatCmd::PenLine(_) | FormatCmd::PenColor(_))
+}
+
 /// The command for a formatting key ([`pergola::widgets::GridAction::Format`]).
 pub fn for_key(k: char) -> Option<FormatCmd> {
     Some(match k {

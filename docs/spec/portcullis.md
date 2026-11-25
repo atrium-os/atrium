@@ -52,11 +52,13 @@ jails, devfs.rules, nullfs, rctl, and the Atrium substrate
 
 ## 0.5 Architecture (privsep — post-V7 revision)
 
-> **As built (2026-11-25):** portcullisd still creates app, workspace and
-> console jails itself with `jail -c`, as host root and without Capsicum;
-> only services, components and the one-shot lane go through jaild.
-> [app-jails-via-jaild.md](app-jails-via-jaild.md) is the plan to close
-> that gap (codebase review H3).
+> **As built (2026-11-25, J2):** every jail portcullisd needs (apps, their
+> setup phase, workspaces, app consoles, the empty console) is made by jaild
+> from a typed `CreateJailRequest`; shells and commands go in with
+> `ExecInJail` and the debugger's listening socket with `ListenInJail`.
+> portcullisd never runs `jail(8)` or `jail_attach`. Details and what is
+> left: [app-jails-via-jaild.md](app-jails-via-jaild.md) §4.2. The rest of
+> this section and §6 below describe the earlier design.
 
 Originally this spec described a single `portcullisd` that did
 both policy interpretation and `jail_set(2)`. Validation work in
@@ -295,12 +297,10 @@ At parse time:
 - `app.entry` is a relative path within the tree, points at an
   executable file. It, `[bundle].entry` and every `[[workers]].entry` are
   plain paths: `/`-separated components of `A-Z a-z 0-9 . _ + -`, none empty,
-  `.` or `..`. The entry becomes the jail's `exec.start` in a jail.conf, so a
-  quote, `$`, `\`, space or control character in it could add jail.conf
-  parameters (`exec.prestart` runs on the host as root). The renderer
-  (`portcullis-jail`, `render_jail_conf`) refuses such values too rather than
-  escaping them, and writes the file with `O_EXCL` and mode 0600 under a
-  fresh name (review 2026-11-24).
+  `.` or `..`. The entry becomes the path jaild executes; portcullisd
+  refuses an `exec.start` that is not one plain absolute path
+  (`jail_request.rs`), and arguments travel as their own list, never as
+  words in a string.
 - `capabilities.filesystem` paths are absolute (after `~/`
   expansion to the user's home) and not under `/atrium/`,
   `/dev/`, `/var/lib/tessera/` (those are managed mounts).

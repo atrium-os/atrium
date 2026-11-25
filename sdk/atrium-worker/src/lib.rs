@@ -250,6 +250,33 @@ impl Workers {
     }
 }
 
+/// One of the system's decoders (`decoders = ["image"]` in the app's
+/// manifest; app-composition.md C6): portcullisd's `SystemWorker`, a jail
+/// of its own per session, as the system's uid. With `ATRIUM_WORKERS=local`
+/// (development off Atrium), the program `ATRIUM_DECODER_<NAME>` names, or
+/// `atrium-<name>-decode` on the PATH, as a plain child.
+pub fn system(name: &str, timeout: Duration) -> Result<Session, Error> {
+    if name.is_empty() || name.len() > 32 || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return Err(Error::NoSuchWorker(name.into()));
+    }
+    let (ours, theirs) = UnixStream::pair()?;
+    let err = dup_stderr()?;
+    let proc = if std::env::var("ATRIUM_WORKERS").is_ok_and(|v| v == "local") {
+        use std::process::{Command, Stdio};
+        let var = format!("ATRIUM_DECODER_{}", name.to_ascii_uppercase().replace('-', "_"));
+        let prog = std::env::var(&var).unwrap_or_else(|_| format!("atrium-{name}-decode"));
+        let out: OwnedFd = err.try_clone()?;
+        let c = Command::new(&prog).stdin(Stdio::from(OwnedFd::from(theirs))).stdout(Stdio::from(out)).stderr(Stdio::from(err))
+            .env_clear().env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())).spawn()
+            .map_err(|e| Error::Start(format!("{prog}: {e}")))?;
+        Proc::Child(c)
+    } else {
+        let fds = [theirs.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()];
+        Proc::Jail(portcullisd_call(serde_json::json!({"op": "system_worker", "name": name}), &fds)?)
+    };
+    Ok(Session { sock: ours, proc, timeout, max: DEFAULT_MAX, broken: false })
+}
+
 impl Workers {
     /// Whether the app declares worker `name`.
     pub fn has(&self, name: &str) -> bool { self.defs.contains_key(name) }
@@ -593,6 +620,11 @@ fn worker_call(name: &str, sock: &UnixStream, err: &OwnedFd) -> Result<UnixStrea
 pub const MAX_EXTRA_FDS: usize = 8;
 
 fn worker_call_fds(name: &str, fds: &[std::os::fd::RawFd]) -> Result<UnixStream, Error> {
+    portcullisd_call(serde_json::json!({"op": "worker_call", "worker": name}), fds)
+}
+
+/// `op` on portcullisd's socket, then `fds` for the jail it starts.
+fn portcullisd_call(op: serde_json::Value, fds: &[std::os::fd::RawFd]) -> Result<UnixStream, Error> {
     let start = |e: io::Error| Error::Start(format!("portcullisd: {e}"));
     let mut s = portcullisd().map_err(start)?;
     s.set_read_timeout(Some(Duration::from_secs(30))).map_err(start)?;
@@ -601,7 +633,7 @@ fn worker_call_fds(name: &str, fds: &[std::os::fd::RawFd]) -> Result<UnixStream,
     if hello["kind"] != "hello" {
         return Err(Error::Start(format!("portcullisd: {hello}")));
     }
-    json_line(&mut s, &serde_json::json!({"op": "worker_call", "worker": name})).map_err(start)?;
+    json_line(&mut s, &op).map_err(start)?;
     let ready = read_line(&mut s).map_err(start)?;
     match ready["kind"].as_str() {
         Some("ready_for_fds") => {}
@@ -630,6 +662,9 @@ pub struct Session {
 }
 
 impl Session {
+    /// The largest answer to accept (default [`DEFAULT_MAX`]).
+    pub fn set_max_answer(&mut self, bytes: usize) { self.max = bytes }
+
     /// Change the time a call may take.
     pub fn set_timeout(&mut self, d: Duration) { self.timeout = d }
 

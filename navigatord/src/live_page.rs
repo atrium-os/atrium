@@ -57,19 +57,85 @@ pub fn scope(page: &str, url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Where a live page's resources come from: the plain fetcher (`L`), or a
+/// Where a live page's resources come from: the page's jar through Arca
+/// ([`LiveJar`], D9), the plain fetcher (`L`) where there is no Arca, or a
 /// test's stand-in.
 pub trait Resources {
-    /// One GET: status, content type token (`-` for none), body.
-    fn get(&mut self, url: &str) -> Result<(u16, String, Vec<u8>), String>;
+    /// One GET (`first`: the page itself): status, content type token
+    /// (`-` for none), body.
+    fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String>;
+    /// A script's POST (I6.3) of `body` as `content_type`.
+    fn post(&mut self, _url: &str, _content_type: &str, _body: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+        Err("a POST needs the page's jar".into())
+    }
 }
 
 impl Resources for crate::Upstream {
-    fn get(&mut self, url: &str) -> Result<(u16, String, Vec<u8>), String> {
+    fn get(&mut self, url: &str, _first: bool) -> Result<(u16, String, Vec<u8>), String> {
         match self {
             crate::Upstream::Fetchd(f, _) => f.live_resource(url),
             _ => Err("a live page needs the plain fetcher".into()),
         }
+    }
+}
+
+/// The content type token a live page's answer carries: `type/subtype`,
+/// lower case, or `-` (as fetchd's `L` spells it).
+fn type_token(headers: &[(String, String)]) -> String {
+    let value = headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str());
+    let Some(mime) = value.and_then(|v| v.split(';').next()).map(str::trim) else { return "-".into() };
+    let token = |t: &str| !t.is_empty() && t.len() <= 64 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b));
+    match mime.split_once('/') {
+        Some((a, b)) if token(a) && token(b) => mime.to_ascii_lowercase(),
+        _ => "-".into(),
+    }
+}
+
+/// A live page's jar (D9): its site's partition in the trail's jar, kept
+/// by Arca, the broker's view for this run. Every request goes through
+/// Arca's couriers with a ticket; the engine never holds a cookie.
+#[derive(Clone)]
+pub struct LiveJar {
+    pub cookies: crate::Cookies,
+    pub view: u64,
+    /// The page's host, the initiator of its requests.
+    pub host: String,
+}
+
+impl LiveJar {
+    /// A new view for the page at `url` in the jar `jar` (`None`: the
+    /// persona's own).
+    pub fn open(cookies: crate::Cookies, url: &str, jar: Option<u64>) -> Result<Self, String> {
+        let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).ok_or("no host")?;
+        let view = crate::VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cookies.lock().unwrap().show_live(view, url, jar).map_err(|e| format!("the page's jar: {e:?}"))?;
+        Ok(LiveJar { cookies, view, host })
+    }
+
+    fn answer(got: Result<navigator_cookies::Fetched, navigator_cookies::Refused>) -> Result<(u16, String, Vec<u8>), String> {
+        let r = got.map_err(|e| format!("through Arca: {e:?}"))?;
+        if r.body.len() > navigator_prerender::fetch::LIVE_RESOURCE_MAX { return Err("the answer is too big".into()); }
+        Ok((r.status, type_token(&r.headers), r.body))
+    }
+
+    /// A form the page submitted (I6.3): sent through the jar, its answer's
+    /// redirects followed; the address of the page that answered.
+    pub fn submit(&self, url: &str, body: &[u8]) -> Result<String, String> {
+        let f = navigator_cookies::Fetch::live_form(url, &self.host, body.to_vec());
+        let r = self.cookies.lock().unwrap().fetch(self.view, &f).map_err(|e| format!("through Arca: {e:?}"))?;
+        Ok(r.url)
+    }
+}
+
+impl Resources for LiveJar {
+    fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String> {
+        let f = if first { navigator_cookies::Fetch::navigation(url, None, true) } else { navigator_cookies::Fetch::subresource(url, &self.host) };
+        Self::answer(self.cookies.lock().unwrap().fetch_once(self.view, &f))
+    }
+
+    fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+        let f = navigator_cookies::Fetch::script_post(url, &self.host, content_type, body.to_vec());
+        Self::answer(self.cookies.lock().unwrap().fetch_once(self.view, &f))
     }
 }
 
@@ -120,8 +186,20 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, start
             if served.refused.len() < 64 { served.refused.push(target); }
             output.send(Event::Error { id, code }).map_err(|e| e.to_string())
         };
-        if open.method != Method::Get || open.body.is_some() || open.range.is_some() || open.if_range.is_some() || open.deliver != Deliver::Stream {
-            refuse("only a whole GET in I6.1", ErrorCode::Policy, &mut served)?;
+        // A whole GET, or a script's POST with its body (I6.3); never a
+        // range or a conditional request.
+        let post = match (&open.method, &open.body) {
+            (Method::Get, None) => None,
+            (Method::Post, Some(b)) if delivered && b.bytes.len() <= navigator_cookies::BODY_MAX
+                && !b.content_type.is_empty() && b.content_type.len() <= navigator_cookies::CONTENT_TYPE_MAX
+                && b.content_type.bytes().all(|c| (0x20..0x7f).contains(&c)) => Some(b),
+            _ => {
+                refuse("only a whole GET, or a POST with its body", ErrorCode::Policy, &mut served)?;
+                continue;
+            }
+        };
+        if open.range.is_some() || open.if_range.is_some() || open.deliver != Deliver::Stream {
+            refuse("only a whole resource", ErrorCode::Policy, &mut served)?;
             continue;
         }
         // The engine's first request is for the page; it names no address.
@@ -137,7 +215,11 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, start
             }
             open.url.clone()
         };
-        let (status, kind, body) = match upstream.get(&url) {
+        let got = match post {
+            Some(b) => upstream.post(&url, &b.content_type, &b.bytes),
+            None => upstream.get(&url, !delivered),
+        };
+        let (status, kind, body) = match got {
             Ok(r) => r,
             Err(why) if delivered => {
                 eprintln!("navigatord: a live page's resource failed: {why}");
@@ -202,6 +284,8 @@ pub struct Live {
     /// Whether the engine started, and the latest placement: the engine
     /// lays the page out at its size (I6.2), told once it runs.
     placed: Arc<Mutex<(bool, [u32; 4])>>,
+    /// The broker's view for this run, closed with it (its cookies stay in Arca).
+    jar: Option<LiveJar>,
 }
 
 /// Tell the engine its page area's size; a refusal is logged, not fatal.
@@ -224,8 +308,9 @@ impl Live {
         press: navigator_control::Press,
         rect: [u32; 4],
         cfg: Arc<crate::Config>,
+        jar: Option<LiveJar>,
         started: impl FnOnce(String) + Send + 'static,
-        navigate: impl Fn(String) + Send + 'static,
+        navigate: impl Fn(String) + Send + Sync + 'static,
         url_changed: impl Fn(String) + Send + 'static,
         finished: impl FnOnce(Option<String>) + Send + 'static,
     ) -> Result<Self, String> {
@@ -253,10 +338,14 @@ impl Live {
         let (done, fetched) = std::sync::mpsc::channel();
         let page = url.clone();
         let (delivered_tx, delivered) = std::sync::mpsc::channel::<String>();
+        let forms = jar.clone();
+        let closing = jar.clone();
         std::thread::spawn(move || {
-            let result = crate::upstream(&cfg, &crate::instance()).and_then(|mut up| {
-                serve(channel, &page, &mut up, &mut |u| { let _ = delivered_tx.send(u.to_string()); })
-            });
+            let mut on_delivered = |u: &str| { let _ = delivered_tx.send(u.to_string()); };
+            let result = match jar {
+                Some(mut jar) => serve(channel, &page, &mut jar, &mut on_delivered),
+                None => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, &mut on_delivered)),
+            };
             match &result {
                 Ok(s) => eprintln!("navigatord: live page served {} requests, {} bytes, {} refused", s.requests, s.bytes, s.refused.len()),
                 Err(e) => eprintln!("navigatord: live page: {e}"),
@@ -265,6 +354,7 @@ impl Live {
         });
         let watched = parent.clone();
         let size = placed.clone();
+        let navigate = Arc::new(navigate);
         std::thread::spawn(move || {
             use limen::web_island::{EndReason, Lifecycle, Report};
             let mut reports = Lifecycle::default();
@@ -297,7 +387,7 @@ impl Live {
                         // it as a trail entry: live again if it is this origin's
                         // (`ContinueLive`), in the document lane if not.
                         Some(Report::Navigate(to)) => match navigation(page.as_deref(), to) {
-                            Some(to) => navigate(to),
+                            Some(to) => (*navigate)(to),
                             None => eprintln!("navigatord: a live page's navigation refused ({})", crate::refused_target(to)),
                         },
                         // The page changed its own address (pushState): a trail
@@ -306,6 +396,20 @@ impl Live {
                         Some(Report::UrlChanged(to)) => match address_change(page.as_deref(), to) {
                             Some(to) => url_changed(to),
                             None => break Some("the engine claimed another origin's address".into()),
+                        },
+                        // A form (I6.3): only to the page's own site, sent
+                        // through its jar off this thread; the page that
+                        // answers opens as the next trail entry.
+                        Some(Report::Submit { url: to, body }) => match (page.as_deref().map(|p| scope(p, to)), &forms) {
+                            (Some(Ok(())), Some(jar)) => {
+                                let (jar, to, body, navigate) = (jar.clone(), to.to_string(), body.to_vec(), navigate.clone());
+                                std::thread::spawn(move || match jar.submit(&to, &body) {
+                                    Ok(answer) => (*navigate)(answer),
+                                    Err(why) => eprintln!("navigatord: a live page's form to {} failed: {why}", crate::refused_target(&to)),
+                                });
+                            }
+                            (Some(Err(why)), _) => eprintln!("navigatord: a live page's form refused: {why} ({})", crate::refused_target(to)),
+                            _ => eprintln!("navigatord: a live page's form refused: no jar ({})", crate::refused_target(to)),
                         },
                         Some(Report::Ended(EndReason::Closed)) => break None,
                         Some(Report::Ended(EndReason::Failed)) => break Some("the page's engine failed".into()),
@@ -331,7 +435,7 @@ impl Live {
                 finished(why);
             }
         });
-        Ok(Live { url, press, parent, embed, placed })
+        Ok(Live { url, press, parent, embed, placed, jar: closing })
     }
 
     /// Move the island with the page area (the window resized).
@@ -358,6 +462,7 @@ impl Drop for Live {
     fn drop(&mut self) {
         // Dropping Limen's connection ends the embed and its engine.
         self.parent.lock().unwrap().take();
+        if let Some(j) = &self.jar { j.cookies.lock().unwrap().close(j.view); }
     }
 }
 
@@ -407,7 +512,12 @@ mod tests {
 
     struct Fake(Vec<String>);
     impl Resources for Fake {
-        fn get(&mut self, url: &str) -> Result<(u16, String, Vec<u8>), String> {
+        fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+            self.0.push(format!("POST {url} {content_type} {}", String::from_utf8_lossy(body)));
+            Ok((201, "application/json".into(), b"{\"count\":1}".to_vec()))
+        }
+        fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String> {
+            assert_eq!(first, self.0.is_empty(), "only the page is the first");
             self.0.push(url.to_string());
             match url {
                 "https://app.example/app.html" => Ok((200, "text/html".into(), b"<p>hi".to_vec())),
@@ -456,17 +566,29 @@ mod tests {
         let mut post = Open::get(5, "https://app.example/api/items");
         post.method = Method::Post;
         post.body = Some(nuntius::Body { content_type: "application/json".into(), bytes: b"{}".to_vec() });
-        c.open(post).unwrap();
-        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy), "no POST in I6.1");
+        c.open(post.clone()).unwrap();
+        let (head, answer, _) = body(&mut c);
+        assert_eq!((head.map(|h| h.0), answer.as_slice()), (Some(201), &b"{\"count\":1}"[..]), "a script's POST, with its body (I6.3)");
+        // Not to another site; never a range.
+        let mut away = post.clone();
+        (away.id, away.url) = (6, "https://cdn.thirdparty.example/collect".into());
+        let mut part = Open::get(7, "https://app.example/app.js");
+        part.range = Some((0, Some(1)));
+        for o in [away, part] {
+            c.open(o).unwrap();
+            assert_eq!(body(&mut c).2, Some(ErrorCode::Policy));
+        }
         drop(c);
         let (r, asked, started) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         server.join().unwrap();
         let served = r.unwrap();
         assert_eq!(started, vec!["https://app.example/app.html".to_string()]);
         // Refused requests never reached the network.
-        assert_eq!(asked, ["https://app.example/app.html", "https://app.example/app.js", "https://api.app.example/status"]);
-        assert_eq!(served.refused, ["host cdn.thirdparty.example, site thirdparty.example", "host app.example, site app.example"]);
-        assert_eq!(served.requests, 5);
+        assert_eq!(asked, ["https://app.example/app.html", "https://app.example/app.js", "https://api.app.example/status",
+                           "POST https://app.example/api/items application/json {}"]);
+        assert_eq!(served.refused, ["host cdn.thirdparty.example, site thirdparty.example", "host cdn.thirdparty.example, site thirdparty.example",
+                                    "host app.example, site app.example"]);
+        assert_eq!(served.requests, 7);
     }
 
     #[test]

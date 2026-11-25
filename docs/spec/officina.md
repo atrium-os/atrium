@@ -4885,6 +4885,12 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Ctrl+T** (or Ctrl+L) is Format as Table, **Ctrl+Shift+L** turns Filter on or off, and **Ctrl+K** opens Insert/Edit Link. The menu shows these keys (`data::key_cmd`).
 - Tests: `f4_cycles_the_reference_at_the_caret`, the grid editor's F2/F4 key test, the grid key test, and `excel_row_and_column_keys_pick_the_command_for_the_selection`. Results: pergola 231 and Sheets 141 lib tests pass.
 
+### 16.114 F4 repeats; Ctrl+A and Ctrl+Shift+* select the current region (2026-11-25)
+
+- **F4** outside the editor repeats the last command on the current selection, as Excel's Repeat does. That covers format commands, a colour typed as hex, and data commands that act on cells in place: insert, delete, hide, merge, align, clear, the Paste Special family, sort, AutoSum and fill (`format::repeatable`, `data::repeatable`). Commands that only open a bar, such as Fill Colour… or Custom Format…, or that set the border pen, don't replace what F4 repeats. Before any command, F4 says there's nothing to repeat yet. Inside the editor, F4 still anchors references (§16.113).
+- **Ctrl+Shift+*** selects the current region: the rectangle around the cursor, grown while any cell just outside it, diagonals included, holds something. **Ctrl+A** does the same first. Pressed again, or on a cell with nothing around it, Ctrl+A selects everything (`pergola::widgets::grid_view::current_region`). Each side is grown as far as it goes in one pass, and at most 4,000,000 cells are looked at.
+- Tests: `f4_repeats_the_last_command_on_the_new_selection` (Sheets) and `ctrl_a_and_ctrl_shift_star_select_the_data_around_the_cursor` (pergola). Results: Sheets 142 and pergola 232 lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

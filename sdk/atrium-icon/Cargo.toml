@@ -1,0 +1,16 @@
+[package]
+name = "atrium-icon"
+description = "Atrium app icons: the dock's own check, and importing an SVG drawn elsewhere into one the dock draws (dev-tools.md §3.5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The strict profile and the fills the dock draws (MIT OR Apache-2.0).
+navigator-svg = { path = "../../navigator-svg" }
+# The dock's limits.
+portcullis-toml = { path = "../../portcullis/portcullis-toml" }
+# Same as navigator-svg's (MIT OR Apache-2.0).
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }
+usvg = { version = "0.49", default-features = false }

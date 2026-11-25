@@ -137,6 +137,29 @@ pub struct SysfilParams {
     pub families: Option<String>,
 }
 
+impl SysfilParams {
+    /// Both filters' allowances: each list the union of the two, and a list
+    /// one side leaves unrestricted stays unrestricted. The mode is `self`'s.
+    pub fn union(&self, other: &SysfilParams) -> SysfilParams {
+        let join = |x: &Option<String>, y: &Option<String>| match (x, y) {
+            (None, _) | (_, None) => None,
+            (Some(x), Some(y)) => {
+                let mut v: Vec<&str> = x.split(',').chain(y.split(',')).filter(|s| !s.is_empty()).collect();
+                v.sort();
+                v.dedup();
+                Some(v.join(","))
+            }
+        };
+        SysfilParams {
+            mode: self.mode,
+            syscalls: join(&self.syscalls, &other.syscalls),
+            ioctls: join(&self.ioctls, &other.ioctls),
+            sockopts: join(&self.sockopts, &other.sockopts),
+            families: join(&self.families, &other.families),
+        }
+    }
+}
+
 impl SysfilPolicy {
     /// Resolve a profile by name, following `include`s (no cycles, depth 8).
     pub fn resolve(&self, name: &str) -> Result<SysfilParams, String> {
@@ -689,6 +712,18 @@ pub struct AppsPolicy {
     /// be given read-write: one per capability that reaches a service.
     #[serde(default)]
     pub sockets:                   Vec<String>,
+    /// Where a classed jail (app, workspace, console) may have its root:
+    /// globs whose `*` segment is one plain name, with `{owner}` standing
+    /// for the class's owner.
+    #[serde(default)]
+    pub class_roots:               Vec<String>,
+    /// Sources a classed jail may mount read-only, beyond the mount_sources
+    /// lists: each a subtree, with `{owner}` standing for the class's owner.
+    #[serde(default)]
+    pub class_ro_subtrees:         Vec<String>,
+    /// And read-write (or read-only).
+    #[serde(default)]
+    pub class_rw_subtrees:         Vec<String>,
 }
 
 impl Policy {

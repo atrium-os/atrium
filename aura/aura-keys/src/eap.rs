@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 /// EAPOL packet types (802.1X-2010 §11.3.2).
 pub const EAPOL_EAP: u8 = 0;
+pub const EAPOL_START: u8 = 1;
 pub const EAPOL_LOGOFF: u8 = 2;
 pub const EAPOL_KEY: u8 = 3;
 const EAPOL_VERSION: u8 = 2;

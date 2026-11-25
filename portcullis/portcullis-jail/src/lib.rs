@@ -9,7 +9,6 @@
 
 pub mod capabilities;
 pub mod config;
-pub mod render;
 
 use std::path::PathBuf;
 
@@ -18,7 +17,6 @@ use thiserror::Error;
 use portcullis_toml::Manifest;
 
 pub use config::{JailConfig, MountSpec, Value};
-pub use render::RenderError;
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -229,10 +227,11 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
 
     /* Apply each declared capability. */
     capabilities::apply_all(&manifest.capabilities, &mut jc, opts)?;
-    /* An app with `[[workers]]` reaches portcullisd's worker-call socket,
-     * which takes WorkerCall and nothing else. (A worker's own jail is
-     * built from a manifest with no workers, so it does not.) */
-    if !manifest.workers.is_empty() {
+    /* An app with `[[workers]]` or `decoders` reaches portcullisd's
+     * worker-call socket, which takes WorkerCall (its own workers) and
+     * SystemWorker (the decoders it names) and nothing else. (A worker's
+     * own jail is built from a manifest with neither, so it does not.) */
+    if !manifest.workers.is_empty() || manifest.capabilities.decoders.as_ref().is_some_and(|d| !d.is_empty()) {
         capabilities::apply_socket("workers", &mut jc, opts);
     }
     /* `embeds` (app-composition.md §5.1): limend's socket. limend checks
@@ -245,7 +244,7 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
      *
      * Capabilities have always recorded devfs actions (audio unhides dsp*,
      * input unhides input/event*, …) and nothing ever applied them: the
-     * per-jail rules were rendered by render_devfs_rules and never loaded, and
+     * per-jail rules were rendered as devfs.rules text and never loaded, and
      * the ruleset the jail was mounted with (99) did not exist. Apps got their
      * devices only because nothing was hidden at all. With a real baseline
      * ruleset those grants must actually happen, per jail.

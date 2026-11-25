@@ -40,6 +40,16 @@ Commands:
       archive to <out>.insula, which installs through the install sheet.
       Programs are stripped; their debug info goes to <out>.debug/.
       Without Cargo.toml (a C project) it bundles what make built.
+  icon check <file.svg> [--json]
+      Would the dock draw this SVG as an app icon? Its shapes, points and
+      size against the limits (64 shapes, 8192 points, 32 KB), and the
+      first thing it can't take.
+  icon import <file.svg> [--name <n>] [--dry-run] [--json]
+      An SVG drawn in another app, as an icon the dock draws, in
+      assets/icons/<n>.svg (n from the file name by default): editor data,
+      hidden layers, scripts and links are dropped, transforms and styles
+      are folded into plain filled paths. Says what it converted and what
+      it couldn't keep (text, filters, masks, pictures).
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
       Fuzz a worker or an input surface of the core with libFuzzer
@@ -73,12 +83,94 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args[1..]),
         Some("worker") => cmd_worker(&args[1..]),
         Some("bundle") => cmd_bundle(&args[1..]),
+        Some("icon") => cmd_icon(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
         }
         Some(other) => {
             eprintln!("cargo atrium: unknown command {other:?}\n\n{HELP}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_icon(args: &[String]) -> ExitCode {
+    use cargo_atrium::icon;
+    let sub = args.first().map(String::as_str);
+    let (mut file, mut name, mut json, mut dry) = (None, None, false, false);
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--dry-run" => dry = true,
+            "--name" => name = it.next().cloned(),
+            o if o.starts_with("--") => {
+                eprintln!("cargo atrium icon: unknown flag {o}");
+                return ExitCode::from(2);
+            }
+            o => file = Some(PathBuf::from(o)),
+        }
+    }
+    let fail = |e: String| {
+        if json {
+            println!("{}", serde_json::json!({"ok": false, "error": e}));
+        } else {
+            eprintln!("cargo atrium icon: {e}");
+        }
+        ExitCode::FAILURE
+    };
+    let Some(file) = file else { return fail("an SVG file, e.g. cargo atrium icon check assets/icons/app.svg".into()) };
+    match sub {
+        Some("check") => {
+            let r = match icon::read_source(&file) {
+                Ok(b) => atrium_icon::check(&b),
+                Err(e) => return fail(e),
+            };
+            if json {
+                println!("{}", icon::report_json(&r));
+            } else {
+                println!("{}: {} shapes, {} points, {} bytes", file.display(), r.shapes, r.points, r.bytes);
+                match &r.problem {
+                    None => println!("  the dock draws it"),
+                    Some(why) => println!("  the dock won't draw it: {why}"),
+                }
+            }
+            if r.ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Some("import") => {
+            let proj = PathBuf::from(".");
+            let p = match icon::plan(&proj, &file, name.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            let ok = p.import.report.ok();
+            if !dry && ok {
+                if let Err(e) = icon::apply(&proj, &p) {
+                    return fail(e);
+                }
+            }
+            if json {
+                let v = serde_json::json!({
+                    "ok": ok, "dry_run": dry, "path": p.path, "replaces": p.replaces,
+                    "report": icon::report_json(&p.import.report),
+                    "converted": p.import.converted, "dropped": p.import.dropped,
+                    "svg": if dry { Some(&p.import.svg) } else { None },
+                });
+                println!("{v}");
+            } else {
+                let verb = match (ok, dry) { (false, _) => "can't import", (true, true) => "would write", _ => "wrote" };
+                println!("cargo atrium: {verb} {}{}", p.path, if p.replaces { " (replacing it)" } else { "" });
+                let r = &p.import.report;
+                println!("  {} shapes, {} points, {} bytes", r.shapes, r.points, r.bytes);
+                for c in &p.import.converted { println!("  converted: {c}") }
+                for d in &p.import.dropped { println!("  dropped:   {d}") }
+                if let Some(why) = &r.problem { println!("  the dock won't draw it: {why}") }
+            }
+            if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        _ => {
+            eprintln!("cargo atrium icon: check <file.svg> [--json] | import <file.svg> [--name <n>] [--dry-run] [--json]");
             ExitCode::from(2)
         }
     }
@@ -339,7 +431,16 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
         programs.push(from.clone());
     }
     for f in bundle::named_files(&manifest) {
+        // The icon is the project's own file, not a link out of it.
+        if std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink()) {
+            return fail(format!("{f} is a link: the icon must be a file in the project"));
+        }
         steps.push((PathBuf::from(&f), f.clone()));
+    }
+    // The pictures and icons atrium-assets opens, at the same paths.
+    match cargo_atrium::icon::asset_files(Path::new(".")) {
+        Ok(files) => steps.extend(files.into_iter().map(|f| (PathBuf::from(&f), f))),
+        Err(e) => return fail(e),
     }
     for (from, to) in &steps {
         if let Err(e) = place(from, to) {

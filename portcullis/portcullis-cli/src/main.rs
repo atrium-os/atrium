@@ -1,11 +1,8 @@
 //! portcullis — CLI front-end.
 //!
 //! Phase 1: `validate <atrium.toml>`
-//! Phase 2: `launch --dry-run <app-tree>` (renders jail.conf;
-//!          doesn't invoke jail(8) yet)
-//!          `launch --no-prompt <app-tree>` (also runs jail -c)
-//!
-//! Future phases add capability prompts, portcullisd integration, etc.
+//! `launch <app-id>` asks portcullisd, which has jaild make the jail;
+//! `launch --dry-run <app-tree>` shows the jail an app's manifest builds.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,8 +25,7 @@ usage:
         keys there). Prints whose key signed it; exits 1 if refused.
 
     portcullis launch [--dry-run | --no-prompt] [--persona NAME] <app-id|app-tree>
-        Reads <tree>/atrium.toml, builds a jail.conf section, and
-        launches the jail.
+        Asks portcullisd to launch the installed app <app-id>.
 
         --persona NAME runs the app's instance in that persona (one of
         the person's personas, personas.md): its own jail, uid and data.
@@ -42,8 +38,8 @@ usage:
             [d]eny          — refuse this launch
         Non-tty contexts (scripts) get the old refusal + hint.
 
-        --dry-run    Render jail.conf + devfs.rules and exit; no
-                     mounts, no jail, no policy check.
+        --dry-run    Show the jail <app-tree>'s manifest builds and
+                     exit; no mounts, no jail, no policy check.
         --no-prompt  Bypass the policy check (dev mode). All
                      manifest-declared capabilities are granted
                      for this launch only — nothing persisted.
@@ -354,9 +350,13 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool, persona: Option<&s
         }
     }
 
-    /* Path-based or --dry-run path: read manifest locally. Same as
-     * before — used for development workflows that pass an app tree
-     * by path, and for `--dry-run` rendering. */
+    /* Only portcullisd launches (through jaild): an app tree given by path
+     * is installed first, as a dev bundle or a package, and launched by id. */
+    if !dry_run {
+        eprintln!("portcullis launch: {tree_arg} is a path; install it and launch it by its id");
+        return ExitCode::from(2);
+    }
+    /* --dry-run: read the manifest here and show the jail it builds. */
     let tree = resolve_app_tree(tree_arg);
     if !tree.exists() {
         if looks_like_app_id(tree_arg) {
@@ -401,17 +401,9 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool, persona: Option<&s
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: None,                /* one jail per app on this path */
         persist: true,
-        /* ★ Synthetic, per app (portcullis.md §9.1c). A dry run only RENDERS
-         * the config, so it must not create the root-only machine secret on
-         * whatever machine renders it — it shows a placeholder, labelled. */
-        host_identity: if dry_run {
-            portcullis_identity::derive(&[0u8; 32], "dry-run placeholder — not this machine's identity")
-        } else {
-            match portcullis_identity::for_app(&manifest.app.id) {
-                Ok(id) => id,
-                Err(e) => { eprintln!("portcullis: host identity: {e}"); return ExitCode::from(1) }
-            }
-        },
+        /* ★ A dry run must not create the root-only machine secret on
+         * whatever machine shows it: a placeholder, labelled. */
+        host_identity: portcullis_identity::derive(&[0u8; 32], "dry-run placeholder — not this machine's identity"),
         /* Dev launches run unfiltered; portcullisd's launch path applies the
          * app's system call filter (jail-sysfil.md §5.2). */
         sysfil: None,
@@ -425,315 +417,9 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool, persona: Option<&s
         Ok(jc) => jc,
     };
 
-    if dry_run {
-        println!("# jail.conf section ──────────────────────────────");
-        match jc.render_jail_conf() {
-            Ok(conf) => print!("{conf}"),
-            Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
-        }
-        println!();
-        println!("# devfs.rules ruleset ────────────────────────────");
-        print!("{}", jc.render_devfs_rules());
-        return ExitCode::SUCCESS;
-    }
-
-    /* Default mode: consult the policy. Try portcullisd first;
-     * fall back to direct file access if the daemon isn't running.
-     * --no-prompt is the dev-mode bypass — skips the policy check
-     * AND the interactive prompt entirely. */
-    if !no_prompt {
-        let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
-        loop {
-            let approval = check_authorization(&manifest.app.id, &current_hash,
-                                               &manifest.capabilities);
-            let lines = match approval {
-                Ok(None) => break,                 /* authorized */
-                Ok(Some(delta_lines)) => delta_lines,
-                Err(e) => {
-                    eprintln!("portcullis launch: policy check failed: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            /* Phase 5 prompt — same shape as the daemon-forward
-             * path but driven from the in-CLI delta. */
-            if !stdin_is_tty() {
-                eprintln!("portcullis launch: {} needs capabilities not yet granted:",
-                    manifest.app.id);
-                for line in &lines { eprintln!("    - {line}"); }
-                eprintln!();
-                eprintln!("    grant with: portcullis policy grant {}", manifest.app.id);
-                eprintln!("    or bypass:  portcullis launch --no-prompt {tree_arg}");
-                return ExitCode::from(1);
-            }
-            match prompt_for_approval(&manifest.app.id, &lines) {
-                ApprovalDecision::AllowOnce => {
-                    /* Skip remaining policy enforcement on this
-                     * launch only (no persistence). */
-                    break;
-                }
-                ApprovalDecision::AllowAlways => {
-                    if let Err(e) = persist_grant_for(
-                        &manifest.app.id, &text, &manifest.capabilities,
-                    ) {
-                        eprintln!("portcullis launch: persist grant: {e}");
-                        return ExitCode::from(1);
-                    }
-                    /* Re-run the check; should be empty delta now. */
-                    continue;
-                }
-                ApprovalDecision::Deny => {
-                    eprintln!("portcullis launch: denied by user");
-                    return ExitCode::from(1);
-                }
-            }
-        }
-    }
-
-    /* Daemon-first: if portcullisd is running, it owns the
-     * privileged side of the launch (mount + jail -c + teardown).
-     * The CLI degrades to performing the launch in-process when
-     * the daemon isn't running — useful for headless development
-     * and as a fallback if the daemon dies. */
-    if looks_like_app_id(tree_arg) {
-        let mut bypass = no_prompt;
-        loop {
-            match daemon::launch(&manifest.app.id, bypass, None) {
-                Ok(Some(daemon::LaunchReply::Exited { code })) => {
-                    return match code {
-                        Some(0) => ExitCode::SUCCESS,
-                        Some(c) => ExitCode::from(c.min(255).max(1) as u8),
-                        None    => ExitCode::from(1),  /* signal */
-                    };
-                }
-                Ok(Some(daemon::LaunchReply::Failed { stage, message })) => {
-                    eprintln!("portcullis launch [{stage}]: {message}");
-                    return ExitCode::from(1);
-                }
-                Ok(Some(daemon::LaunchReply::AlreadyRunning { jid, uid })) => {
-                    println!("portcullis launch: {} is already running (jid {jid}, uid {uid})",
-                        manifest.app.id);
-                    return ExitCode::SUCCESS;
-                }
-                Ok(Some(daemon::LaunchReply::NeedsApproval { delta })) => {
-                    /* Phase 5: prompt on tty, refuse otherwise. */
-                    if !stdin_is_tty() {
-                        eprintln!("portcullis launch: {} needs capabilities not yet granted:",
-                            manifest.app.id);
-                        for line in &delta { eprintln!("    - {line}"); }
-                        eprintln!();
-                        eprintln!("    grant with: portcullis policy grant {}", manifest.app.id);
-                        eprintln!("    or bypass:  portcullis launch --no-prompt {tree_arg}");
-                        return ExitCode::from(1);
-                    }
-                    match prompt_for_approval(&manifest.app.id, &delta) {
-                        ApprovalDecision::AllowOnce => {
-                            bypass = true;
-                            continue;   /* retry the launch with bypass */
-                        }
-                        ApprovalDecision::AllowAlways => {
-                            if let Err(e) = persist_grant_for(
-                                &manifest.app.id, &text, &manifest.capabilities,
-                            ) {
-                                eprintln!("portcullis launch: persist grant: {e}");
-                                return ExitCode::from(1);
-                            }
-                            /* Loop: daemon will now Authorize. bypass
-                             * stays at its original value (likely
-                             * false) — we want the daemon to verify
-                             * the persisted grant covers everything. */
-                            continue;
-                        }
-                        ApprovalDecision::Deny => {
-                            eprintln!("portcullis launch: denied by user");
-                            return ExitCode::from(1);
-                        }
-                    }
-                }
-                Ok(None) => break,  /* daemon offline → local fallback below */
-                Err(e) => {
-                    eprintln!("portcullisd launch: {e}");
-                    return ExitCode::from(1);
-                }
-            }
-        }
-    }
-    /* If the user passed an explicit path (not an app id), the
-     * daemon doesn't have a way to find it — daemon only knows
-     * APPS_DIR-installed apps. Falls through to local launch. */
-
-    /* ★★ THE TRUST GATE, ON THE PATH THAT DID NOT HAVE ONE.
-     *
-     * This local fallback built and ran `jail -c` from whatever atrium.toml
-     * sat at the given path, with no signature check at all — while the
-     * daemon path checked twice. A development convenience that reads as a
-     * launch path is a launch path.
-     *
-     * Demand::PolicyDefault, deliberately: on an unconfigured machine this
-     * keeps working exactly as it did, because breaking every developer's
-     * explicit-path launch is not a security improvement anyone would keep.
-     * An operator who sets require_signatures gets it enforced HERE too,
-     * which is the whole reason the setting exists. */
-    if let Err(e) = portcullis_trust::Trust::load()
-        .verify(&tree, &text, portcullis_trust::Demand::PolicyDefault)
-    {
-        eprintln!("portcullis: REFUSED — {e}");
-        return ExitCode::from(1);
-    }
-
-    /* Approved (or bypassed) and daemon offline: set up overlay
-     * mounts, run jail, tear down — same as before this commit. */
-    let app_id = manifest.app.id.clone();
-    let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(&app_id);
-    let jail_path   = PathBuf::from(JAILS_DIR).join(&app_id);
-
-    /* Rebuild the JailConfig with the unionfs path as jail.path
-     * (overrides BuildOpts.root_path which we set to tree above). */
-    let opts2 = BuildOpts { root_path: jail_path.clone(), ..opts };
-    let mut jc = match build(&manifest, &opts2) {
-        Ok(j) => j,
-        Err(e) => { eprintln!("build error: {e}"); return ExitCode::from(1); }
-    };
-
-    /* Pre-launch: ensure dirs exist, set up the union mount. */
-    if let Err(e) = ensure_dir(&overlay_dir) { eprintln!("{e}"); return ExitCode::from(1); }
-    if let Err(e) = ensure_dir(&jail_path)   { eprintln!("{e}"); return ExitCode::from(1); }
-
-    /* Defensive: unmount any stale layers from a previous crash.
-     * Use silent=true so the common case (nothing to unmount) is
-     * quiet. */
-    let _ = umount_silent(&jail_path);
-    let _ = umount_silent(&jail_path);
-
-    if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro",
-                                     tree.to_str().unwrap(),
-                                     jail_path.to_str().unwrap()]) {
-        eprintln!("nullfs mount: {e}"); return ExitCode::from(1);
-    }
-    if let Err(e) = run("mount", &["-t", "unionfs",
-                                     overlay_dir.to_str().unwrap(),
-                                     jail_path.to_str().unwrap()]) {
-        eprintln!("unionfs mount: {e}");
-        let _ = umount(&jail_path);
-        return ExitCode::from(1);
-    }
-
-    /* ★ Mountpoints jail(8) needs and will not create — the same three the
-     * daemon's launch (portcullisd/src/launch.rs) makes. This path had none of
-     * them and failed at `mount.devfs: …/dev: No such file or directory` before
-     * the jail ever existed (found 2026-09-22 checking the host identity on
-     * this lane). App trees ship no /dev and no home; writes land in the
-     * overlay. */
-    let home_in_jail = jail_path.join(opts2.user_home.strip_prefix("/").unwrap_or(&opts2.user_home));
-    for d in [jail_path.join("dev"), home_in_jail] {
-        if let Err(e) = fs::create_dir_all(&d) {
-            eprintln!("mkdir {}: {e}", d.display());
-            teardown(&jail_path);
-            return ExitCode::from(1);
-        }
-    }
-    if let Err(e) = portcullis_mounts::ensure_mountpoints(&jc) {
-        eprintln!("portcullis: {e}");
-        teardown(&jail_path);
-        return ExitCode::from(1);
-    }
-
-    /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
-    if let Err(e) = portcullis_mounts::ensure_devfs_isolation(&jc) {
-        eprintln!("portcullis: {e}");
-        teardown(&jail_path);
-        return ExitCode::from(1);
-    }
-
-    /* ★★ A `full` network comes from jaild, the one allocator (network.md §0) —
-     * a point-to-point epair with the app's derived MAC, never the host's stack.
-     * Released on every path out once allocated. */
-    const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
-    let networked = jc.needs_routed_net.clone();
-    if let Some(mac) = &networked {
-        let grants = match &jc.routed_net_spec {
-            Some((id, spec)) => portcullis_oneshot::net_grants(spec, id),
-            None => Ok(None),
-        };
-        match grants
-            .and_then(|g| jaild::client::allocate_net(std::path::Path::new(JAILD_SOCK), &jc.name, mac, g))
-            .and_then(|(b, app, host)| jc.attach_routed_net(&b, &app, &host))
-        {
-            Ok(()) => {
-                let etc = jail_path.join("etc");
-                let _ = fs::create_dir_all(&etc);
-                let _ = fs::copy("/etc/resolv.conf", etc.join("resolv.conf"));
-            }
-            Err(e) => {
-                eprintln!("portcullis: network: {e}");
-                jaild::client::release_net(std::path::Path::new(JAILD_SOCK), &jc.name);
-                teardown(&jail_path);
-                return ExitCode::from(1);
-            }
-        }
-    }
-    let release = |name: &str| if networked.is_some() {
-        jaild::client::release_net(std::path::Path::new(JAILD_SOCK), name);
-    };
-    if let Err(e) = portcullis_mounts::ensure_network_ready(&jc) {
-        eprintln!("portcullis: {e}");
-        release(&jc.name);
-        teardown(&jail_path);
-        return ExitCode::from(1);
-    }
-
-    /* Write jail.conf, run jail -c. */
-    let conf_path = match jc.write_jail_conf("portcullis") {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            release(&jc.name);
-            teardown(&jail_path);
-            return ExitCode::from(1);
-        }
-    };
-    let status = Command::new("jail")
-        // -q: jail(8)'s "<name>: created" goes to stdout — the app's stream.
-        .arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
-        .status();
-    let _ = fs::remove_file(&conf_path);
-
-    /* Teardown: jail -r (idempotent if already removed by exec.start
-     * exit), then umount in reverse order — and the network after the jail
-     * is gone, so its epair end has come home to be destroyed. */
-    let _ = Command::new("jail").arg("-q").arg("-r").arg(&jc.name)
-        .stderr(std::process::Stdio::null()).status();
-    /* ★★ A dying jail pins its root, and its epair end only comes home when it
-     * is freed: wait for it before releasing the network or unmounting. */
-    portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
-    release(&jc.name);
-    teardown(&jail_path);
-
-    match status {
-        Ok(s) if s.success() => {
-            println!("portcullis: jail '{}' completed cleanly", jc.name);
-            ExitCode::SUCCESS
-        }
-        Ok(s) => {
-            eprintln!("jail -c exited {s}");
-            ExitCode::from(1)
-        }
-        Err(e) => {
-            eprintln!("could not invoke jail: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn ensure_dir(p: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(p)
-}
-
-fn umount(p: &Path) -> std::io::Result<()> {
-    let st = Command::new("umount").arg(p).status()?;
-    if !st.success() {
-        return Err(std::io::Error::other(format!("umount {} failed: {st}", p.display())));
-    }
-    Ok(())
+    println!("# the jail portcullisd would ask jaild for ──────────────");
+    println!("{jc:#?}");
+    ExitCode::SUCCESS
 }
 
 /// Like `umount`, but suppresses umount(8)'s stderr. Used for the
@@ -745,30 +431,6 @@ fn umount_silent(p: &Path) -> std::io::Result<()> {
         .stderr(std::process::Stdio::null())
         .status()?;
     Ok(())
-}
-
-fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
-    let st = Command::new(cmd).args(args).status()?;
-    if !st.success() {
-        return Err(std::io::Error::other(format!("{cmd} {args:?} failed: {st}")));
-    }
-    Ok(())
-}
-
-/// Tear down a jail's mounts, convergently.
-///
-/// ★★ THIS PATH HAD THE ORIGINAL, AND KEPT IT. It used to unmount `dev`, then
-/// the jail path twice (unionfs, nullfs), and nothing else — which is exactly
-/// the version portcullisd's launch path was debugged away from, because
-/// capability mounts live UNDER the jail path and held the whole stack busy.
-/// The fix landed there and never reached here: the local fallback is only
-/// taken when the daemon is down, so its mount piles accumulated on the one
-/// path nobody was watching.
-///
-/// Now the same convergent unwind as everywhere else, from one crate.
-fn teardown(jail_path: &Path) {
-    let left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
-    portcullis_mounts::warn_survivors("portcullis", &left);
 }
 
 /// Map a daemon LaunchReply to a CLI ExitCode. Used by the
@@ -826,111 +488,7 @@ fn handle_daemon_launch_reply(
 
 // ── Phase 5: interactive approval prompt ─────────────────────────
 
-#[derive(Debug)]
-enum ApprovalDecision {
-    AllowOnce,    /* this launch only — bypass_policy=true on retry  */
-    AllowAlways,  /* persist a grant + retry                          */
-    Deny,         /* refuse the launch                                */
-}
-
-/// True when stdin AND stderr (where the prompt lives) are both tty's.
-/// We require both because:
-///   - if stderr isn't a tty, the prompt is invisible (logged somewhere
-///     the user isn't looking),
-///   - if stdin isn't a tty, there's nobody at the keyboard.
-fn stdin_is_tty() -> bool {
-    /* libc::isatty returns 1 for tty, 0 otherwise. */
-    unsafe {
-        extern "C" { fn isatty(fd: i32) -> i32; }
-        isatty(0) == 1 && isatty(2) == 1
-    }
-}
-
-/// Print the delta + the three-way prompt; loop on bad input.
-/// Returns Deny on EOF (Ctrl-D).
-fn prompt_for_approval(app_id: &str, delta: &[String]) -> ApprovalDecision {
-    use std::io::{BufRead, Write};
-    eprintln!();
-    eprintln!("'{app_id}' wants to:");
-    for line in delta {
-        eprintln!("    • {line}");
-    }
-    eprintln!();
-    let stdin = std::io::stdin();
-    let mut buf = String::new();
-    loop {
-        eprint!("Allow? [o]nce, [a]lways, [d]eny: ");
-        let _ = std::io::stderr().flush();
-        buf.clear();
-        match stdin.lock().read_line(&mut buf) {
-            Ok(0) => return ApprovalDecision::Deny,   /* EOF */
-            Ok(_) => {}
-            Err(_) => return ApprovalDecision::Deny,
-        }
-        match buf.trim().to_ascii_lowercase().as_str() {
-            "o" | "once"   => return ApprovalDecision::AllowOnce,
-            "a" | "always" => return ApprovalDecision::AllowAlways,
-            "d" | "deny" | "n" | "no" | "" => return ApprovalDecision::Deny,
-            _ => eprintln!("    (please answer o, a, or d)"),
-        }
-    }
-}
-
-/// Persist a grant for ALL the manifest's requested capabilities.
-/// Used by the "Allow always" branch so the user doesn't have to
-/// re-prompt on every launch. Tries daemon first, falls back to
-/// direct file write — same shape as `policy_grant`.
-fn persist_grant_for(
-    app_id:        &str,
-    manifest_text: &str,
-    caps:          &portcullis_toml::Capabilities,
-) -> Result<(), String> {
-    let manifest_hash = portcullis_policy::hash_manifest(manifest_text.as_bytes());
-    match daemon::grant(app_id, &manifest_hash, caps) {
-        Ok(Some(())) => return Ok(()),
-        Ok(None) => { /* daemon offline, fall through */ }
-        Err(e) => return Err(format!("portcullisd grant: {e}")),
-    }
-    let path = portcullis_policy::Policy::user_path(&current_user());
-    let mut policy = portcullis_policy::Policy::load(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    policy.grants.insert(app_id.to_string(), portcullis_policy::Grant {
-        manifest_hash,
-        granted_at:    portcullis_policy::now_iso8601(),
-        capabilities:  caps.clone(),
-    });
-    policy.save(&path).map_err(|e| format!("save {}: {e}", path.display()))
-}
-
 // ── policy oracle (daemon-first, file-fallback) ──────────────────
-
-/// Returns `Ok(None)` if authorized, `Ok(Some(lines))` if approval
-/// is needed (with human-readable delta lines), `Err(_)` on real
-/// failure. Tries portcullisd over its socket first; on connection
-/// failure falls back to reading policy.toml directly so the CLI
-/// keeps working in headless / pre-daemon contexts.
-fn check_authorization(
-    app_id: &str,
-    manifest_hash: &str,
-    requested: &portcullis_toml::Capabilities,
-) -> std::io::Result<Option<Vec<String>>> {
-    match daemon::authorize(app_id, manifest_hash, requested)? {
-        Some(daemon::AuthorizeOutcome::Authorized)            => return Ok(None),
-        Some(daemon::AuthorizeOutcome::NeedsApproval(lines))  => return Ok(Some(lines)),
-        None => { /* daemon not running, fall through to file path */ }
-    }
-    let policy_path = portcullis_policy::Policy::user_path(&current_user());
-    let policy = portcullis_policy::Policy::load(&policy_path)?;
-    let system = portcullis_policy::Policy::load_system(std::path::Path::new(portcullis_policy::SYSTEM_PATH));
-    let d = portcullis_policy::decide(app_id, requested, manifest_hash, &policy, system.as_ref());
-    if let Some(why) = &d.system_unusable { eprintln!("portcullis: system policy unusable: {why}") }
-    let delta = d.delta;
-    if delta.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(delta.describe()))
-    }
-}
 
 // ── policy subcommands ───────────────────────────────────────────
 

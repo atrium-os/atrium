@@ -13,7 +13,11 @@
 //! still green. That is the exact property one-jail-per-document exists to
 //! provide.
 
-use portcullis_jail::{build, jail_name_for_instance, jail_name_from_app_id, BuildOpts};
+use portcullis_jail::{build, jail_name_for_instance, jail_name_from_app_id, BuildOpts, JailConfig, Value};
+
+fn has(jc: &JailConfig, key: &str, want: Value) -> bool {
+    jc.params.iter().any(|(k, v)| k == key && *v == want)
+}
 use std::path::PathBuf;
 
 fn opts(instance: Option<&str>) -> BuildOpts {
@@ -85,9 +89,8 @@ fn sanitizing_does_not_collapse_distinct_tags() {
 #[test]
 fn the_hostname_does_not_leak_the_instance() {
     let jc = build(&manifest("org.atrium.worker"), &opts(Some("7"))).expect("builds");
-    let conf = jc.render_jail_conf().unwrap();
-    assert!(conf.contains("host.hostname = \"org.atrium.worker\""),
-        "hostname leaked the instance: {conf}");
+    assert!(has(&jc, "host.hostname", Value::String("org.atrium.worker".into())),
+        "hostname leaked the instance: {:?}", jc.params);
 }
 
 /// ★ And the minimal capability set is the DEFAULT, not something a worker
@@ -101,10 +104,9 @@ fn the_hostname_does_not_leak_the_instance() {
 #[test]
 fn a_manifest_with_no_capabilities_renders_a_closed_jail() {
     let jc = build(&manifest("org.atrium.worker"), &opts(Some("1"))).expect("builds");
-    let conf = jc.render_jail_conf().unwrap();
-    assert!(conf.contains("vnet = new"), "{conf}");
-    assert!(!conf.contains("ip4") && !conf.contains("ip6"), "{conf}");
-    assert!(conf.contains("allow.raw_sockets = false"), "{conf}");
+    assert!(has(&jc, "vnet", Value::Symbolic("new".into())), "{:?}", jc.params);
+    assert!(!jc.params.iter().any(|(k, _)| k.starts_with("ip4") || k.starts_with("ip6")), "{:?}", jc.params);
+    assert!(has(&jc, "allow.raw_sockets", Value::Bool(false)), "{:?}", jc.params);
     assert!(jc.mounts.is_empty(), "a closed jail mounted something: {:?}", jc.mounts);
 }
 
@@ -120,11 +122,11 @@ fn a_manifest_with_no_capabilities_renders_a_closed_jail() {
 fn a_one_shot_jail_does_not_persist_and_an_application_does() {
     let mut o = opts(Some("1"));
     o.persist = false;
-    let conf = build(&manifest("org.atrium.worker"), &o).expect("builds").render_jail_conf().unwrap();
-    assert!(conf.contains("persist = false"), "a one-shot jail would outlive its work: {conf}");
+    let jc = build(&manifest("org.atrium.worker"), &o).expect("builds");
+    assert!(has(&jc, "persist", Value::Bool(false)), "a one-shot jail would outlive its work: {:?}", jc.params);
 
-    let conf = build(&manifest("org.atrium.notes"), &opts(None)).expect("builds").render_jail_conf().unwrap();
-    assert!(conf.contains("persist = true"), "an application lost its persistence: {conf}");
+    let jc = build(&manifest("org.atrium.notes"), &opts(None)).expect("builds");
+    assert!(has(&jc, "persist", Value::Bool(true)), "an application lost its persistence: {:?}", jc.params);
 }
 
 /// ★ The jaild-lane name is jaild-valid by construction: lowercase, digits and
@@ -143,4 +145,20 @@ fn jaild_instance_names_are_jaild_valid() {
 fn an_overlong_jaild_instance_name_is_refused() {
     let long = "org.".to_string() + &"x".repeat(70);
     assert!(portcullis_jail::jaild_instance_name(&long, Some("1")).is_none());
+}
+
+/// `decoders = ["image"]` (app-composition.md C6) is what brings the
+/// worker-call socket into a jail that has no `[[workers]]`; a bad decoder
+/// name is a manifest error.
+#[test]
+fn decoders_bring_the_worker_call_socket() {
+    let m = portcullis_toml::parse_and_validate(
+        "[app]\nid = \"org.atrium.pics\"\nname = \"T\"\nversion = \"1\"\nentry = \"bin/t\"\n\n[capabilities]\ndecoders = [\"image\"]\n"
+    ).expect("valid manifest").0;
+    let jc = build(&m, &opts(None)).expect("builds");
+    assert!(jc.mounts.iter().any(|mt| format!("{mt:?}").contains("workers")), "no worker-call socket: {:?}", jc.mounts);
+    let (_, r) = portcullis_toml::parse_and_validate(
+        "[app]\nid = \"org.atrium.pics\"\nname = \"T\"\nversion = \"1\"\nentry = \"bin/t\"\n\n[capabilities]\ndecoders = [\"../x\"]\n"
+    ).expect("parses");
+    assert!(r.errors.iter().any(|e| e.contains("decoders")), "{:?}", r.errors);
 }

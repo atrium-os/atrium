@@ -223,33 +223,34 @@ mod rs_tests {
 /// advertisements (ICMPv6 134, hop limit 255, no extension headers),
 /// DHCPv6 replies (UDP 547 -> 546, no extension headers) and ARP (for the
 /// lease parser's conflict check before a new address is used, RFC 5227).
-pub const RX_FILTER: [(u16, u8, u8, u32); 26] = [
+pub const RX_FILTER: [(u16, u8, u8, u32); 27] = [
     (0x28, 0, 0, 12),       // 0  ldh [12]
     (0x15, 0, 9, 0x0800),   // 1  jeq IPv4 ? 2 : 11
     (0x30, 0, 0, 23),       // 2  ldb [23]
-    (0x15, 0, 21, 17),      // 3  jeq UDP ? 4 : drop
+    (0x15, 0, 22, 17),      // 3  jeq UDP ? 4 : drop
     (0x28, 0, 0, 20),       // 4  ldh [20]
-    (0x45, 19, 0, 0x1fff),  // 5  fragment ? drop : 6
+    (0x45, 20, 0, 0x1fff),  // 5  fragment ? drop : 6
     (0xb1, 0, 0, 14),       // 6  ldx 4*([14]&0xf)
     (0x48, 0, 0, 14),       // 7  ldh [x+14]
-    (0x15, 0, 16, 67),      // 8  jeq 67 ? 9 : drop
+    (0x15, 0, 17, 67),      // 8  jeq 67 ? 9 : drop
     (0x48, 0, 0, 16),       // 9  ldh [x+16]
-    (0x15, 13, 14, 68),     // 10 jeq 68 ? take : drop
+    (0x15, 14, 15, 68),     // 10 jeq 68 ? take : drop
     (0x15, 0, 11, 0x86dd),  // 11 jeq IPv6 ? 12 : 23
     (0x30, 0, 0, 20),       // 12 ldb [20] next header
     (0x15, 0, 4, 58),       // 13 jeq ICMPv6 ? 14 : 18
     (0x30, 0, 0, 21),       // 14 ldb [21] hop limit
-    (0x15, 0, 9, 255),      // 15 jeq 255 ? 16 : drop
+    (0x15, 0, 10, 255),     // 15 jeq 255 ? 16 : drop
     (0x30, 0, 0, 54),       // 16 ldb [54] ICMPv6 type
-    (0x15, 6, 7, 134),      // 17 jeq RA ? take : drop
-    (0x15, 0, 6, 17),       // 18 jeq UDP ? 19 : drop
+    (0x15, 7, 8, 134),      // 17 jeq RA ? take : drop
+    (0x15, 0, 7, 17),       // 18 jeq UDP ? 19 : drop
     (0x28, 0, 0, 54),       // 19 ldh [54] source port
-    (0x15, 0, 4, 547),      // 20 jeq 547 ? 21 : drop
+    (0x15, 0, 5, 547),      // 20 jeq 547 ? 21 : drop
     (0x28, 0, 0, 56),       // 21 ldh [56] destination port
-    (0x15, 1, 2, 546),      // 22 jeq 546 ? take : drop
-    (0x15, 0, 1, 0x0806),   // 23 jeq ARP ? take : drop
-    (0x06, 0, 0, 1514),     // 24 take
-    (0x06, 0, 0, 0),        // 25 drop
+    (0x15, 2, 3, 546),      // 22 jeq 546 ? take : drop
+    (0x15, 1, 0, 0x0806),   // 23 jeq ARP ? take : 24
+    (0x15, 0, 1, 0x888e),   // 24 jeq EAPOL (wired 802.1X) ? take : drop
+    (0x06, 0, 0, 1514),     // 25 take
+    (0x06, 0, 0, 0),        // 26 drop
 ];
 
 #[cfg(test)]
@@ -279,7 +280,7 @@ mod filter_tests {
     }
 
     #[test]
-    fn passes_dhcp_ra_dhcpv6_only() {
+    fn passes_dhcp_ra_dhcpv6_arp_eapol_only() {
         let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let me = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
         assert!(run(&frame::frame_for_test(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::BROADCAST, &[0; 300])) > 0);
@@ -299,12 +300,15 @@ mod filter_tests {
         let mut r = ra::ra_for_test(ll, 1800, &[]);
         r[54] = 135;
         assert_eq!(run(&r), 0);
-        // ARP passes (the lease parser's conflict check); other types do not.
+        // ARP passes (the lease parser's conflict check), and EAPOL (wired
+        // 802.1X, relayed to aura-keys); other types do not.
         let mut arp = vec![0xff; 12];
         arp.extend_from_slice(&[0x08, 0x06]);
         arp.extend_from_slice(&[0; 28]);
         assert!(run(&arp) > 0);
         arp[12..14].copy_from_slice(&[0x88, 0x8e]);
+        assert!(run(&arp) > 0);
+        arp[12..14].copy_from_slice(&[0x88, 0xcc]);
         assert_eq!(run(&arp), 0);
         let p = super::arp_probe(&[2, 0, 0, 0, 0, 1], Ipv4Addr::new(10, 0, 0, 5));
         assert!(run(&p) > 0);

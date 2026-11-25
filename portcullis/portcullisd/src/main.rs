@@ -84,11 +84,6 @@ usage:
 fn main() -> ExitCode {
     let mut socket_path: Option<PathBuf> = None;
     let args: Vec<String> = std::env::args().collect();
-    // The registries proxy's helper (egress.rs): bind in a workspace's
-    // jail and hand the socket back; never the daemon.
-    if args.get(1).map(String::as_str) == Some(egress::BIND_ARG) {
-        egress::bind_in_jail_main(args.get(2).map(String::as_str).unwrap_or(""), args.get(3).map(String::as_str));
-    }
     // A debug run doesn't outlive portcullisd: no stale "debugging" tag.
     dev::clear_debugging();
     let mut i = 1;
@@ -469,7 +464,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &response)?;
             continue;
         }
-        if workers_only && !matches!(req, Request::WorkerCall { .. }) {
+        if workers_only && !matches!(req, Request::WorkerCall { .. } | Request::SystemWorker { .. }) {
             write_response(&mut writer, &Response::Error {
                 message: "request is unavailable on the worker-call socket".into() })?;
             return Ok(());
@@ -653,6 +648,72 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
                                  &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()),
                                  Some((person.clone(), persona.clone())), false)?;
+            continue;
+        }
+        /* ★ SystemWorker (app-composition.md C6, dev-tools.md §3.5): one of
+         * the system's decoders (portcullis_ipc::SYSTEM_WORKERS), for a
+         * launched app that names it in `decoders`, never a worker. Its bundle is the system's
+         * installed one for that name; it runs as the system worker rule's
+         * uid (never the caller's) in a one-shot jail with no capability,
+         * on the rule's own concurrency budget. Without a rule it is
+         * refused: it never runs as its caller. */
+        if let Request::SystemWorker { name } = &req {
+            let refuse = |why: String| Response::LaunchFailed { stage: "system-worker".into(), message: why };
+            let Some(bundle) = portcullis_ipc::system_worker_app(name) else {
+                write_response(&mut writer, &refuse("no such system worker".into()))?;
+                continue;
+            };
+            let reg = load_registry();
+            let Some((person, app)) = reg.resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+                eprintln!("portcullisd: system worker {bundle} DENIED to uid {uid}: not a launched app");
+                write_response(&mut writer, &refuse("only an app calls a system worker: uid is not a launched app".into()))?;
+                continue;
+            };
+            if app.starts_with("worker:") {
+                write_response(&mut writer, &refuse("a worker calls no workers".into()))?;
+                continue;
+            }
+            // Named in the caller's INSTALLED manifest, else refused (an
+            // unreadable manifest refuses too).
+            let named = launch::installed_manifest(&app)
+                .is_some_and(|m| m.capabilities.decoders.as_ref().is_some_and(|d| d.iter().any(|n| n == name)));
+            if !named {
+                eprintln!("portcullisd: system worker {bundle} DENIED to {app}: not in its decoders");
+                write_response(&mut writer, &refuse(format!("{app}'s manifest does not name {name:?} in decoders")))?;
+                continue;
+            }
+            let Some(rule) = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+                .and_then(|p| p.workers.get(bundle).cloned()) else {
+                eprintln!("portcullisd: system worker {bundle} for {app} REFUSED: no system worker rule");
+                write_response(&mut writer, &refuse(format!("no system worker rule for {bundle}: it never runs as its caller")))?;
+                continue;
+            };
+            // Its own installed manifest asks for nothing (a bundle that
+            // does is not the one this path runs); unreadable refuses.
+            let checked = launch::installed_manifest(bundle)
+                .ok_or_else(|| format!("{bundle} is not installed or its manifest is unreadable"))
+                .and_then(|m| portcullisd::system_worker::check_bundle(&m));
+            if let Err(why) = checked {
+                eprintln!("portcullisd: system worker {bundle} for {app} REFUSED: {why}");
+                write_response(&mut writer, &refuse(why))?;
+                continue;
+            }
+            // A few per caller, under the rule's system-wide cap: one app
+            // cannot take every decoder jail. Held until the jail is gone.
+            let _per_caller = match portcullisd::ratelimit::Slot::acquire_reserved(
+                &LIMITER, &portcullisd::system_worker::caller_key(bundle, &person, &app),
+                portcullisd::system_worker::PER_CALLER, now_millis()) {
+                Ok(s) => s,
+                Err(why) => {
+                    eprintln!("portcullisd: system worker {bundle} for {app} ({person}) REFUSED: {why}");
+                    write_response(&mut writer, &Response::LaunchFailed { stage: "ratelimit".into(), message: why.to_string() })?;
+                    continue;
+                }
+            };
+            let instance = fetcher_instance(uid);
+            eprintln!("portcullisd: system worker {bundle} {instance} for {app} ({person}) runs as {}", rule.run_as);
+            handle_exec_instance(bundle.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -1315,8 +1376,8 @@ fn handle_exec_instance(
         memory_mb: limits.0,
         cpu_pct: limits.1,
         require_memory_limit: limits.2,
-        // The home jail(8) chdirs into is resolved from this user's passwd
-        // inside portcullis_oneshot — see Spec::user_name.
+        // The worker's account; portcullis_oneshot resolves its uid and
+        // home from passwd (Spec::user_name).
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
         extra_env,
         worker,
@@ -1328,8 +1389,18 @@ fn handle_exec_instance(
      * does for a renderer), the jail is removed. Without this the caller had
      * no way to end a worker that runs as another uid (a worker rule). */
     let watch = jail_name_for(&spec).and_then(|name| {
-        reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name))
+        // A system worker's jail also ends at its wall-clock bound.
+        let life = portcullis_ipc::SYSTEM_WORKERS.iter().any(|(_, b)| *b == app_id)
+            .then(|| std::time::Instant::now() + portcullisd::system_worker::LIFE);
+        reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name, life))
     });
+    // A system worker runs only with its time bound watched.
+    if watch.is_none() && portcullis_ipc::SYSTEM_WORKERS.iter().any(|(_, b)| *b == app_id) {
+        eprintln!("portcullisd: system worker {app_id} REFUSED: no watcher for its time bound");
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "system-worker".into(), message: "can't bound its life: refused".into(),
+        });
+    }
     // A worker's caller has its answer once the jail is removed; its mounts
     // are unwound after (a dying jail can pin them for seconds).
     let run = if spec.worker.is_some() { portcullis_oneshot::run_with_fds_detached } else { portcullis_oneshot::run_with_fds };
@@ -1383,30 +1454,38 @@ fn jail_name_for(spec: &portcullis_oneshot::Spec) -> Option<String> {
     portcullis_jail::jaild_instance_name(&spec.target, spec.instance.as_deref())
 }
 
-/// Watch `caller` until `done` is set; if it hangs up first, remove the
-/// jail `name` (its processes are killed, and `run_with_stdio` returns).
-fn end_jail_on_hangup(caller: UnixStream, name: String) -> Arc<std::sync::atomic::AtomicBool> {
+/// Watch `caller` until `done` is set; if it hangs up first, or `until`
+/// passes, remove the jail `name` (its processes are killed, and
+/// `run_with_stdio` returns).
+fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time::Instant>) -> Arc<std::sync::atomic::AtomicBool> {
     use std::sync::atomic::Ordering;
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d = done.clone();
     let _ = std::thread::Builder::new().name("portcullisd-exec-hup".into()).spawn(move || {
         while !d.load(Ordering::Acquire) {
+            let expired = until.is_some_and(|t| std::time::Instant::now() >= t);
             let mut p = libc::pollfd { fd: caller.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            let n = unsafe { libc::poll(&mut p, 1, 250) };
-            if n <= 0 || d.load(Ordering::Acquire) { continue }
-            let hung_up = p.revents & (libc::POLLHUP | libc::POLLERR) != 0 || {
+            // SAFETY: `p` is one live pollfd on the stack for the call, and
+            // `caller` owns the descriptor for the thread's whole life.
+            let n = if expired { 0 } else { unsafe { libc::poll(&mut p, 1, 250) } };
+            if !expired && (n <= 0 || d.load(Ordering::Acquire)) { continue }
+            let hung_up = expired || p.revents & (libc::POLLHUP | libc::POLLERR) != 0 || {
                 let mut b = [0u8; 1];
+                // SAFETY: `b` is a 1-byte buffer that outlives the call, and
+                // the length passed is its length.
                 let r = unsafe { libc::recv(caller.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
                 r == 0
             };
             if hung_up {
-                eprintln!("portcullisd: caller hung up; removing worker jail {name}");
-                // SIGKILL first: `jail -r` alone sends SIGTERM and waits ten
-                // seconds for a worker that may be ignoring it (or stopped).
+                if expired { eprintln!("portcullisd: worker jail {name} reached its time limit; removing it") }
+                else { eprintln!("portcullisd: caller hung up; removing worker jail {name}") }
+                // SIGKILL first: removing the jail alone sends SIGTERM and
+                // waits for a worker that may be ignoring it (or stopped).
                 let _ = std::process::Command::new("pkill").args(["-9", "-j", &name])
                     .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-                let _ = std::process::Command::new("jail").arg("-r").arg(&name)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                if let Err(e) = portcullisd::jaild_jail::remove(&name) {
+                    eprintln!("portcullisd: remove {name}: {e}");
+                }
                 return;
             }
             // The caller wrote something it should not have; do not spin on it.
@@ -1438,11 +1517,9 @@ fn handle_launch(
      *
      * This is checked FIRST, ahead of the policy gate and long before any
      * mount, so a duplicate launch cannot disturb the instance that is already
-     * up. Previously the request went all the way to jail(8), which failed with
-     *     jail: "org_atrium_forum-bar" already exists
-     * and a generic non-zero exit — indistinguishable, to a launcher, from a
-     * broken app. Clicking a dock icon twice reported an error instead of
-     * raising the window that was already there.
+     * up, and a launcher gets "already running" rather than a generic
+     * failure it cannot tell from a broken app: a second click on a dock
+     * icon raises the window that is already there.
      *
      * The uid goes back with the reply because surfaces carry `owner_uid`: it
      * is what lets a jailed launcher find the live window and focus it without
@@ -1567,9 +1644,8 @@ fn handle_launch(
     let mut iter = fds.into_iter();
     let stdio = [iter.next().unwrap(), iter.next().unwrap(), iter.next().unwrap()];
 
-    /* 4. launch as the connecting user. launch_with_stdio sets
-     *    BuildOpts.user_name = user, which becomes exec.jail_user
-     *    in the rendered jail.conf. */
+    /* 4. launch for the connecting user (the entry runs as that
+     *    person's uid for the app). */
     let resp = match launch::launch_instance(&app_id, persona, user, Some(stdio)) {
         Ok(o) => Response::LaunchExit { code: o.exit_code },
         Err(e) => Response::LaunchFailed {
@@ -3149,11 +3225,10 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     /* The debugger's way in: a socket listening on the workspace's own
      * loopback, so only what runs in the workspace reaches it. */
     let listener = if debug {
-        let jid = match workspace::start(owner, ws) {
-            Ok(r) => r.jid,
-            Err(why) => return refuse(why),
-        };
-        match egress::bind_in(jid, 0) {
+        if let Err(why) = workspace::start(owner, ws) {
+            return refuse(why);
+        }
+        match egress::bind_in(&workspace::jail_name(owner, ws), 0) {
             Ok(l) => Some(l),
             Err(why) => return refuse(why),
         }
@@ -3500,7 +3575,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
     // A workspace (homes.md §5) or an app (§4): where the shell goes.
     let ws_groups: Vec<u32>;
     let mut ws_env: Vec<String> = Vec::new();
-    let (jid, app_uid, gid, home, kind, title) = if to_empty {
+    let (jid, jail, app_uid, gid, home, kind, title) = if to_empty {
         // Nothing to reach, so no press: a new tab or window of it is free.
         if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
             return refuse(format!("the terminal: {why}"));
@@ -3510,7 +3585,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
             Err(why) => return refuse(why),
         };
         ws_groups = Vec::new();
-        (jid, uid, gid, "/tmp".to_string(), console::Kind::App, "Terminal".to_string())
+        (jid, empty::jail_name(owner), uid, gid, "/tmp".to_string(), console::Kind::App, "Terminal".to_string())
     } else if let Some(ws) = app_id.strip_prefix(console::WORKSPACE_PREFIX) {
         if !workspace::valid_name(ws) {
             return refuse(format!("{ws:?} is not a workspace name"));
@@ -3531,7 +3606,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         };
         ws_groups = vec![r.files];
         ws_env = r.env.clone();
-        (r.jid, r.uid, r.gid, r.home, console::Kind::Workspace, format!("Workspace: {ws}"))
+        (r.jid, workspace::jail_name(owner, ws), r.uid, r.gid, r.home, console::Kind::Workspace, format!("Workspace: {ws}"))
     } else {
         let Some(m) = launch::installed_manifest(app_id) else {
             return refuse(format!("{app_id} is not installed"));
@@ -3579,14 +3654,14 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         }
         // The shell goes in the console jail beside the app's, never in the
         // app's own (dev-tools-plan.md M0, P1): the app keeps its class.
-        let jid = match console::console_jail(app_id, &app_root) {
+        let jid = match console::console_jail(app_id, owner, &app_root) {
             Ok(j) => j,
             Err(why) => return refuse(format!("the console's jail: {why}")),
         };
         ws_groups = Vec::new();
-        (jid, app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
+        (jid, console::console_jail_name(app_id), app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
     };
-    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind, env: &ws_env };
+    let spec = console::Spec { owner, jail: &jail, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind, env: &ws_env };
     let hub = Hub::global();
     if let Err(e) = hub.listen(console::TERMINAL) {
         return refuse(format!("the terminal's channel: {e}"));
@@ -4222,6 +4297,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::OpenCdm { .. } => Response::Error {
             message: "OpenCdm must be routed through the peer-uid, fd-passing path".into(),
+        },
+        Request::SystemWorker { .. } => Response::Error {
+            message: "SystemWorker must be routed through the peer-uid, fd-passing path".into(),
         },
         Request::WorkerCall { .. } => Response::Error {
             message: "WorkerCall must be routed through the peer-uid, fd-passing path".into(),

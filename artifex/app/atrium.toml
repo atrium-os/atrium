@@ -16,6 +16,9 @@ graphics       = "fresco"
 workspace-exec = true
 clipboard      = true
 network        = "none"
+# Asset previews (dev-tools.md §3.5): pictures are decoded by the system's
+# image decoder in a jail of its own, never in Artifex.
+decoders       = ["image"]
 # No Limen roles: the terminal button asks portcullisd for the workspace's
 # console, not an embed. Without this key a platform bundle keeps every role.
 embeds         = []

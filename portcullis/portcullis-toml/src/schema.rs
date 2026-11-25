@@ -529,6 +529,11 @@ pub struct Capabilities {
     /// Limen roles the app may ask to embed (app-composition.md §3, C7):
     /// `embeds = ["picker", "doc-viewer"]`. Each is a consent line.
     pub embeds: Option<Vec<String>>,
+    /// The system's decoders the app calls (app-composition.md C6,
+    /// dev-tools.md §3.5): `decoders = ["image"]`. Each runs in a jail of
+    /// its own with no capability, as the system's uid, never the app's
+    /// (portcullisd's `SystemWorker`), so it asks no consent.
+    pub decoders: Option<Vec<String>>,
     /// Arca's API for the app's own items (app-composition.md §3, C8): it
     /// keeps secrets in Arca and reads back only its own. Asks consent.
     pub arca: Option<bool>,
@@ -552,6 +557,16 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Does this declare no capability at all, not even one set to false
+    /// or a key this schema does not know? A system worker
+    /// (portcullis_ipc::SYSTEM_WORKERS) must, since it runs for any app
+    /// that names it. Judged on the serialized form, so a field added
+    /// later counts without this list knowing it; a form that cannot be
+    /// serialized declares something.
+    pub fn declares_nothing(&self) -> bool {
+        matches!(toml::Value::try_from(self), Ok(toml::Value::Table(t)) if t.is_empty())
+    }
+
     /// The system-only capabilities this asks for (homes.md §4, decision
     /// H5): an app holding any of them is part of the system, whose files
     /// are not the person's to edit by hand, so it has no console.
@@ -798,6 +813,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         protected_media:  ovr.protected_media.or(base.protected_media),
         network_portal:   ovr.network_portal.or(base.network_portal),
         embeds:           ovr.embeds.clone().or_else(|| base.embeds.clone()),
+        decoders:         ovr.decoders.clone().or_else(|| base.decoders.clone()),
         arca:             ovr.arca.or(base.arca),
         arca_courier:     ovr.arca_courier.or(base.arca_courier),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),
@@ -853,6 +869,17 @@ graphics = "fresco"
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn declares_nothing_counts_every_key() {
+        let caps = |t: &str| -> Capabilities { toml::from_str(t).expect("caps parse") };
+        assert!(Capabilities::default().declares_nothing());
+        assert!(caps("").declares_nothing());
+        assert!(!caps("clipboard = false").declares_nothing(), "a key set to false is still declared");
+        assert!(!caps("network = \"full\"").declares_nothing());
+        assert!(!caps("decoders = []").declares_nothing());
+        assert!(!caps("a-key-from-later = true").declares_nothing(), "an unknown key counts");
+    }
 
     #[test]
     fn override_adds_network_keeps_runtime_clipboard() {

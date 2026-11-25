@@ -1932,7 +1932,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
-            Request::RunPageLive { url, rect, press } => {
+            Request::RunPageLive { url, rect, press, jar } => {
                 let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone())
                     .or_else(|| opened.as_ref().filter(|o| **o == url).and_then(|_| state.lock().unwrap().page(&url)).map(|p| p.url.clone()));
                 let window = strip.lock().unwrap().window_token;
@@ -1945,7 +1945,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     if let Err(why) = spend(press) { return Err(format!("\0{why}")); }
                     live = None;
                     widget = None;
-                    start_live(&cfg, &w, window, page, press, rect)
+                    start_live(&cfg, &w, window, page, press, rect, cookies.clone(), jar)
                 })();
                 match result {
                     Ok(l) => {
@@ -1961,7 +1961,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     },
                 }
             }
-            Request::ContinueLive { url, rect } => {
+            Request::ContinueLive { url, rect, jar } => {
                 let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone())
                     .or_else(|| opened.as_ref().filter(|o| **o == url).map(|o| o.clone()));
                 let window = strip.lock().unwrap().window_token;
@@ -1974,7 +1974,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     let window = window.ok_or("no window to run it in")?;
                     live = None;
                     widget = None;
-                    start_live(&cfg, &w, window, page, [0; 16], rect)
+                    start_live(&cfg, &w, window, page, [0; 16], rect, cookies.clone(), jar)
                 })();
                 match result {
                     Ok(l) => live = Some(l),
@@ -2887,10 +2887,14 @@ mod island_metadata_tests {
 
 /// Start the whole-page engine for `page` in the UI's window (I6.1, I6.2),
 /// telling the UI when it started, where it asked to go, and when it ended.
-fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4]) -> Result<live_page::Live, String> {
+/// Its requests go through the trail's `jar` in Arca when navigatord has
+/// one (I6.3, D9), else the plain fetcher.
+fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4],
+              cookies: Option<Cookies>, jar: Jar) -> Result<live_page::Live, String> {
+    let jar = cookies.map(|c| live_page::LiveJar::open(c, &page, jar_id(jar))).transpose()?;
     let (on_start, on_nav, on_route, on_end) = (w.clone(), w.clone(), w.clone(), w.clone());
     let (start_url, nav_url, route_url, end_url) = (page.clone(), page.clone(), page.clone(), page.clone());
-    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(),
+    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar,
         move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
         move |url| send(&on_nav, &Event::LiveNavigate { from: nav_url.clone(), url }),
         move |url| send(&on_route, &Event::LiveUrlChanged { from: route_url.clone(), url }),

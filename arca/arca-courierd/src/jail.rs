@@ -134,7 +134,7 @@ fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> 
         mounts,
         devfs_ruleset: DEVFS_RULESET,
         network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
-        exec: Some(ExecSpec { groups: vec![], path: EXEC_PATH.into(), argv: vec![EXEC_PATH.into()], env, uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
+        exec: Some(ExecSpec { cwd: None, groups: vec![], path: EXEC_PATH.into(), argv: vec![EXEC_PATH.into()], env, uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
         rctl: None,
         hostname: Some(name(uid)),
         hostid: Some(id.hostid),

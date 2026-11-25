@@ -688,6 +688,17 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
     }
 }
 
+/// Whether F4 repeats `c`: commands that act on the selection in place, as
+/// Excel's Repeat does (insert, delete, hide, merge, align, clear, fill).
+pub fn repeatable(c: DataCmd) -> bool {
+    use DataCmd::*;
+    matches!(c, InsertRows | InsertCols | DeleteRows | DeleteCols | InsertCellsDown | InsertCellsRight | DeleteCellsUp | DeleteCellsLeft
+        | HideRows | HideCols | Merge | MergeAcross | Unmerge | CenterAcross | WrapText | AlignTop | AlignMiddle | AlignBottom
+        | ClearFormats | ClearAll | ClearComments | DeleteComments | RemoveLinks | PasteValues | PasteFormulas | PasteFormats
+        | PasteTransposed | PasteComments | PasteSkipBlanks | PasteAdd | PasteSubtract | PasteMultiply | PasteDivide | PasteLink
+        | SortAsc | SortDesc | AutoSum | FillCopy | FillSeries | FillFormats | FillNoFormats)
+}
+
 /// The row and column command for an Excel key (Ctrl+9, Ctrl+0, Ctrl+Shift+(,
 /// Ctrl+Shift+), Ctrl+-, Ctrl++). Delete and insert act on whole rows or
 /// columns when those are selected, else on cells, shifting them up or down,

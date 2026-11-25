@@ -576,16 +576,18 @@ fn handle_attach_mount(
         return Response::Ok;
     }
 
-    /* mkdir -p the host-side dest before mounting (same logic as
-     * jaild's pdfork-child for create-time mounts). */
-    if let Err(e) = std::fs::create_dir_all(&host_dest) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Response::SyscallFailed {
-                name:  "mkdir".into(),
-                errno: e.raw_os_error().unwrap_or(-1),
-                msg:   format!("mkdir -p {host_dest_str}: {e}"),
-            };
-        }
+    /* mkdir -p the host-side dest, never through a link out of the jail's
+     * root, and refuse a dest that resolves outside it: the jail is running
+     * and its processes can plant links (dirs_under). A link swapped in
+     * between this check and nmount is still followed; jaild has no
+     * descriptor-relative mount to close that. */
+    if let Err(e) = dirs_under(std::path::Path::new(&jail.path), &host_dest) {
+        return Response::PolicyDenied { rule: "attach.dest".into(), detail: format!("{host_dest_str}: {e}") };
+    }
+    match (std::fs::canonicalize(&jail.path), std::fs::canonicalize(&host_dest)) {
+        (Ok(r), Ok(d)) if d.starts_with(&r) => {}
+        (r, d) => return Response::PolicyDenied { rule: "attach.dest".into(),
+            detail: format!("{host_dest_str} does not resolve inside the jail root ({r:?}, {d:?})") },
     }
 
     let mount_res = match req.mount_kind {
@@ -769,11 +771,21 @@ fn handle_remove(
     if let Some(p) = jail_path.as_deref() {
         if p != "/" && !p.is_empty() {
             let devdir = format!("{}/dev", p.trim_end_matches('/'));
-            {
-                if let Err(e) = ffi::unmount_at(&devdir, 0) {
-                    if e.raw_os_error() != Some(libc::EINVAL) {
-                        warn!("jaild: RemoveJail devfs unmount {devdir}: {e}");
+            // A jail that was just removed can hold its devfs for a moment
+            // while its last processes exit: a few short tries (jaild serves
+            // one request at a time, so never long), then say so.
+            let mut tries = 0;
+            loop {
+                match ffi::unmount_at(&devdir, 0) {
+                    Err(e) if e.raw_os_error() == Some(libc::EBUSY) && tries < 10 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
+                    Err(e) if e.raw_os_error() != Some(libc::EINVAL) => {
+                        warn!("jaild: RemoveJail devfs unmount {devdir} (after {tries} tries): {e}");
+                        break;
+                    }
+                    _ => break,
                 }
             }
         }
@@ -1534,11 +1546,59 @@ fn resolve_mounts(req: &CreateJailRequest, tmpfs_ceiling: u64) -> Vec<ResolvedMo
     }).collect()
 }
 
+/// Make sure a mount's destination exists before it is resolved. A nullfs
+/// mount of a single file (a registry file) needs a regular file there: the
+/// jail root provides it, and jaild never creates one. Every other mount gets
+/// a directory, made under `root` by [`dirs_under`].
+fn prepare_dest(m: &ResolvedMount, root: &str) -> std::io::Result<()> {
+    let file_source = m.kind != MountKind::Tmpfs
+        && std::fs::metadata(&m.source)?.is_file();
+    if !file_source {
+        return dirs_under(std::path::Path::new(root), std::path::Path::new(&m.dest));
+    }
+    if std::fs::metadata(&m.dest)?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!("{} is a file, so {} must be an existing regular file in the jail root", m.source, m.dest)))
+    }
+}
+
+/// `mkdir -p dest`, one part at a time, never leaving `root`: a part that
+/// is a link must resolve inside the root before anything is made through
+/// it. A jail's writable root can hold a link left by an earlier run, and
+/// `create_dir_all` would follow it and make host directories as root.
+fn dirs_under(root: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let outside = |p: &std::path::Path| std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+        format!("{} is outside the jail root {}", p.display(), root.display()));
+    let rel = dest.strip_prefix(root).map_err(|_| outside(dest))?;
+    let real_root = std::fs::canonicalize(root)?;
+    let mut p = root.to_path_buf();
+    for c in rel.components() {
+        let std::path::Component::Normal(c) = c else { return Err(outside(dest)) };
+        p.push(c);
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let to = std::fs::canonicalize(&p)?;
+                if !to.starts_with(&real_root) { return Err(outside(&to)) }
+                if !to.is_dir() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a directory", p.display())));
+                }
+            }
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a directory", p.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&p)?,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Make the destination and mount it. The destination must still lie under
 /// the root once symlinks are resolved: a jail's writable root can hold a
 /// link left by an earlier run, and nmount follows it.
 fn mount_one(m: &ResolvedMount, root: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(&m.dest)?;
+    prepare_dest(m, root)?;
     let real_root = std::fs::canonicalize(root)?;
     let real_dest = std::fs::canonicalize(&m.dest)?;
     if !real_dest.starts_with(&real_root) {
@@ -1740,6 +1800,14 @@ fn handle_create_with_exec(
                 exec.uid, exec.gid);
             ffi::child_exit(103);
         }
+        /* After the drop: a directory the entry's identity cannot enter is
+         * not entered. */
+        if let Some(dir) = &exec.cwd {
+            if let Err(e) = ffi::child_chdir(dir) {
+                eprintln!("jaild-child: chdir {dir}: {e}");
+                ffi::child_exit(106);
+            }
+        }
         let mut env_pairs: Vec<(String, String)> = exec.env.iter()
             .filter(|p| !p.key.starts_with("ATRIUM_LISTEN_") && p.key != "ATRIUM_READY_FD")
             .map(|p| (p.key.clone(), p.value.clone()))
@@ -1879,6 +1947,11 @@ fn handle_listen_in_jail(
     let sys = |name: &'static str| move |e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
+    /* A workspace with no network has its own lo0, down: the listener needs
+     * it up. Nothing leaves the jail by it. */
+    if let Err(e) = crate::routed::configure_loopback(name) {
+        warn!("jaild: lo0 in {name}: {e}");
+    }
     let (ours, theirs) = UnixStream::pair().map_err(sys("socketpair"))?;
     let pdf = ffi::pdfork().map_err(sys("pdfork"))?;
     if pdf.pid == 0 {
@@ -2091,6 +2164,80 @@ pub fn bind(socket_path: &Path) -> Result<UnixListener, JaildError> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(socket_path, perms)?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod mount_dest_tests {
+    use super::*;
+
+    fn mount(source: &std::path::Path, dest: &std::path::Path, kind: MountKind) -> ResolvedMount {
+        ResolvedMount {
+            source: source.display().to_string(),
+            dest: dest.display().to_string(),
+            kind,
+            size_mb: 0,
+            owner: None,
+            flags: ffi::MountFlags::default(),
+        }
+    }
+
+    /// A registry file mounted onto the empty file the jail root provides
+    /// (arcad's app-registry): create_dir_all on it failed with EEXIST.
+    #[test]
+    fn a_file_mounts_onto_the_existing_file_without_a_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let (source, dest) = (t.path().join("app-registry"), t.path().join("root-registry"));
+        std::fs::write(&source, b"x").unwrap();
+        std::fs::write(&dest, b"").unwrap();
+        prepare_dest(&mount(&source, &dest, MountKind::RoNullfs), &t.path().to_string_lossy()).unwrap();
+        assert!(std::fs::metadata(&dest).unwrap().is_file());
+    }
+
+    /// The refusals beside it: jaild does not invent the file, and a file
+    /// does not mount onto a directory.
+    #[test]
+    fn a_file_source_needs_a_regular_file_destination() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("registry");
+        std::fs::write(&source, b"x").unwrap();
+        let missing = t.path().join("missing");
+        assert!(prepare_dest(&mount(&source, &missing, MountKind::RoNullfs), &t.path().to_string_lossy()).is_err());
+        assert!(!missing.exists());
+        let dir = t.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(prepare_dest(&mount(&source, &dir, MountKind::RwNullfs), &t.path().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn directory_and_tmpfs_mounts_still_get_their_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("a/b");
+        prepare_dest(&mount(t.path(), &dest, MountKind::RoNullfs), &t.path().to_string_lossy()).unwrap();
+        assert!(dest.is_dir());
+        let tmp = t.path().join("tmp/x");
+        prepare_dest(&mount(std::path::Path::new(""), &tmp, MountKind::Tmpfs), &t.path().to_string_lossy()).unwrap();
+        assert!(tmp.is_dir());
+    }
+
+    /// A link in the root left by an earlier run: nothing is made through it
+    /// outside the root, and a link that stays inside is followed.
+    #[test]
+    fn directories_are_never_made_through_a_link_out_of_the_root() {
+        let t = tempfile::tempdir().unwrap();
+        let (root, host) = (t.path().join("root"), t.path().join("host"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        std::os::unix::fs::symlink(&host, root.join("var")).unwrap();
+        let r = root.to_string_lossy();
+        let e = prepare_dest(&mount(t.path(), &root.join("var/made"), MountKind::RoNullfs), &r).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        assert!(!host.join("made").exists(), "made a host directory through the link");
+        std::fs::create_dir_all(root.join("usr/share")).unwrap();
+        std::os::unix::fs::symlink("usr/share", root.join("share")).unwrap();
+        prepare_dest(&mount(t.path(), &root.join("share/x"), MountKind::RoNullfs), &r).unwrap();
+        assert!(root.join("usr/share/x").is_dir());
+        assert!(prepare_dest(&mount(t.path(), &t.path().join("elsewhere"), MountKind::RoNullfs), &r).is_err());
+    }
 }
 
 #[cfg(test)]

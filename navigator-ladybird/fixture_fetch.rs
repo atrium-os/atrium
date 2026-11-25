@@ -216,6 +216,11 @@ static LIVE_NEXT: Mutex<u32> = Mutex::new(1);
 /// with the body in `out`. `None` on a refusal, a failure, or anything out
 /// of shape (a body over `out`, data out of order, a second head).
 fn live_exchange(url: &str, out: &mut [u8], wait: Duration) -> Option<(u16, String, Option<String>, usize)> {
+    live_exchange_with(url, None, out, wait)
+}
+
+/// As [`live_exchange`], or a script's POST of `post` (content type, body; I6.3).
+fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wait: Duration) -> Option<(u16, String, Option<String>, usize)> {
     let mut state = CLIENT.get()?.lock().ok()?;
     let (client, _, _) = state.as_mut()?;
     let id = {
@@ -224,7 +229,10 @@ fn live_exchange(url: &str, out: &mut [u8], wait: Duration) -> Option<(u16, Stri
         *next = next.checked_add(1)?;
         id
     };
-    let mut open = Open::get(id, url);
+    let mut open = match post {
+        Some((kind, body)) => Open::post(id, url, kind, body.to_vec()),
+        None => Open::get(id, url),
+    };
     open.limits.max_bytes = out.len() as u64;
     open.retry.max_attempts = 0;
     client.open(open).ok()?;
@@ -297,6 +305,41 @@ pub unsafe extern "C" fn navigator_live_get(
         *status = code;
         std::ptr::copy_nonoverlapping(content_type.as_ptr(), kind, content_type.len());
         *kind_len = content_type.len();
+    }
+    n as isize
+}
+
+/// A script's POST (I6.3): `body` as `content_type` to `url`, which
+/// navigatord sends through the page's jar inside its site. The answer as
+/// for [`navigator_live_get`]; -1: refused or failed.
+/// # Safety
+/// The inputs are readable and the outputs writable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_post(
+    url: *const u8, len: usize, content_type: *const u8, content_type_len: usize, body: *const u8, body_len: usize,
+    out: *mut u8, cap: usize, status: *mut u16, kind: *mut u8, kind_cap: usize, kind_len: *mut usize,
+) -> isize {
+    if url.is_null() || content_type.is_null() || out.is_null() || status.is_null() || kind.is_null() || kind_len.is_null()
+        || len > 8192 || content_type_len == 0 || content_type_len > 128 || body_len > nuntius::BODY_MAX || (body.is_null() && body_len > 0) {
+        return -1;
+    }
+    // SAFETY: the caller passes readable buffers of these lengths.
+    let (url, content_type, body) = unsafe { (
+        std::slice::from_raw_parts(url, len), std::slice::from_raw_parts(content_type, content_type_len),
+        if body_len == 0 { &[][..] } else { std::slice::from_raw_parts(body, body_len) },
+    ) };
+    let (Ok(url), Ok(content_type)) = (std::str::from_utf8(url), std::str::from_utf8(content_type)) else { return -1 };
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
+    let answer = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+    let Some((code, final_url, answer_type, n)) = live_exchange_with(url, Some((content_type, body)), answer, Duration::from_secs(30)) else { return -1 };
+    if final_url != url { return -1; }
+    let answer_type = answer_type.unwrap_or_default();
+    if answer_type.len() > kind_cap { return -1; }
+    // SAFETY: `status`, `kind` (`kind_cap` bytes) and `kind_len` are writable.
+    unsafe {
+        *status = code;
+        std::ptr::copy_nonoverlapping(answer_type.as_ptr(), kind, answer_type.len());
+        *kind_len = answer_type.len();
     }
     n as isize
 }

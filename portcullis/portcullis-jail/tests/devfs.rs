@@ -61,8 +61,6 @@ fn a_capability_grant_is_applied_to_this_jails_devfs_before_it_starts() {
     // ★ `&&`, so a grant that fails to apply fails the launch instead of
     // starting an app without the device it asked for.
     assert!(pre.contains(" && "), "{pre}");
-    // And it renders into the jail.conf jail(8) actually reads.
-    assert!(jc.render_jail_conf().unwrap().contains("exec.prestart = \"devfs -m "), "{}", jc.render_jail_conf().unwrap());
 }
 
 /// An app with no device capability gets no prestart at all — the baseline
@@ -113,7 +111,7 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         if let Some(Value::String(pre)) = param(&jc, "exec.prestart") {
             assert!(!pre.contains("dsp") && !pre.contains("mixer"), "{caps}: {pre}");
         }
-        let conf = jc.render_jail_conf().unwrap();
+        let conf = format!("{:?} {:?}", jc.params, jc.devfs_actions);
         assert!(!conf.contains("dsp") && !conf.contains("mixer"), "{caps}: {conf}");
         for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "bluetooth-control", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure", "vpn-read", "vpn-use", "vpn-configure", "navigator", "fresco-chrome", "fresco-activation", "limen", "arca", "arca-courier", "sigillum", "monstrator"] {
             let n = sock(&jc, name);

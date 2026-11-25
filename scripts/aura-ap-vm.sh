@@ -14,6 +14,9 @@
 #   sh scripts/aura-ap-vm.sh signal FREQ DBM [FREQ DBM...]
 #                                       what the FreeBSD side hears per channel
 #   sh scripts/aura-ap-vm.sh blackout SECS    # every channel out of range for SECS s (timed in the VM)
+#   sh scripts/aura-ap-vm.sh wired     a wired 802.1X switch port on the cable NIC (hostapd
+#                                       driver=wired; DHCP 10.79.0.0/24 only while signed in)
+#   sh scripts/aura-ap-vm.sh wired-log the wired port's hostapd, open/close and DHCP logs
 #   sh scripts/aura-ap-vm.sh log       hostapd and medium logs
 #   sh scripts/aura-ap-vm.sh ssh CMD   run a command in the VM as root
 #   sh scripts/aura-ap-vm.sh down      power off
@@ -93,6 +96,7 @@ up() {
             -drive if=pflash,format=raw,unit=1,file="$D/vars.fd" \
             -drive if=virtio,format=qcow2,file="$D/vm.qcow2" \
             -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22 -device virtio-net-pci,netdev=n0 \
+            -netdev socket,id=cable,udp=127.0.0.1:7812,localaddr=127.0.0.1:7811 -device virtio-net-pci,netdev=cable,mac=02:4e:00:00:02:01 \
             -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:$HTTP_PORT/" \
             -display none -serial "file:$D/console.log" -daemonize -pidfile "$D/qemu.pid"
     fi
@@ -135,6 +139,26 @@ ap() {
     echo "aura-ap-vm: AP up ($*)"
 }
 
+# Wired 802.1X (wifi.md §7.5): the NIC on the cable to the FreeBSD VM
+# (QEMU socket netdev, MAC 02:4e:00:00:02:01) becomes a switch port that
+# asks for a sign-in: hostapd with driver=wired, and DHCP only while
+# authorized (wired-port.sh). Run after `ap`, which stops every hostapd.
+wired() {
+    for f in hostapd-wired.conf udhcpd-wired.conf wired-port.sh; do
+        scp -q -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -P "$SSH_PORT" "$ROOT/aura/sim-ap/$f" ubuntu@localhost:/tmp/
+    done
+    gssh "set -e; n=\$(grep -l 02:4e:00:00:02:01 /sys/class/net/*/address | cut -d/ -f5); [ -n \"\$n\" ] || { echo 'no cable NIC: aura-ap-vm.sh up boots with it'; exit 1; }
+        pkill -f '[h]ostapd /tmp/hostapd-wired' || true; pkill -f '[h]ostapd_cli -i' || true; pkill -f '[u]dhcpd -f /tmp/udhcpd-wired.conf' || true; sleep 1
+        ip addr flush dev \$n; ip addr add 10.79.0.1/24 dev \$n; ip link set \$n up
+        sed -i \"s/cable0/\$n/\" /tmp/hostapd-wired.conf /tmp/udhcpd-wired.conf; chmod 755 /tmp/wired-port.sh
+        rm -f /run/udhcpd-wired.leases /tmp/wired-port.log /tmp/udhcpd-wired.log; touch /run/udhcpd-wired.leases
+        (nohup hostapd ${HOSTAPD_ARGS:-} /tmp/hostapd-wired.conf >/tmp/hostapd-wired.log 2>&1 &)
+        i=0; until [ -S /run/hostapd-wired/\$n ]; do i=\$((i+1)); [ \$i -lt 30 ] || { cat /tmp/hostapd-wired.log; exit 1; }; sleep 1; done
+        hostapd_cli -B -p /run/hostapd-wired -i \$n -a /tmp/wired-port.sh
+        echo \"aura-ap-vm: wired 802.1X port on \$n\""
+}
+
 signal() {
     l=""
     while [ $# -ge 2 ]; do l="$l$1 $2\n"; shift 2; done
@@ -156,6 +180,8 @@ up) up ;;
 blackout) blackout "$2" ;;
 ap) shift; ap "$@" ;;
 signal) shift; signal "$@" ;;
+wired) wired ;;
+wired-log) gssh "tail -n 80 /tmp/hostapd-wired.log; echo ---; cat /tmp/wired-port.log; echo ---; tail -n 20 /tmp/udhcpd-wired.log" ;;
 log) gssh "tail -n 60 /tmp/hostapd.log; echo ---; tail -n 20 /tmp/air.log; echo ---; tail -n 20 /tmp/udhcpd.log" ;;
 ssh) shift; gssh "$*" ;;
 down) gssh "poweroff" || true; sleep 5; [ -f "$D/qemu.pid" ] && kill "$(cat "$D/qemu.pid")" 2>/dev/null || true ;;

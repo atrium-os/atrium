@@ -177,50 +177,6 @@ pub fn warn_survivors(who: &str, survivors: &[PathBuf]) {
 /// Refuse a jail whose devfs would hide nothing. Call immediately before every
 /// `jail -c`.
 ///
-/// ★★★ A ruleset the kernel has not loaded does not fail the mount — the
-/// kernel creates it EMPTY and the jail gets the host's entire /dev. Measured
-/// 2026-09-22: every app and one-shot worker (ruleset 99, never defined) and
-/// every session jail (100, likewise) saw raw disks, mem/kmem and bpf, and a
-/// root process in one read the host's disk. So "has rules" is checked, not
-/// "exists": once any jail has mounted an unloaded number, it is listed.
-/// Same check as jaild's own (jaild/src/ffi.rs), for the jail(8) paths jaild
-/// does not see.
-pub fn ensure_devfs_isolation(jc: &JailConfig) -> Result<(), String> {
-    use portcullis_jail::Value;
-    let devfs = jc.params.iter().any(|(k, v)| k == "mount.devfs" && matches!(v, Value::Bool(true)));
-    if !devfs { return Ok(()) }
-    let id = jc.params.iter().find_map(|(k, v)| match (k.as_str(), v) {
-        ("devfs_ruleset", Value::Number(n)) => Some(*n),
-        _ => None,
-    });
-    // ★ mount.devfs with NO ruleset, or 0, is the host's full /dev — the same
-    // exposure by another name, so it is refused too.
-    let Some(id) = id.filter(|n| *n > 0) else {
-        return Err(format!("jail {} mounts devfs with no ruleset: it would see the \
-                            host's entire /dev", jc.name));
-    };
-    let out = Command::new("devfs").args(["rule", "-s", &id.to_string(), "show"]).output()
-        .map_err(|e| format!("cannot verify devfs ruleset {id}: {e}"))?;
-    if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-        return Ok(());
-    }
-    Err(format!("devfs ruleset {id} has no rules loaded in the kernel; jail {} would \
-                 see the host's entire /dev. Install etc/atrium.devfs.rules and \
-                 `service devfs restart`", jc.name))
-}
-
-/// Refuse a jail whose `full` network was never attached. ★ Call before every
-/// `jail -c`, beside [`ensure_devfs_isolation`]: build() no longer puts a
-/// networked app on the host's stack, so an unattached config would run with
-/// no network at all — or, if someone "fixed" it by hand, on the host's.
-pub fn ensure_network_ready(jc: &JailConfig) -> Result<(), String> {
-    if jc.needs_routed_net.is_some() && !jc.routed_net_attached {
-        return Err(format!("jail {} needs its network from jaild (AllocateNet) \
-                            before it can start", jc.name));
-    }
-    Ok(())
-}
-
 /// Create the destinations a jail's mounts need. ★ `jail(8)` does not create
 /// mountpoints; without this a capability mount fails with "No such file or
 /// directory" after everything else has succeeded.
@@ -404,38 +360,5 @@ tmpfs /var/run/portcullis-exec/w tmpfs rw 0 0
         let v = parse_mounts(t, &roots);
         assert_eq!(v.len(), 3, "each layer is one entry: {v:?}");
         assert_eq!(v.iter().filter(|p| p.ends_with("jails/w")).count(), 2, "{v:?}");
-    }
-
-    fn jail(devfs: bool, ruleset: Option<i64>) -> JailConfig {
-        use portcullis_jail::Value;
-        let mut jc = JailConfig::new("t".into(), PathBuf::from("/j"));
-        jc.set("mount.devfs", Value::Bool(devfs));
-        if let Some(n) = ruleset { jc.set("devfs_ruleset", Value::Number(n)); }
-        jc
-    }
-
-    /// ★★ devfs with no ruleset, or ruleset 0, is the host's full /dev under
-    /// another name — refused without asking the kernel anything.
-    #[test]
-    fn a_devfs_with_no_ruleset_is_refused() {
-        let e = ensure_devfs_isolation(&jail(true, None)).unwrap_err();
-        assert!(e.contains("no ruleset"), "{e}");
-        let e = ensure_devfs_isolation(&jail(true, Some(0))).unwrap_err();
-        assert!(e.contains("no ruleset"), "{e}");
-    }
-
-    /// A jail that mounts no devfs has nothing to isolate.
-    #[test]
-    fn no_devfs_mount_needs_no_ruleset() {
-        assert!(ensure_devfs_isolation(&jail(false, None)).is_ok());
-    }
-
-    /// ★ Unverifiable is refused, not assumed fine. Off FreeBSD there is no
-    /// `devfs(8)`, which is exactly the "cannot tell" case — the check must
-    /// fail closed there, never open.
-    #[cfg(not(target_os = "freebsd"))]
-    #[test]
-    fn a_ruleset_that_cannot_be_verified_is_refused() {
-        assert!(ensure_devfs_isolation(&jail(true, Some(22))).is_err());
     }
 }

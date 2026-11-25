@@ -1230,14 +1230,14 @@ impl Live {
                     }
                 }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
-                Out::RunPageLive { url, press } => {
+                Out::RunPageLive { url, press, jar } => {
                     let rect = live_rect(s);
-                    send(&mut self.w, &Request::RunPageLive { url: url.clone(), rect, press });
+                    send(&mut self.w, &Request::RunPageLive { url: url.clone(), rect, press, jar });
                     self.live_placed = Some((url, rect));
                 }
-                Out::ContinueLive { url } => {
+                Out::ContinueLive { url, jar } => {
                     let rect = live_rect(s);
-                    send(&mut self.w, &Request::ContinueLive { url: url.clone(), rect });
+                    send(&mut self.w, &Request::ContinueLive { url: url.clone(), rect, jar });
                     self.live_placed = Some((url, rect));
                 }
                 Out::StopLive { url } => {

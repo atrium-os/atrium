@@ -268,6 +268,39 @@ impl CuriaView {
             y = self.trust_prompt(ctx, &p, x0, pw, y);
         }
 
+        // Wired 802.1X (wifi.md §7.5): a port whose switch asks to sign in.
+        if let Some(i) = p.wired_port() {
+            text(ctx, x0, y + em(10.0), "Wired network", type_size::SM, Weight::Semibold, t.text_secondary());
+            y += em(28.0);
+            let rh = em(44.0);
+            icon(ctx, x0 + em(12.0), y + em(13.0), ph::PLUGS_CONNECTED, em(18.0), t.text_secondary());
+            let port = format!("Ethernet ({})", i.name);
+            text(ctx, x0 + em(44.0), y + rh / 2.0, &port, type_size::SM, Weight::Medium, t.text_primary());
+            let lx = x0 + em(44.0) + width(&port, type_size::SM, Weight::Medium) + em(16.0);
+            text(ctx, lx, y + rh / 2.0, &crate::network::wired_label(i).unwrap_or_default(), type_size::SM, Weight::Regular, t.text_secondary());
+            let state = i.dot1x.as_deref().unwrap_or("");
+            let open = p.asking.as_deref() == Some(crate::network::WIRED);
+            let mut bx = x0 + pw - em(8.0);
+            let by = y + (rh - em(30.0)) / 2.0;
+            if state == "authorized" || state == "failed" || state == "running" {
+                let label = "Forget sign-in";
+                bx -= width(label, type_size::SM, Weight::Medium) + em(24.0);
+                let pg = self.page.clone();
+                button(ctx, bx, by, label, Look::Ghost, true, move || with(&pg, NetPage::forget_wired));
+                bx -= em(8.0);
+            }
+            let label = if state == "needed" { "Sign in…" } else { "Change sign-in…" };
+            bx -= width(label, type_size::SM, Weight::Medium) + em(24.0);
+            let pg = self.page.clone();
+            let look = if state == "needed" || state == "failed" { Look::Primary } else { Look::Secondary };
+            button(ctx, bx, by, label, look, !open, move || with(&pg, NetPage::sign_in_wired));
+            y += rh;
+            if open && p.ent.is_some() {
+                y = self.enterprise_sheet(ctx, &p, x0, pw, y);
+            }
+            y += em(20.0);
+        }
+
         // Networks around.
         text(ctx, x0, y + em(10.0), "Wi-Fi networks", type_size::SM, Weight::Semibold, t.text_secondary());
         {
@@ -527,7 +560,8 @@ impl CuriaView {
             y += mh + em(8.0);
         }
         let ready = p.joining.is_none() && p.armed.is_none() && p.pick.is_none() && if f.tls() { f.cert.is_some() } else { p.field_up };
-        let jw = button(ctx, fx, y, "Join", Look::Primary, ready, join);
+        let verb = if p.asking.as_deref() == Some(crate::network::WIRED) { "Sign in" } else { "Join" };
+        let jw = button(ctx, fx, y, verb, Look::Primary, ready, join);
         let pg = self.page.clone();
         button(ctx, fx + jw + em(8.0), y, "Cancel", Look::Ghost, true, move || with(&pg, NetPage::cancel_ask));
         y += em(40.0);
@@ -1884,7 +1918,7 @@ mod tests {
         p.apply(Got::Status(Some(Status { link: Link::Wired, online: Online::Yes, metered: false, bars: None, ssid: None, portal: None })));
         let m = Manual { addr: "10.0.0.5".parse().unwrap(), prefix: 24, router: Some("10.0.0.1".parse().unwrap()), dns: vec![] };
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: Some(m), enterprise: false }])));
-        let em0 = Iface { name: "em0".into(), wifi: false, link: "up".into(), addr: Some("192.168.1.9/24".into()), router: None, dns: vec![], mac: String::new(), addrs6: vec![], dns6: vec![], online: Online::Yes, metered: false, egress: true, manual: None };
+        let em0 = Iface { name: "em0".into(), wifi: false, link: "up".into(), addr: Some("192.168.1.9/24".into()), router: None, dns: vec![], mac: String::new(), addrs6: vec![], dns6: vec![], online: Online::Yes, metered: false, egress: true, manual: None, dot1x: None, dot1x_why: None };
         p.apply(Got::Details(Ok(vec![em0])));
         p.apply(Got::OwnDns(Ok((vec!["9.9.9.9".into()], Some("dns.quad9.net".into())))));
         p.toggle_details();

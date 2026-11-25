@@ -27,11 +27,7 @@ pub fn jail_name(owner: &str) -> String { format!("empty_{owner}") }
 fn jail_path(owner: &str) -> PathBuf { Path::new(JAILS).join(owner) }
 
 pub fn running_jid(owner: &str) -> Option<i32> {
-    let out = Command::new("jls").args(["-j", &jail_name(owner), "jid"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    jaild::ffi::jail_id_by_name(&jail_name(owner))
 }
 
 /// Where the shell goes: (jid, uid, gid).
@@ -107,13 +103,12 @@ pub fn start(owner: &str) -> Result<(i32, u32, u32), String> {
         sysfil,
     };
     let mut jc = portcullis_jail::build(&manifest, &opts).map_err(|e| fail(format!("build: {e}")))?;
-    jc.set("exec.jail_user", portcullis_jail::Value::String("root".into()));
-    // Its entry is the toolbox's shell, which reads no input (stdin is
-    // /dev/null) and returns at once: nothing else runs at creation.
+    // Nothing runs at creation: jaild makes it empty.
     let tools = crate::console::ensure_toolbox().map_err(|e| fail(format!("the console's toolbox: {e}")))?;
     jc.add_mount(&tools, &jp.join(crate::console::IN_JAIL), "nullfs", &["ro"]);
     launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
-    launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
+    launch::create_persistent(&jc, &jp, jaild::protocol::JailClass::Terminal { owner: owner.into() }, launch::TERMINAL_CLASS)
+        .map_err(|e| fail(format!("{e:?}")))?;
     let jid = running_jid(owner).ok_or_else(|| fail(format!("the empty console of {owner} did not start")))?;
     eprintln!("portcullisd: empty console of {owner} started (jid {jid}, uid {uid})");
     Ok((jid, uid, gid))

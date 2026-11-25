@@ -483,7 +483,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
         // ★ Isolated, not Disable: an own empty vnet, so the worker cannot
         // list the host's interfaces or read its real MAC (§9.1c).
         network,
-        exec: Some(jaild::protocol::ExecSpec {
+        exec: Some(jaild::protocol::ExecSpec { cwd: None,
             groups: vec![],
             path:  entry.clone(),
             argv:  vec![entry],
@@ -935,12 +935,7 @@ fn leftovers(jail_path: &Path, jail_name: &str) -> bool {
 /// nothing should hold these mounts, so forcing costs nothing and guarantees
 /// the next run does not stack on a survivor.
 fn teardown(jail_path: &Path, jail_name: &str) {
-    if portcullis_mounts::sys::jail_id(jail_name, false).is_err() {
-        let _ = Command::new("jail").arg("-r").arg(jail_name)
-            .stderr(std::process::Stdio::null()).status();
-    } else {
-        portcullis_mounts::sys::jail_remove_by_name(jail_name);
-    }
+    portcullis_mounts::sys::jail_remove_by_name(jail_name);
     // ★★ A dying jail pins its root: unmounting before it is gone stacks the
     // pile (portcullis_mounts::wait_jail_gone).
     portcullis_mounts::wait_jail_gone(jail_name, portcullis_mounts::JAIL_GONE_TIMEOUT);

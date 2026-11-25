@@ -30,9 +30,17 @@
 //!   wifi-forget ssid=HEX | country cc=XX
 //!   static ssid=HEX|iface=NAME [maddr=A/P [mrouter=R] [mdns=A,B]]  (no maddr: DHCP)
 //!   dns [servers=A,B,C]  (the machine's own DNS servers; none: each network's)
+//!   wired-remember-eap method=.. identity=.. [..]  (wifi.md §7.5: the machine's
+//!     wired 802.1X profile, as wifi-remember-eap; used on whichever port asks)
+//!   wired-eap-seen | wired-eap-trust | wired-eap-key cn=HEX | wired-forget
+//!
+//! Wired 802.1X: EAPOL frames on an Ethernet port are relayed, unparsed, to
+//! aura-keys over one connection held for that port (dot1x.rs); `dot1x`
+//! events and the port's `dot1x=` status say where it stands.
 
 #[cfg(target_os = "freebsd")]
 mod imp {
+    use atrium_net::dot1x::{self, Do, Dot1x};
     use atrium_net::egress::{Cand, Egress, Inet};
     use atrium_net::plan::{Action, Applied};
     use atrium_net::sys::{self, Bpf, Dir, Ifc, Rtsock, Unbound};
@@ -88,8 +96,8 @@ mod imp {
         Some((v, tls))
     }
 
-    fn parse_settings(text: &str) -> (Vec<(String, Manual)>, OwnDns) {
-        let (mut wired, mut dns) = (Vec::new(), (Vec::new(), None));
+    fn parse_settings(text: &str) -> (Vec<(String, Manual)>, OwnDns, bool) {
+        let (mut wired, mut dns, mut dot1x) = (Vec::new(), (Vec::new(), None), false);
         for l in text.lines().take(64).filter_map(Line::parse) {
             match l.verb.as_str() {
                 "wired" => {
@@ -103,10 +111,12 @@ mod imp {
                         dns = d;
                     }
                 }
+                // A wired 802.1X profile is set up (kept in aura-keys).
+                "dot1x" => dot1x = true,
                 _ => {}
             }
         }
-        (wired, dns)
+        (wired, dns, dot1x)
     }
     /// A probe that has not answered by then is abandoned (atrium-probe's
     /// own timeouts add up to about 15 s).
@@ -413,6 +423,10 @@ mod imp {
         /// Wired ports with a fixed setting, and the machine's own DNS
         /// servers (used instead of every network's when set).
         wired_manual: Vec<(String, Manual)>,
+        /// Wired 802.1X: the port signing in, and its connection to
+        /// aura-keys (wifi.md §7.5).
+        dot1x: Dot1x,
+        dot1x_conn: Option<Conn>,
         own_dns: Vec<IpAddr>,
         /// Ask `own_dns` only over TLS, checked against this name.
         dns_tls: Option<String>,
@@ -1341,6 +1355,9 @@ mod imp {
                 let tls = self.dns_tls.as_ref().map(|n| format!(" tls={n}")).unwrap_or_default();
                 out.push_str(&format!("dns servers={}{tls}\n", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")));
             }
+            if self.dot1x.configured {
+                out.push_str("dot1x\n");
+            }
             if let Err(e) = self.state.write(SETTINGS_FILE, out.as_bytes()) {
                 eprintln!("atrium-net: saving settings: {e}");
             }
@@ -1392,6 +1409,112 @@ mod imp {
             if let Err(e) = self.state.write(STATE_FILE, w.saved.render().as_bytes()) {
                 eprintln!("atrium-net: saving profiles: {e}");
             }
+        }
+
+        /// Carry out wired 802.1X's decisions (dot1x.rs).
+        fn dot1x_do(&mut self, acts: Vec<Do>) {
+            for a in acts {
+                match a {
+                    Do::Start(k) => {
+                        if self.dot1x_conn.is_none() {
+                            let c = self.keys.as_ref().and_then(|d| d.connect("keys.sock").ok()).and_then(|s| Conn::new(s).ok());
+                            match c {
+                                Some(c) => self.dot1x_conn = Some(c),
+                                None => {
+                                    self.log("dot1x: aura-keys unreachable");
+                                    let a = self.dot1x.keys_lost();
+                                    self.dot1x_do(a);
+                                    return;
+                                }
+                            }
+                        }
+                        let l = Line::new("wired-start").with("port", &self.ifs[k].name);
+                        self.log(&format!("{}: 802.1X", self.ifs[k].name));
+                        if self.dot1x_conn.as_mut().is_some_and(|c| c.send(&l).is_err()) {
+                            self.dot1x_conn = None;
+                        }
+                    }
+                    Do::Stop(k) => {
+                        if self.ifs[k].link {
+                            let _ = self.ifs[k].bpf.write(&dot1x::frame_to_switch(&self.ifs[k].mac, &dot1x::LOGOFF));
+                        }
+                        if let Some(mut c) = self.dot1x_conn.take() {
+                            let _ = c.send(&Line::new("wired-stop"));
+                        }
+                    }
+                    Do::RestartLease(k) => {
+                        self.log(&format!("{}: 802.1X authorized; DHCP again", self.ifs[k].name));
+                        if self.ifs[k].link && self.manual_for(k).is_none() {
+                            let _ = self.ifs[k].lease.send(&Line::new("down"));
+                            let _ = self.ifs[k].lease.send(&Line::new("up"));
+                        }
+                    }
+                    Do::Report(k) => {
+                        let mut l = Line::new("dot1x").with("iface", &self.ifs[k].name).with("state", self.dot1x.state.word());
+                        if let dot1x::State::Failed(why) = &self.dot1x.state {
+                            l = l.with("why", why);
+                        }
+                        self.log(&format!("{l:?}"));
+                        self.event(&l);
+                    }
+                }
+            }
+        }
+
+        /// Lines from aura-keys on the wired port's connection.
+        fn dot1x_lines(&mut self) {
+            let lines = match self.dot1x_conn.as_mut().map(|c| c.lines()) {
+                Some(Ok(v)) => v,
+                Some(Err(_)) => {
+                    self.log("dot1x: aura-keys went away");
+                    self.dot1x_conn = None;
+                    let a = self.dot1x.keys_lost();
+                    return self.dot1x_do(a);
+                }
+                None => return,
+            };
+            for g in lines {
+                let Got::Line(l) = g else { continue };
+                match l.verb.as_str() {
+                    "wired-tx" => {
+                        let Some(k) = self.dot1x.port else { continue };
+                        // aura-keys' EAPOL PDU, framed here to the PAE group.
+                        match l.hex("body").filter(|b| !b.is_empty() && b.len() <= 1500) {
+                            Some(b) => {
+                                if let Err(e) = self.ifs[k].bpf.write(&dot1x::frame_to_switch(&self.ifs[k].mac, &b)) {
+                                    eprintln!("atrium-net: {}: bpf write: {e}", self.ifs[k].name);
+                                }
+                            }
+                            None => eprintln!("atrium-net: dot1x: a bad frame from aura-keys"),
+                        }
+                    }
+                    "ok" => {}
+                    "error" => eprintln!("atrium-net: dot1x: aura-keys: {}", l.get("why").unwrap_or("?")),
+                    v => {
+                        let now = self.now();
+                        let a = self.dot1x.keys_line(v, l.get("why"), now);
+                        self.dot1x_do(a);
+                    }
+                }
+            }
+        }
+
+        /// An EAPOL frame from port k's switch.
+        fn dot1x_frame(&mut self, k: usize, body: &[u8]) {
+            let now = self.now();
+            let (relay, acts) = self.dot1x.frame(k, now);
+            self.dot1x_do(acts);
+            if relay {
+                let l = Line::new("wired-rx").with_hex("body", body);
+                if self.dot1x_conn.as_mut().is_some_and(|c| c.send(&l).is_err()) {
+                    self.dot1x_conn = None;
+                }
+            }
+        }
+
+        /// The first wired port with its link up.
+        fn wired_up(&self) -> Option<usize> {
+            self.ifs.iter().position(|i| !i.wifi && i.link)
         }
 
         /// One request to aura-keys (a fresh connection each time).
@@ -1671,6 +1794,56 @@ mod imp {
                         None => err("aura-keys-unreachable"),
                     }
                 }
+                // Wired 802.1X (wifi.md §7.5): the machine's one wired
+                // profile, kept in aura-keys like a Wi-Fi network's.
+                "wired-remember-eap" => {
+                    let mut r = Line::new("remember-eap").with("wired", 1);
+                    for k in ["method", "identity", "anonymous", "domain", "ca", "roots", "secret", "handle", "key", "cert"] {
+                        if let Some(v) = l.get(k) {
+                            r = r.with(k, v);
+                        }
+                    }
+                    match self.keys_call(&r) {
+                        Some(r) if r.verb == "ok" => {}
+                        Some(r) => return vec![r],
+                        None => return err("aura-keys-unreachable"),
+                    }
+                    let a = self.dot1x.configure(true, self.wired_up());
+                    self.save_settings();
+                    self.dot1x_do(a);
+                    ok()
+                }
+                "wired-eap-seen" | "wired-eap-key" => {
+                    let mut r = Line::new(&l.verb["wired-".len()..]).with("wired", 1);
+                    if let Some(cn) = l.get("cn") {
+                        r = r.with("cn", cn);
+                    }
+                    match self.keys_call(&r) {
+                        Some(r) if r.verb == "error" => vec![r],
+                        Some(r) => vec![r, Line::new("ok")],
+                        None => err("aura-keys-unreachable"),
+                    }
+                }
+                "wired-eap-trust" => match self.keys_call(&Line::new("eap-trust").with("wired", 1)) {
+                    Some(r) if r.verb == "ok" => {
+                        let a = self.dot1x.configure(true, self.wired_up());
+                        self.dot1x_do(a);
+                        vec![r]
+                    }
+                    Some(r) => vec![r],
+                    None => err("aura-keys-unreachable"),
+                },
+                "wired-forget" => {
+                    let r = self.keys_call(&Line::new("forget").with("wired", 1));
+                    let a = self.dot1x.configure(false, None);
+                    self.save_settings();
+                    self.dot1x_do(a);
+                    match r {
+                        Some(r) if r.verb == "ok" || r.get("why") == Some("unknown") => ok(),
+                        Some(r) => vec![r],
+                        None => err("aura-keys-unreachable"),
+                    }
+                }
                 "static" => {
                     let m = nlines::manual(l);
                     if l.get("maddr").is_some() && m.is_none() {
@@ -1797,6 +1970,12 @@ mod imp {
                 }
                 if i.wifi {
                     l = l.with("wifi", 1);
+                }
+                if k.is_some() && k == self.dot1x.port {
+                    l = l.with("dot1x", self.dot1x.state.word());
+                    if let dot1x::State::Failed(why) = &self.dot1x.state {
+                        l = l.with("dot1x_why", why);
+                    }
                 }
                 if let Ok(m) = self.ifc.mtu(&i.name) {
                     l = l.with("mtu", m);
@@ -2572,7 +2751,7 @@ mod imp {
         let all = sys::interfaces().unwrap_or_else(|e| die(&e.to_string()));
         let _ = std::fs::create_dir_all(&o.state);
         let state = Dir::open(&o.state).unwrap_or_else(|e| die(&format!("{}: {e}", o.state)));
-        let (wired_manual, (own_dns, dns_tls)) = parse_settings(&state.read(SETTINGS_FILE, 1 << 16).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default());
+        let (wired_manual, (own_dns, dns_tls), dot1x_on) = parse_settings(&state.read(SETTINGS_FILE, 1 << 16).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default());
         let wifi = o.wifi.as_ref().map(|_| {
             let text = state.read(STATE_FILE, 1 << 20).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
             Wifi::new(Saved::parse(&text))
@@ -2607,13 +2786,23 @@ mod imp {
             ctls: Vec::new(),
             state,
             aura: wifi.as_ref().map(|_| Dir::open(&o.aura).unwrap_or_else(|e| die(&format!("{}: {e}", o.aura)))),
-            keys: wifi.as_ref().map(|_| Dir::open(&o.keys).unwrap_or_else(|e| die(&format!("{}: {e}", o.keys)))),
+            // Wi-Fi needs aura-keys; wired 802.1X uses it when it runs.
+            keys: match Dir::open(&o.keys) {
+                Ok(d) => Some(d),
+                Err(e) if wifi.is_some() => die(&format!("{}: {e}", o.keys)),
+                Err(e) => {
+                    eprintln!("atrium-net: {}: {e} (no wired 802.1X)", o.keys);
+                    None
+                }
+            },
             wifi,
             mlme: None,
             mlme_retry: 0,
             wifi_grace: None,
             forwarders: Vec::new(),
             wired_manual,
+            dot1x: Dot1x::new(dot1x_on),
+            dot1x_conn: None,
             own_dns,
             dns_tls,
             unbound_up: 0,
@@ -2658,6 +2847,11 @@ mod imp {
                 eprintln!("atrium-net: {name}: IPv6: {e}");
             }
             let bpf = Bpf::open(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
+            if !is_wifi {
+                if let Err(e) = net.ifc.add_multi(name, &dot1x::PAE_GROUP) {
+                    eprintln!("atrium-net: {name}: no 802.1X group address: {e}");
+                }
+            }
             let mut lease = Conn::new(net.spawner.spawn(b'L').unwrap_or_else(|e| die(&format!("atrium-lease: {e}")))).unwrap_or_else(|_| die("lease conn"));
             lease.send(&Line::new("hello").with("mac", fmt_mac(&mac))).unwrap_or_else(|_| die("hello"));
             // Wired links start now (DHCP, or the port's fixed setting just
@@ -2756,9 +2950,14 @@ mod imp {
             net.log("in capability mode");
         }
         net.mlme_connect();
+        // A wired 802.1X profile set up: sign in on the port that is up.
+        if net.dot1x.configured {
+            let a = net.dot1x.configure(true, net.wired_up());
+            net.dot1x_do(a);
+        }
 
         loop {
-            let mut fds = vec![net.rt.s.as_raw_fd(), listener.as_raw_fd(), net.mlme.as_ref().map_or(-1, |c| c.fd()), net.prober.as_ref().map_or(-1, |p| p.c.fd())];
+            let mut fds = vec![net.rt.s.as_raw_fd(), listener.as_raw_fd(), net.mlme.as_ref().map_or(-1, |c| c.fd()), net.prober.as_ref().map_or(-1, |p| p.c.fd()), net.dot1x_conn.as_ref().map_or(-1, |c| c.fd())];
             for i in &net.ifs {
                 fds.push(i.bpf.fd.as_raw_fd());
                 fds.push(i.lease.fd());
@@ -2816,6 +3015,8 @@ mod imp {
                         } else {
                             let _ = net.ifs[k].lease.send(&Line::new("down"));
                         }
+                        let a = net.dot1x.link(k, up, now);
+                        net.dot1x_do(a);
                     }
                 }
             }
@@ -2849,6 +3050,9 @@ mod imp {
                     }
                 }
             }
+            if ready[4] {
+                net.dot1x_lines();
+            }
             if ready[3] {
                 match net.prober.as_mut().map(|p| p.c.lines()) {
                     Some(Ok(v)) => {
@@ -2863,14 +3067,18 @@ mod imp {
                 }
             }
             for k in 0..net.ifs.len() {
-                if ready[4 + 2 * k] {
+                if ready[5 + 2 * k] {
                     for f in net.ifs[k].bpf.read() {
+                        if let Some(body) = dot1x::eapol_of(&f).filter(|_| !net.ifs[k].wifi) {
+                            net.dot1x_frame(k, body);
+                            continue;
+                        }
                         if f.len() <= 1514 && net.ifs[k].lease_hold.is_none() {
                             let _ = net.ifs[k].lease.send(&Line::new("frame").with_hex("hex", &f));
                         }
                     }
                 }
-                if ready[5 + 2 * k] {
+                if ready[6 + 2 * k] {
                     let lines = match net.ifs[k].lease.lines() {
                         Ok(l) => l,
                         Err(_) => {
@@ -2941,6 +3149,12 @@ mod imp {
                 net.portal_watch_until = None;
                 net.log("portal watch: 10 minutes, off");
             }
+            let a = {
+                let now = net.now();
+                let ifs = &net.ifs;
+                net.dot1x.tick(now, |k| ifs.get(k).is_some_and(|i| i.link))
+            };
+            net.dot1x_do(a);
             net.probe_tick();
             net.dot_tick();
             net.probe_restart();

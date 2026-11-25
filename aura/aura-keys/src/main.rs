@@ -29,6 +29,14 @@
 //! method=tls key=.. cert=<DER hex>` takes the certificate issued for it.
 //! The helper never holds the key: it asks here, and Arca signs.
 //!
+//! Wired 802.1X (wifi.md §7.5): atrium-net keeps one connection open for
+//! the Ethernet port whose switch asks, and relays that port's EAPOL:
+//! `wired-start port=NAME`, `wired-rx body=HEX`, `wired-stop`; it gets
+//! `wired-tx body=HEX` (to send to the PAE group address), `authorized`
+//! and `failed why=..` on the same connection. The profile verbs take
+//! `wired=1` instead of `ssid=..` for the machine's one wired profile.
+//! `--dev none` runs without Wi-Fi (a machine with only Ethernet).
+//!
 //! usage: aura-keys [-v] [--dev /dev/aura/key0] [--sock PATH]
 //!                  [--mlme-uid UID] [--ctl-uid UID]
 //!                  [--arca PATH | --memory-store] [--eap-helper PATH]
@@ -42,7 +50,7 @@ use aura_proto::{decode, encode, Cipher, Direction, Key, KeyKind, Msg, HEADER_LE
 use aura_rsn::crypto::{self, Akm, Pmk};
 use aura_rsn::sae::{self, Sae, SaeError};
 use aura_rsn::supp::{Action, Config, Supplicant};
-use creds::{Secret, Store};
+use creds::{Net, Secret, Store};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -129,7 +137,7 @@ struct Params {
 
 /// The certificate an 802.1X server showed on a first join (no CA set).
 struct Seen {
-    ssid: Vec<u8>,
+    net: Net,
     names: Vec<String>,
     chain: Vec<Vec<u8>>,
 }
@@ -142,12 +150,29 @@ struct SaeRun {
     token: Option<Vec<u8>>,
 }
 
+/// A wired port's 802.1X session (one port at a time).
+struct Wired {
+    /// atrium-net's connection for the port.
+    conn: usize,
+    port: String,
+    /// The EAP helper of the authentication under way.
+    run: Option<eap::Run>,
+    tls_key: Option<[u8; 16]>,
+    authorized: bool,
+    /// `no-credential` was said once for this session.
+    told_none: bool,
+}
+
+/// Largest EAPOL frame accepted from a wire (an Ethernet payload).
+const MAX_WIRED_EAPOL: usize = 1500;
+
 struct Keys {
     sae: Option<SaeRun>,
     sae_pmk: Option<([u8; 6], Pmk)>,
     /// Transition Disable bits from the last message 3.
     td: u8,
-    f: File,
+    /// /dev/aura/keyN; none on a machine without Wi-Fi.
+    f: Option<File>,
     seq: u32,
     verbose: bool,
     store: Box<dyn Store>,
@@ -164,6 +189,7 @@ struct Keys {
     pending: Vec<([u8; 6], Vec<u8>)>,
     eap_helper: String,
     seen: Option<Seen>,
+    wired: Option<Wired>,
 }
 
 impl Keys {
@@ -172,7 +198,8 @@ impl Keys {
         self.seq = self.seq.wrapping_add(1).max(1);
         match encode(m, self.seq, &mut buf) {
             Ok(n) => {
-                if let Err(e) = self.f.write(&buf[..n]) {
+                let Some(f) = self.f.as_mut() else { return };
+                if let Err(e) = f.write(&buf[..n]) {
                     eprintln!("aura-keys: write: {e}");
                 }
             }
@@ -295,13 +322,7 @@ impl Keys {
                 eap::Event::Sign(digest) => {
                     // One CertificateVerify per join, with this network's key.
                     let Some(j) = &mut self.join else { break };
-                    let sig = match j.tls_key.take() {
-                        Some(id) => self.store.tls_sign(&id, &digest).unwrap_or_else(|e| {
-                            eprintln!("aura-keys: Arca did not sign: {e}");
-                            Vec::new()
-                        }),
-                        None => Vec::new(),
-                    };
+                    let sig = arca_sign(&mut *self.store, j.tls_key.take(), &digest);
                     let Some(run) = self.join.as_mut().and_then(|j| j.eap.as_mut()) else { break };
                     if run.signed(&sig).is_err() {
                         eprintln!("aura-keys: the EAP helper went away while signing");
@@ -338,7 +359,7 @@ impl Keys {
                     eprintln!("aura-keys: EAP stopped at the server's certificate ({}); waiting for the user", names.join(","));
                     self.logoff(bssid);
                     let ssid = self.prepared.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
-                    self.seen = Some(Seen { ssid, names, chain });
+                    self.seen = Some(Seen { net: Net::Wifi(ssid), names, chain });
                     self.join = None;
                     out.push(Line::new("failed").with("why", "eap-trust"));
                     break;
@@ -530,9 +551,29 @@ impl Keys {
 
     fn ctl(&mut self, l: &Line) -> Line {
         let err = |why: &str| Line::new("error").with("why", why);
-        let Some(ssid) = l.hex("ssid").filter(|s| !s.is_empty() && s.len() <= 32) else {
+        let Some(net) = Net::from_line(l) else {
             return err("bad-ssid");
         };
+        match l.verb.as_str() {
+            "remember-eap" => return self.remember_eap(l, net),
+            "eap-seen" => return self.eap_seen(&net),
+            "eap-trust" => return self.eap_trust(l, net),
+            "eap-key" => return self.eap_key(l, net),
+            "forget" => {
+                if let Net::Wifi(ssid) = &net {
+                    self.trial = self.trial.take().filter(|(s, _)| s != ssid);
+                }
+                let key = self.store.forget(&net.tls_account());
+                return match self.store.forget(&net.account()).and_then(|f| key.map(|k| f || k)) {
+                    Ok(true) => Line::new("ok"),
+                    Ok(false) => err("unknown"),
+                    Err(e) => err(&store_err(&e)),
+                };
+            }
+            _ => {}
+        }
+        // The rest are a Wi-Fi network's passphrase.
+        let Net::Wifi(ssid) = net else { return err("not-wifi") };
         match l.verb.as_str() {
             "remember" => {
                 // The passphrase itself (atrium-netctl, as root), or the
@@ -562,34 +603,6 @@ impl Keys {
                     Err(e) => err(&store_err(&e)),
                 }
             }
-            "remember-eap" => self.remember_eap(l, ssid),
-            "eap-seen" => match &self.seen {
-                Some(seen) if seen.ssid == ssid => {
-                    use sha2::Digest;
-                    let top = seen.chain.last().expect("a chain");
-                    let leaf = seen.chain.first().and_then(|c| aura_eap::cert::summary(c));
-                    let mut r = Line::new("seen")
-                        .with("names", if seen.names.is_empty() { "-".to_string() } else { seen.names.join(",") })
-                        .with("certs", seen.chain.len())
-                        .with_hex("top_sha256", &sha2::Sha256::digest(top));
-                    if let Some(s) = leaf {
-                        r = r.with_hex("subject", s.subject.as_bytes()).with_hex("issuer", s.issuer.as_bytes()).with("not_after", s.not_after);
-                    }
-                    r
-                }
-                _ => err("nothing-seen"),
-            },
-            "eap-trust" => self.eap_trust(l, ssid),
-            "eap-key" => self.eap_key(l, ssid),
-            "forget" => match {
-                self.trial = self.trial.take().filter(|(s, _)| *s != ssid);
-                let key = self.store.forget(&creds::tls_account(&ssid));
-                self.store.forget(&creds::account(&ssid)).and_then(|f| key.map(|k| f || k))
-            } {
-                Ok(true) => Line::new("ok"),
-                Ok(false) => err("unknown"),
-                Err(e) => err(&store_err(&e)),
-            },
             "prepare" if self.trial.as_ref().is_some_and(|(s, _)| *s == ssid) => {
                 // Used once: a failed join leaves the stored one in place.
                 let (s, secret) = self.trial.take().expect("trial");
@@ -614,7 +627,7 @@ impl Keys {
 impl Keys {
     /// `remember-eap`: an 802.1X network's profile, kept in Arca like a
     /// passphrase (the profile carries the password).
-    fn remember_eap(&mut self, l: &Line, ssid: Vec<u8>) -> Line {
+    fn remember_eap(&mut self, l: &Line, net: Net) -> Line {
         use aura_eap::profile::{Method, Profile};
         let err = |why: &str| Line::new("error").with("why", why);
         let text = |k: &str| l.hex(k).and_then(|v| String::from_utf8(v).ok());
@@ -662,20 +675,38 @@ impl Keys {
             (cert, key) = (vec![c], Some(id));
         }
         let p = Profile { method, identity, anonymous: text("anonymous"), domain, ca, system_roots, pin: None, password, cert, key };
-        match self.store.remember(&creds::account(&ssid), &p.encode()) {
+        match self.store.remember(&net.account(), &p.encode()) {
             Ok(()) => Line::new("ok"),
             Err(e) => err(&store_err(&e)),
         }
     }
 
+    /// `eap-seen`: the certificate the last first join stopped at.
+    fn eap_seen(&self, net: &Net) -> Line {
+        let Some(seen) = self.seen.as_ref().filter(|s| s.net == *net) else {
+            return Line::new("error").with("why", "nothing-seen");
+        };
+        use sha2::Digest;
+        let Some(top) = seen.chain.last() else { return Line::new("error").with("why", "no-chain") };
+        let leaf = seen.chain.first().and_then(|c| aura_eap::cert::summary(c));
+        let mut r = Line::new("seen")
+            .with("names", if seen.names.is_empty() { "-".to_string() } else { seen.names.join(",") })
+            .with("certs", seen.chain.len())
+            .with_hex("top_sha256", &sha2::Sha256::digest(top));
+        if let Some(s) = leaf {
+            r = r.with_hex("subject", s.subject.as_bytes()).with_hex("issuer", s.issuer.as_bytes()).with("not_after", s.not_after);
+        }
+        r
+    }
+
     /// `eap-key`: a new EAP-TLS key for this network, made and kept in
     /// Arca, and a certificate request for it with `cn` as its name.
-    fn eap_key(&mut self, l: &Line, ssid: Vec<u8>) -> Line {
+    fn eap_key(&mut self, l: &Line, net: Net) -> Line {
         let err = |why: &str| Line::new("error").with("why", why);
         let Some(cn) = l.hex("cn").and_then(|v| String::from_utf8(v).ok()).filter(|c| !c.is_empty() && c.len() <= 64) else {
             return err("bad-cn");
         };
-        let (id, public) = match self.store.mint_tls(&creds::tls_account(&ssid)) {
+        let (id, public) = match self.store.mint_tls(&net.tls_account()) {
             Ok(k) => k,
             Err(e) => return err(&store_err(&e)),
         };
@@ -689,10 +720,10 @@ impl Keys {
 
     /// `eap-trust`: pin the certificate the last first join stopped at
     /// ("Trust this server"), with its name, for that network only.
-    fn eap_trust(&mut self, _l: &Line, ssid: Vec<u8>) -> Line {
+    fn eap_trust(&mut self, _l: &Line, net: Net) -> Line {
         let err = |why: &str| Line::new("error").with("why", why);
-        let Some(seen) = self.seen.take_if(|s| s.ssid == ssid) else { return err("nothing-seen") };
-        let acc = creds::account(&ssid);
+        let Some(seen) = self.seen.take_if(|s| s.net == net) else { return err("nothing-seen") };
+        let acc = net.account();
         let mut p = match self.store.release(&acc) {
             Ok(Some(v)) => match aura_eap::profile::Profile::decode(&v) {
                 Some(p) => p,
@@ -717,6 +748,161 @@ impl Keys {
             Ok(()) => Line::new("ok").with("domain", &p.domain),
             Err(e) => err(&store_err(&e)),
         }
+    }
+}
+
+impl Keys {
+    /// A line from atrium-net about the wired port it holds; lines back.
+    fn wired_line(&mut self, l: &Line, conn: usize) -> Vec<Line> {
+        let fail = |why: &str| vec![Line::new("error").with("why", why)];
+        match l.verb.as_str() {
+            "wired-start" => {
+                let Some(port) = l.get("port").filter(|p| p.len() <= 15 && p.bytes().all(|b| b.is_ascii_alphanumeric())) else {
+                    return fail("bad-port");
+                };
+                if self.wired.as_ref().is_some_and(|w| w.conn != conn) {
+                    return fail("busy");
+                }
+                eprintln!("aura-keys: wired 802.1X on {port}");
+                self.wired = Some(Wired { conn, port: port.into(), run: None, tls_key: None, authorized: false, told_none: false });
+                match self.store.release(&Net::Wired.account()) {
+                    // Ask the switch to begin rather than wait for it.
+                    Ok(Some(_)) => vec![Line::new("wired-tx").with_hex("body", &eap::eapol(eap::EAPOL_START, &[])), Line::new("ok")],
+                    Ok(None) => {
+                        if let Some(w) = self.wired.as_mut() {
+                            w.told_none = true;
+                        }
+                        vec![Line::new("ok"), Line::new("failed").with("why", "no-credential")]
+                    }
+                    Err(e) => vec![Line::new("ok"), Line::new("failed").with("why", store_err(&e))],
+                }
+            }
+            "wired-stop" => {
+                // atrium-net sends the logoff itself as it closes.
+                self.wired.take_if(|w| w.conn == conn);
+                vec![Line::new("ok")]
+            }
+            "wired-rx" => {
+                let Some(body) = l.hex("body").filter(|b| b.len() <= MAX_WIRED_EAPOL) else { return fail("bad-body") };
+                self.wired_rx(&body, conn)
+            }
+            _ => fail("unknown-command"),
+        }
+    }
+
+    fn wired_rx(&mut self, body: &[u8], conn: usize) -> Vec<Line> {
+        let mut out = Vec::new();
+        let Some(w) = self.wired.as_mut().filter(|w| w.conn == conn) else { return out };
+        let Some((eap::EAPOL_EAP, p)) = eap::parse_eapol(body) else { return out };
+        if p.len() < 4 {
+            return out;
+        }
+        if w.run.is_none() {
+            // Only a Request begins an authentication; a Success or Failure
+            // with nothing running is a late one.
+            if p[0] != 1 {
+                return out;
+            }
+            let profile = match self.store.release(&Net::Wired.account()) {
+                Ok(Some(v)) => aura_eap::profile::Profile::decode(&v),
+                Ok(None) => None,
+                Err(e) => {
+                    out.push(Line::new("failed").with("why", store_err(&e)));
+                    return out;
+                }
+            };
+            let Some(w) = self.wired.as_mut() else { return out };
+            let Some(profile) = profile else {
+                if !std::mem::replace(&mut w.told_none, true) {
+                    out.push(Line::new("failed").with("why", "no-credential"));
+                }
+                return out;
+            };
+            match eap::Run::start(&self.eap_helper, &profile.encode()) {
+                Ok(r) => {
+                    eprintln!("aura-keys: EAP ({}) on {}", profile.method.name(), w.port);
+                    w.run = Some(r);
+                    w.tls_key = profile.key;
+                }
+                Err(e) => {
+                    eprintln!("aura-keys: starting {}: {e}", self.eap_helper);
+                    out.push(Line::new("failed").with("why", "eap-helper"));
+                    return out;
+                }
+            }
+        }
+        let Some(w) = self.wired.as_mut() else { return out };
+        if let Some(run) = w.run.as_mut() {
+            if let Err(e) = run.packet(p) {
+                eprintln!("aura-keys: EAP helper: {e}");
+                w.run = None;
+                out.push(Line::new("failed").with("why", "eap-helper"));
+            }
+        }
+        out
+    }
+
+    /// What the wired port's EAP helper said; lines for atrium-net.
+    fn wired_events(&mut self) -> Vec<Line> {
+        let mut out = Vec::new();
+        let Some(run) = self.wired.as_mut().and_then(|w| w.run.as_mut()) else { return out };
+        let events = match run.read() {
+            Ok(e) => e,
+            Err(e) => vec![eap::Event::Failed(format!("helper-{}", e.kind()).replace(' ', "-"))],
+        };
+        let logoff = || Line::new("wired-tx").with_hex("body", &eap::eapol(eap::EAPOL_LOGOFF, &[]));
+        for ev in events {
+            let Some(w) = self.wired.as_mut() else { break };
+            match ev {
+                eap::Event::Send(f) => out.push(Line::new("wired-tx").with_hex("body", &f)),
+                eap::Event::Log(m) => eprintln!("aura-keys: EAP helper dropped a packet: {m}"),
+                eap::Event::Sign(digest) => {
+                    let sig = arca_sign(&mut *self.store, w.tls_key.take(), &digest);
+                    let Some(run) = self.wired.as_mut().and_then(|w| w.run.as_mut()) else { break };
+                    if run.signed(&sig).is_err() {
+                        eprintln!("aura-keys: the EAP helper went away while signing");
+                    }
+                }
+                eap::Event::Done(_msk) => {
+                    // No keys on a wire: the switch opens the port.
+                    eprintln!("aura-keys: EAP succeeded on {}", w.port);
+                    w.run = None;
+                    w.authorized = true;
+                    out.push(Line::new("authorized"));
+                    break;
+                }
+                eap::Event::Failed(why) => {
+                    eprintln!("aura-keys: EAP failed on {}: {why}", w.port);
+                    w.run = None;
+                    w.authorized = false;
+                    out.push(logoff());
+                    out.push(Line::new("failed").with("why", format!("eap-{why}")));
+                    break;
+                }
+                eap::Event::Trust(names, chain) => {
+                    eprintln!("aura-keys: EAP on {} stopped at the server's certificate ({}); waiting for the user", w.port, names.join(","));
+                    w.run = None;
+                    w.authorized = false;
+                    self.seen = Some(Seen { net: Net::Wired, names, chain });
+                    out.push(logoff());
+                    out.push(Line::new("failed").with("why", "eap-trust"));
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The one CertificateVerify signature of an EAP-TLS run, by Arca with
+/// the profile's key; empty when there is none or Arca refused.
+fn arca_sign(store: &mut dyn Store, key: Option<[u8; 16]>, digest: &[u8; 32]) -> Vec<u8> {
+    match key {
+        Some(id) => store.tls_sign(&id, digest).unwrap_or_else(|e| {
+            eprintln!("aura-keys: Arca did not sign: {e}");
+            Vec::new()
+        }),
+        None => Vec::new(),
     }
 }
 
@@ -751,12 +937,14 @@ fn store_err(e: &std::io::Error) -> String {
 
 fn main() {
     let o = opts();
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&o.dev)
-        .unwrap_or_else(|e| die(&format!("{}: {e}", o.dev)));
+    let f = (o.dev != "none").then(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&o.dev)
+            .unwrap_or_else(|e| die(&format!("{}: {e}", o.dev)))
+    });
     let store: Box<dyn Store> = match &o.arca {
         Some(p) => Box::new(creds::Arca::new(p)),
         None => {
@@ -764,7 +952,7 @@ fn main() {
             Box::new(creds::Memory::default())
         }
     };
-    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, trial: None, prepared_trial: false, join: None, pending: Vec::new(), eap_helper: o.eap_helper.clone(), seen: None };
+    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, trial: None, prepared_trial: false, join: None, pending: Vec::new(), eap_helper: o.eap_helper.clone(), seen: None, wired: None };
     let listener = sock::listen(&o.sock, 0o666).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut buf = vec![0u8; HEADER_LEN + MAX_BODY];
@@ -772,14 +960,24 @@ fn main() {
     let mut last_gc = Instant::now();
 
     loop {
-        let mut fds = vec![k.f.as_raw_fd(), listener.as_raw_fd()];
+        let mut fds = vec![k.f.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1), listener.as_raw_fd()];
         let live: Vec<usize> = (0..conns.len()).filter(|&i| conns[i].is_some()).collect();
         fds.extend(live.iter().map(|&i| conns[i].as_ref().map(|c| c.fd()).unwrap_or(-1)));
         let helper_fd = k.join.as_ref().and_then(|j| j.eap.as_ref()).map(|r| r.fd());
         fds.push(helper_fd.unwrap_or(-1));
+        let wired_fd = k.wired.as_ref().and_then(|w| w.run.as_ref()).map(|r| r.fd());
+        fds.push(wired_fd.unwrap_or(-1));
         let ready = sock::poll_read(&fds, 500);
         let mut to_mlme: Vec<(usize, Line)> = Vec::new();
-        if helper_fd.is_some() && *ready.last().unwrap() {
+        if wired_fd.is_some() && ready[fds.len() - 1] {
+            let conn = k.wired.as_ref().map(|w| w.conn);
+            for r in k.wired_events() {
+                if let Some(c) = conn {
+                    to_mlme.push((c, r));
+                }
+            }
+        }
+        if helper_fd.is_some() && ready[fds.len() - 2] {
             let mlme = k.join.as_ref().map(|j| j.mlme);
             for r in k.eap_events() {
                 if let Some(m) = mlme {
@@ -790,7 +988,8 @@ fn main() {
 
         if ready[0] {
             loop {
-                let n = match k.f.read(&mut buf) {
+                let Some(f) = k.f.as_mut() else { break };
+                let n = match f.read(&mut buf) {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => die(&format!("read {}: {e}", o.dev)),
@@ -851,6 +1050,7 @@ fn main() {
                 Ok(l) => l,
                 Err(_) => {
                     conns[i] = None;
+                    k.wired.take_if(|w| w.conn == i);
                     continue;
                 }
             };
@@ -878,6 +1078,11 @@ fn main() {
                         k.join = None;
                         k.pending.clear();
                     }
+                    "wired-start" | "wired-rx" | "wired-stop" if uid == o.ctl_uid => {
+                        for r in k.wired_line(&l, i) {
+                            to_mlme.push((i, r));
+                        }
+                    }
                     "remember" | "forget" | "prepare" | "remember-eap" | "eap-seen" | "eap-trust" | "eap-key" if uid == o.ctl_uid => {
                         let r = k.ctl(&l);
                         to_mlme.push((i, r));
@@ -893,6 +1098,7 @@ fn main() {
             if let Some(c) = conns.get_mut(i).and_then(|c| c.as_mut()) {
                 if c.send(&l).is_err() {
                     conns[i] = None;
+                    k.wired.take_if(|w| w.conn == i);
                 }
             }
         }

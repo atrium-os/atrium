@@ -1,10 +1,12 @@
 //! Reports from a broker-fetched web island (navigator-islands.md §5).
 use serde::{Deserialize, Serialize};
 
-/// The longest report: a navigation's address and its framing.
-pub const MAX_FRAME: usize = 2304;
+/// The longest report: a submitted form's address, its body and framing.
+pub const MAX_FRAME: usize = URL_MAX + FORM_MAX + 64;
 /// The longest address a whole page's engine reports (I6.2).
 pub const URL_MAX: usize = 2048;
+/// The longest form a whole page submits (I6.3): a sign-in, not an upload.
+pub const FORM_MAX: usize = 4096;
 
 /// A whole-page island's first request (navigator-islands.md I6.1): the
 /// engine asks for "its page" by this address, which never resolves
@@ -30,6 +32,10 @@ pub enum Report<'a> {
     /// The page's own address changed without a new document
     /// (`history.pushState`, I6.2): a trail entry, same engine.
     UrlChanged(&'a str),
+    /// A whole page submitted a form to `url` (I6.3): a POST navigation,
+    /// `application/x-www-form-urlencoded`. Never sent by the engine;
+    /// navigatord sends it through the page's jar and opens the answer.
+    Submit { url: &'a str, body: &'a [u8] },
 }
 
 /// An address an engine may report: plain HTTPS, bounded, printable.
@@ -47,6 +53,7 @@ impl Report<'_> {
             Self::Ended(_) | Self::MediaReady => true,
             Self::BeforeUnload { query } => *query != 0,
             Self::Navigate(url) | Self::UrlChanged(url) => reportable(url),
+            Self::Submit { url, body } => reportable(url) && body.len() <= FORM_MAX && body.iter().all(u8::is_ascii_graphic),
         }
     }
 
@@ -153,7 +160,7 @@ impl Lifecycle {
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
             (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
-            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_)) => running,
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. }) => running,
             (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
             (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,
@@ -216,6 +223,18 @@ mod tests {
         }
         let long = format!("https://a.example/{}", "x".repeat(URL_MAX));
         assert!(Report::UrlChanged(&long).encode().is_none());
+        // A form: a plain HTTPS address and a bounded, printable body.
+        let form = Report::Submit { url: "https://app.example/login", body: b"user=ana&next=%2F" };
+        assert_eq!(state.receive(&form.encode().unwrap()), Some(form));
+        let big = vec![b'a'; FORM_MAX];
+        let at_max = Report::Submit { url: &format!("https://a.example/{}", "x".repeat(URL_MAX - 18)), body: &big };
+        assert!(at_max.encode().is_some_and(|b| b.len() <= MAX_FRAME), "the longest form fits a frame");
+        for bad in [Report::Submit { url: "http://app.example/login", body: b"a=1" },
+                    Report::Submit { url: "https://app.example/login", body: b"a=1\n" },
+                    Report::Submit { url: "https://app.example/login", body: &vec![b'a'; FORM_MAX + 1] }] {
+            assert!(bad.encode().is_none());
+            assert!(state.receive(&postcard::to_stdvec(&bad).unwrap()).is_none());
+        }
     }
 
     #[test]

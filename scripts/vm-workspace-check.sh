@@ -136,7 +136,7 @@ check "the state is root's alone" "root 700" "$(V "stat -f '%Su %Lp' $W/scratch/
 wsl "new liba --network none" >/dev/null
 L=$(wsl "new appb --network none --uses liba")
 echo "$L" | grep -q "^appb.*uses=liba" && ok "appb uses liba" || bad "new appb: $L"
-case "$(wsl 'new rusty --toolchain rust')" in *"isn't available"*) ok "a toolchain without its layer is refused" ;; *) bad "rust toolchain accepted" ;; esac
+case "$(wsl 'new rusty --toolchain rust')" in *"needs its toolchain layer"*) ok "a toolchain without its layer is refused" ;; *) bad "rust toolchain accepted" ;; esac
 case "$(wsl 'new c2 --uses nosuch')" in *"no workspace"*) ok "an unknown link is refused" ;; *) bad "unknown link accepted" ;; esac
 case "$(wsl 'new ../x')" in *"a name is"*) ok "a bad name is refused" ;; *) bad "bad name accepted" ;; esac
 check "the project file is written" "1" "$(V "grep -c 'language = \"c\"' $W/liba/work/.atrium/devjail.toml" | tr -d ' ')"

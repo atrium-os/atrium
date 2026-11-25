@@ -37,6 +37,8 @@ name = "artifex"
 version = "0.1.0"
 dependencies = [
  "artifex-syntax",
+ "atrium-assets",
+ "atrium-worker",
  "fresco-protocol",
  "libc",
  "pergola",
@@ -73,6 +75,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-assets"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "atrium-worker",
+]
+
+[[package]]
 name = "atrium-colr"
 version = "0.1.0"
 dependencies = [
@@ -103,8 +113,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-message"
+version = "0.1.0"
+dependencies = [
+ "atrium-message-derive",
+]
+
+[[package]]
+name = "atrium-message-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "atrium-types"
 version = "0.1.0"
+
+[[package]]
+name = "atrium-worker"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "bincode"

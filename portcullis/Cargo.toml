@@ -9,7 +9,6 @@ members = [
     "portcullis-protocol",
     "portcullis-cli",
     "portcullisd",
-    "atrium-session",
     "jaild-policy",
     "jaild",
     "sockmux",

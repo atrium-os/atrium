@@ -551,6 +551,8 @@ pub enum GridAction {
     FitRow(u32),
     Undo,
     Redo,
+    /// F4 outside the editor: the last command again, on the selection.
+    Repeat,
     Copy(CellRange),
     Cut(CellRange),
     /// Paste at the active cell; `sel` the selection (a bigger one may be
@@ -1960,6 +1962,46 @@ fn next_visible_col(src: &dyn GridSource, col: u32, cols: u32, right: bool) -> O
 }
 
 /// Whether cell (`r`, `c`) shows nothing: text may run over it.
+/// The most cells [`current_region`] looks at.
+const MAX_REGION_LOOKS: u64 = 4_000_000;
+
+/// Excel's current region: the rectangle around `at` grown while a cell
+/// just outside it (diagonals too) holds something, at most
+/// [`MAX_REGION_LOOKS`] cells looked at. The cell itself when nothing is
+/// around it.
+pub fn current_region(src: &dyn GridSource, at: (u32, u32)) -> CellRange {
+    let (rows, cols) = (src.rows(), src.cols());
+    let mut r = CellRange { r0: at.0, c0: at.1, r1: at.0, c1: at.1 };
+    if rows == 0 || cols == 0 {
+        return r;
+    }
+    let seen = std::cell::Cell::new(0u64);
+    let filled = |row: u32, col: u32| {
+        seen.set(seen.get() + 1);
+        !blank(src, row, col)
+    };
+    loop {
+        let before = r;
+        // Each side grown as far as it goes before the next is looked at,
+        // so a long column of data costs one pass, not one per row.
+        while r.r1 + 1 < rows && seen.get() <= MAX_REGION_LOOKS && (r.c0.saturating_sub(1)..=(r.c1 + 1).min(cols - 1)).any(|c| filled(r.r1 + 1, c)) {
+            r.r1 += 1;
+        }
+        while r.r0 > 0 && seen.get() <= MAX_REGION_LOOKS && (r.c0.saturating_sub(1)..=(r.c1 + 1).min(cols - 1)).any(|c| filled(r.r0 - 1, c)) {
+            r.r0 -= 1;
+        }
+        while r.c1 + 1 < cols && seen.get() <= MAX_REGION_LOOKS && (r.r0.saturating_sub(1)..=(r.r1 + 1).min(rows - 1)).any(|row| filled(row, r.c1 + 1)) {
+            r.c1 += 1;
+        }
+        while r.c0 > 0 && seen.get() <= MAX_REGION_LOOKS && (r.r0.saturating_sub(1)..=(r.r1 + 1).min(rows - 1)).any(|row| filled(row, r.c0 - 1)) {
+            r.c0 -= 1;
+        }
+        if r == before || seen.get() > MAX_REGION_LOOKS {
+            return r;
+        }
+    }
+}
+
 fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
     src.merge_at(r, c).is_none() && src.cell(r, c).is_none_or(|v| v.text.is_empty())
 }
@@ -2755,6 +2797,17 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             send(GridAction::GoTo);
             return true;
         }
+        Key::F(4) if !cmd && !m.alt && src.fills() => {
+            send(GridAction::Repeat);
+            return true;
+        }
+        // Ctrl+Shift+*: the data around the cursor (its current region).
+        Key::Char if cmd && m.shift && (chars == "*" || chars == "8") => {
+            let r = current_region(src, g.cursor);
+            g.anchor = (r.r0, r.c0);
+            g.cursor = (r.r1, r.c1);
+            return true;
+        }
         // Ctrl+Space: the selection's whole columns; Shift+Space: its whole rows.
         Key::Char if chars == " " && cmd && !m.shift && !m.alt => {
             let s = g.selection();
@@ -2796,9 +2849,17 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 "e" if src.fills() => send(GridAction::FlashFill { row: g.cursor.0, col: g.cursor.1 }),
                 "x" => send(GridAction::Cut(g.selection())),
                 "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0, sel: g.selection(), plain: m.shift }),
+                // Ctrl+A: the data around the cursor, then (pressed again,
+                // or on a lone cell) everything.
                 "a" => {
-                    g.anchor = (0, 0);
-                    g.cursor = (last_r, last_c);
+                    let r = current_region(src, g.cursor);
+                    if r != g.selection() && (r.r0 != r.r1 || r.c0 != r.c1) {
+                        g.anchor = (r.r0, r.c0);
+                        g.cursor = (r.r1, r.c1);
+                    } else {
+                        g.anchor = (0, 0);
+                        g.cursor = (last_r, last_c);
+                    }
                     return true;
                 }
                 _ => return false,
@@ -3109,6 +3170,54 @@ mod tests {
         assert_eq!(c("A1", 2), None);
         assert_eq!(c("=A0", 3), None);
         assert_eq!(c("=1+2", 2), None);
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_shift_star_select_the_data_around_the_cursor() {
+        let (mut app, grid, _, state, log) = host(100, 30);
+        // Blank overrides: the test sheet fills every third row by itself.
+        for r in 0..100 {
+            for c in 0..30 {
+                grid.cells.borrow_mut().insert((r, c), String::new());
+            }
+        }
+        for (r, c) in [(2, 2), (2, 3), (3, 2), (4, 3), (5, 4), (9, 9)] {
+            grid.cells.borrow_mut().insert((r, c), "x".into());
+        }
+        grid.fills.set(true);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        let at = Point::new(hw + 3.5 * 64.0, HEADER_H + 3.5 * 20.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::default() };
+        let mut g = state.get_cloned();
+        g.anchor = (3, 3);
+        g.cursor = (3, 3);
+        state.set(g);
+        key(&mut app, Key::Char, "*", Modifiers { shift: true, ..ctrl });
+        // (5, 4) joins by the diagonal from (4, 3); (9, 9) is apart.
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 2, c0: 2, r1: 5, c1: 4 });
+        // Ctrl+A on the region: everything.
+        key(&mut app, Key::Char, "a", ctrl);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 0, r1: 99, c1: 29 });
+        let mut g = state.get_cloned();
+        g.anchor = (2, 2);
+        g.cursor = (2, 2);
+        state.set(g);
+        key(&mut app, Key::Char, "a", ctrl);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 2, c0: 2, r1: 5, c1: 4 });
+        // A lone empty cell: everything at once.
+        let mut g = state.get_cloned();
+        g.anchor = (50, 20);
+        g.cursor = (50, 20);
+        state.set(g);
+        key(&mut app, Key::Char, "a", ctrl);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 0, r1: 99, c1: 29 });
+        // F4 outside the editor asks to repeat.
+        key(&mut app, Key::F(4), "", Modifiers::default());
+        assert_eq!(log.borrow().last(), Some(&GridAction::Repeat));
     }
 
     #[test]

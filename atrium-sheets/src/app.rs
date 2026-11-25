@@ -57,6 +57,8 @@ pub enum Cmd {
     Print,
     Undo,
     Redo,
+    /// F4: the last repeatable command again, on the selection.
+    Repeat,
     /// Drop the file's macros (kept inert; never run).
     RemoveMacros,
     /// A Data menu command, on the selection.
@@ -361,6 +363,8 @@ pub struct Sheets {
     /// Data ▸ Goal Seek's bar: `goal, cell`.
     pub seeking: Mutable<bool>,
     pub seek_text: Mutable<TextEdit>,
+    /// The last command F4 repeats.
+    pub last_repeat: Cell<Option<Cmd>>,
     /// The Rotation Angle bar is open, with its field.
     pub angling: Mutable<bool>,
     pub angle_text: Mutable<TextEdit>,
@@ -395,7 +399,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -2176,6 +2180,7 @@ impl Sheets {
                 // Alt+=: totals; Ctrl+G or F5: the Go To bar.
                 GridAction::AutoSum(_) => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::AutoSum)),
                 GridAction::GoTo => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::GoTo)),
+                GridAction::Repeat => cmds.lock().unwrap().push(Cmd::Repeat),
                 // Ctrl+`: formulas shown in their cells, or values again.
                 GridAction::Format('`') => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowFormulas)),
                 // Ctrl+9 / Ctrl+0 hide, Ctrl+Shift+( / ) unhide, Ctrl+- / Ctrl++ delete and insert;
@@ -2232,7 +2237,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -3294,6 +3299,17 @@ impl Sheets {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Redo);
                     false
                 }
+                Cmd::Repeat => {
+                    match self.last_repeat.get() {
+                        Some(c) => {
+                            self.cmds.lock().unwrap().push(c);
+                            let _ = self.take_cmds();
+                        }
+                        None => self.set_status("There's nothing to repeat yet."),
+                    }
+                    self.changed();
+                    false
+                }
                 Cmd::Author(c) | Cmd::Data(crate::data::DataCmd::Author(c)) => {
                     self.authoring.run(self, c);
                     false
@@ -3714,6 +3730,9 @@ impl Sheets {
                     if matches!(f, crate::format::FormatCmd::Color(..)) {
                         self.color_bar.set(None);
                     }
+                    if crate::format::repeatable(f) {
+                        self.last_repeat.set(Some(c));
+                    }
                     let g = self.grid.get_cloned();
                     let sel = g.selection();
                     crate::format::run(&mut self.doc.borrow_mut(), sel, f);
@@ -3742,6 +3761,7 @@ impl Sheets {
                             self.color_bar.set(None);
                             let sel = self.grid.get_cloned().selection();
                             crate::format::run(&mut self.doc.borrow_mut(), sel, crate::format::FormatCmd::Color(fill, Some(rgb)));
+                            self.last_repeat.set(Some(Cmd::Format(crate::format::FormatCmd::Color(fill, Some(rgb)))));
                             self.rev.set(self.rev.get().wrapping_add(1));
                         }
                         None => self.set_status(format!("Type a colour as #RRGGBB, such as #1F77B4; {:?} isn't one.", typed.trim())),
@@ -3764,6 +3784,9 @@ impl Sheets {
                         self.doc.borrow_mut().view_top = top;
                     }
                     crate::data::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, dc);
+                    if crate::data::repeatable(dc) {
+                        self.last_repeat.set(Some(c));
+                    }
                     self.rev.set(self.rev.get().wrapping_add(1));
                     false
                 }
@@ -7397,6 +7420,35 @@ mod tests {
         s.take_cmds();
         assert_eq!(f(3).as_deref(), Some("=SUM(Block)"));
         assert_eq!(shown(&s, 4, 0), "20");
+    }
+
+    #[test]
+    fn f4_repeats_the_last_command_on_the_new_selection() {
+        use crate::data::DataCmd;
+        use crate::format::FormatCmd;
+        let s = sheets_of(b"a,b,c\n1,2,3\n4,5,6\n7,8,9\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        run(Cmd::Repeat);
+        assert_eq!(s.doc.borrow().status, "There's nothing to repeat yet.");
+        let bold = |r, c| { let d = s.doc.borrow(); d.wb.style(officina_grid::CellAddr::new(0, r, c)).font.bold };
+        select(&s, (1, 0), (1, 0));
+        run(Cmd::Format(FormatCmd::Bold));
+        assert!(bold(1, 0));
+        select(&s, (2, 1), (3, 2));
+        run(Cmd::Repeat);
+        assert!(bold(2, 1) && bold(3, 2) && !bold(2, 0));
+        // A data command replaces it; a bar-opening one does not.
+        select(&s, (1, 0), (1, 0));
+        data(&s, DataCmd::InsertRows);
+        assert_eq!(shown(&s, 2, 0), "1");
+        run(Cmd::Format(FormatCmd::Colors(true)));
+        s.color_bar.set(None);
+        select(&s, (0, 0), (0, 0));
+        run(Cmd::Repeat);
+        assert_eq!((shown(&s, 0, 0), shown(&s, 1, 0)), ("".into(), "a".into()));
+        // Not repeatable: Go To.
+        data(&s, DataCmd::GoTo);
+        assert_eq!(s.last_repeat.get(), Some(Cmd::Data(DataCmd::InsertRows)));
     }
 
     #[test]
