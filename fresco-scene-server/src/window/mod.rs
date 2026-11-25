@@ -1242,7 +1242,7 @@ impl Compositor {
     /// Whether `e` is an island something is composed over: it takes no
     /// input, pointer or keys, while it is.
     pub fn island_held(&self, e: WindowId) -> bool {
-        self.is_island(e) && self.shown.as_ref().is_some_and(|s| island_covered(s.iter().map(|l| (l.id, l.rect)), e))
+        self.is_island(e) && self.shown.as_ref().is_some_and(|s| self.island_covered_in(s.iter().map(|l| (l.id, l.rect)), e))
     }
 
     fn set_embed_focus(&mut self, to: Option<WindowId>) {
@@ -1869,7 +1869,7 @@ impl Compositor {
                 return (0, (x, y)); // the WM's, like the background
             }
             // A covered island takes no input (navigator-ui.md §6.3).
-            if self.is_island(l.id) && island_covered(shown.iter().map(|l| (l.id, l.rect)), l.id) {
+            if self.is_island(l.id) && self.island_covered_in(shown.iter().map(|l| (l.id, l.rect)), l.id) {
                 return (0, (x, y));
             }
             return (l.id, local);
@@ -1912,6 +1912,15 @@ impl Compositor {
     /// Whether `id` is bound as an island slot.
     pub fn is_island(&self, id: WindowId) -> bool {
         self.windows.get(&id).and_then(|w| w.slot).is_some_and(|s| s.kind == fresco_protocol::slot::kind::ISLAND)
+    }
+
+    /// Whether `island` is covered among `layers`, another island of its
+    /// own parent wholly inside it aside ([`island_covered_but`]).
+    pub fn island_covered_in(&self, layers: impl Iterator<Item = (WindowId, [i32; 4])>, island: WindowId) -> bool {
+        let parent = self.windows.get(&island).and_then(|w| w.slot).map(|s| s.parent);
+        island_covered_but(layers, island, |id| {
+            id != island && self.is_island(id) && parent.is_some() && self.windows.get(&id).and_then(|w| w.slot).map(|s| s.parent) == parent
+        })
     }
 
     /// Phase-B1c entry point: which window contains (x, y) at the top
@@ -1972,13 +1981,23 @@ pub const SHEET_TOP: f32 = 48.0;
 /// to top as composed, frescod's own chrome (which frames the island)
 /// left out.
 pub fn island_covered(layers: impl Iterator<Item = (WindowId, [i32; 4])>, island: WindowId) -> bool {
+    island_covered_but(layers, island, |_| false)
+}
+
+/// As [`island_covered`], leaving out the layers `nested` names when they
+/// lie wholly inside the island: another island of the same parent, such
+/// as a live page's frame over its page (navigator-islands.md I6.5). It is
+/// an engine of its own, framed and tagged by frescod, so the island under
+/// it keeps its input everywhere else, and the frame takes its own.
+pub fn island_covered_but(layers: impl Iterator<Item = (WindowId, [i32; 4])>, island: WindowId, nested: impl Fn(WindowId) -> bool) -> bool {
     let mut at: Option<[i32; 4]> = None;
     for (id, r) in layers {
         match at {
             None if id == island => at = Some(r),
             None => {}
             Some(a) => {
-                if id != CHROME_LAYER && a[0] < r[2] && r[0] < a[2] && a[1] < r[3] && r[1] < a[3] {
+                let inside = r[0] >= a[0] && r[1] >= a[1] && r[2] <= a[2] && r[3] <= a[3];
+                if id != CHROME_LAYER && a[0] < r[2] && r[0] < a[2] && a[1] < r[3] && r[1] < a[3] && !(inside && nested(id)) {
                     return true;
                 }
             }
@@ -2638,6 +2657,38 @@ mod notification_tests {
         // A plain slot in the same place is not held back.
         assert_eq!(c.bind_slot(island, p, kind::PLAIN, Some([100.0, 100.0, 200.0, 100.0]), 2), Ok(()));
         assert_eq!(c.pointer_target(150.0, 150.0).0, island);
+    }
+
+    #[test]
+    fn an_island_of_the_same_parent_inside_an_island_does_not_hold_it() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (800, 600));
+        let page = c.create(2, (10, 10));
+        let frame = c.create(3, (10, 10));
+        let other = c.create(4, (10, 10));
+        let q = c.create(5, (800, 600));
+        for w in [page, frame, other] { c.hide(w); }
+        assert_eq!(c.bind_slot(page, p, kind::ISLAND, Some([0.0, 0.0, 800.0, 600.0]), 1), Ok(()));
+        assert_eq!(c.bind_slot(frame, p, kind::ISLAND, Some([100.0, 100.0, 320.0, 80.0]), 2), Ok(()));
+        let layer = |id, rect| ShownLayer { id, rect, alpha: None };
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(page, [0, 0, 800, 600]), layer(frame, [100, 100, 420, 180])]);
+        // A live page's frame over its page: each takes its own input.
+        assert_eq!(c.pointer_target(50.0, 50.0).0, page);
+        assert_eq!(c.pointer_target(150.0, 150.0).0, frame);
+        assert!(!c.island_held(page));
+        // Reaching outside the island, it holds it as anything else does.
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(page, [0, 0, 700, 600]), layer(frame, [600, 100, 920, 180])]);
+        assert!(c.island_held(page));
+        // A plain slot of the parent, or another window's island, holds it.
+        assert_eq!(c.bind_slot(other, p, kind::PLAIN, Some([100.0, 100.0, 50.0, 50.0]), 3), Ok(()));
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(page, [0, 0, 800, 600]), layer(other, [100, 100, 150, 150])]);
+        assert!(c.island_held(page));
+        let away = c.create(6, (10, 10));
+        c.hide(away);
+        assert_eq!(c.bind_slot(away, q, kind::ISLAND, Some([100.0, 100.0, 50.0, 50.0]), 3), Ok(()));
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(page, [0, 0, 800, 600]), layer(away, [100, 100, 150, 150])]);
+        assert!(c.island_held(page));
     }
 
     #[test]

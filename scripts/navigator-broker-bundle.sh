@@ -9,7 +9,7 @@
 # per-app uid for that person, in the Navigator's jail. Its restricted
 # `navigator-broker` capability provides the directories of the sockets it serves
 # (navigator/, navigator-page/) and uses (fresco-chrome/, fresco-activation/,
-# limen/, portcullis/, arca/, arca-courier/). No network: its pages come
+# limen/, portcullis/, arca/, arca-courier/); `clipboard` mounts Tabula's. No network: its pages come
 # through fetcher jails. A jail gets no environment of its caller's, so its
 # settings are etc/navigatord.conf in the bundle.
 set -e
@@ -33,6 +33,10 @@ audio = true  # Limen attributes the native player to Navigator after a user pla
 graphics = "fresco"  # the broker owns the trusted sign-in sheet window
 # The captive portal's sign-in window (atrium-net.md §8.1 S3), restricted.
 network-portal = true
+# A live page's copy and paste: navigatord opens the UI's Tabula connection,
+# so Tabula's presenter is the owner of the UI's windows, whom frescod lets
+# spend the island's Ctrl-C or Ctrl-V (navigator-islands.md I6.4).
+clipboard = true
 
 # Web links other apps open come here (opening-links.md §4.1, D5).
 [[links]]

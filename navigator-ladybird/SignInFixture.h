@@ -163,8 +163,15 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 #ifdef ATRIUM_I6_PAGE
     auto last_url = doc->url();
 #endif
-#ifdef ATRIUM_I4_YOUTUBE
+#if defined(ATRIUM_I4_YOUTUBE) || defined(ATRIUM_I6_PAGE)
+    // A video or a live page runs for as long as the person keeps it: the
+    // fixtures' tick bound (15,000 input polls, about 5 minutes) ended a
+    // live page mid-use. navigatord ends the run; this only bounds the loop.
+#    ifdef ATRIUM_I6_PAGE
+    auto deadline = AK::MonotonicTime::now() + AK::Duration::from_seconds(12 * 3600);
+#    else
     auto deadline = AK::MonotonicTime::now() + AK::Duration::from_seconds(3600);
+#    endif
     for (unsigned tick = 0; AK::MonotonicTime::now() < deadline; ++tick) {
 #else
     for (unsigned tick = 0; tick < 15000; ++tick) {
@@ -201,7 +208,10 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
             }
         }
 #endif
-        if (action < 0) break;
+        if (action < 0) {
+            warnln("island: the embed ended (pointer {}); ending", action);
+            break;
+        }
 #ifdef ATRIUM_I6_PAGE
         // The page changed its own address (pushState, I6.2): the trail
         // follows. One it may not report (not plain HTTPS) is only logged.
@@ -233,7 +243,9 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
                     if (got >= 0 && status == 200) {
                         auto contents = buffer.release_value();
                         contents.resize(static_cast<size_t>(got));
-                        files.append(Web::HTML::SelectedFile { ByteString { StringView { name, name_length } }, move(contents) });
+                        // The name is navigatord's (made safe), but never trusted to be UTF-8.
+                        auto file_name = Utf16String::try_from_utf8(StringView { name, name_length });
+                        files.append(Web::HTML::SelectedFile { file_name.is_error() ? Utf16String::from_utf8("file"sv) : file_name.release_value(), move(contents) });
                     } else {
                         warnln("live page: the picked file could not be fetched");
                     }
@@ -253,9 +265,9 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
             if (navigator_take_key(scene, &special, &code_point, &mods, &pressed, token)) {
                 bool ctrl = (mods & 0x11) && !(mods & 0x44);
                 if (pressed && ctrl && (code_point == 'c' || code_point == 'C')) {
-                    auto text = client.page().focused_navigable().selected_text();
-                    auto utf8 = text.to_byte_string();
-                    if (!utf8.is_empty() && !navigator_live_copy(scene, reinterpret_cast<u8 const*>(utf8.characters()), utf8.length(), token))
+                    auto navigable = client.page().hosted_focused_navigable();
+                    auto utf8 = navigable ? navigable->selected_text().to_well_formed_utf8() : String {};
+                    if (!utf8.is_empty() && !navigator_live_copy(scene, utf8.bytes().data(), utf8.bytes().size(), token))
                         warnln("live page: the copy was not handed over");
                 } else if (pressed && ctrl && (code_point == 'v' || code_point == 'V')) {
                     if (!navigator_live_paste(scene, token))
@@ -308,14 +320,20 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
             Gfx::IntSize extent { root->scroll_width(), root->scroll_height() };
             if (extent != last_extent && extent.width() > 0 && extent.height() > 0
                 && extent.width() <= 16384 && extent.height() <= 16384) {
-                if (!navigator_counter_resize(scene, extent.width(), extent.height())) return 6;
+                if (!navigator_counter_resize(scene, extent.width(), extent.height())) {
+                    warnln("island: the page's new extent {}x{} could not be reported; ending", extent.width(), extent.height());
+                    return 6;
+                }
                 last_extent = extent;
             }
         }
 #endif
         if (!doc->record_display_list(read, Web::HTML::PaintConfig {}, Web::Painting::PaintCommandCacheMode::ReadWrite)
-            || !navigator_scene_sample(scene, doc->layout_node_arena().host(), true, false))
+            || !navigator_scene_sample(scene, doc->layout_node_arena().host(), true, false)) {
+            // Loud: an island that stops painting otherwise just disappears.
+            warnln("island: the page's scene could not be recorded or sent; ending");
             return 6;
+        }
     }
     return 0;
 }

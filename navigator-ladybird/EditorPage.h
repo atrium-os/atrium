@@ -8,7 +8,8 @@
 #ifdef ATRIUM_I6_PAGE
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
-#include <LibWeb/HTML/SelectedFile.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
 #endif
 
 struct NavigatorScene;
