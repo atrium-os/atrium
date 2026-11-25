@@ -139,6 +139,31 @@ impl Resources for LiveJar {
     }
 }
 
+/// Where a live page's `localStorage` is kept (I6.3): navigatord's
+/// [`crate::live_storage::Stores`], or a test's stand-in. `page` is the
+/// delivered page's address, whose site names the store.
+pub trait LocalStorage {
+    fn load(&mut self, page: &str) -> Result<Vec<u8>, String>;
+    fn apply(&mut self, page: &str, batch: &[u8]) -> Result<(), String>;
+}
+
+/// The stores of one jar.
+pub struct JarStores {
+    pub stores: Arc<Mutex<crate::live_storage::Stores>>,
+    pub jar: Option<u64>,
+}
+
+impl LocalStorage for JarStores {
+    fn load(&mut self, page: &str) -> Result<Vec<u8>, String> {
+        let key = crate::live_storage::Key::of(self.jar, page).ok_or("the page's site has no store")?;
+        Ok(self.stores.lock().unwrap().load(&key))
+    }
+    fn apply(&mut self, page: &str, batch: &[u8]) -> Result<(), String> {
+        let key = crate::live_storage::Key::of(self.jar, page).ok_or("the page's site has no store")?;
+        self.stores.lock().unwrap().apply(&key, batch)
+    }
+}
+
 /// What the serve loop saw, for the log and the UI.
 #[derive(Debug, Default, PartialEq)]
 pub struct Served {
@@ -151,7 +176,8 @@ pub struct Served {
 /// Serve one live page's engine on its fetch channel until it closes it.
 /// `page` is the address the person pressed on; `started` is called once
 /// the page itself has been delivered, with its address.
-pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, started: &mut dyn FnMut(&str)) -> Result<Served, String> {
+pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut local: Option<&mut dyn LocalStorage>, started: &mut dyn FnMut(&str)) -> Result<Served, String> {
+    let mut delivered_url = String::new();
     socket.set_write_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
     socket.set_read_timeout(Some(IDLE_POLL)).map_err(|e| e.to_string())?;
     let (mut input, mut output) = nuntius::server::channel(socket).map_err(|e| e.to_string())?;
@@ -200,6 +226,33 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, start
         };
         if open.range.is_some() || open.if_range.is_some() || open.deliver != Deliver::Stream {
             refuse("only a whole resource", ErrorCode::Policy, &mut served)?;
+            continue;
+        }
+        // The page's storage (I6.3): loaded once, changed in batches, kept
+        // by navigatord for the page's site.
+        if delivered && open.url == limen::web_island::LIVE_STORAGE {
+            let answer = match (local.as_deref_mut(), post) {
+                (None, _) => Err("no storage here".to_string()),
+                (Some(l), None) => l.load(&delivered_url).map(|b| (200, b)),
+                (Some(l), Some(b)) => l.apply(&delivered_url, &b.bytes).map(|_| (204, vec![])),
+            };
+            match answer {
+                Ok((status, body)) if body.len() as u64 <= open.limits.max_bytes => {
+                    let length = body.len() as u64;
+                    output.send(Event::Head { id, status, final_url: open.url.clone(), redirects: 0,
+                        content_type: Some("application/octet-stream".into()), length: Some(length), accept_ranges: false, validator: None })
+                        .map_err(|e| e.to_string())?;
+                    for (i, bytes) in body.chunks(nuntius::DATA_MAX).enumerate() {
+                        output.send(Event::Data { id, offset: (i * nuntius::DATA_MAX) as u64, bytes: bytes.to_vec() }).map_err(|e| e.to_string())?;
+                    }
+                    output.send(Event::Done { id, bytes: length }).map_err(|e| e.to_string())?;
+                }
+                Ok(_) => refuse("the store is over the engine's bound", ErrorCode::TooBig, &mut served)?,
+                Err(why) => {
+                    eprintln!("navigatord: a live page's storage: {why}");
+                    output.send(Event::Error { id, code: ErrorCode::Policy }).map_err(|e| e.to_string())?;
+                }
+            }
             continue;
         }
         // The engine's first request is for the page; it names no address.
@@ -253,6 +306,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, start
         output.send(Event::Done { id, bytes: length }).map_err(|e| e.to_string())?;
         if !delivered {
             delivered = true;
+            delivered_url = url.clone();
             started(&url);
         }
     }
@@ -309,6 +363,7 @@ impl Live {
         rect: [u32; 4],
         cfg: Arc<crate::Config>,
         jar: Option<LiveJar>,
+        storage: Option<JarStores>,
         started: impl FnOnce(String) + Send + 'static,
         navigate: impl Fn(String) + Send + Sync + 'static,
         url_changed: impl Fn(String) + Send + 'static,
@@ -342,9 +397,11 @@ impl Live {
         let closing = jar.clone();
         std::thread::spawn(move || {
             let mut on_delivered = |u: &str| { let _ = delivered_tx.send(u.to_string()); };
+            let mut storage = storage;
+            let local = storage.as_mut().map(|s| s as &mut dyn LocalStorage);
             let result = match jar {
-                Some(mut jar) => serve(channel, &page, &mut jar, &mut on_delivered),
-                None => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, &mut on_delivered)),
+                Some(mut jar) => serve(channel, &page, &mut jar, local, &mut on_delivered),
+                None => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, local, &mut on_delivered)),
             };
             match &result {
                 Ok(s) => eprintln!("navigatord: live page served {} requests, {} bytes, {} refused", s.requests, s.bytes, s.refused.len()),
@@ -548,7 +605,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut fake = Fake(vec![]);
             let mut started = vec![];
-            let r = serve(ours, "https://app.example/app.html", &mut fake, &mut |u| started.push(u.to_string()));
+            let r = serve(ours, "https://app.example/app.html", &mut fake, None, &mut |u| started.push(u.to_string()));
             tx.send((r, fake.0, started)).unwrap();
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
@@ -592,10 +649,51 @@ mod tests {
     }
 
     #[test]
+    fn the_page_loads_and_changes_its_sites_storage_after_it_is_delivered() {
+        use crate::live_storage::{encode_ops, Op, Stores};
+        let stores = Arc::new(Mutex::new(Stores::new(None)));
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let s2 = stores.clone();
+        let server = std::thread::spawn(move || {
+            let mut local = JarStores { stores: s2, jar: None };
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), Some(&mut local), &mut |_| {})
+        });
+        let storage = limen::web_island::LIVE_STORAGE;
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, LIVE_PAGE)).unwrap();
+        assert_eq!(body(&mut c).2, None);
+        c.open(Open::get(2, storage)).unwrap();
+        assert_eq!(body(&mut c), (Some((200, storage.into(), Some("application/octet-stream".into()))), vec![], None), "empty at first");
+        c.open(Open::post(3, storage, "application/octet-stream", encode_ops(&[Op::Set("visits".into(), "1".into())]))).unwrap();
+        assert_eq!(body(&mut c).0.map(|h| h.0), Some(204));
+        c.open(Open::post(4, storage, "application/octet-stream", vec![9, 9])).unwrap();
+        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy), "a batch out of shape");
+        c.open(Open::get(5, storage)).unwrap();
+        assert_eq!(body(&mut c).1, crate::live_storage::encode(&[("visits".to_string(), "1".to_string())].into()));
+        drop(c);
+        server.join().unwrap().unwrap();
+        // The store is the page's site's, in the persona's jar.
+        let key = crate::live_storage::Key::of(None, "https://api.app.example/").unwrap();
+        assert_ne!(stores.lock().unwrap().load(&key), b"");
+    }
+
+    #[test]
+    fn storage_is_not_asked_for_before_the_page() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), jar: None };
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), Some(&mut local), &mut |_| {})
+        });
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, limen::web_island::LIVE_STORAGE)).unwrap();
+        assert!(server.join().unwrap().is_err_and(|e| e.contains("first request")));
+    }
+
+    #[test]
     fn an_engine_that_names_its_own_page_is_ended() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut |_| {})
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), None, &mut |_| {})
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
         c.open(Open::get(1, "https://app.example/app.html")).unwrap();
@@ -606,7 +704,7 @@ mod tests {
     fn a_page_that_is_not_html_does_not_start() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            serve(ours, "https://app.example/app.js", &mut Fake(vec![]), &mut |_| panic!("started"))
+            serve(ours, "https://app.example/app.js", &mut Fake(vec![]), None, &mut |_| panic!("started"))
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
         c.open(Open::get(1, LIVE_PAGE)).unwrap();

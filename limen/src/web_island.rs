@@ -14,6 +14,10 @@ pub const FORM_MAX: usize = 4096;
 /// on, its address as the answer's final URL. The engine never names the
 /// page it runs.
 pub const LIVE_PAGE: &str = "https://live-page.atrium.invalid/";
+/// A whole page's `localStorage` (I6.3): a GET loads its site's store, a
+/// POST sends a batch of changes. navigatord keeps it; the engine holds
+/// no file.
+pub const LIVE_STORAGE: &str = "https://live-page.atrium.invalid/local-storage";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndReason { Closed, Failed }
