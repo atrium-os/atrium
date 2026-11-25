@@ -81,6 +81,16 @@ document.getElementById("add").addEventListener("submit", async e => {
     await show();
 });
 
+// Memory (I6.6): Grow holds 64 MiB more in touched 8 MiB chunks, Release
+// drops every reference, so the next collection and purge can return it.
+let held = [];
+const showHeld = () => { document.getElementById("held").textContent = held.length * 8 + " MiB held"; };
+document.getElementById("grow").addEventListener("click", () => {
+    for (let i = 0; i < 8; i++) held.push(new Uint8Array(8 * 1024 * 1024).fill(1));
+    showHeld();
+});
+document.getElementById("release").addEventListener("click", () => { held = []; showHeld(); });
+
 // D12: a sibling host on the registrable domain is reachable.
 await step("same-site-api", async () => {
     const r = await fetch("https://api.app.example/status", { credentials: "include" });
