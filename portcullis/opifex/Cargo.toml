@@ -34,6 +34,8 @@ portcullis-toml = { path = "../portcullis-toml" }
 portcullis-sig  = { path = "../portcullis-sig" }
 portcullis-token = { path = "../portcullis-token" }
 portcullis-trust = { path = "../portcullis-trust" }
+# The launch registry: whose app a side-load's asker is.
+portcullis-peer = { path = "../portcullis-peer" }
 opifex-catalog  = { path = "../opifex-catalog" }
 sha2   = "0.10"
 base64 = "0.22"

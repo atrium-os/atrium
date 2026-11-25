@@ -784,8 +784,8 @@ mounts) with the stand-in key on the side-load list; Install shows the
 sheet, its Install press installs the bundle (recorded as a side-load,
 taken from the sheet's uid) and Artifex shows Installed. The key step
 sends the same `WorkspaceExec` as `portcullis workspace exec`, so naming a
-real Arca key there is the path `vm-ssh-agent-check.sh` runs. The asker
-the sheet records is Artifex's uid, as for Scrinium's side-loads.
+real Arca key there is the path `vm-ssh-agent-check.sh` runs. opifexd
+records the person Artifex runs for as the installer (opifex.md §7.4).
 Artifex's jail now mounts `/atrium/sockets/opifex-sheet`, so that directory
 must exist on the host (the sheet's service makes it; the check makes it).
 

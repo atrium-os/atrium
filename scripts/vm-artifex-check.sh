@@ -823,8 +823,8 @@ if want package && V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_pr
     SB=$B/sheet; AID=org.example.app
     V "pkill -x opifex-sheetd; pkill -x opifexd; rm -rf $SB; mkdir -p $SB; cp $PK/publisher.pem /etc/atrium/publishers/artifex-check.pem 2>/dev/null \
        || { mkdir -p /etc/atrium/publishers && cp $PK/publisher.pem /etc/atrium/publishers/artifex-check.pem; }; \
-       OPIFEX_SOCKET=/nonexistent opifex uninstall $AID >/dev/null 2>&1; \
        daemon -f -o $SB/opifexd.log env OPIFEX_SOCKET=$SB/opifex.sock OPIFEX_DAILY=0 PRAECO_SOCKET=none /usr/local/sbin/opifexd; sleep 2; \
+       OPIFEX_SOCKET=$SB/opifex.sock opifex remove $AID >/dev/null 2>&1; \
        daemon -f -u _opifexsheet -o $SB/sheet.log env OPIFEX_SHEET_SOCKET=/atrium/sockets/opifex-sheet/opifex-sheet.sock OPIFEX_SOCKET=$SB/opifex.sock \
          OPIFEX_SHEET_ACTIVATION=$B/activation.sock FRESCO_SOCKET=/atrium/sockets/fresco/fresco.sock /usr/local/bin/opifex-sheetd"
     i=0; while [ $i -lt 20 ] && ! V "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock"; do sleep 1; i=$((i+1)); done
@@ -842,9 +842,10 @@ if want package && V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_pr
         || bad "installed: $(pkg) $(V "tail -3 $SB/sheet.log; tail -3 $SB/opifexd.log")"
     check "the bundle's own binary is in apps/" "yes" "$(V "cmp -s $TREE/app /var/lib/atrium/apps/$AID/app && echo yes")"
     check "recorded as a side-load" "1" "$(V "grep -A9 'id = \"$AID\"' /var/db/atrium/opifex/installed.toml | grep -c 'source = \"side-load\"'")"
+    check "for alice, whose Artifex asked (opifex.md §7.4)" "1" "$(V "grep -A9 'id = \"$AID\"' /var/db/atrium/opifex/installed.toml | grep -c 'installed_by = 1011'")"
     check "opifexd took the file and the press from the sheet's uid" "2" "$(V "grep -c 'uid 65042: \\(PreviewLocal\\|InstallLocalApproved\\) -> ok' $SB/opifexd.log")"
     shot artifex-package-4-installed
-    V "pkill -x opifex-sheetd; pkill -x opifexd; OPIFEX_SOCKET=/nonexistent opifex uninstall $AID >/dev/null 2>&1; rm -f /etc/atrium/publishers/artifex-check.pem; true"
+    V "pkill -x opifex-sheetd; OPIFEX_SOCKET=$SB/opifex.sock opifex remove $AID >/dev/null 2>&1; pkill -x opifexd; rm -f /etc/atrium/publishers/artifex-check.pem; true"
     check "the sheet's socket is in Artifex's jail" "1" "$(V "p=\$(pgrep -x artifex | head -1); r=\$(jls -j \$(ps -o jid= -p \$p) path); test -d \$r/atrium/sockets/opifex-sheet && echo 1")"
     press 64 100
     waitstate 'view=Code' 20 || bad "files: $(state)"

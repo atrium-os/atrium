@@ -115,6 +115,7 @@ fn main() {
         fonts: env("OPIFEX_FONTS", opifex::font::SYSTEM_FONTS),
         system: env("OPIFEX_SYSTEM", "/"),
         sysroot: PathBuf::from("/"),
+        app_registry: env("OPIFEX_APP_REGISTRY", portcullis_peer::DEFAULT_REGISTRY),
         praeco: match std::env::var("PRAECO_SOCKET").ok().as_deref() {
             Some("none") => None,
             Some(p) => Some(p.into()),

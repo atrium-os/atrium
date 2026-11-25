@@ -59,6 +59,9 @@ pub struct Daemon {
     pub system: PathBuf,
     /// Where side-loaded bundles' libraries are read from (`/`).
     pub sysroot: PathBuf,
+    /// Portcullis's launch registry (`portcullis_peer::DEFAULT_REGISTRY`):
+    /// a file handed over by an app is installed for that app's person.
+    pub app_registry: PathBuf,
     /// One change at a time.
     pub lock: Mutex<()>,
 }
@@ -745,9 +748,31 @@ impl Daemon {
 
     /// Copy the file the sheet was handed, check it as a side-load, and hold
     /// it under a token for the person to approve.
+    /// Who a file is installed for. The sheet names its asker; when that is
+    /// an app (Files or Artifex handing over a file), the person it runs
+    /// for, as the launch registry binds the uid; any other uid is the
+    /// person's own. An unreadable registry or an owner with no account
+    /// refuses: it never records the app as the installer.
+    pub fn person_for(&self, uid: u32) -> Result<u32, String> {
+        let path = self.app_registry.to_str().ok_or("the app registry's path")?;
+        let reg = portcullis_peer::AppRegistry::load(path).map_err(|e| format!("the app registry: {e}"))?;
+        let Some((user, _)) = reg.resolve(uid) else { return Ok(uid) };
+        let name = std::ffi::CString::new(user).map_err(|_| "the app registry names no person".to_string())?;
+        // SAFETY: getpwnam reads a NUL-terminated name that outlives the call;
+        // the result is checked for NULL and pw_uid copied out before any
+        // other getpw* call can reuse the static entry.
+        let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+        if pw.is_null() {
+            return Err(format!("{user}, whose app asked, has no account"));
+        }
+        // SAFETY: pw is non-NULL, from getpwnam just above.
+        Ok(unsafe { (*pw).pw_uid })
+    }
+
     fn preview_local(&self, file: std::os::fd::OwnedFd, for_uid: u32) -> Result<Response, String> {
         use std::io::Read;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let for_uid = self.person_for(for_uid)?;
         self.prune_held();
         let held = self.held();
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&held).map_err(|e| format!("{}: {e}", held.display()))?;
@@ -815,6 +840,7 @@ impl Daemon {
         if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("not a token".into());
         }
+        let for_uid = self.person_for(for_uid)?;
         self.prune_held();
         let (path, meta) = (self.held().join(format!("{token}.insula")), self.held().join(format!("{token}.toml")));
         let held = fs::read_to_string(&meta).map_err(|_| "that file is no longer held; open it again".to_string())?;
