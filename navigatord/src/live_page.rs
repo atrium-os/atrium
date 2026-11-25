@@ -359,12 +359,19 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         // Navigatord's own addresses are counted apart: a page with frames
         // asks for its messages every quarter second.
         let own = delivered && open.url.starts_with("https://live-page.atrium.invalid/");
-        if own {
+        // An IndexedDB commit is many parts in a row (I6.7: 32 KiB each, so
+        // a 30 MiB transaction is about 960); it is bounded by the run's and
+        // the site's quota instead of the rate.
+        if own && open.url != limen::web_island::LIVE_IDB {
             // A rate, not a lifetime count: a page with frames reads its
             // messages for as long as it runs.
             if own_window.elapsed() >= Duration::from_secs(1) { (own_window, own_count) = (Instant::now(), 0); }
             own_count += 1;
             if own_count > OWN_PER_SECOND {
+                // Loud once a window: a silent refusal reads as a broken page.
+                if own_count == OWN_PER_SECOND + 1 {
+                    eprintln!("navigatord: a live page asked navigatord more than {OWN_PER_SECOND} times in a second; refused until the second is over");
+                }
                 output.send(Event::Error { id: open.id, code: ErrorCode::Policy }).map_err(|e| e.to_string())?;
                 continue;
             }
@@ -1592,12 +1599,23 @@ mod tests {
         assert_eq!(p.len(), 1);
         c.open(Open::post(3, at, "application/octet-stream", p[0].clone())).unwrap();
         assert_eq!(body(&mut c).0.map(|h| h.0), Some(204));
+        // A commit of more parts than navigatord's own rate a second: every
+        // part is taken (the run is bounded by its quota, not the rate).
+        let many = parts(9, &[Op::Version(b"mail".to_vec(), 1), Op::Store(b"m".to_vec()), Op::Put(b"big".to_vec(), vec![7; (OWN_PER_SECOND as usize + 5) * 32 * 1024])]);
+        assert!(many.len() > OWN_PER_SECOND as usize + 2, "{} parts", many.len());
+        for (i, part) in many.iter().enumerate() {
+            c.open(Open::post(100 + i as u32, at, "application/octet-stream", part.clone())).unwrap();
+            assert_eq!(body(&mut c).0.map(|h| h.0), Some(204), "part {i} of {}", many.len());
+        }
         let bad = parts(8, &[Op::Store(b"nope".to_vec())]);
         c.open(Open::post(4, at, "application/octet-stream", bad[0].clone())).unwrap();
         assert_eq!(body(&mut c).2, Some(ErrorCode::Policy), "a commit refused");
         c.open(Open::get(5, at)).unwrap();
         let loaded = body(&mut c).1;
-        assert_eq!(crate::live_idb::decode_ops(&loaded, crate::live_idb::LOAD_MAX).unwrap(), commit, "read back as the commit made it");
+        let back = crate::live_idb::decode_ops(&loaded, crate::live_idb::LOAD_MAX).unwrap();
+        assert!(back.contains(&Op::Put(b"k".to_vec(), b"v".to_vec())), "the first commit read back");
+        let big: usize = back.iter().map(|o| match o { Op::Put(k, v) | Op::Append(k, v) if k == b"big" => v.len(), _ => 0 }).sum();
+        assert_eq!(big, (OWN_PER_SECOND as usize + 5) * 32 * 1024, "the many-part commit read back whole");
         // localStorage is a store of its own.
         c.open(Open::get(6, limen::web_island::LIVE_STORAGE)).unwrap();
         assert_eq!(body(&mut c).1, b"");

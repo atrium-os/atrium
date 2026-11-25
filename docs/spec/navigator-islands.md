@@ -3646,6 +3646,17 @@ WARNs.
    Navigator's uid for the person. The log never passed 1 MiB, so there
    was no fold.
 
+6. Passed, after a navigatord fix (2026-11-25, 2736b429e's fixture).
+   navigatord held its own addresses to 20 requests a second, so a
+   30 MiB commit (about 960 parts) lost every part past the 20th, with no
+   log. `LIVE_IDB` is now outside that rate, since the run and site quotas
+   bound it, and the rate's refusal is logged. Then Fill passed and folded
+   into `app.example.idb` (31,457,395 bytes, 0600). A second Fill failed,
+   and navigatord logged "over the site's IndexedDB quota". After Stop and
+   a new live run, 1 stored. Empty passed. The fixture's `show()` printed
+   the 30 MiB array as text, which took the engine past its limit at the
+   next load (2.5 GB); the run used a copy that prints its size.
+
 The trim, rechecked with the fixture's Grow and Release buttons: Grow
 three times took the page's engine from 109 to 306 MB, and Release left it
 there. `kill -INFO` logged the trim, and RSS fell to 110 MB. The page ran
