@@ -37,13 +37,16 @@ diff -ruN a/Libraries/LibWeb/HTML/Window.cpp b/Libraries/LibWeb/HTML/Window.cpp
 diff -ruN a/Libraries/LibWeb/Page/Page.h b/Libraries/LibWeb/Page/Page.h
 --- a/Libraries/LibWeb/Page/Page.h
 +++ b/Libraries/LibWeb/Page/Page.h
-@@ -929,6 +929,9 @@
-         HTML::WindowType window_type { HTML::WindowType::NewAndUnrestricted };
-     };
-     virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] HTML::CrossProcessId current_navigable_id, [[maybe_unused]] Utf16String const& name, [[maybe_unused]] HTML::TokenizedFeature::NoOpener no_opener, [[maybe_unused]] Optional<URL::URL> current_document_base_url) { return {}; }
+@@ -1085,6 +1085,12 @@
+ 
+ protected:
+     virtual ~PageClient() = default;
++
++public:
 +    // ATRIUM (navigator-islands.md I6.2): a page asked for a new window at url on the person's activation. A host
-+    // that opens it elsewhere answers true, and no window is made here.
++    // that opens it elsewhere answers true, and no window is made here. Declared last, so that objects built
++    // against the unpatched header keep every other slot of the vtable.
 +    virtual bool page_did_propose_new_window([[maybe_unused]] URL::URL const& url) { return false; }
-     virtual void page_did_close() { }
-     virtual void page_did_update_session_history_entry_navigation_api_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::StorageSerializationRecord const& navigation_api_state) { }
-     virtual void page_did_update_session_history_entry_scroll_restoration_mode([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::ScrollRestorationMode scroll_restoration_mode) { }
+ };
+ 
+ }
