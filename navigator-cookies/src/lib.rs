@@ -372,6 +372,15 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// The view closed.
     pub fn close(&mut self, view: ViewId) { self.views.remove(&view); }
 
+    /// Close a live view whose jar was for this run only (a live page's
+    /// frame, navigator-islands.md I6.5), and have Arca forget it.
+    pub fn close_throwaway(&mut self, view: ViewId) {
+        if let Some(v) = self.views.get(&view).filter(|v| v.live) {
+            let _ = self.arca.forget(&v.partition, false);
+        }
+        self.close(view);
+    }
+
     /// Whether (and why) a view is cookied.
     pub fn cookied(&self, view: ViewId) -> Option<Why> { self.views.get(&view).and_then(|v| v.cookied) }
 

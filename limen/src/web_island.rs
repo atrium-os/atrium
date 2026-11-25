@@ -96,6 +96,24 @@ impl FilePicked {
 /// rendering through Prelum's sheet.
 pub const LIVE_PRINT: &str = "https://live-page.atrium.invalid/print";
 
+/// A cross-origin frame in a whole page (navigator-islands.md D11, I6.5),
+/// reported by navigatord's script in the page: a GET of
+/// `frame?id=N&url=U&x=X&y=Y&w=W&h=H` (device pixels in the page's
+/// viewport) when it appears or moves, `frame?id=N&gone=1` when it goes.
+/// The frame runs in its own engine, an island over the page's.
+pub const LIVE_FRAME: &str = "https://live-page.atrium.invalid/frame";
+
+/// `postMessage` between a page and its frames' engines (I6.5): a POST
+/// here of the message as JSON text, `?to=N&target=O` from the page to its
+/// frame `N`, `?target=O` from a frame to its page. navigatord delivers it
+/// only to a receiver whose origin is `O` (or any, for `*`), stamped with
+/// the sender's real origin.
+pub const LIVE_MESSAGE: &str = "https://live-page.atrium.invalid/message";
+
+/// The messages waiting for this engine (I6.5): a GET answers a JSON array
+/// of `{"from": N or null, "origin": O, "data": TEXT}`, oldest first.
+pub const LIVE_MESSAGES: &str = "https://live-page.atrium.invalid/messages";
+
 /// A web API a whole page asked for that I6 refuses (navigator-islands.md
 /// "What the page can reach"), so the popover can say what the page was
 /// refused; nothing is refused silently.

@@ -12,12 +12,14 @@
 //! end retires the island and the trail shows the document lane again.
 
 use std::os::unix::net::UnixStream;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use limen::{client::Parent, proto::ParentEvent, web_island::LIVE_PAGE};
 use nuntius::{Deliver, ErrorCode, Event, Method, Request};
+use crate::live_frames::{FrameAsk, Mailbox};
 
 /// The most requests one live page makes before its engine is ended: a
 /// map or an editor makes hundreds; thousands is a page that loops.
@@ -271,6 +273,8 @@ impl LocalStorage for JarStores {
 #[derive(Debug, Default, PartialEq)]
 pub struct Served {
     pub requests: usize,
+    /// Of `requests`, those for the network (not navigatord's own addresses).
+    pub network: usize,
     pub bytes: u64,
     /// Refused requests' hosts and sites, as `refused_target` spells them.
     pub refused: Vec<String>,
@@ -295,6 +299,18 @@ pub trait Hooks {
     fn picked(&mut self) -> Option<Vec<u8>> { None }
     /// The page asked to be printed (I6.4).
     fn print(&mut self) {}
+    /// This engine runs a page's frame (I6.5): its reporter works as the
+    /// frame's side.
+    fn is_frame(&self) -> bool { false }
+    /// The page's script reported one of its cross-origin frames (I6.5).
+    fn frame(&mut self, _ask: crate::live_frames::FrameAsk) {}
+    /// The script posted a message (I6.5): to frame `to` from the page, or
+    /// to the page from a frame (`None`).
+    fn post_message(&mut self, _to: Option<u32>, _target: &str, _data: String) -> Result<(), &'static str> {
+        Err("no frames here")
+    }
+    /// The messages waiting for this engine, as JSON.
+    fn messages(&mut self) -> Vec<u8> { b"[]".to_vec() }
 }
 
 /// Serve one live page's engine on its fetch channel until it closes it.
@@ -324,8 +340,12 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
             Request::Cancel { .. } | Request::Budget { .. } => continue,
             _ => return Err("a live page's engine asked for something other than a resource".into()),
         };
+        // Navigatord's own addresses are counted apart: a page with frames
+        // asks for its messages every quarter second.
+        let own = delivered && open.url.starts_with("https://live-page.atrium.invalid/");
         served.requests += 1;
-        if served.requests > MAX_REQUESTS {
+        if !own { served.network += 1; }
+        if served.network > MAX_REQUESTS || served.requests > MAX_REQUESTS * 64 {
             return Err("the page made too many requests".into());
         }
         let id = open.id;
@@ -385,6 +405,29 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         if delivered && open.url.starts_with("https://live-page.atrium.invalid/") && open.url != limen::web_island::LIVE_STORAGE {
             let (status, kind, body): (u16, Option<&str>, std::borrow::Cow<[u8]>) = match (reporter_request(&open.url), post) {
                 (Some(Reporter::Script), None) => (200, Some("text/javascript"), REPORTER.into()),
+                // Frames and their messages (I6.5).
+                (Some(Reporter::Frame(ask)), None) if !hooks.is_frame() => {
+                    hooks.frame(ask);
+                    (204, None, b"".into())
+                }
+                (Some(Reporter::Message { to }), Some(b)) if to.is_some() != hooks.is_frame() => {
+                    let text = String::from_utf8(b.bytes.clone()).ok().filter(|t| t.len() <= crate::live_frames::MESSAGE_MAX);
+                    let target = reporter_target(&open.url);
+                    match (text, target) {
+                        (Some(text), Some(target)) => match hooks.post_message(to, &target, text) {
+                            Ok(()) => (204, None, b"".into()),
+                            Err(why) => {
+                                eprintln!("navigatord: a live page's message not delivered: {why}");
+                                (204, None, b"".into())
+                            }
+                        },
+                        _ => {
+                            refuse("a message out of shape", ErrorCode::Policy, &mut served, hooks)?;
+                            continue;
+                        }
+                    }
+                }
+                (Some(Reporter::Messages), None) => (200, Some("application/json"), hooks.messages().into()),
                 (Some(Reporter::Print), None) => {
                     hooks.print();
                     (204, None, b"".into())
@@ -416,6 +459,12 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
             };
             output.send(Event::Head { id, status, final_url: open.url.clone(), redirects: 0, content_type: kind.map(str::to_string),
                 length: Some(body.len() as u64), accept_ranges: false, validator: None }).map_err(|e| e.to_string())?;
+            // The page's script reads its messages from another origin
+            // (navigatord's own name): the answer allows any, without
+            // credentials (I6.5).
+            if open.url == limen::web_island::LIVE_MESSAGES {
+                output.send(Event::Cors { id, allow_origin: "*".into(), allow_credentials: false }).map_err(|e| e.to_string())?;
+            }
             for (i, bytes) in body.chunks(nuntius::DATA_MAX).enumerate() {
                 output.send(Event::Data { id, offset: (i * nuntius::DATA_MAX) as u64, bytes: bytes.to_vec() }).map_err(|e| e.to_string())?;
             }
@@ -451,7 +500,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         if !delivered && (status != 200 || kind != "text/html") {
             return Err(format!("the page answered {status} {kind}, not an HTML page"));
         }
-        let body = if delivered { body } else { with_reporter(&body) };
+        let body = if delivered { body } else { with_reporter_for(&body, hooks.is_frame()) };
         let length = body.len() as u64;
         if length > open.limits.max_bytes || served.bytes.saturating_add(length) > MAX_BYTES {
             refuse("over the page's byte bound", ErrorCode::TooBig, &mut served, hooks)?;
@@ -492,6 +541,11 @@ const REPORTER: &[u8] = include_bytes!("live_reporter.js");
 #[derive(Debug, PartialEq)]
 enum Reporter {
     Script,
+    Frame(crate::live_frames::FrameAsk),
+    /// A message to frame `to`, or to the page (`None`), for the target in
+    /// the address's `target`.
+    Message { to: Option<u32> },
+    Messages,
     Print,
     PickedFile,
     Refused(limen::web_island::Api),
@@ -500,13 +554,30 @@ enum Reporter {
 
 fn reporter_request(url: &str) -> Option<Reporter> {
     use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
-    if url == LIVE_REPORTER { return Some(Reporter::Script); }
+    if url == LIVE_REPORTER || url == FRAME_REPORTER { return Some(Reporter::Script); }
     if url == limen::web_island::LIVE_FILE { return Some(Reporter::PickedFile); }
     if url == limen::web_island::LIVE_PRINT { return Some(Reporter::Print); }
+    if url == limen::web_island::LIVE_MESSAGES { return Some(Reporter::Messages); }
     let (at, query) = url.split_once('?')?;
+    if query.len() > navigator_control::URL_MAX + 256 { return None; }
     let u = url::Url::parse(url).ok()?;
-    let pairs: Vec<(String, String)> = u.query_pairs().take(4).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let pairs: Vec<(String, String)> = u.query_pairs().take(8).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
     let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let number = |k: &str| get(k).and_then(|v| (v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit() || b == b'-')).then(|| v.parse::<i32>().ok()).flatten());
+    if at == limen::web_island::LIVE_FRAME {
+        use crate::live_frames::FrameAsk;
+        let id = get("id")?.parse::<u32>().ok().filter(|v| get("id").is_some_and(|s| s.len() <= 10 && !s.starts_with('+')) && *v > 0)?;
+        if get("gone") == Some("1") { return Some(Reporter::Frame(FrameAsk::Gone { id })); }
+        let url = get("url").filter(|u| navigator_control::clean(u, navigator_control::URL_MAX))?.to_string();
+        return Some(Reporter::Frame(FrameAsk::At { id, url, rect: [number("x")?, number("y")?, number("w")?, number("h")?] }));
+    }
+    if at == limen::web_island::LIVE_MESSAGE {
+        reporter_target(url)?;
+        return match get("to") {
+            Some(t) => Some(Reporter::Message { to: Some(t.parse::<u32>().ok().filter(|v| *v > 0 && t.len() <= 10 && !t.starts_with('+'))?) }),
+            None => Some(Reporter::Message { to: None }),
+        };
+    }
     if query.len() > 1024 { return None; }
     match at {
         _ if at == LIVE_REFUSED => Api::from_token(get("api")?).map(Reporter::Refused),
@@ -519,10 +590,27 @@ fn reporter_request(url: &str) -> Option<Reporter> {
     }
 }
 
+/// The reporter as a frame's engine asks for it (I6.5): the same script,
+/// which then works as the frame's side.
+const FRAME_REPORTER: &str = "https://live-page.atrium.invalid/reporter.js?frame=1";
+
+/// A message's target origin, from its address's `target`: `*`, `/` or
+/// an origin (`postMessage`'s own rule; navigatord compares it).
+fn reporter_target(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    let t = u.query_pairs().take(8).find(|(k, _)| k == "target").map(|(_, v)| v.into_owned())?;
+    (t == "*" || t == "/" || (t.len() <= 300 && crate::origin(&t).is_some())).then_some(t)
+}
+
 /// `html` with the reporter's script first: after a doctype (and any
 /// comments before it), so the page keeps its mode.
-pub fn with_reporter(html: &[u8]) -> Vec<u8> {
-    let tag = format!("<script src=\"{}\"></script>", limen::web_island::LIVE_REPORTER);
+#[cfg(test)]
+pub fn with_reporter(html: &[u8]) -> Vec<u8> { with_reporter_for(html, false) }
+
+/// As [`with_reporter`], for a page's frame when `frame` (I6.5).
+pub fn with_reporter_for(html: &[u8], frame: bool) -> Vec<u8> {
+    let src = if frame { FRAME_REPORTER } else { limen::web_island::LIVE_REPORTER };
+    let tag = format!("<script src=\"{src}\"></script>");
     let mut at = if html.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
     let start = at;
     loop {
@@ -717,13 +805,33 @@ struct RunHooks {
     picked: Arc<Mutex<Option<Vec<u8>>>>,
     /// When the page last asked to be printed.
     printed: Option<Instant>,
+    /// Its frames' reports, for the watcher (I6.5).
+    asks: Arc<Mutex<VecDeque<FrameAsk>>>,
+    mail: Arc<Mutex<Mailbox>>,
 }
 
 /// How long after a print a page may ask for another.
 const PRINT_AGAIN: Duration = Duration::from_secs(5);
 
 impl Hooks for RunHooks {
-    fn started(&mut self, page: &str) { let _ = self.delivered.send(page.to_string()); }
+    fn started(&mut self, page: &str) {
+        if let Some(o) = crate::origin(page) { self.mail.lock().unwrap().page_started(o); }
+        let _ = self.delivered.send(page.to_string());
+    }
+    fn frame(&mut self, ask: FrameAsk) {
+        // The latest place of a frame replaces one not yet looked at.
+        let mut asks = self.asks.lock().unwrap();
+        let id = match &ask { FrameAsk::At { id, .. } | FrameAsk::Gone { id } => *id };
+        if let Some(at) = asks.iter().position(|a| matches!(a, FrameAsk::At { id: i, .. } if *i == id)) {
+            asks[at] = ask;
+        } else if asks.len() < crate::live_frames::ASKS_MAX {
+            asks.push_back(ask);
+        }
+    }
+    fn post_message(&mut self, to: Option<u32>, target: &str, data: String) -> Result<(), &'static str> {
+        self.mail.lock().unwrap().from_page(to.ok_or("from the page, a message names its frame")?, target, data)
+    }
+    fn messages(&mut self) -> Vec<u8> { self.mail.lock().unwrap().take_for_page() }
     fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.storage.as_mut().map(|s| s as &mut dyn LocalStorage) }
     fn made(&mut self, page: &str, name: &str, kind: &str, bytes: Vec<u8>) -> Result<(), String> {
         if bytes.is_empty() { return Err("an empty file".into()); }
@@ -756,6 +864,119 @@ impl Hooks for RunHooks {
             eprintln!("navigatord: a live page was refused {}", api.label());
             self.tell.refused(api.label().to_string());
         }
+    }
+}
+
+/// A frame's engine, served (I6.5): its own site's scope, a throwaway
+/// jar, no storage, no files; its messages go through the page's mailbox.
+struct FrameHooks {
+    id: u32,
+    mail: Arc<Mutex<Mailbox>>,
+    tell: Arc<dyn Tell>,
+    apis: std::collections::HashSet<limen::web_island::Api>,
+}
+
+impl Hooks for FrameHooks {
+    fn is_frame(&self) -> bool { true }
+    fn started(&mut self, page: &str) {
+        if let Some(o) = crate::origin(page) { self.mail.lock().unwrap().frame_started(self.id, o); }
+    }
+    fn refused(&mut self, target: &str) { self.tell.refused(format!("a request to {} from a frame", refused_host(target))); }
+    fn refused_api(&mut self, api: limen::web_island::Api) {
+        if self.apis.insert(api) { self.tell.refused(format!("{} (a frame)", api.label())); }
+    }
+    fn post_message(&mut self, to: Option<u32>, target: &str, data: String) -> Result<(), &'static str> {
+        if to.is_some() { return Err("a frame posts only to its page"); }
+        self.mail.lock().unwrap().from_frame(self.id, target, data)
+    }
+    fn messages(&mut self) -> Vec<u8> { self.mail.lock().unwrap().take_for_frame(self.id) }
+}
+
+/// One of a live page's frames, as the watcher keeps it (I6.5).
+struct FrameRun {
+    url: String,
+    /// Where the page's script said it is, in the page's viewport.
+    rect: [i32; 4],
+    embed: u64,
+    /// Its fetch channel was taken and served.
+    served: bool,
+    started: bool,
+    reports: limen::web_island::Lifecycle,
+    /// Its throwaway jar's view, closed and forgotten when it ends.
+    view: Option<LiveJar>,
+}
+
+/// Throwaway jar ids for frames, apart from the trails' (I6.5).
+static FRAME_JARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 62);
+
+impl FrameRun {
+    fn end(self, connection: &mut Parent, mail: &Mutex<Mailbox>, id: u32) {
+        let _ = connection.detach(self.embed);
+        mail.lock().unwrap().frame_gone(id);
+        if let Some(j) = self.view { j.cookies.lock().unwrap().close_throwaway(j.view); }
+    }
+
+    /// Put its island where the page's script said, in the page's place;
+    /// hidden while none of it shows.
+    fn place(&self, connection: &mut Parent, page: [u32; 4]) {
+        match crate::live_frames::frame_rect(page, self.rect).and_then(|r| crate::widget::bounds(r).ok().map(|b| (r, b))) {
+            Some((r, b)) => {
+                let _ = connection.set_visible(self.embed, true);
+                let _ = connection.place(self.embed, Some(b));
+                if self.started { tell_size(connection, self.embed, r); }
+            }
+            None => { let _ = connection.set_visible(self.embed, false); }
+        }
+    }
+}
+
+/// What the watcher does with one of the page script's frame reports.
+#[allow(clippy::too_many_arguments)]
+fn frame_ask(connection: &mut Parent, window: [u8; 16], frames: &mut HashMap<u32, FrameRun>, starts: &mut usize, ask: FrameAsk,
+             page: Option<&str>, page_rect: [u32; 4], mail: &Mutex<Mailbox>, tell: &Arc<dyn Tell>, can_run: bool) {
+    use crate::live_frames::{frame_address, FRAMES_MAX, FRAME_MIN, FRAME_STARTS_MAX};
+    let (id, url, rect) = match ask {
+        FrameAsk::Gone { id } => {
+            if let Some(run) = frames.remove(&id) { run.end(connection, mail, id); }
+            return;
+        }
+        FrameAsk::At { id, url, rect } => (id, url, rect),
+    };
+    if let Some(run) = frames.get_mut(&id) {
+        if run.url == url {
+            run.rect = rect;
+            if run.served { run.place(connection, page_rect); }
+            return;
+        }
+        // The frame went somewhere else: its engine goes, a new one starts.
+        if let Some(run) = frames.remove(&id) { run.end(connection, mail, id); }
+    }
+    let Some(page) = page else { return };
+    let host = crate::refused_target(&url);
+    let why = match frame_address(page, &url) {
+        _ if !can_run => Some("no jar for a frame here"),
+        None => Some("not a plain https address of another origin"),
+        Some(_) if frames.len() >= FRAMES_MAX || *starts >= FRAME_STARTS_MAX => Some("more frames than a live page runs"),
+        Some(_) if rect[2] < FRAME_MIN as i32 || rect[3] < FRAME_MIN as i32 => {
+            // Too small to show (a tracking pixel): not started, not told.
+            eprintln!("navigatord: a live page's frame too small to run ({host})");
+            return;
+        }
+        Some(_) => None,
+    };
+    if let Some(why) = why {
+        eprintln!("navigatord: a live page's frame not run: {why} ({host})");
+        tell.refused(format!("a frame from {}", refused_host(&host)));
+        return;
+    }
+    match connection.request_island(window, 2) {
+        Ok(embed) => {
+            *starts += 1;
+            limen::start_trace("navigatord", "live-frame", &url);
+            mail.lock().unwrap().frame_added(id);
+            frames.insert(id, FrameRun { url, rect, embed, served: false, started: false, reports: Default::default(), view: None });
+        }
+        Err(e) => eprintln!("navigatord: a live page's frame engine: {e:?}"),
     }
 }
 
@@ -800,7 +1021,10 @@ impl Live {
         let forms = jar.clone();
         let closing = jar.clone();
         let picked = Arc::new(Mutex::new(None));
-        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone(), printed: None };
+        let asks = Arc::new(Mutex::new(VecDeque::new()));
+        let mail = Arc::new(Mutex::new(Mailbox::default()));
+        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone(), printed: None,
+                                   asks: asks.clone(), mail: mail.clone() };
         std::thread::spawn(move || {
             let result = match jar {
                 Some(mut jar) => serve(channel, &page, &mut jar, &mut hooks),
@@ -820,10 +1044,26 @@ impl Live {
             let mut started = false;
             let mut pick = Pick::default();
             let mut page = None::<String>;
+            let mut frames: HashMap<u32, FrameRun> = HashMap::new();
+            let mut frame_starts = 0usize;
+            let mut page_rect = size.lock().unwrap().1;
+            let cookies = forms.as_ref().map(|j| j.cookies.clone());
             let why = loop {
                 let mut slot = watched.lock().unwrap();
                 let Some(connection) = slot.as_mut() else { return };
                 if let Ok(u) = delivered.try_recv() { page = Some(u); }
+                // The page's frames (I6.5): started, moved or ended as its
+                // script reports them, and moved with the page.
+                let now_rect = size.lock().unwrap().1;
+                if now_rect != page_rect {
+                    page_rect = now_rect;
+                    for run in frames.values().filter(|r| r.served) { run.place(connection, page_rect); }
+                }
+                // Reports wait for the page's engine to have started.
+                let waiting: Vec<FrameAsk> = if started { asks.lock().unwrap().drain(..).collect() } else { vec![] };
+                for ask in waiting {
+                    frame_ask(connection, window, &mut frames, &mut frame_starts, ask, page.as_deref(), page_rect, &mail, &tell, cookies.is_some());
+                }
                 match connection.poll(Duration::from_millis(40)) {
                     Ok(Some(ParentEvent::Message { embed: id, bytes })) if id == embed => match reports.receive(&bytes) {
                         Some(Report::Started { origin }) => {
@@ -917,6 +1157,70 @@ impl Live {
                         Some(Report::BeforeUnload { .. }) | None => break Some("the engine sent a report out of order".into()),
                     },
                     Ok(Some(ParentEvent::IslandStopped { embed: id })) if id == embed => break None,
+                    // A frame's engine (I6.5).
+                    Ok(Some(ParentEvent::IslandFetch { embed: id })) if frames.values().any(|r| r.embed == id) => {
+                        let Some((&fid, run)) = frames.iter_mut().find(|(_, r)| r.embed == id) else { continue };
+                        let jar = cookies.clone().ok_or("no jar".to_string())
+                            .and_then(|c| LiveJar::open(c, &run.url, Some(FRAME_JARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))));
+                        match (connection.take_island_fetch(id), jar) {
+                            (Some(channel), Ok(jar)) => {
+                                run.view = Some(jar.clone());
+                                run.served = true;
+                                let (url, mail, tell) = (run.url.clone(), mail.clone(), tell.clone());
+                                std::thread::spawn(move || {
+                                    let mut jar = jar;
+                                    let mut hooks = FrameHooks { id: fid, mail, tell, apis: Default::default() };
+                                    match serve(channel, &url, &mut jar, &mut hooks) {
+                                        Ok(s) => eprintln!("navigatord: a live page's frame served {} requests, {} refused", s.requests, s.refused.len()),
+                                        Err(e) => eprintln!("navigatord: a live page's frame: {e}"),
+                                    }
+                                });
+                                run.place(connection, page_rect);
+                            }
+                            (_, why) => {
+                                eprintln!("navigatord: a live page's frame not served: {:?}", why.err());
+                                if let Some(run) = frames.remove(&fid) { run.end(connection, &mail, fid); }
+                            }
+                        }
+                    }
+                    Ok(Some(ParentEvent::Message { embed: id, bytes })) if frames.values().any(|r| r.embed == id) => {
+                        let Some((&fid, run)) = frames.iter_mut().find(|(_, r)| r.embed == id) else { continue };
+                        let ended = match run.reports.receive(&bytes) {
+                            Some(Report::Started { origin }) if crate::origin(&run.url).as_deref() == Some(origin) => {
+                                run.started = true;
+                                run.place(connection, page_rect);
+                                false
+                            }
+                            Some(Report::Started { .. }) => {
+                                eprintln!("navigatord: a live page's frame reported another origin; ended");
+                                true
+                            }
+                            Some(Report::Copy { text, token }) => { tell.copy(text.to_string(), token); false }
+                            Some(Report::Paste { token }) => { tell.paste(token); false }
+                            Some(Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::UrlChanged(_)) => false,
+                            // A frame does not navigate the trail, send forms
+                            // through a jar, or pick files in I6.5.
+                            Some(Report::Navigate(_) | Report::Submit { .. }) => {
+                                tell.refused("a frame's navigation or form".into());
+                                false
+                            }
+                            Some(Report::PickFile) => {
+                                tell.refused("a file for a frame".into());
+                                tell_picked(connection, id, &limen::web_island::FilePicked::Cancelled);
+                                false
+                            }
+                            Some(Report::Ended(_)) | Some(Report::BeforeUnload { .. }) | None => true,
+                        };
+                        if ended { if let Some(run) = frames.remove(&fid) { run.end(connection, &mail, fid); } }
+                    }
+                    Ok(Some(ParentEvent::ChildLost { embed: id } | ParentEvent::Detached { embed: id } | ParentEvent::IslandStopped { embed: id }))
+                        if frames.values().any(|r| r.embed == id) =>
+                    {
+                        if let Some(fid) = frames.iter().find(|(_, r)| r.embed == id).map(|(f, _)| *f) {
+                            eprintln!("navigatord: a live page's frame ended");
+                            if let Some(run) = frames.remove(&fid) { run.end(connection, &mail, fid); }
+                        }
+                    }
                     // The picker (I6.4): its file, then its end; or it went.
                     Ok(Some(ParentEvent::Message { embed: id, bytes } | ParentEvent::MessageFd { embed: id, bytes })) if Some(id) == pick.embed => {
                         let fd = connection.take_fd();
@@ -943,6 +1247,9 @@ impl Live {
                 drop(slot);
                 std::thread::sleep(Duration::from_millis(5));
             };
+            for (_, run) in frames.drain() {
+                if let Some(j) = run.view { j.cookies.lock().unwrap().close_throwaway(j.view); }
+            }
             if watched.lock().unwrap().take().is_some() {
                 tell.finished(why);
             }
@@ -1241,6 +1548,88 @@ mod tests {
         assert_eq!(seen.started.len(), 1);
     }
 
+    /// A run's `Tell` that keeps what it was told was refused.
+    #[derive(Default)]
+    struct Told(Mutex<Vec<String>>);
+    impl Tell for Told {
+        fn started(&self, _: String) {}
+        fn navigate(&self, _: String) {}
+        fn url_changed(&self, _: String) {}
+        fn file(&self, _: Offered) {}
+        fn refused(&self, what: String) { self.0.lock().unwrap().push(what); }
+        fn print(&self) {}
+        fn copy(&self, _: String, _: [u8; 16]) {}
+        fn paste(&self, _: [u8; 16]) {}
+        fn finished(&self, _: Option<String>) {}
+    }
+
+    struct PayFrame;
+    impl Resources for PayFrame {
+        fn get(&mut self, url: &str, first: bool) -> Result<Got, String> {
+            match (url, first) {
+                ("https://pay.example/frame.html", true) => Ok(Got::new(200, "text/html", b"<!doctype html><p>pay".to_vec())),
+                _ => Err("not here".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_and_its_frame_run_apart_and_talk_only_through_the_mailbox() {
+        use limen::web_island::{LIVE_FRAME, LIVE_MESSAGE, LIVE_MESSAGES};
+        let mail = Arc::new(Mutex::new(Mailbox::default()));
+        let asks = Arc::new(Mutex::new(VecDeque::new()));
+        let told = Arc::new(Told::default());
+        let (page_end, page_engine) = UnixStream::pair().unwrap();
+        let (delivered, _) = std::sync::mpsc::channel();
+        let mut page_hooks = RunHooks { delivered, storage: None, tell: told.clone(), apis: Default::default(), picked: Default::default(),
+                                        printed: None, asks: asks.clone(), mail: mail.clone() };
+        let page_server = std::thread::spawn(move || serve(page_end, "https://app.example/app.html", &mut Fake(vec![]), &mut page_hooks));
+        let mut page = nuntius::client::Client::from_stream(page_engine).unwrap();
+        page.open(Open::get(1, LIVE_PAGE)).unwrap();
+        assert_eq!(body(&mut page).2, None);
+        // The page's script reports its frame; the watcher would start it.
+        page.open(Open::get(2, &format!("{LIVE_FRAME}?id=1&url=https%3A%2F%2Fpay.example%2Fframe.html&x=10&y=20&w=320&h=80"))).unwrap();
+        assert_eq!(body(&mut page).0.map(|h| h.0), Some(204));
+        assert_eq!(asks.lock().unwrap().front(), Some(&FrameAsk::At { id: 1, url: "https://pay.example/frame.html".into(), rect: [10, 20, 320, 80] }));
+        mail.lock().unwrap().frame_added(1);
+        // The frame's engine: its own document, the reporter as the frame's.
+        let (frame_end, frame_engine) = UnixStream::pair().unwrap();
+        let mut frame_hooks = FrameHooks { id: 1, mail: mail.clone(), tell: told.clone(), apis: Default::default() };
+        let frame_server = std::thread::spawn(move || serve(frame_end, "https://pay.example/frame.html", &mut PayFrame, &mut frame_hooks));
+        let mut frame = nuntius::client::Client::from_stream(frame_engine).unwrap();
+        frame.open(Open::get(1, LIVE_PAGE)).unwrap();
+        let (_, html, _) = body(&mut frame);
+        assert!(html.starts_with(format!("<!doctype html><script src=\"{FRAME_REPORTER}\"></script>").as_bytes()), "{}", String::from_utf8_lossy(&html));
+        frame.open(Open::get(2, FRAME_REPORTER)).unwrap();
+        assert_eq!(body(&mut frame).1, REPORTER);
+        // The frame to its page, for the page's origin: stamped with the frame's.
+        let post = |id, url: String, text: &str| Open::post(id, &url, "text/plain", text.as_bytes().to_vec());
+        frame.open(post(3, format!("{LIVE_MESSAGE}?target=https%3A%2F%2Fapp.example"), "\"pay.example running\"")).unwrap();
+        assert_eq!(body(&mut frame).0.map(|h| h.0), Some(204));
+        page.open(Open::get(3, LIVE_MESSAGES)).unwrap();
+        let (_, answer, _, cors) = body_and_cors(&mut page);
+        assert_eq!(cors, Some(("*".into(), false)), "readable by the page's script");
+        let got: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(got, serde_json::json!([{ "from": 1, "origin": "https://pay.example", "data": "\"pay.example running\"" }]));
+        // The page to its frame.
+        page.open(post(4, format!("{LIVE_MESSAGE}?to=1&target=*"), "{\"total\":12}")).unwrap();
+        assert_eq!(body(&mut page).0.map(|h| h.0), Some(204));
+        frame.open(Open::get(4, LIVE_MESSAGES)).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&body(&mut frame).1).unwrap();
+        assert_eq!(got, serde_json::json!([{ "from": null, "origin": "https://app.example", "data": "{\"total\":12}" }]));
+        // A frame names no frame and reports none; the page names one.
+        frame.open(post(5, format!("{LIVE_MESSAGE}?to=1&target=*"), "1")).unwrap();
+        assert_eq!(body(&mut frame).2, Some(ErrorCode::Policy));
+        frame.open(Open::get(6, &format!("{LIVE_FRAME}?id=2&url=https%3A%2F%2Fevil.example%2F&x=0&y=0&w=99&h=99"))).unwrap();
+        assert_eq!(body(&mut frame).2, Some(ErrorCode::Policy));
+        page.open(post(5, format!("{LIVE_MESSAGE}?target=*"), "1")).unwrap();
+        assert_eq!(body(&mut page).2, Some(ErrorCode::Policy));
+        // Messages are not network requests.
+        drop((page, frame));
+        let (page, frame) = (page_server.join().unwrap().unwrap(), frame_server.join().unwrap().unwrap());
+        assert_eq!((page.network, frame.network), (1, 1));
+    }
+
     #[test]
     fn the_reporters_requests_are_parsed_strictly() {
         use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
@@ -1254,6 +1643,22 @@ mod tests {
         assert_eq!(reporter_request(&format!("{LIVE_REPORTER}?x=1")), None);
         assert_eq!(reporter_request(&format!("{LIVE_REFUSED}x?api=push")), None);
         assert_eq!(reporter_request(&format!("{LIVE_REFUSED}?api=push%0a")), None);
+        // Frames and messages (I6.5).
+        use limen::web_island::{LIVE_FRAME, LIVE_MESSAGE, LIVE_MESSAGES};
+        assert_eq!(reporter_request(FRAME_REPORTER), Some(Reporter::Script));
+        assert_eq!(reporter_request(LIVE_MESSAGES), Some(Reporter::Messages));
+        assert_eq!(reporter_request(&format!("{LIVE_FRAME}?id=3&url=https%3A%2F%2Fpay.example%2F&x=-5&y=7&w=320&h=80")),
+                   Some(Reporter::Frame(FrameAsk::At { id: 3, url: "https://pay.example/".into(), rect: [-5, 7, 320, 80] })));
+        assert_eq!(reporter_request(&format!("{LIVE_FRAME}?id=3&gone=1")), Some(Reporter::Frame(FrameAsk::Gone { id: 3 })));
+        for bad in ["id=0&gone=1", "id=%2B3&gone=1", "id=3&url=https%3A%2F%2Fpay.example%2F&x=1&y=1&w=99999999999&h=1",
+                    "id=3&url=https%3A%2F%2Fpay.example%2F%0a&x=1&y=1&w=1&h=1", "id=3&url=https%3A%2F%2Fpay.example%2F&x=1&y=1&w=1"] {
+            assert_eq!(reporter_request(&format!("{LIVE_FRAME}?{bad}")), None, "{bad}");
+        }
+        assert_eq!(reporter_request(&format!("{LIVE_MESSAGE}?to=2&target=https%3A%2F%2Fpay.example")), Some(Reporter::Message { to: Some(2) }));
+        assert_eq!(reporter_request(&format!("{LIVE_MESSAGE}?target=*")), Some(Reporter::Message { to: None }));
+        for bad in ["to=2", "to=2&target=pay.example", "to=x&target=*", "to=0&target=*"] {
+            assert_eq!(reporter_request(&format!("{LIVE_MESSAGE}?{bad}")), None, "{bad}");
+        }
     }
 
     #[test]
