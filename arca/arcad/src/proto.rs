@@ -470,13 +470,18 @@ pub mod courier_op {
     /// nothing. Arca validates it (arcad::cookie); DENIED = ignored.
     pub const SET_COOKIE: u16 = 0x81;
     /// After TLS is up: `str request path [| ticket[16] | u8 method | str
-    /// query]` → the `Cookie` header value for that request (empty: none).
+    /// query [| str origin]]` → the `Cookie` header value for that request
+    /// (empty: none). `origin` is the request's `Origin` header, which
+    /// only a ticket whose initiator is on its site allows (DENIED, the
+    /// ticket unspent, otherwise; navigator-islands.md I6.5).
     /// An app's courier sends no ticket and gets every matching cookie. A
     /// web courier (its label has a partition) must redeem the broker's
     /// ticket for exactly this request — its method, path and query; SameSite
     /// goes by the ticket. A web courier's SET_COOKIE carries the same
     /// ticket at its end.
     pub const COOKIES: u16 = 0x82;
+    /// The longest `origin` a COOKIES names.
+    pub const ORIGIN_MAX: usize = 300;
 
     /// A mail courier's login (mail.md §5.2), after TLS is up and only for
     /// a courier whose label is a mail scheme: `u8 source (1 item) | ref[16]`

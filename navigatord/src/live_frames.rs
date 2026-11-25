@@ -67,7 +67,17 @@ fn target_ok(target: &str, sender: &str, receiver: &str) -> bool {
 struct Frame {
     /// Its engine's origin, once it delivered its document.
     origin: Option<String>,
-    inbox: VecDeque<(String, String)>,
+    /// (sender's origin, the origin it was for, data).
+    inbox: VecDeque<(String, String, String)>,
+}
+
+/// JSON for the reporter. Strings and numbers always encode; a failure is
+/// said, and nothing is delivered.
+fn encoded(all: &[serde_json::Value]) -> Vec<u8> {
+    serde_json::to_vec(all).unwrap_or_else(|e| {
+        eprintln!("navigatord: a live page's messages did not encode ({e}); {} dropped", all.len());
+        b"[]".to_vec()
+    })
 }
 
 /// The messages between a page and its frames, for one run.
@@ -104,7 +114,7 @@ impl Mailbox {
         if !message_ok(&data) { return Err("a message out of bounds"); }
         if !target_ok(target, &page, receiver) { return Err("the frame is not at that origin"); }
         if frame.inbox.len() >= QUEUE_MAX { return Err("the frame's messages are full"); }
-        frame.inbox.push_back((page, data));
+        frame.inbox.push_back((page, receiver.to_string(), data));
         Ok(())
     }
 
@@ -123,14 +133,19 @@ impl Mailbox {
     pub fn take_for_page(&mut self) -> Vec<u8> {
         let all: Vec<serde_json::Value> = self.for_page.drain(..)
             .map(|(from, origin, data)| serde_json::json!({ "from": from, "origin": origin, "data": data })).collect();
-        serde_json::to_vec(&all).unwrap_or_else(|_| b"[]".to_vec())
+        encoded(&all)
     }
 
-    /// Frame `id`'s waiting messages.
+    /// Frame `id`'s waiting messages. Each target is checked again here,
+    /// as `postMessage` checks at delivery: a frame now at another origin
+    /// than the one a message named doesn't get it.
     pub fn take_for_frame(&mut self, id: u32) -> Vec<u8> {
-        let all: Vec<serde_json::Value> = self.frames.get_mut(&id).map(|f| f.inbox.drain(..).collect::<Vec<_>>()).unwrap_or_default()
-            .into_iter().map(|(origin, data)| serde_json::json!({ "from": null, "origin": origin, "data": data })).collect();
-        serde_json::to_vec(&all).unwrap_or_else(|_| b"[]".to_vec())
+        let Some(f) = self.frames.get_mut(&id) else { return b"[]".to_vec() };
+        let now = f.origin.clone();
+        let all: Vec<serde_json::Value> = f.inbox.drain(..)
+            .filter(|(_, target, _)| now.as_deref().is_some_and(|o| target == o))
+            .map(|(origin, _, data)| serde_json::json!({ "from": null, "origin": origin, "data": data })).collect();
+        encoded(&all)
     }
 }
 
@@ -183,6 +198,11 @@ mod tests {
         assert_eq!(m.from_page(1, "*", "x".repeat(MESSAGE_MAX + 1)), Err("a message out of bounds"));
         let got: serde_json::Value = serde_json::from_slice(&m.take_for_frame(1)).unwrap();
         assert_eq!(got, serde_json::json!([{ "from": null, "origin": "https://app.example", "data": "1" }]));
+        // A frame that moved to another origin since doesn't get what was
+        // for the old one.
+        assert_eq!(m.from_page(1, "*", "2".into()), Ok(()));
+        m.frame_started(1, "https://other.pay.example".into());
+        assert_eq!(m.take_for_frame(1), b"[]");
         // Bounded, and gone with the frame.
         for _ in 0..QUEUE_MAX { m.from_frame(1, "*", "0".into()).unwrap(); }
         assert_eq!(m.from_frame(1, "*", "0".into()), Err("the page's messages are full"));

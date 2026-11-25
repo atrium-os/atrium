@@ -126,19 +126,28 @@ impl Vault for Arcad {
         let _ = self.call(courier_op::SET_COOKIE, &w.buf);
     }
 
-    fn cookies(&mut self, method: crate::schema::Method, path: &str, query: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
+    fn cookies(&mut self, method: crate::schema::Method, path: &str, query: &str, ticket: Option<&[u8; 16]>, origin: Option<&str>) -> Result<Option<LockedBuf>, Refusal> {
         let mut w = Writer::new();
         w.str(path);
         // A ticket is redeemed for exactly this request: its method and
-        // query go with it.
-        if let Some(t) = ticket {
-            w.raw(t);
-            w.u8(method as u8);
-            w.str(query);
+        // query go with it, and its Origin, which Arca checks against the
+        // ticket's initiator.
+        match (ticket, origin) {
+            (Some(t), origin) => {
+                w.raw(t);
+                w.u8(method as u8);
+                w.str(query);
+                if let Some(o) = origin { w.str(o); }
+            }
+            (None, Some(_)) => return Err(Refusal::Denied),
+            (None, None) => {}
         }
         match self.call(courier_op::COOKIES, &w.buf) {
-            Ok((status::OK, b)) if !b.is_empty() => Some(b),
-            _ => None,
+            Ok((status::OK, b)) if !b.is_empty() => Ok(Some(b)),
+            // A refused Origin refuses the request; without one, a refusal
+            // is no cookies.
+            Ok((status::DENIED, _)) | Err(_) if origin.is_some() => Err(Refusal::Denied),
+            _ => Ok(None),
         }
     }
 }

@@ -2308,10 +2308,23 @@ impl State {
     /// ticket is for that one request; a response's Set-Cookies name only
     /// the path of the request whose ticket was redeemed.
     fn courier_ticket(&mut self, c: &CourierLabel, path: &str, exact: Option<(u8, &str)>, id: &[u8; 16], redeem: bool) -> Option<crate::tickets::Ticket> {
+        self.courier_ticket_from(c, path, exact, None, id, redeem)
+    }
+
+    /// As [`Self::courier_ticket`], for a request that names `origin` (an
+    /// `Origin` header, navigator-islands.md I6.5): only a ticket whose
+    /// initiator is on that origin's site is one for it, so the header and
+    /// the initiator Arca's same-site rule goes by are one claim.
+    fn courier_ticket_from(&mut self, c: &CourierLabel, path: &str, exact: Option<(u8, &str)>, origin: Option<&str>, id: &[u8; 16], redeem: bool) -> Option<crate::tickets::Ticket> {
         let Recipient::Endpoint { host, port, partition: Some(partition), .. } = &c.endpoint else { return None };
+        let from_site = |o: &str, initiator: &str| {
+            let host = o.strip_prefix("https://").map(|h| h.split(':').next().unwrap_or(h));
+            !initiator.is_empty() && host.is_some_and(|h| !h.is_empty() && crate::cookie::site(h) == crate::cookie::site(initiator))
+        };
         let ok = |t: &crate::tickets::Ticket| {
             t.user == c.user && &t.partition == partition && &t.host == host && t.port == *port && t.path == path
                 && exact.is_none_or(|(m, q)| t.method == m && t.query == q)
+                && origin.is_none_or(|o| from_site(o, &t.initiator))
         };
         if redeem {
             self.tickets.redeem(id, ok)
@@ -2647,6 +2660,10 @@ impl State {
                         _ => return malformed(),
                     }
                 } else { None };
+                // The request's `Origin`, if it sends one (I6.5).
+                let origin = if r.remaining() > 0 {
+                    match r.str(courier_op::ORIGIN_MAX) { Ok(o) => Some(o), Err(_) => return malformed() }
+                } else { None };
                 if r.end().is_err() || !path.starts_with('/') {
                     return malformed();
                 }
@@ -2655,12 +2672,14 @@ impl State {
                 // request, and SameSite goes by it. An app's courier has none.
                 let ctx = match (partition, ticket) {
                     (None, None) => None,
-                    (Some(_), Some((t, m, q))) => match self.courier_ticket(c, path, Some((m, q)), &t, true) {
+                    (Some(_), Some((t, m, q))) => match self.courier_ticket_from(c, path, Some((m, q)), origin, &t, true) {
                         Some(t) => Some(t),
                         None => return reply(status::DENIED),
                     },
                     _ => return reply(status::DENIED),
                 };
+                // An Origin only with a web courier's ticket.
+                if origin.is_some() && ctx.is_none() { return reply(status::DENIED); }
                 let now = (self.clock)();
                 if let Some(p) = partition.as_deref().filter(|p| crate::jar::in_memory(p)) {
                     if !self.stores.get(&c.user).is_some_and(|s| s.state() == arca_store::LockState::Unlocked) {

@@ -128,6 +128,8 @@ struct MockVault {
     /// What Arca's matching answers, and the paths it was asked for.
     jar: Option<Vec<u8>>,
     asked: Vec<String>,
+    /// An Origin Arca refuses for the ticket.
+    refused_origin: Option<String>,
 }
 
 impl Vault for MockVault {
@@ -140,9 +142,10 @@ impl Vault for MockVault {
     fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, _: Option<&[u8; 16]>) {
         self.cookies.push((name.into(), value.into(), attrs.into(), path.into()));
     }
-    fn cookies(&mut self, _: Method, path: &str, _: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
-        self.asked.push(format!("{path}{}", ticket.map_or(String::new(), |t| format!(" ticket {}", t[0]))));
-        self.jar.as_ref().map(|j| LockedBuf::from_slice(j).unwrap())
+    fn cookies(&mut self, _: Method, path: &str, _: &str, ticket: Option<&[u8; 16]>, origin: Option<&str>) -> Result<Option<LockedBuf>, Refusal> {
+        self.asked.push(format!("{path}{}{}", ticket.map_or(String::new(), |t| format!(" ticket {}", t[0])), origin.map_or(String::new(), |o| format!(" from {o}"))));
+        if origin.is_some_and(|o| self.refused_origin.as_deref() == Some(o)) { return Err(Refusal::Denied); }
+        Ok(self.jar.as_ref().map(|j| LockedBuf::from_slice(j).unwrap()))
     }
 }
 
@@ -470,6 +473,14 @@ fn an_origin_is_sent_only_as_a_plain_https_origin() {
     let sent = String::from_utf8(seen.lock().unwrap()[0].clone()).unwrap();
     assert!(sent.contains("\r\nOrigin: https://app.example\r\n"), "{sent}");
     assert!(headers.iter().any(|(k, v)| k == "access-control-allow-origin" && v == "https://app.example"), "{headers:?}");
+    assert_eq!(v.asked.last().map(String::as_str), Some("/status from https://app.example"), "Arca is asked with it");
+    // An Origin Arca refuses for the ticket refuses the request, unsent.
+    v.refused_origin = Some("https://other.example".into());
+    let mut req = get_with_bearer("/status");
+    req.slots.clear();
+    req.headers.push((Header::Origin, b"https://other.example".to_vec()));
+    assert_eq!(c.handle(&req.encode(), &mut v), Response::Refused(Refusal::Denied));
+    assert_eq!(seen.lock().unwrap().len(), 1, "nothing more reached the server");
     for bad in [&b"http://app.example"[..], b"https://App.example", b"https://app.example/", b"https://app.example:0",
                 b"https://app.example:65536", b"https://", b"null", b"https://app.example, https://evil.example", b"https://.example"] {
         let mut req = get_with_bearer("/status");

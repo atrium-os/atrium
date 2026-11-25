@@ -22,8 +22,10 @@ pub trait Vault {
     fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, ticket: Option<&[u8; 16]>);
     /// The `Cookie` header Arca matched for this request (`method`, `path`,
     /// `query` without its `?`), if any. A web courier's request redeems its
-    /// ticket here, for exactly this request.
-    fn cookies(&mut self, method: Method, path: &str, query: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf>;
+    /// ticket here, for exactly this request. `origin`: the request's
+    /// `Origin` header, which Arca allows only from the ticket's initiator's
+    /// site; `Err` refuses the request.
+    fn cookies(&mut self, method: Method, path: &str, query: &str, ticket: Option<&[u8; 16]>, origin: Option<&str>) -> Result<Option<LockedBuf>, Refusal>;
 }
 
 /// The one endpoint this courier serves, from its label.
@@ -171,10 +173,15 @@ impl<'a> Courier<'a> {
             vault.fill(&refs)?
         };
         // Arca's matching, after TLS like the fill. No cookies is no
-        // refusal: the request goes without.
+        // refusal: the request goes without. An Origin Arca doesn't allow
+        // for the ticket is.
         let path = std::str::from_utf8(&req.path).map_err(|_| Refusal::Malformed)?;
         let query = std::str::from_utf8(&req.query).map_err(|_| Refusal::Malformed)?;
-        let cookie = vault.cookies(req.method, path, query, req.ticket.as_ref());
+        let origin = match req.headers.iter().find(|(h, _)| *h == crate::schema::Header::Origin) {
+            Some((_, v)) => Some(std::str::from_utf8(v).map_err(|_| Refusal::Malformed)?),
+            None => None,
+        };
+        let cookie = vault.cookies(req.method, path, query, req.ticket.as_ref(), origin)?;
         let wire = build(req, &self.endpoint, &values, cookie.as_ref())?;
         if s.write_all(wire.as_ref()).and_then(|_| s.flush()).is_err() {
             // The server closed a kept-alive connection: once more, fresh.
