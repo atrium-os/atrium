@@ -319,7 +319,7 @@ A person's profile can use machine scope only if that person is an administrator
 role); otherwise app scope over their own apps. A machine profile set to "always" starts at
 boot, before login.
 
-### 7.1a Persona profiles at rest: PROPOSED 2026-11-25
+### 7.1a Persona profiles at rest: ACCEPTED 2026-11-25 (Shankar)
 
 **What's wrong today** (review, `reviews/stores-at-rest-assessment.md` S2 in project files):
 - A persona-scoped profile sits in `/var/db/crypta`, on the plain root, beside machine

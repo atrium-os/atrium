@@ -473,7 +473,7 @@ Per-session retention policy (default: keep all unique blobs up to
 Tessera's GC handles the actual reclamation when the last reference
 to a blob is dropped — Stoa does not need to know about it.
 
-### 5.4a Where session state lives: PROPOSED 2026-11-25
+### 5.4a Where session state lives: ACCEPTED 2026-11-25 (Shankar)
 
 **What's wrong today** (review, `reviews/stores-at-rest-assessment.md` S1 in project files):
 - stoad is one `_stoad` service for every person. It writes the session table and each
