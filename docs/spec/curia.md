@@ -497,7 +497,10 @@ list in Navigator only or the chip alone. Build order:
 
 ### 15.1 As built (2026-11-25)
 
-Steps 1 to 5 are on main; the VM check is next.
+Steps 1 to 5 are on main. The VM check is
+`scripts/navigator-settings-pane-check.sh PERSON [PERSONA]` (18 checks). It
+runs while someone opens the pane in Settings and presses Ask again, and
+has not been run yet.
 
 - **The list's crate.** `navigator-live-origins` holds the parser and the
   lock for navigatord and the pane. The pane sees the Navigator's data
