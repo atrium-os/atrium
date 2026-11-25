@@ -230,6 +230,13 @@ pub enum Request {
         /// this one is on.
         #[serde(default)]
         persona: Option<String>,
+        /// With `serves`, for limend only, for a plugin (`editor-extension`,
+        /// dev-tools.md §3.8): this workspace's `work`, read-only at `/work`
+        /// in the plugin's jail. portcullisd mounts it only when the served
+        /// instance's app picked that workspace and the plugin's installed
+        /// manifest has `[roles.editor-extension] workspace-read = true`.
+        #[serde(default)]
+        workspace: Option<String>,
     },
 
     /// ★ limend only: `app_id`'s own settings pane (curia.md §15) for the
@@ -1292,7 +1299,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let s = serde_json::to_string(&Request::ExecInstance { app_id: "a".into(), instance: None, tmpfs_mb: 64,
-            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true, serves: None, persona: None }).unwrap();
+            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true, serves: None, persona: None, workspace: None }).unwrap();
         assert!(s.contains("\"memory_mb\":512") && s.contains("\"cpu_pct\":100") && s.contains("\"require_memory_limit\":true"), "{s}");
     }
 

@@ -130,6 +130,11 @@ pub struct Plugin {
     pub window: WindowToken,
     pub z: u8,
     pub app: String,
+    /// A workspace the parent has picked whose `work` the plugin may read
+    /// at `/work` (`workspace-read`, granted by the person there):
+    /// portcullisd mounts it only if the parent picked it and the plugin's
+    /// manifest asks.
+    pub workspace: Option<String>,
 }
 
 /// The slot's rect in the parent window's surface pixels; `None` hides it.

@@ -13,7 +13,7 @@ use crate::eval::funcs::text_key;
 use crate::value::Value;
 
 mod appearance;
-pub use appearance::{AppearanceFilter, ColorFilter, IconFilter};
+pub use appearance::{shown_color, AppearanceFilter, ColorFilter, IconFilter};
 mod calendar;
 pub use calendar::{valid_calendar_type, CalendarSelection, DateBounds, DateGroup, DynamicDate, GROUP_FIELDS, MAX_SELECTIONS};
 mod text;

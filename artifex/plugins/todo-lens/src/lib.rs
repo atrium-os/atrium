@@ -20,6 +20,52 @@ pub const MAX_TODOS: usize = 1000;
 const WORDS: [&str; 2] = ["TODO", "FIXME"];
 
 /// The TODOs in `text`: the word whole, not inside another (`TODOS`).
+/// Files [`in_tree`] reads at most, and the most of each it reads.
+pub const MAX_FILES: usize = 5000;
+pub const MAX_FILE: u64 = 512 << 10;
+
+/// The TODOs in the text files under `root` (read-only, the workspace):
+/// (files with any, TODOs). Hidden folders and `target` are skipped, links
+/// aren't followed, and at most [`MAX_FILES`] files of at most
+/// [`MAX_FILE`] each are read, so a huge tree costs a bounded walk.
+pub fn in_tree(root: &std::path::Path) -> (usize, usize) {
+    let (mut files, mut count, mut seen) = (0, 0, 0);
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let Ok(ft) = e.file_type() else { continue };
+            if name.starts_with('.') || ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if depth < 16 && name != "target" {
+                    stack.push((e.path(), depth + 1));
+                }
+                continue;
+            }
+            seen += 1;
+            if seen > MAX_FILES {
+                return (files, count);
+            }
+            let Ok(f) = std::fs::File::open(e.path()) else { continue };
+            let mut bytes = Vec::new();
+            if std::io::Read::read_to_end(&mut std::io::Read::take(f, MAX_FILE), &mut bytes).is_err() {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+            let n = todos(text).len();
+            if n > 0 {
+                files += 1;
+                count += n;
+            }
+        }
+    }
+    (files, count)
+}
+
 pub fn todos(text: &str) -> Vec<Todo> {
     let mut out = Vec::new();
     for (n, l) in text.lines().enumerate() {
@@ -68,6 +114,20 @@ pub fn fixes(uri: &str, todos: &[Todo], line: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_without_hidden_folders_targets_or_links() {
+        let d = std::env::temp_dir().join(format!("todo-lens-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for (f, s) in [("a.rs", "// TODO one\n// FIXME two\n"), ("src/b.md", "TODO three\n"), ("c.txt", "none\n"),
+                       (".git/x", "TODO hidden\n"), ("target/y.rs", "TODO built\n")] {
+            std::fs::create_dir_all(d.join(f).parent().unwrap()).unwrap();
+            std::fs::write(d.join(f), s).unwrap();
+        }
+        std::os::unix::fs::symlink(d.join("a.rs"), d.join("link.rs")).unwrap();
+        assert_eq!(in_tree(&d), (2, 3));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn whole_words_with_what_follows() {

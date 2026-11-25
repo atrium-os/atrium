@@ -763,8 +763,15 @@ shot confined-6-work
 # the Personal Navigator, but navtest's switch for links from Work to
 # Personal is off, so it says so and nothing crosses.
 sheets() { g "grep -c 'asking which' $ML" | tr -d '\r '; }
+# Open with… is in the More menu (navigator-ui.md §15.1): press More, then
+# the row the window's trace names. $1 reads that window's last trace.
+openwith() {
+    press $((W - 26)) $((TOP + 20))
+    R=$($1 | sed -n 's/.* more=[^ ]*OpenWith:\([0-9]*\),\([0-9]*\).*/\1 \2/p')
+    if [ -n "$R" ]; then press ${R% *} $((TOP + ${R#* })); else bad "no More menu: $($1)"; fi
+}
 S0=$(sheets)
-press $((W - 26)) $((TOP + 20))                        # Open with…
+openwith WLAST                                         # More, then Open with…
 i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
 g "tail -1 $ML | grep -q 'opens a https link, in which of 2 personas'" && ok "Open with… in Work: Monstrator asks, with the personas" || bad "Open with: $(g "tail -2 $ML; grep -h 'open with' $WL | tail -1" | tr '\n' ';')"
 sleep 3
@@ -783,7 +790,7 @@ g "printf '\n[[crossings]]\nfrom = \"work\"\nto = \"personal\"\nkinds = [\"links
    su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null"
 PT0=$(last | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
 S0=$(sheets)
-press $((W - 26)) $((TOP + 20))
+openwith WLAST
 i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
 sleep 3
 key 0x51; key 0x28        # In: Personal
@@ -799,7 +806,7 @@ shot confined-8-crossed
 g "printf '\n[[crossings]]\nfrom = \"personal\"\nto = \"work\"\nkinds = [\"links\"]\n' >> /var/db/atrium/navtest/policy.toml
    su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null"
 S0=$(sheets)
-press $((W - 26)) $((TOP + 20))
+openwith last
 i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
 sleep 3
 key 0x51; key 0x28        # In: Work

@@ -185,6 +185,8 @@ pub enum Act {
     /// again.
     PluginSwitch(String, bool),
     PluginRestart(String),
+    /// Allow a plugin that asks to read this workspace, or take it back.
+    PluginRead(String, bool),
 }
 
 /// The debugger as the window shows it.
@@ -354,6 +356,8 @@ pub struct PluginRow {
     /// What it asks for, one line each.
     pub asks: Vec<String>,
     pub on: bool,
+    /// Whether it may read the workspace; `None`: it doesn't ask.
+    pub read: Option<bool>,
     /// "Running", or why it stopped; empty while off.
     pub state: String,
     pub stopped: bool,

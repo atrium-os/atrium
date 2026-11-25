@@ -100,6 +100,15 @@ pub struct Spec {
     /// mounted read-write at [`PANE_DATA`]. Set only by portcullisd, for
     /// limend, for the settings app.
     pub pane: Option<PathBuf>,
+    /// ★ An editor plugin's read of a workspace (dev-tools.md §3.8, D28):
+    /// this `work` folder, read-only and noexec at [`PLUGIN_WORK`]. Set
+    /// only by portcullisd, after checking the IDE the plugin serves picked
+    /// the workspace and the plugin's manifest asks for `workspace-read`.
+    pub work: Option<PathBuf>,
+    /// The primary group in place of the account's: with `work`, the
+    /// person's files group it is shared under (an unclassed jail takes
+    /// no supplementary groups). Set only by portcullisd.
+    pub group: Option<u32>,
     /// The caller's persona's route domain (vpn.md §5.4, V2): a networked
     /// worker's epair goes in this routing table, as its caller's does, so a
     /// Work app's helper leaves by Work's tunnel too. Set only by
@@ -256,6 +265,9 @@ pub fn as_worker(m: &mut portcullis_toml::Manifest, name: &str) -> Result<(), St
     m.workers.clear();
     Ok(())
 }
+
+/// Where an editor plugin reads the workspace it was granted.
+pub const PLUGIN_WORK: &str = "/work";
 
 /// Where a settings pane finds its app's data (`ATRIUM_PANE_DATA`).
 pub const PANE_DATA: &str = "/app-data";
@@ -426,6 +438,11 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
             source: data.to_string_lossy().into_owned(), dest: PANE_DATA.into(),
             kind: jaild::protocol::MountKind::RwNullfs, size_mb: None, owner: None });
     }
+    if let Some(work) = &spec.work {
+        mounts.push(jaild::protocol::MountSpec { noexec: true,
+            source: work.to_string_lossy().into_owned(), dest: PLUGIN_WORK.into(),
+            kind: jaild::protocol::MountKind::RoNullfs, size_mb: None, owner: None });
+    }
 
     // ★★ A LIVE JAIL WITH THIS NAME IS A REFUSAL, NOT SOMETHING TO CLEAN UP.
     //
@@ -535,7 +552,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
                        .chain(pane_for.map(|at| jaild::protocol::EnvPair { key: "ATRIUM_PANE_DATA_FOR".into(), value: at }))
                        .collect(),
             uid:   pw.uid,
-            gid:   pw.gid,
+            gid:   spec.group.unwrap_or(pw.gid),
             stdio: true,
             listen: Vec::new(), ready: false,
         }),

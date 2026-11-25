@@ -108,6 +108,8 @@ pub enum Cmd {
     FilterJoin(bool),
     /// The filter panel's Date is choice: an index of [`crate::data::DATE_RULES`].
     FilterDate(usize),
+    /// The filter panel's colour choice: an index of its `colors`.
+    FilterColor(usize),
     /// A Format menu command on the selection.
     Format(crate::format::FormatCmd),
     /// The text or fill colour bar closed.
@@ -267,6 +269,8 @@ pub struct FilterPanel {
     /// A second condition (0: none), joined by and, or by or with `or`.
     pub cond2: usize,
     pub or: bool,
+    /// The colours a colour condition offers ([`crate::data::column_colors`]).
+    pub colors: Vec<Option<u32>>,
 }
 
 impl FilterPanel {
@@ -562,7 +566,8 @@ impl Sheets {
                     let d = self.doc.borrow();
                     crate::data::column_cond(&d, row, col).unwrap_or_default()
                 };
-                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on, cond: pc.kind, cond2: pc.kind2, or: pc.or });
+                let colors = if matches!(pc.kind, crate::data::FILL_COND | crate::data::FONT_COND) { crate::data::column_colors(&self.doc.borrow(), row, col, pc.kind == crate::data::FILL_COND) } else { Vec::new() };
+                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on, cond: pc.kind, cond2: pc.kind2, or: pc.or, colors });
                 self.filter_a.set(TextEdit::new(&pc.a));
                 self.filter_b.set(TextEdit::new(&pc.b));
                 self.filter_c.set(TextEdit::new(&pc.c));
@@ -1232,7 +1237,7 @@ impl Sheets {
         let rect = Self::grid_rect(w, h);
         let old = self.source.zoom_factor();
         let (sw, sh) = ((self.source.col_left(sel.c1 + 1) - self.source.col_left(sel.c0)) / old, (self.source.row_top(sel.r1 + 1) - self.source.row_top(sel.r0)) / old);
-        let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::grid_view::header_height(self.source.zoom() as f32) - 16.0).max(40.0));
+        let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::GridView::headings_size(&*self.source, 0).1 - 16.0).max(40.0));
         let fit = (bw / sw.max(1.0)).min(bh / sh.max(1.0)) * 100.0;
         self.set_zoom(fit.clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)).floor() as u16);
         let scroll = self.authoring.active_scroll(self);
@@ -2423,16 +2428,15 @@ impl Sheets {
             return;
         };
         // Content px to window px, as the grid places its body.
-        use pergola::widgets::grid_view::{header_height, TILE_ROWS};
-        use pergola::widgets::GridSource;
+        use pergola::widgets::grid_view::TILE_ROWS;
         let rect = Self::grid_rect(w, h);
         let active = self.authoring.active(rect);
         let Some((_, r, scroll)) = self.authoring.panes(self, rect).nth(active) else { return };
         let st = scroll.get();
         let (tiles_r, _) = GridView::tiles(&*self.source, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
-        let hw = GridView::header_width_at((tiles_r.1 + 1) * TILE_ROWS, self.source.zoom());
+        let (hw, hh) = GridView::headings_size(&*self.source, (tiles_r.1 + 1) * TILE_ROWS);
         let x = r.x() + hw + (at[0] - st.physics_x.y) as f32;
-        let y = r.y() + header_height(self.source.zoom()) + (at[1] + at[3] - st.physics.y) as f32;
+        let y = r.y() + hh + (at[1] + at[3] - st.physics.y) as f32;
         let cmds = self.cmds.clone();
         let picks = [DataCmd::FillCopy, DataCmd::FillSeries, DataCmd::FillFormats, DataCmd::FillNoFormats];
         use pergola::widgets::{Menu, MenuItem};
@@ -3107,7 +3111,19 @@ impl View for Sheets {
                 let now = if fp.cond == 0 { "Pick values" } else { crate::data::FILTER_CONDS[fp.cond] };
                 MenuButton::new(now.to_string(), self.filter_cond_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterCond(i))).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).render(ctx);
             }
-            if fp.cond == crate::data::DATE_COND {
+            if matches!(fp.cond, crate::data::FILL_COND | crate::data::FONT_COND) {
+                let fill = fp.cond == crate::data::FILL_COND;
+                let a = self.filter_a.get_cloned().text().to_string();
+                let now = fp.colors.iter().position(|&c| crate::data::color_text(c) == a);
+                let items: Vec<pergola::widgets::MenuItem> = fp.colors.iter().map(|&c| pergola::widgets::MenuItem::new(crate::data::color_label(c, fill)).radio(now.is_some_and(|i| fp.colors[i] == c))).collect();
+                let label = now.map_or_else(|| if fp.colors.is_empty() { "No colours in this column".to_string() } else { "Choose a colour".to_string() }, |i| crate::data::color_label(fp.colors[i], fill));
+                let cmds = self.cmds.clone();
+                MenuButton::new(label, self.filter_cond2_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterColor(i))).at(x0 + 12.0, y0 + 78.0).width(FILTER_W - 24.0).render(ctx);
+                if let Some(c) = now.and_then(|i| fp.colors[i]) {
+                    ctx.add(Node::Rect { rect: Rect::new(x0 + FILTER_W - 40.0, y0 + 86.0, 14.0, 14.0), fill: crate::source::rgb(c), radius: 3.0 });
+                }
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 120.0, FILTER_W - 24.0, 18.0), content: if fill { "Rows whose cell shows this fill." } else { "Rows whose text shows this colour." }.into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            } else if fp.cond == crate::data::DATE_COND {
                 let a = self.filter_a.get_cloned().text().to_string();
                 let now = crate::data::DATE_RULES.iter().position(|(_, n)| *n == a);
                 let items: Vec<pergola::widgets::MenuItem> = crate::data::DATE_RULES.iter().enumerate().map(|(i, (l, _))| pergola::widgets::MenuItem::new(*l).radio(now == Some(i))).collect();
@@ -4184,6 +4200,13 @@ impl Sheets {
                     self.changed();
                     false
                 }
+                Cmd::FilterColor(i) => {
+                    if let Some(&c) = self.filter.get_cloned().colors.get(i) {
+                        self.filter_a.set(TextEdit::new(&crate::data::color_text(c)));
+                    }
+                    self.changed();
+                    false
+                }
                 Cmd::FilterDate(i) => {
                     if let Some((_, n)) = crate::data::DATE_RULES.get(i) {
                         self.filter_a.set(TextEdit::new(n));
@@ -4201,6 +4224,13 @@ impl Sheets {
                 Cmd::FilterCond(i) => {
                     let mut p = self.filter.get_cloned();
                     if i < crate::data::FILTER_CONDS.len() {
+                        let fill = i == crate::data::FILL_COND;
+                        if fill || i == crate::data::FONT_COND {
+                            p.colors = crate::data::column_colors(&self.doc.borrow(), p.row, p.col, fill);
+                            // Start from the first colour that isn't the plain one.
+                            let pick = p.colors.iter().find(|c| c.is_some()).or(p.colors.first()).copied();
+                            self.filter_a.set(TextEdit::new(&pick.map(crate::data::color_text).unwrap_or_default()));
+                        }
                         p.cond = i;
                         self.filter.set(p);
                     }
@@ -7256,6 +7286,19 @@ mod tests {
         assert!(crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some("B")).unwrap().contains("2 duplicate rows removed"));
         assert_eq!(col(1), ["Qty", "1", "2", "3", "20", "", "", ""]);
         assert!(crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some(" , ")).is_err());
+        // A name that is one column's header and another's letter, or two
+        // columns' header, is refused and nothing changes.
+        let s = sheets_of(b"City,A,City2\nParis,X,1\nParis,Y,1\nRome,X,1\n");
+        let before = |s: &Sheets| (0..4).map(|r| shown(s, r, 0) + &shown(s, r, 1)).collect::<Vec<_>>();
+        let was = before(&s);
+        let err = crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some("a")).unwrap_err();
+        assert!(err.contains("column B's header and column A's letter"), "{err}");
+        assert_eq!(before(&s), was);
+        assert!(crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some("B")).unwrap().contains("1 duplicate row removed"));
+        assert_eq!(before(&s), ["CityA", "ParisX", "ParisY", ""], "Rome/X goes: B decides");
+        let s = sheets_of(b"Name,Name\na,1\na,2\n");
+        let err = crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some("name")).unwrap_err();
+        assert!(err.contains("heads columns A and B"), "{err}");
     }
 
     #[test]
@@ -8666,6 +8709,103 @@ mod tests {
         let x = officina_convert::xlsx::write(&s.doc.borrow().wb, Vec::new()).unwrap();
         let (back, _) = officina_convert::xlsx::read(&x).unwrap();
         assert_eq!(back.style(officina_grid::CellAddr::new(0, 0, 0)).font.name.as_deref(), Some("Courier New"));
+    }
+
+    #[test]
+    fn gridlines_and_headings_turn_off_per_sheet_and_files_keep_them() {
+        use crate::data::DataCmd;
+        use pergola::widgets::GridSource;
+        let s = sheets_of(b"a,b\n1,2\n");
+        let checked = |s: &Sheets, c: DataCmd| crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (0, 0)).iter().any(|(m, x)| *x == Some(c) && m.mark == pergola::widgets::Mark::Check(true));
+        assert!(s.source.show_grid() && s.source.show_headings() && checked(&s, DataCmd::Gridlines) && checked(&s, DataCmd::Headings));
+        s.doc.borrow_mut().dirty = false;
+        assert_eq!(data(&s, DataCmd::Gridlines), "Gridlines hidden.");
+        assert!(!s.source.show_grid() && s.source.show_headings() && !checked(&s, DataCmd::Gridlines));
+        assert!(s.doc.borrow().dirty, "the file keeps it, so saving does");
+        assert_eq!(data(&s, DataCmd::Headings), "Headings hidden.");
+        assert!(!s.source.show_headings());
+        // Another sheet shows both; this one keeps its own.
+        data(&s, DataCmd::AddSheet);
+        assert!(s.source.show_grid() && s.source.show_headings());
+        let x = officina_convert::xlsx::write(&s.doc.borrow().wb, Vec::new()).unwrap();
+        let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+        assert_eq!((back.sheet(0).show_grid, back.sheet(0).show_headings, back.sheet(1).show_grid), (false, false, true));
+        s.doc.borrow_mut().sheet = 0;
+        assert_eq!(data(&s, DataCmd::Gridlines), "Gridlines shown.");
+        assert!(s.source.show_grid());
+    }
+
+    #[test]
+    fn cell_styles_set_font_fill_and_borders_and_keep_the_number_format() {
+        use crate::format::{FormatCmd, CELL_STYLES};
+        let s = sheets_of(b"Total,0.5\n");
+        let style = |s: &Sheets, c: u32| s.doc.borrow().wb.style(officina_grid::CellAddr::new(0, 0, c)).clone();
+        select(&s, (0, 1), (0, 1));
+        fmt(&s, FormatCmd::Number(3));
+        let at = |name: &str| CELL_STYLES.iter().position(|x| x.0 == name).unwrap();
+        assert_eq!(fmt(&s, FormatCmd::CellStyle(at("Bad"))), "Cell style Bad.");
+        let st = style(&s, 1);
+        assert_eq!((st.fill, st.font.color, &*st.num_fmt), (Some(0xFFC7CE), Some(0x9C0006), "0%"));
+        let menu = crate::format::menu(&s.doc.borrow(), s.grid.get_cloned().selection());
+        assert!(menu.iter().any(|(m, c)| *c == Some(FormatCmd::CellStyle(at("Bad"))) && m.mark == pergola::widgets::Mark::Radio(true)));
+        // Heading 1: bold 15 pt over a thick line; Total: thin over, double under.
+        fmt(&s, FormatCmd::CellStyle(at("Heading 1")));
+        let st = style(&s, 1);
+        assert!(st.fill.is_none() && st.font.bold && st.font.size == Some(300) && st.borders[3].line == officina_grid::style::Line::Thick);
+        select(&s, (0, 0), (0, 1));
+        fmt(&s, FormatCmd::CellStyle(at("Total")));
+        let st = style(&s, 0);
+        assert!(st.font.bold && st.borders[2].line == officina_grid::style::Line::Thin && st.borders[3].line == officina_grid::style::Line::Double && st.font.size.is_none());
+        // Normal takes it all off but the number format; one undo step each.
+        fmt(&s, FormatCmd::CellStyle(at("Normal")));
+        let st = style(&s, 1);
+        assert!(!st.font.bold && st.borders == [Default::default(); 4] && &*st.num_fmt == "0%");
+        assert!(s.doc.borrow_mut().undo());
+        assert!(style(&s, 1).font.bold);
+        // Files keep the look.
+        let x = officina_convert::xlsx::write(&s.doc.borrow().wb, Vec::new()).unwrap();
+        let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+        assert_eq!(back.style(officina_grid::CellAddr::new(0, 0, 0)).borders[3].line, officina_grid::style::Line::Double);
+    }
+
+    #[test]
+    fn a_filter_column_keeps_rows_by_fill_or_text_colour() {
+        use crate::data::{DataCmd, FILL_COND, FONT_COND};
+        use crate::format::FormatCmd;
+        let s = sheets_of(b"Item\na\nb\nc\nd\n");
+        select(&s, (2, 0), (3, 0));
+        fmt(&s, FormatCmd::Color(true, Some(0xFFC7CE)));
+        select(&s, (4, 0), (4, 0));
+        fmt(&s, FormatCmd::Color(false, Some(0xFF0000)));
+        let hidden = |s: &Sheets| (1..=4).filter(|&r| s.doc.borrow().wb.sheet(0).row_hidden(r)).collect::<Vec<u32>>();
+        select(&s, (1, 0), (1, 0));
+        data(&s, DataCmd::Filter);
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 0));
+        s.cmds.lock().unwrap().push(Cmd::FilterCond(FILL_COND));
+        s.take_cmds();
+        assert_eq!(s.filter.get_cloned().colors, [None, Some(0xFFC7CE)], "the column's fills, as met");
+        assert_eq!(s.filter_a.get_cloned().text(), "FFC7CE", "the first colour is chosen");
+        assert_eq!(crate::data::color_label(Some(0xFFC7CE), true), "Light red");
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert_eq!(hidden(&s), [1, 4], "{}", s.doc.borrow().status);
+        // Opened again, it shows; then No fill keeps the others.
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 0));
+        s.take_cmds();
+        assert_eq!((s.filter.get_cloned().cond, s.filter_a.get_cloned().text().to_string()), (FILL_COND, "FFC7CE".into()));
+        s.cmds.lock().unwrap().push(Cmd::FilterColor(0));
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert_eq!(hidden(&s), [2, 3]);
+        // Text colour: red keeps d.
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 0));
+        s.cmds.lock().unwrap().push(Cmd::FilterCond(FONT_COND));
+        s.take_cmds();
+        assert_eq!(s.filter.get_cloned().colors, [None, Some(0xFF0000)]);
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert_eq!(hidden(&s), [1, 2, 3]);
+        assert!(crate::data::filter_cond(FILL_COND, "red", "").is_err());
     }
 
     #[test]

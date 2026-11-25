@@ -124,6 +124,38 @@ pub fn launch_mounts(owner: &str, app: &str, run_as: &str, jail_path: &Path, jc:
     Ok(())
 }
 
+/// An editor plugin's read of a workspace (dev-tools.md §3.8, D28): the
+/// IDE it serves, `ide`, picked `ws`, and `plugin`'s installed manifest asks
+/// for `workspace-read`. The answer is the `work` to mount read-only and
+/// the person's files group it is shared under (mode 2770), which the
+/// plugin runs with as its primary group: a one-shot jail has no
+/// supplementary groups. Any doubt refuses.
+pub fn plugin_work(owner: &str, ide: &str, plugin: &str, ws: &str) -> Result<(PathBuf, u32), String> {
+    if !workspace::valid_name(ws) {
+        return Err(format!("{ws:?} is not a workspace name"));
+    }
+    if !picked(owner, ide).iter().any(|w| w == ws) {
+        return Err(format!("{ide} hasn't picked workspace {ws}"));
+    }
+    let m = launch::installed_manifest(plugin).ok_or_else(|| format!("{plugin} is not installed"))?;
+    if !asks_to_read(&m) {
+        return Err(format!("{plugin}'s manifest doesn't ask for workspace-read"));
+    }
+    let work = workspace::work_dir(owner, ws)?;
+    let gid = workspace::files_gid(owner)?;
+    let meta = fs::symlink_metadata(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    if std::os::unix::fs::MetadataExt::gid(&meta) != gid {
+        return Err(format!("{} isn't shared under {owner}'s files group", work.display()));
+    }
+    Ok((work, gid))
+}
+
+/// Whether a manifest is a plugin that asks to read the workspace.
+fn asks_to_read(m: &portcullis_toml::Manifest) -> bool {
+    m.roles.as_ref().is_some_and(|r| r.implements.iter().any(|i| i == "editor-extension"))
+        && m.roles.as_ref().and_then(|r| r.editor_extension.as_ref()).is_some_and(|x| x.workspace_read)
+}
+
 /// The person picked `name` in `app`: remember it, and if the app is
 /// running, mount its `work` now.
 pub fn pick(owner: &str, app: &str, name: &str) -> Result<(), String> {
@@ -305,6 +337,18 @@ pub fn admin(owner: &str, name: &str, argv: &[String]) -> Result<Started, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_plugin_that_asks_reads_a_workspace() {
+        let m = |extra: &str| portcullis_toml::Manifest::from_str(&format!(
+            "[app]\nid = \"org.example.p\"\nname = \"P\"\nversion = \"1\"\nentry = \"bin/p\"\n{extra}")).unwrap();
+        assert!(asks_to_read(&m("[roles]\nimplements = [\"editor-extension\"]\n\n[roles.editor-extension]\nlanguages = [\"*\"]\nworkspace-read = true\n")));
+        assert!(!asks_to_read(&m("[roles]\nimplements = [\"editor-extension\"]\n\n[roles.editor-extension]\nlanguages = [\"*\"]\n")), "not asked");
+        assert!(!asks_to_read(&m("[roles]\nimplements = []\n\n[roles.editor-extension]\nlanguages = [\"*\"]\nworkspace-read = true\n")), "not a plugin");
+        assert!(!asks_to_read(&m("")));
+        // A name that isn't a workspace's is refused before anything is read.
+        assert!(plugin_work("alice", "org.atrium.artifex", "org.example.p", "../x").is_err());
+    }
 
     #[test]
     fn pkg_argv() {

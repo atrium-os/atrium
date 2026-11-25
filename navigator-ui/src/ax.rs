@@ -103,6 +103,10 @@ mod id {
     pub const PRESENCE_MENU: u64 = 27;
     pub const SECTIONS: u64 = 28;
     pub const SECTIONS_MENU: u64 = 29;
+    pub const DOWNLOADS: u64 = 30;
+    pub const SHARE: u64 = 31;
+    pub const MORE_MENU: u64 = 32;
+    pub const DOWNLOADS_MENU: u64 = 33;
     pub const HISTORY_CLEAR_SITE: u64 = 5 << 40;
     pub const TRAIL: u64 = 1 << 40;
     pub const PAGE_ROW: u64 = 2 << 40;
@@ -215,13 +219,24 @@ pub fn tree(s: &Shell) -> Node {
             label.push_str(&format!(" {count} from {}.", facts.live_parts.join(", ")));
         }
         bar.push(Node::new(id::TIER, "button", label).with(if s.popover { state::EXPANDED } else { 0 }));
-        let knows = store.knows(site);
-        let words = if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") };
+        let words = match s.presence(site) {
+            crate::shell::Presence::NotKnown => format!("Not known here: {site} doesn't know you"),
+            crate::shell::Presence::Remembers => format!("Remembers you: {site} knows you"),
+            crate::shell::Presence::SignedIn(n) => format!("Signed in to {site} as {n}"),
+        };
         bar.push(Node::new(id::PRESENCE, "button", words).with(if s.presence_open { state::EXPANDED } else { 0 }));
-        bar.push(Node::new(id::AA, "button", "Reading controls").with(if s.reading_open { state::EXPANDED } else { 0 }));
         bar.push(Node::new(id::KEEP, "switch", "Keep this page (Ctrl-D)").with(if store.is_kept(&p.url) { state::CHECKED } else { 0 }));
+        if g.share.is_some() {
+            bar.push(Node::new(id::AA, "button", "Reading controls").with(if s.reading_open { state::EXPANDED } else { 0 }));
+        }
     }
-    bar.push(Node::new(id::MORE, "button", "More"));
+    let new = if s.downloads_new { ", new" } else { "" };
+    bar.push(Node::new(id::DOWNLOADS, "button", format!("Downloads ({}{new})", s.downloads.len())).with(if s.downloads_open { state::EXPANDED } else { 0 }));
+    if g.share.is_some() {
+        let can = matches!(s.live, Some(crate::shell::LivePage::Shown(_))) && !s.sharing;
+        bar.push(Node::new(id::SHARE, "button", "Share this page").with(if can { 0 } else { state::DISABLED }));
+    }
+    bar.push(Node::new(id::MORE, "button", "More").with(if s.more_open { state::EXPANDED } else { 0 }));
     top.push(Node::new(id::TOOLBAR, "toolbar", "Navigation").kids(bar));
 
     // The find bar.
@@ -305,6 +320,26 @@ pub fn tree(s: &Shell) -> Node {
             Node::new(id::READING | 3 << 8, "radio-group", "Theme").value(theme),
             Node::new(id::READING | 4 << 8, "radio-group", "Width").value(if r.comfortable { "Comfortable" } else { "Full" }),
         ]));
+    }
+
+    // The More menu and the Downloads list (§15.1).
+    if g.more_menu.is_some() {
+        let kids = s.more_rows().into_iter().enumerate()
+            .map(|(i, r)| Node::new(id::MORE_MENU | (i as u64 + 1) << 8, "menu-item", r.label().to_string())).collect();
+        top.push(Node::new(id::MORE_MENU, "menu", "More").kids(kids));
+    }
+    if g.downloads_menu.is_some() {
+        let kids = s.downloads.iter().rev().enumerate().map(|(i, d)| {
+            let st = match &d.state {
+                crate::shell::DownloadState::Saving => "saving".to_string(),
+                crate::shell::DownloadState::Opening => "opening".to_string(),
+                crate::shell::DownloadState::Saved(p) => format!("saved in {p}"),
+                crate::shell::DownloadState::Opened(a) => format!("opened in {a}"),
+                crate::shell::DownloadState::Failed(w) => format!("not kept: {w}"),
+            };
+            Node::new(id::DOWNLOADS_MENU | (i as u64 + 1) << 8, "list-item", d.file.clone()).value(st)
+        }).collect();
+        top.push(Node::new(id::DOWNLOADS_MENU, "list", "Downloads").kids(kids));
     }
 
     // The presence menu (§6.2).

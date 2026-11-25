@@ -113,6 +113,18 @@ pub struct Plugin<C: Channel = Child> {
     queued: VecDeque<Event>,
 }
 
+/// Where a plugin the person allowed to read the workspace finds it
+/// (read-only, `workspace-read`, dev-tools.md §3.8).
+pub const WORKSPACE: &str = "/work";
+
+impl<C: Channel> Plugin<C> {
+    /// The workspace, read-only, when the person allowed this plugin to
+    /// read it there; `None` otherwise (it sees only the files opened).
+    pub fn workspace(&self) -> Option<&'static std::path::Path> {
+        (self.init.read && std::path::Path::new(WORKSPACE).is_dir()).then(|| std::path::Path::new(WORKSPACE))
+    }
+}
+
 /// How long [`Plugin::start`] waits for limend and Artifex.
 pub const START_WAIT: Duration = Duration::from_secs(30);
 

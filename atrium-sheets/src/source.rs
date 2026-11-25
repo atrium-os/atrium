@@ -963,6 +963,12 @@ impl GridSource for SheetSource {
     fn zoom(&self) -> f32 {
         self.zoom_factor() as f32
     }
+    fn show_grid(&self) -> bool {
+        self.doc.try_borrow().map_or(true, |d| d.wb.sheet(d.sheet).show_grid)
+    }
+    fn show_headings(&self) -> bool {
+        self.doc.try_borrow().map_or(true, |d| d.wb.sheet(d.sheet).show_headings)
+    }
     fn outline_control(&self, rows: bool, at: u32) -> Option<(u32, u32, bool)> {
         let d = self.doc.borrow();
         let outline = d.wb.sheet(d.sheet).outline(if rows { Axis::Rows } else { Axis::Cols });

@@ -60,7 +60,9 @@ pub enum LinkEvent {
 
 /// How plugins are started and reached.
 pub trait Link {
-    fn start(&mut self, app: &str) -> Result<Id, String>;
+    /// Start `app`; with `workspace`, that workspace's `work` read-only at
+    /// `/work` in its jail (the person allowed it there).
+    fn start(&mut self, app: &str, workspace: Option<&str>) -> Result<Id, String>;
     fn send(&mut self, id: Id, bytes: Vec<u8>) -> Result<(), String>;
     fn stop(&mut self, id: Id);
     /// What arrived since the last call, without waiting.
@@ -103,7 +105,7 @@ pub struct Host {
     workspace: String,
     /// The plugins the person switched on here, in the order they were.
     pub on: Vec<Info>,
-    /// Which of them may read the workspace (granted per workspace, D28).
+    /// Which of them the person allowed to read this workspace (D28).
     pub read: Vec<String>,
     pub runs: Vec<Run>,
     /// Plugins stopped this session, and why: not started again until
@@ -142,6 +144,34 @@ impl Host {
         self.load_on();
     }
 
+    /// Where the workspace reads granted are kept, beside the store.
+    fn read_store_path(&self) -> Option<PathBuf> {
+        self.store.as_ref().map(|p| p.with_file_name("plugins-read"))
+    }
+
+    /// Allow `app` to read this workspace, or take that back. A running
+    /// plugin stops, since its jail's mounts are made at start; the engine
+    /// starts it again for the open files.
+    pub fn allow_read(&mut self, app: &str, on: bool) -> Result<(), String> {
+        let info = self.installed.iter().find(|i| i.app == app).cloned().ok_or("it isn't installed")?;
+        if on && !info.workspace_read {
+            return Err("it doesn't ask to read the workspace".into());
+        }
+        self.read.retain(|a| a != app);
+        if on {
+            self.read.push(app.to_string());
+        }
+        if let Some(p) = self.read_store_path() {
+            let mut lines: Vec<(String, String)> = read_store(&p).into_iter().filter(|(w, a)| *w != self.workspace || a != app).collect();
+            if on {
+                lines.push((self.workspace.clone(), app.to_string()));
+            }
+            write_store(&p, &lines)?;
+        }
+        self.stop(app, "");
+        Ok(())
+    }
+
     /// Keep which plugins are on in `path` (one `workspace<TAB>app` a line).
     pub fn set_store(&mut self, path: PathBuf) {
         self.store = Some(path);
@@ -172,6 +202,10 @@ impl Host {
         // Without a store (tests), what was set by hand stays.
         if self.store.is_some() {
             self.on = on;
+            let ws = self.workspace.clone();
+            self.read = self.read_store_path().map(|p| read_store(&p)).unwrap_or_default().into_iter()
+                .filter(|(w, a)| *w == ws && self.installed.iter().any(|i| i.app == *a && i.workspace_read))
+                .map(|(_, a)| a).collect();
         }
     }
 
@@ -223,10 +257,10 @@ impl Host {
     }
 
     fn start(&mut self, info: &Info, lang: &str) {
+        let read = info.workspace_read && self.read.iter().any(|a| *a == info.app);
         let Some(link) = self.link.as_mut() else { return };
-        match link.start(&info.app) {
+        match link.start(&info.app, read.then_some(self.workspace.as_str())) {
             Ok(id) => {
-                let read = info.workspace_read && self.read.iter().any(|a| *a == info.app);
                 let init = ToChild::Init(ext::Init { languages: vec![lang.to_string()], workspace: self.workspace.chars().take(ext::MAX_WORKSPACE / 4).collect(), read });
                 if let Err(e) = link.send(id, init.encode()) {
                     link.stop(id);
@@ -491,10 +525,12 @@ impl LimenLink {
 }
 
 impl Link for LimenLink {
-    fn start(&mut self, app: &str) -> Result<Id, String> {
-        self.embeds.borrow_mut().request_plugin(self.window, app).map_err(|e| match e {
+    fn start(&mut self, app: &str, workspace: Option<&str>) -> Result<Id, String> {
+        self.embeds.borrow_mut().request_plugin_reading(self.window, app, workspace).map_err(|e| match e {
             limen::client::Error::Refused(r) if r == limen::proto::refusal::NO_PLUGIN => "it isn't a plugin for you".into(),
             limen::client::Error::Refused(r) if r == limen::proto::refusal::NOT_EMBEDDABLE => "Artifex may not start plugins".into(),
+            limen::client::Error::Refused(r) if r == limen::proto::refusal::LAUNCH_FAILED && workspace.is_some() =>
+                "its jail couldn't start: is the workspace still picked? (limend's log says why)".into(),
             limen::client::Error::Refused(r) if r == limen::proto::refusal::LAUNCH_FAILED => "its jail couldn't start (limend's log says why)".into(),
             limen::client::Error::Refused(r) if r == limen::proto::refusal::TOO_MANY => "it is already running here".into(),
             e => format!("{e:?}"),
@@ -575,7 +611,7 @@ pub mod testing {
     }
 
     impl Link for Stdio {
-        fn start(&mut self, app: &str) -> Result<Id, String> {
+        fn start(&mut self, app: &str, _: Option<&str>) -> Result<Id, String> {
             let mut c = std::process::Command::new("python3").arg(&self.script)
                 .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().map_err(|e| e.to_string())?;
             self.next += 1;
@@ -686,10 +722,13 @@ pub mod testing {
         pub stopped: std::rc::Rc<std::cell::RefCell<Vec<Id>>>,
         pub installed: Vec<Info>,
         pub next: Id,
+        /// Each start: the app and the workspace it may read.
+        pub starts: std::rc::Rc<std::cell::RefCell<Vec<(String, Option<String>)>>>,
     }
 
     impl Link for Script {
-        fn start(&mut self, _: &str) -> Result<Id, String> {
+        fn start(&mut self, app: &str, workspace: Option<&str>) -> Result<Id, String> {
+            self.starts.borrow_mut().push((app.to_string(), workspace.map(str::to_string)));
             self.next += 1;
             Ok(self.next)
         }
@@ -811,6 +850,29 @@ mod tests {
         // A line the store can't hold is refused, not written.
         assert!(write_store(&store, &[("a\nb".into(), "x".into())]).is_err());
         assert_eq!(host("hello").on.len(), 1);
+
+        // Reading the workspace: only for one that asks, per workspace,
+        // kept, and its jail started again with the workspace named.
+        let mut h = host("hello");
+        assert!(h.allow_read("org.example.todo", true).is_err(), "it doesn't ask");
+        h.installed[0].workspace_read = true;
+        h.on.iter_mut().for_each(|o| o.workspace_read = true);
+        h.open("rust", Path::new("/w/a.rs"), 1, "");
+        let first = h.runs[0].id;
+        h.allow_read("org.example.todo", true).unwrap();
+        assert!(h.runs.is_empty(), "stopped, to start with the mount");
+        assert!(h.stopped.is_empty(), "not as a failure");
+        let starts = Script::default().starts;
+        let mut link = Script { installed: h.installed.clone(), next: first, starts: starts.clone(), ..Script::default() };
+        link.installed[0].workspace_read = true;
+        h.set_link(Box::new(link));
+        h.open("rust", Path::new("/w/a.rs"), 1, "");
+        assert_eq!(*starts.borrow(), vec![("org.example.todo".to_string(), Some("hello".to_string()))]);
+        assert!(std::fs::read_to_string(store.with_file_name("plugins-read")).unwrap().contains("hello\torg.example.todo"));
+        // Taken back: started again without it.
+        h.allow_read("org.example.todo", false).unwrap();
+        h.open("rust", Path::new("/w/a.rs"), 1, "");
+        assert_eq!(starts.borrow().last().cloned(), Some(("org.example.todo".to_string(), None)));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

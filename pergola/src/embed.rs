@@ -69,6 +69,12 @@ impl Embeds {
         self.parent.request_plugin(window, app)
     }
 
+    /// [`Self::request_plugin`], with `workspace`'s `work` read-only in the
+    /// plugin's jail at `/work` (the person allowed it there).
+    pub fn request_plugin_reading(&mut self, window: WindowToken, app: &str, workspace: Option<&str>) -> Result<EmbedId, Error> {
+        self.parent.request_plugin_reading(window, app, workspace)
+    }
+
     /// The plugins installed for this app's person.
     pub fn list_plugins(&mut self) -> Result<Vec<limen::proto::PluginInfo>, Error> {
         self.parent.list_plugins()

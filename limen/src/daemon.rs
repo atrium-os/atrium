@@ -109,7 +109,11 @@ pub trait Launcher: Send {
     /// A plugin (`editor-extension`) for the parent running as
     /// `parent_uid`, held to [`catalogue::PLUGIN_MEMORY_MB`] and
     /// [`catalogue::PLUGIN_CPU_PCT`].
-    fn launch_plugin(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
+    /// With `workspace`, that workspace's `work` read-only at `/work`.
+    fn launch_plugin(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, workspace: Option<&str>) -> Result<u32, String> {
+        if workspace.is_some() {
+            return Err("this launcher mounts no workspaces".into());
+        }
         self.launch_for(app_id, embed, channel, parent_uid)
     }
     /// End the child's jail.
@@ -495,7 +499,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             op::REQUEST_PLUGIN => {
                 let p: proto::Plugin = de(payload)?;
                 request(shared, conn, uid, proto::Request { role: "editor-extension".into(), window: p.window, z: p.z },
-                        Via::Plugin { app: p.app })
+                        Via::Plugin { app: p.app, workspace: p.workspace })
             }
             op::LIST_PLUGINS => {
                 // Only a parent that may start plugins learns which there are.
@@ -604,12 +608,19 @@ enum Via {
     /// `REQUEST_APP_SETTINGS`: the app and persona Curia named.
     Pane { app: String, persona: String },
     /// `REQUEST_PLUGIN`: the plugin the parent named.
-    Plugin { app: String },
+    Plugin { app: String, workspace: Option<String> },
+}
+
+/// A workspace's name as portcullisd makes them: 1–32 of `a-z0-9-`,
+/// starting with a letter or digit.
+fn plausible_workspace(w: &str) -> bool {
+    (1..=32).contains(&w.len()) && w.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && w.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
 fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, via: Via) -> Result<Reply, Reply> {
     let island = match via { Via::Island(i) => Some(i), _ => None };
-    let plugin = match &via { Via::Plugin { app } => Some(app.clone()), _ => None };
+    let (plugin, workspace) = match &via { Via::Plugin { app, workspace } => (Some(app.clone()), workspace.clone()), _ => (None, None) };
     let pane = match via { Via::Pane { app, persona } => Some((app, persona)), _ => None };
     let with_fetch = island.is_some();
     let refuse = |reason| Err(Reply::Refused { reason });
@@ -651,6 +662,11 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
         if !ok {
             eprintln!("limend: {app} (uid {uid}) asked for plugin {named:?}: not one");
             return refuse(refusal::NO_PLUGIN);
+        }
+        // Whether the parent picked it is portcullisd's to check; a name
+        // that can't be a workspace's goes no further.
+        if workspace.as_deref().is_some_and(|w| !plausible_workspace(w)) {
+            return refuse(refusal::MALFORMED);
         }
     }
     if let Some((named, persona)) = &pane {
@@ -769,7 +785,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
                 match &persona {
                     Some(p) if pane.is_some() => shared.launcher.lock().unwrap().launch_settings(&provider, embed, theirs, uid, p),
                     Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
-                    None if plugin.is_some() => shared.launcher.lock().unwrap().launch_plugin(&provider, embed, theirs, uid),
+                    None if plugin.is_some() => shared.launcher.lock().unwrap().launch_plugin(&provider, embed, theirs, uid, workspace.as_deref()),
                     None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
                 }
             };

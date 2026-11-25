@@ -207,6 +207,14 @@ ro_subtrees = [
     "/usr/local/libexec/atrium/drivers/",
 ]
 
+# A workspace's work, read-only (and noexec) in an editor plugin's jail
+# (dev-tools.md §3.8, D28): portcullisd mounts it only for a workspace the
+# IDE the plugin serves picked, for a plugin whose manifest asks.
+ro_patterns = [
+    "/home/*/.atrium/workspaces/*/work",
+    "/usr/home/*/.atrium/workspaces/*/work",
+]
+
 rw_subtrees = [
     "/var/lib/atrium/storage/jails/",
     # Session components' own state, one folder per person and component

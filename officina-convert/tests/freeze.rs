@@ -53,6 +53,30 @@ fn each_sheets_zoom_round_trips_through_xlsx_ods_and_the_native_file() {
     assert_eq!(zooms(&back), vec![100, 150, 100, 75, 100]);
 }
 
+#[test]
+fn gridlines_and_headings_off_round_trip_through_xlsx_ods_and_the_native_file() {
+    let mut wb = book();
+    wb.sheet_mut(1).show_grid = false;
+    wb.sheet_mut(2).show_headings = false;
+    wb.sheet_mut(3).show_grid = false;
+    wb.sheet_mut(3).show_headings = false;
+    wb.sheet_mut(3).zoom = 80;
+    let views = |wb: &Workbook| (0..wb.sheet_count() as u16).map(|s| (wb.sheet(s).show_grid, wb.sheet(s).show_headings)).collect::<Vec<_>>();
+    let want = vec![(true, true), (false, true), (true, false), (false, false), (true, true)];
+    let x = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+    assert_eq!(views(&back), want);
+    assert_eq!(back.sheet(3).zoom, 80);
+    assert_eq!(all(&back), all(&wb), "frozen panes stay with the view settings");
+    let o = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    let (back, _) = officina_convert::ods::read(&o).unwrap();
+    assert_eq!(views(&back), want);
+    let n = officina_grid::native::save_to_vec(&wb);
+    let back = officina_grid::native::load(&n).unwrap();
+    assert_eq!(views(&back), want);
+    assert_eq!(views(&book()), vec![(true, true); 5], "as made, both show");
+}
+
 /// LibreOffice opens our file with a view (tests/lo_view.py, under Xvfb)
 /// and saves it as the other format; we read that. Headless conversion has
 /// no view and drops view settings, so this needs Xvfb and Python's `uno`.
@@ -63,7 +87,9 @@ fn libreoffice_keeps_our_frozen_panes() {
         eprintln!("skipped: no LibreOffice, Xvfb or Python uno");
         return;
     }
-    let wb = book();
+    let mut wb = book();
+    // Gridlines off on one sheet: LibreOffice keeps them per sheet.
+    wb.sheet_mut(2).show_grid = false;
     let tmp = std::env::temp_dir().join(format!("officina-freeze-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
@@ -89,6 +115,8 @@ fn libreoffice_keeps_our_frozen_panes() {
         let data = std::fs::read(&dst).unwrap();
         let back = if to == "ods" { officina_convert::ods::read(&data).unwrap().0 } else { officina_convert::xlsx::read(&data).unwrap().0 };
         assert_eq!(all(&back), all(&wb), "{ext} -> LibreOffice -> {to}");
+        let grids: Vec<bool> = (0..back.sheet_count() as u16).map(|s| back.sheet(s).show_grid).collect();
+        assert_eq!(grids, [true, true, false, true, true], "{ext} -> LibreOffice -> {to}: gridlines");
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }

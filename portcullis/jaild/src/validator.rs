@@ -832,11 +832,12 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
     match m.kind {
         MountKind::RoNullfs => {
             let allowed = policy.mount_sources.ro_paths.iter().any(|p| p == &m.source)
-                || policy.mount_sources.ro_subtrees.iter().any(|base| below(&m.source, base));
+                || policy.mount_sources.ro_subtrees.iter().any(|base| below(&m.source, base))
+                || policy.mount_sources.ro_patterns.iter().any(|pat| matches_glob(pat, &m.source));
             if !allowed {
                 return Err(JaildError::PolicyViolation {
                     rule:   "mount.source.not_in_ro",
-                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths or ro_subtrees", m.source),
+                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths, ro_subtrees or ro_patterns", m.source),
                 });
             }
         }
@@ -2079,6 +2080,26 @@ mod tests {
             owner: None,
         });
         validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn mount_ro_pattern_is_one_workspaces_work() {
+        let mut p = load_sample_policy();
+        p.mount_sources.ro_patterns = vec!["/home/*/.atrium/workspaces/*/work".into()];
+        let ro = |src: &str| {
+            let mut r = req_default();
+            r.mounts.push(MountSpec { noexec: true, source: src.into(), dest: "work".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
+            validate_create(&r, &p)
+        };
+        ro("/home/alice/.atrium/workspaces/proj/work").unwrap();
+        for bad in ["/home/alice/.atrium/workspaces/proj", "/home/alice/.atrium/workspaces/proj/work/x", "/home/alice/.atrium/workspaces/../work",
+                    "/home/../.atrium/workspaces/proj/work", "/home/alice/.atrium/apps/proj/work", "/home//.atrium/workspaces/proj/work"] {
+            assert!(matches!(ro(bad), Err(JaildError::PolicyViolation { rule: "mount.source.not_in_ro", .. })), "{bad}");
+        }
+        // Read-only only.
+        let mut r = req_default();
+        r.mounts.push(MountSpec { noexec: true, source: "/home/alice/.atrium/workspaces/proj/work".into(), dest: "work".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
+        assert!(validate_create(&r, &p).is_err());
     }
 
     #[test]

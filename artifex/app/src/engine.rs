@@ -482,6 +482,13 @@ impl Engine {
                 self.plugins_open_all();
                 self.plugin_rows(s);
             }
+            Act::PluginRead(app, on) => {
+                if let Err(e) = self.plugins.allow_read(&app, on) {
+                    s.note = Some((format!("{app}: {e}"), true));
+                }
+                self.plugins_open_all();
+                self.plugin_rows(s);
+            }
             Act::ClosePalette => {
                 s.palette = None;
                 self.palette.clear();
@@ -2799,8 +2806,11 @@ impl Engine {
                 [] => "No network".to_string(),
                 n => format!("Network: {}", n.join(", ")),
             });
-            if i.workspace_read {
-                asks.push("Asks to read the whole workspace: not given yet, it sees only the files you open".into());
+            let read = i.workspace_read.then(|| h.read.iter().any(|a| *a == i.app));
+            match read {
+                Some(true) => asks.push("Reads the whole workspace (read-only): you allowed it here".into()),
+                Some(false) => asks.push("Asks to read the whole workspace: not allowed, it sees only the files you open".into()),
+                None => {}
             }
             let on = h.on.iter().any(|o| o.app == i.app);
             let why = h.stopped.iter().find(|(a, _)| *a == i.app).map(|(_, w)| w.clone());
@@ -2811,7 +2821,7 @@ impl Engine {
                 (true, None, true) => ("Running".to_string(), false),
                 (true, None, false) => ("On: starts with a file of its languages".to_string(), false),
             };
-            crate::ui::PluginRow { app: i.app.clone(), name: i.name.clone(), asks, on, state, stopped }
+            crate::ui::PluginRow { app: i.app.clone(), name: i.name.clone(), asks, on, read, state, stopped }
         }).collect();
         if s.plugin_rows != rows {
             s.plugin_rows = rows;

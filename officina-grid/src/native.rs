@@ -28,6 +28,7 @@
 //! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, a plain note, styled note or thread |
 //! | 29 | ZOOM | sheets' view zoom other than 100 %: count; per sheet, its index and percent (10–400) |
+//! | 30 | VIEW_HIDDEN | sheets showing no gridlines or no headings: count; per sheet, its index and flags (1 gridlines off, 2 headings off) |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -65,6 +66,7 @@ pub const SHEET_IDENTITIES: u16 = 26;
 pub const OUTLINES: u16 = 27;
 pub const HIDDEN_SHEETS: u16 = 28;
 pub const ZOOM: u16 = 29;
+pub const VIEW_HIDDEN: u16 = 30;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -367,6 +369,16 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u16(z);
         }
         c.add(ZOOM, &w.into_bytes())?;
+    }
+    let plain: Vec<(usize, u8)> = wb.sheets.iter().enumerate().map(|(i, sh)| (i, u8::from(!sh.show_grid) | u8::from(!sh.show_headings) << 1)).filter(|&(_, f)| f != 0).collect();
+    if !plain.is_empty() {
+        let mut w = Writer::new();
+        w.var(plain.len() as u64);
+        for (i, f) in plain {
+            w.u16(i as u16);
+            w.u8(f);
+        }
+        c.add(VIEW_HIDDEN, &w.into_bytes())?;
     }
     let tabs: Vec<(usize, u32)> = wb.sheets.iter().enumerate().filter_map(|(i, sh)| sh.tab_color.map(|c| (i, c))).collect();
     if !tabs.is_empty() {
@@ -986,6 +998,23 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
                 return Err(LoadError::Bad("a sheet's zoom"));
             }
             sh.zoom = z;
+        }
+        done(&r)?;
+    }
+    for i in of(VIEW_HIDDEN) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n > wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("more plain views than sheets"));
+        }
+        for _ in 0..n {
+            let (s, f) = (r.u16()? as usize, r.u8()?);
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("a view setting for a sheet that does not exist")) };
+            if f == 0 || f > 3 || !(sh.show_grid && sh.show_headings) {
+                return Err(LoadError::Bad("a sheet's view settings"));
+            }
+            sh.show_grid = f & 1 == 0;
+            sh.show_headings = f & 2 == 0;
         }
         done(&r)?;
     }

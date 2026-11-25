@@ -657,12 +657,26 @@ overlay), and shows a stopped one's reason with Restart; the strip
 counts stopped ones. limend starts a plugin with
 `ExecInstance { memory_mb: 256, cpu_pct: 50 }`
 (`catalogue::PLUGIN_MEMORY_MB`, `PLUGIN_CPU_PCT`); one over limend's
-256 messages a second is stopped. **Not built yet:** the
-`workspace-read` mount. Artifex shows the ask as not given, and `Init`
-says `read: false`. Building it means an `ExecInstance` field naming the
-workspace, which portcullisd checks against the parent's picks and the
-plugin's manifest before it nullfs-mounts that workspace's `work`
-read-only at `/work` in the plugin's jail.
+256 messages a second is stopped. The `workspace-read` mount (built
+2026-11-25): the Plugins view shows "Allow reading" on a plugin that asks,
+per workspace (kept in Artifex's `~/.config/artifex/plugins-read`); a
+running plugin is started again, since mounts are made at start. Artifex
+names the workspace in `REQUEST_PLUGIN` (`proto::Plugin::workspace`;
+limend refuses a name that can't be a workspace's, MALFORMED), limend
+passes it on as `ExecInstance { workspace }`, and portcullisd decides:
+only for limend, for a per-instance provider, when the served instance's
+app picked that workspace (`ide::picked`) and the plugin's installed
+manifest implements `editor-extension` with `workspace-read = true`. The
+`work` folder (mode 2770, the person's files group) is mounted read-only
+and noexec at `/work`, and the plugin runs with that files group as its
+primary group (`Spec::group`: a one-shot jail takes no supplementary
+groups, so the account's own uid isn't widened)
+(`Spec::work`, jaild's new `mount_sources.ro_patterns`,
+`/home/*/.atrium/workspaces/*/work`). Anything else refuses the start.
+`Init` says `read: true`, and the SDK's `Plugin::workspace()` returns
+`/work`. TODO lens asks for it: allowed, its count command counts the
+whole workspace (bounded: 5000 files, 512 KiB each, no hidden folders,
+`target` or links).
 P6 (2026-11-25): the SDK crate `sdk/atrium-artifex-ext` (the session
 over Limen, LSP helpers, a stdio `bridge`, an in-memory channel for
 tests) and two samples in `artifex/plugins/`: `md-links`
@@ -682,7 +696,10 @@ jail of its own as a uid of Artifex's instance with rctl `pcpu:deny=50`
 and `memoryuse:sigkill=256M`, md-links marks `notes.md`'s dead anchor and
 its quick fix mends it, and TODO lens' command answers in the status line
 and its panel ("Show the panel TODOs" in the palette) shows its own
-window. A plugin's manifest asks for no `graphics`: its panel is on the
+window; allowed to read proj, TODO lens' new jail has proj's `work` at
+`/work` read-only and noexec (a write there fails), its count covers the
+workspace, and Take back starts it again without the mount. A plugin's
+manifest asks for no `graphics`: its panel is on the
 embed-only frescod connection limend hands it, and limend refuses a
 provider that would also get frescod's app socket. `vm-embeds-check.sh`
 covers the refusals: a plain `editor-extension` request gets no provider,

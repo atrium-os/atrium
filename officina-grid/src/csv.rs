@@ -13,10 +13,12 @@
 //!   Windows-1252, as Excel does for "ANSI" CSV.
 //! - Line ends: CRLF, LF or CR; newlines inside quotes are kept in the cell.
 //! - A cell becomes a number when it reads as one (`1e3`, `-2.5`, `12%`), `TRUE` or
-//!   `FALSE`, an error value, or else text. Dates stay text until number formats (O4).
+//!   `FALSE`, an error value, an ISO date or timestamp (`2026-11-25`,
+//!   `2026-11-25T09:30:00Z`: a date in the ISO date format), or else text.
 //!
 //! Writing quotes a field when it holds the separator, a quote, a newline, or leading or
-//! trailing spaces; numbers are written as General shows them (15 significant digits).
+//! trailing spaces; numbers are written as General shows them (15 significant digits),
+//! and numbers in a date or time format as the format shows them, so ISO dates read back.
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
@@ -145,6 +147,8 @@ pub fn read(wb: &mut Workbook, sheet: u16, data: &[u8], opts: CsvOptions) -> Res
     let mut field = String::new();
     let mut max_col = 0u32;
     let mut formulas: Vec<(u32, u32, String)> = Vec::new();
+    // (column, row, format) of each cell read as a date; one per stored cell at most.
+    let mut dates: Vec<(u32, u32, &'static str)> = Vec::new();
     let mut at_line_start = true;
     while i < b.len() {
         // One field.
@@ -198,7 +202,7 @@ pub fn read(wb: &mut Workbook, sheet: u16, data: &[u8], opts: CsvOptions) -> Res
             if field.len() > MAX_TEXT {
                 st.cut += 1;
             }
-            store(wb, sheet, row, col, &field, quoted_field, opts.formulas, &mut formulas);
+            store(wb, sheet, row, col, &field, quoted_field, opts.formulas, &mut formulas, &mut dates);
             if !field.is_empty() {
                 st.cells += 1;
             }
@@ -241,6 +245,20 @@ pub fn read(wb: &mut Workbook, sheet: u16, data: &[u8], opts: CsvOptions) -> Res
             wb.store(sheet, r, c, &Value::str(&f));
         }
     }
+    // Each run of dates down a column with one format gets that format.
+    dates.sort_unstable();
+    let mut k = 0;
+    while k < dates.len() {
+        let (c, r0, fmt) = dates[k];
+        let mut r1 = r0;
+        k += 1;
+        while k < dates.len() && dates[k].0 == c && dates[k].1 == r1 + 1 && dates[k].2 == fmt {
+            r1 += 1;
+            k += 1;
+        }
+        let style = crate::style::Style { num_fmt: fmt.into(), ..Default::default() };
+        wb.set_style(&Rect { sheet, r0, c0: c, r1, c1: c }, style);
+    }
     if st.rows > 0 && st.cols > 0 {
         wb.changed.push(Rect { sheet, r0: 0, c0: 0, r1: st.rows - 1, c1: st.cols - 1 });
     }
@@ -248,17 +266,19 @@ pub fn read(wb: &mut Workbook, sheet: u16, data: &[u8], opts: CsvOptions) -> Res
 }
 
 #[allow(clippy::too_many_arguments)]
-fn store(wb: &mut Workbook, sheet: u16, row: u32, col: u32, f: &str, quoted: bool, formulas: bool, later: &mut Vec<(u32, u32, String)>) {
+fn store(wb: &mut Workbook, sheet: u16, row: u32, col: u32, f: &str, quoted: bool, formulas: bool, later: &mut Vec<(u32, u32, String)>, dates: &mut Vec<(u32, u32, &'static str)>) {
+    let date = || wb.date_system().iso(f);
     let cell = if f.is_empty() {
         Cell::Empty
-    } else if quoted {
-        // Quoted: text as written (Excel still reads quoted numbers as numbers).
-        match parse_number(f) {
-            Some(x) => Cell::Num(x),
-            None => Cell::Str(wb.strings.intern(f)),
-        }
     } else if let Some(x) = parse_number(f) {
+        // Quoted or not (Excel reads quoted numbers as numbers too).
         Cell::Num(x)
+    } else if let Some((x, fmt)) = date() {
+        dates.push((col, row, fmt));
+        Cell::Num(x)
+    } else if quoted {
+        // Quoted: otherwise text as written.
+        Cell::Str(wb.strings.intern(f))
     } else if f.eq_ignore_ascii_case("TRUE") {
         Cell::Bool(true)
     } else if f.eq_ignore_ascii_case("FALSE") {
@@ -291,7 +311,11 @@ pub fn write<W: Write>(wb: &Workbook, sheet: u16, sep: u8, mut out: W) -> io::Re
             if k > 0 {
                 line.push(sep);
             }
-            let s = v.display();
+            let a = crate::addr::CellAddr::new(sheet, r, k as u32);
+            let s = match v {
+                Value::Num(_) if wb.styles.format(wb.style_id(a)).is_date() => wb.formatted_as(a, v).text,
+                _ => v.display(),
+            };
             let quote = s.bytes().any(|b| b == sep || b == b'"' || b == b'\n' || b == b'\r') || s.starts_with(' ') || s.ends_with(' ');
             if quote {
                 line.push(b'"');
@@ -380,6 +404,24 @@ mod tests {
         read(&mut wb, 0, b"1,2,=A1+B1\n", CsvOptions { formulas: true, ..Default::default() }).unwrap();
         wb.recalc();
         assert_eq!(get(&wb, 0, 2), Value::Num(3.0));
+    }
+
+    #[test]
+    fn iso_dates_read_as_dates_and_write_back_as_written() {
+        let mut wb = book();
+        let csv = b"when,n\n2026-11-25,1\n\"2026-01-31\",2\n2026-02-31,3\n2026-03-01T09:30:00Z,4\n";
+        read(&mut wb, 0, csv, CsvOptions::default()).unwrap();
+        let ds = wb.date_system();
+        assert_eq!(get(&wb, 1, 0), Value::Num(ds.iso("2026-11-25").unwrap().0));
+        assert_eq!(get(&wb, 2, 0), Value::Num(ds.iso("2026-01-31").unwrap().0), "quoted dates are dates, as quoted numbers are numbers");
+        assert_eq!(get(&wb, 3, 0).display(), "2026-02-31", "not a day: text");
+        assert!(matches!(get(&wb, 4, 0), Value::Num(_)));
+        for r in 1..=2 {
+            assert_eq!(&*wb.style(CellAddr::new(0, r, 0)).num_fmt, "yyyy-mm-dd");
+        }
+        assert_eq!(&*wb.style(CellAddr::new(0, 1, 1)).num_fmt, "General", "numbers keep General");
+        let text = String::from_utf8(write(&wb, 0, b',', Vec::new()).unwrap()).unwrap();
+        assert!(text.starts_with("when,n\r\n2026-11-25,1\r\n2026-01-31,2\r\n2026-02-31,3\r\n"), "{text}");
     }
 
     #[test]

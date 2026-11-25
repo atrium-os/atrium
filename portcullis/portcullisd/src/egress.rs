@@ -65,6 +65,8 @@ pub fn start(ws_jail: &str, hosts: &[String], fib: Option<u32>) -> Result<(), St
         extra_env: vec![("ATRIUM_EGRESS_HOSTS".into(), hosts.join(","))],
         worker: None,
         pane: None,
+        work: None,
+        group: None,
         fib,
     };
     let name = ws_jail.to_string();

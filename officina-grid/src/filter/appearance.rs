@@ -40,25 +40,10 @@ pub enum AppearanceFilter {
 
 impl AppearanceFilter {
     pub(super) fn keeps(self, wb: &Workbook, addr: CellAddr) -> bool {
-        let look = wb.look(addr);
-        let (fill, pattern) = if let Some(scale) = look.scale {
-            (Some(scale), None)
-        } else if look.dxf.fill.is_some() || look.dxf.pattern.is_some() {
-            (look.dxf.fill, look.dxf.pattern)
-        } else {
-            let style = wb.style(addr);
-            (style.fill, style.pattern)
-        };
         match self {
-            Self::Pattern(expected) => pattern == Some(expected),
-            Self::Color(ColorFilter { cell: true, rgb }) => {
-                pattern.is_none() && fill == rgb
-            }
-            Self::Color(ColorFilter { cell: false, rgb }) => {
-                let font = look.dxf.color.or_else(|| wb.style(addr).font.color);
-                font == rgb
-            }
-            Self::Icon(icon) => look.icon == icon.index.map(|index| (icon.set, index)),
+            Self::Pattern(expected) => shown_fill(wb, addr).1 == Some(expected),
+            Self::Color(ColorFilter { cell, rgb }) => shown_color(wb, addr, cell) == Some(rgb),
+            Self::Icon(icon) => wb.look(addr).icon == icon.index.map(|index| (icon.set, index)),
         }
     }
 
@@ -103,5 +88,31 @@ impl AppearanceFilter {
             3 => Ok(Self::Pattern(PatternFill::decode(r)?)),
             _ => Err(WireError::Invalid("appearance filter type")),
         }
+    }
+}
+
+/// The fill and pattern a cell shows: a colour scale's, a conditional
+/// format's, or its own.
+fn shown_fill(wb: &Workbook, addr: CellAddr) -> (Option<u32>, Option<PatternFill>) {
+    let look = wb.look(addr);
+    if let Some(scale) = look.scale {
+        (Some(scale), None)
+    } else if look.dxf.fill.is_some() || look.dxf.pattern.is_some() {
+        (look.dxf.fill, look.dxf.pattern)
+    } else {
+        let style = wb.style(addr);
+        (style.fill, style.pattern)
+    }
+}
+
+/// The colour a cell shows, as a colour filter matches it: its solid fill
+/// (`cell`; None inside: no fill), or its text colour (None inside:
+/// automatic). None when the fill is a pattern, which no colour matches.
+pub fn shown_color(wb: &Workbook, addr: CellAddr, cell: bool) -> Option<Option<u32>> {
+    if cell {
+        let (fill, pattern) = shown_fill(wb, addr);
+        pattern.is_none().then_some(fill)
+    } else {
+        Some(wb.look(addr).dxf.color.or_else(|| wb.style(addr).font.color))
     }
 }

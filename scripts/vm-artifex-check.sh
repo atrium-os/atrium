@@ -161,7 +161,12 @@ O=$B/b-$ART; mkdir -p \$O/bin; cp $B/artifex \$O/bin/; cp $B/artifex.toml \$O/at
 echo on > \$O/.trace; echo 40,30 > \$O/.at
 sign \$O; opifex install \$O >/dev/null
 fi
-# The sample plugins, installed like any app (editor-extension in [roles]).
+# The sample plugins, installed like any app (editor-extension in [roles]),
+# and no other plugin (vm-embeds-check.sh's dev build would be a third row).
+for m in /var/lib/atrium/apps/*/atrium.toml; do
+  id=\$(basename \$(dirname \$m))
+  case \$id in $MDL|$TODO) ;; *) grep -q '^implements.*"editor-extension"' \$m && { opifex uninstall \$id >/dev/null 2>&1 || rm -rf /var/lib/atrium/apps/\$id; } ;; esac
+done
 for x in md-links:$MDL todo-lens:$TODO; do
   n=\${x%%:*}; id=\${x#*:}
   O=$B/b-\$id; mkdir -p \$O/bin; cp $B/\$n \$O/bin/; cp $B/\$n.toml \$O/atrium.toml
@@ -568,6 +573,47 @@ if want plugins; then
     pal "show todos" "Show the panel TODOs" && waitstate 'panel=Some(Plugin(0))' 20 && ok "the palette shows it in the bottom panel" || bad "panel: $(state)"
     waitstate 'running=None' 5 >/dev/null
     shot artifex-plugins-4-panel
+    # Reading the workspace (D28): TODO lens asks, the person allows it in
+    # proj, and its jail is started again with proj's work read-only at
+    # /work; its count then covers the whole workspace.
+    pal "plugins" "Show the plugins" && waitstate 'view=Plugins' 20 || bad "plugins view: $(state)"
+    shot artifex-plugins-5-asks
+    # TODO lens' row starts at 280 (md-links' is 116 tall, running): its
+    # Allow reading button is 44 below the top.
+    press 757 340
+    waitstate "plugins=\[[^]]*$TODO:on:Running" 120 || bad "todo-lens after allowing: [$(plugins)]"
+    check "allowed for proj in Artifex's file" "1" "$(V "p=\$(pgrep -x artifex | head -1); h=\$(procstat -e \$p | tr ' ' '\\n' | sed -n 's/^HOME=//p'); r=\$(jls -j \$(ps -o jid= -p \$p) path); cat \$r\$h/.config/artifex/plugins-read" 2>/dev/null | grep -c "^proj	$TODO$")"
+    V "grep -q '$TODO for alice.s $ART reads workspace proj' $LOG" && ok "portcullisd checked the pick and the manifest and mounts proj" || bad "portcullisd: $(V "grep -i 'workspace' $LOG | tail -3")"
+    # The new jail's /work (the old jail may still be going away).
+    M=""; i=0
+    while [ $i -lt 60 ]; do
+        M=$(V "mount -p | awk '\$1 ~ /workspaces\\/proj\\/work\$/ && \$2 ~ /todo-lens[^ ]*\\/work\$/ {print \$2\" \"\$4}'")
+        [ -n "$M" ] && break; sleep 2; i=$((i+2))
+    done
+    TR=${M%/work *}
+    TJ=$(V "jls jid path | awk -v r=$TR '\$2 == r {print \$1}'")
+    case "$M" in *" "*ro*noexec*|*" "*noexec*ro*) ok "proj's work is at /work in its jail, read-only and noexec" ;; *) bad "the mount: [$M]" ;; esac
+    # (The plugin's jail has no shell: the write goes through its mount.)
+    W1=$(V "touch $TR/work/plugin-wrote 2>&1; test -e $W/proj/work/plugin-wrote && echo written")
+    G=$(V "procstat -s \$(pgrep -x todo-lens | head -1) | awk 'NR == 2 {print \$6}'")
+    check "it runs with alice's files group, which proj's work is shared under" "$(V "stat -f %g $W/proj/work")" "$G"
+    case "$W1" in *written*) bad "a write through /work landed" ;; *"Read-only"*) ok "a write through it is refused (read-only file system)" ;; *) bad "write: [$W1]" ;; esac
+    press 64 100
+    waitstate 'view=Code' 20 || bad "files: $(state)"
+    pal "count the todos" "Count the TODOs in the open files" \
+        && waitstate 'lsp=Some("[^"]*TODO lens: [1-9][0-9]* TODOs* in [1-9][0-9]* files* of the workspace' 60 \
+        && ok "the count covers the workspace ($(state | grep -o 'TODO lens: [^"]*'))" || bad "count: $(state | grep -o 'lsp=Some("[^"]*")')"
+    # Taken back: started again without it.
+    pal "plugins" "Show the plugins" && waitstate 'view=Plugins' 20 || bad "plugins view: $(state)"
+    press 757 340
+    waitstate "plugins=\[[^]]*$TODO:on:Running" 120 || bad "todo-lens after taking back: [$(plugins)]"
+    # Its old jail goes; the new one has no /work.
+    i=0; while [ $i -lt 60 ] && [ -n "$(V "mount -p | awk '\$2 ~ /todo-lens[^ ]*\\/work\$/'")" ]; do sleep 2; i=$((i+2)); done
+    check "Take back: no /work in its new jail" "" "$(V "mount -p | awk '\$2 ~ /todo-lens[^ ]*\\/work\$/'")"
+    waitstate "plugins=\[[^]]*$TODO:on:Running" 60 && [ -n "$(V "pgrep -x todo-lens")" ] && ok "and it runs again" || bad "todo-lens: [$(plugins)]"
+    shot artifex-plugins-6-taken-back
+    press 64 100
+    waitstate 'view=Code' 20 || bad "files: $(state)"
     # Back to the Output panel for Run's question.
     ctrl 0x0d
     waitstate 'panel=Some(Output)' 20 || bad "output: $(state)"
