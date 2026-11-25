@@ -2486,7 +2486,7 @@ fn format_key(chars: &str, shift: bool) -> Option<char> {
             _ => None,
         };
     }
-    matches!(c, 'b' | 'i' | 'u' | '5' | '1' | '`' | '9' | '0' | '-' | '+' | 't' | 'l' | 'k').then_some(c)
+    matches!(c, 'b' | 'i' | 'u' | '5' | '1' | '`' | '9' | '0' | '-' | '+' | 't' | 'l' | 'k' | '[' | ']').then_some(c)
 }
 
 /// How far down a cell `ch` px tall lines `th` px tall start, by `v`.

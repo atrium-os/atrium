@@ -147,6 +147,10 @@ pub enum DataCmd {
     MergeAcross,
     /// Formulas shown as typed in their cells instead of their values (not saved).
     ShowFormulas,
+    /// The cells the cursor's formula reads (Ctrl+[).
+    Precedents,
+    /// The formulas that read the cursor's cell (Ctrl+]).
+    Dependents,
     /// Every formula calculated again (F9; random numbers and the time change).
     CalculateNow,
     /// This sheet's formulas calculated again (Shift+F9).
@@ -468,6 +472,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
         (MenuItem::new("Show Formulas").checked(d.show_formulas).shortcut("Ctrl+`"), Some(DataCmd::ShowFormulas)),
+        (MenuItem::new("Go to Precedents").shortcut("Ctrl+[").enabled(wb.group_at(s, row, col).is_some()), Some(DataCmd::Precedents)),
+        (MenuItem::new("Go to Dependents").shortcut("Ctrl+]"), Some(DataCmd::Dependents)),
         (MenuItem::new("Insert Function…").shortcut("Shift+F3"), Some(DataCmd::InsertFunction)),
         (MenuItem::new("Paste Name…").shortcut("F3").enabled(!paste_names(d).is_empty()), Some(DataCmd::PasteName)),
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
@@ -732,6 +738,8 @@ pub fn key_cmd(k: char, sel: CellRange, rows: u32, cols: u32) -> Option<DataCmd>
         't' | 'l' => DataCmd::FormatAsTable,
         'L' => DataCmd::Filter,
         'k' => DataCmd::Link,
+        '[' => DataCmd::Precedents,
+        ']' => DataCmd::Dependents,
         _ => return None,
     })
 }
@@ -1061,6 +1069,47 @@ pub fn paste_names(d: &Doc) -> Vec<String> {
     v.sort_by_key(|n| n.to_lowercase());
     v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     v
+}
+
+/// The most dependents Ctrl+] lists.
+pub const MAX_DEPENDENTS: usize = 1000;
+
+/// Excel's Ctrl+[: the areas the formula at (`row`, `col`) reads directly,
+/// each once, in the order the formula has them (names and tables included).
+pub fn precedents(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Vec<Rect> {
+    let Some(g) = wb.group_at(sheet, row, col) else { return Vec::new() };
+    let mut out: Vec<Rect> = Vec::new();
+    for r in wb.group(g).fps.iter().filter_map(|fp| fp.at(row)) {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Excel's Ctrl+]: the formula cells that read (`row`, `col`) directly, in
+/// sheet and then column and row order, at most `max`.
+pub fn dependents(wb: &Workbook, sheet: u16, row: u32, col: u32, max: usize) -> Vec<CellAddr> {
+    let mut out: Vec<CellAddr> = Vec::new();
+    for (_, g) in wb.groups() {
+        for fp in g.fps.iter().filter(|fp| fp.sheet == sheet && fp.c0 <= col && col <= fp.c1) {
+            if let Some((lo, hi)) = fp.affected(g.r0, g.r1, row, row) {
+                // A Slide footprint covers rows by offset; check each row's own area.
+                for r in lo..=hi {
+                    if out.len() > 4 * max {
+                        break;
+                    }
+                    if fp.at(r).is_some_and(|a| a.r0 <= row && row <= a.r1) {
+                        out.push(CellAddr::new(g.sheet, r, g.col));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|a| (a.sheet, a.col, a.row));
+    out.dedup();
+    out.truncate(max);
+    out
 }
 
 /// The most cells AutoComplete and Pick From List read each way from the cell.
@@ -2231,7 +2280,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.recalc();
             Ok(if cmd == DataCmd::CalculateNow { "Calculated every sheet.".into() } else { "Calculated this sheet.".into() })
         }
-        DataCmd::InsertFunction | DataCmd::PasteName => Ok(String::new()),
+        DataCmd::InsertFunction | DataCmd::PasteName | DataCmd::Precedents | DataCmd::Dependents => Ok(String::new()),
         DataCmd::ShowFormulas => {
             d.show_formulas = !d.show_formulas;
             Ok(if d.show_formulas { "Formulas are shown in their cells.".into() } else { "Values are shown in their cells.".into() })

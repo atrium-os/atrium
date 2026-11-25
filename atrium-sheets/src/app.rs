@@ -1789,6 +1789,44 @@ impl Sheets {
         self.list_scroll.set(ScrollState::default());
     }
 
+    /// Ctrl+[ (`back`) and Ctrl+]: selects the first cell or area the
+    /// cursor's formula reads, or the first formula reading the cursor's
+    /// cell, preferring the sheet on screen; the status names them all.
+    pub fn trace(&self, back: bool) {
+        let (r, c) = self.grid.get_cloned().cursor;
+        let (areas, own) = {
+            let d = self.doc.borrow();
+            let areas: Vec<officina_grid::Rect> = if back {
+                crate::data::precedents(&d.wb, d.sheet, r, c)
+            } else {
+                crate::data::dependents(&d.wb, d.sheet, r, c, crate::data::MAX_DEPENDENTS).into_iter().map(|a| officina_grid::Rect { sheet: a.sheet, r0: a.row, c0: a.col, r1: a.row, c1: a.col }).collect()
+            };
+            (areas, d.sheet)
+        };
+        let Some(&to) = areas.iter().find(|a| a.sheet == own).or(areas.first()) else {
+            self.set_status(if back { "This cell has no formula reading other cells." } else { "No formula reads this cell." });
+            return;
+        };
+        let name = |a: &officina_grid::Rect| {
+            let d = self.doc.borrow();
+            let place = range_name(CellRange { r0: a.r0, c0: a.c0, r1: a.r1, c1: a.c1 });
+            let sheet = d.wb.sheet_name(a.sheet);
+            let sheet = if sheet.chars().all(|ch| ch.is_alphanumeric() || ch == '_') { sheet } else { format!("'{}'", sheet.replace('\'', "''")) };
+            if a.sheet == own { place } else { format!("{sheet}!{place}") }
+        };
+        let list: Vec<String> = areas.iter().take(8).map(name).collect();
+        let more = if areas.len() > 8 { format!(" and {} more", areas.len() - 8) } else { String::new() };
+        let what = if back { "Precedents" } else { "Dependents" };
+        let status = if areas.len() == 1 { format!("{what}: {}.", list[0]) } else { format!("{what} ({}): {}{more}.", areas.len(), list.join(", ")) };
+        self.show_sheet(to.sheet);
+        self.show_cell(to.r0, to.c0);
+        let mut g = self.grid.get_cloned();
+        g.anchor = (to.r1, to.c1);
+        g.cursor = (to.r0, to.c0);
+        self.grid.set(g);
+        self.set_status(status);
+    }
+
     /// Opens the list of functions (Shift+F3) or of names (F3) for the
     /// cursor cell's formula. A cell being edited stays open.
     pub fn formula_list(&self, kind: ListKind) {
@@ -2293,7 +2331,7 @@ impl Sheets {
                 GridAction::Format('`') => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowFormulas)),
                 // Ctrl+9 / Ctrl+0 hide, Ctrl+Shift+( / ) unhide, Ctrl+- / Ctrl++ delete and insert;
                 // Ctrl+T (Ctrl+L) table, Ctrl+Shift+L filter, Ctrl+K link.
-                GridAction::Format(k @ ('9' | '0' | '(' | ')' | '-' | '+' | 't' | 'l' | 'L' | 'k')) => {
+                GridAction::Format(k @ ('9' | '0' | '(' | ')' | '-' | '+' | 't' | 'l' | 'L' | 'k' | '[' | ']')) => {
                     use pergola::widgets::GridSource;
                     let sel = grid.get_cloned().selection();
                     if let Some(c) = crate::data::key_cmd(k, sel, src.rows(), src.cols()) {
@@ -3663,6 +3701,11 @@ impl Sheets {
                 }
                 Cmd::Pivot(c) => {
                     self.pivot_cmd(c);
+                    false
+                }
+                Cmd::Data(c @ (crate::data::DataCmd::Precedents | crate::data::DataCmd::Dependents)) => {
+                    self.trace(c == crate::data::DataCmd::Precedents);
+                    self.changed();
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::InsertFunction) => {
@@ -7695,6 +7738,54 @@ mod tests {
         s.take_cmds();
         assert!(!s.list.get_cloned().open);
         assert_eq!(s.doc.borrow().status, "There is nothing in this column to pick from.");
+    }
+
+    #[test]
+    fn ctrl_brackets_go_to_precedents_and_dependents() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"1,2\n3,4\n5,6\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        run(Cmd::Tab(crate::tabs::TabCmd::Add));
+        s.show_sheet(0);
+        let commit = |row, col, text: &str| Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Commit { row, col, text: text.into() });
+        commit(0, 2, "=A1+B2");
+        commit(0, 3, &format!("=SUM(A1:A2)+{}!B3", s.doc.borrow().wb.sheet_name(1)));
+        for r in 0..3 {
+            commit(r, 4, &format!("=A{}*2", r + 1));
+        }
+        let at = |sh: u16| { let g = s.grid.get_cloned(); (s.doc.borrow().sheet == sh, g.selection()) };
+        let status = || s.doc.borrow().status.clone();
+        let cr = |r0, c0, r1, c1| CellRange { r0, c0, r1, c1 };
+        // The Ctrl+[ and Ctrl+] keys pick these commands.
+        assert_eq!(crate::data::key_cmd('[', cr(0, 0, 0, 0), 100, 100), Some(DataCmd::Precedents));
+        assert_eq!(crate::data::key_cmd(']', cr(0, 0, 0, 0), 100, 100), Some(DataCmd::Dependents));
+        // C1 reads A1 and B2: the first selected, both named.
+        select(&s, (0, 2), (0, 2));
+        run(Cmd::Data(DataCmd::Precedents));
+        assert_eq!(at(0), (true, cr(0, 0, 0, 0)));
+        assert_eq!(status(), "Precedents (2): A1, B2.");
+        // D1: the area on this sheet first; the other sheet's cell named with its sheet.
+        select(&s, (0, 3), (0, 3));
+        run(Cmd::Data(DataCmd::Precedents));
+        assert_eq!(at(0), (true, cr(0, 0, 1, 0)));
+        assert!(status().starts_with("Precedents (2): A1:A2, ") && status().ends_with("!B3."), "{}", status());
+        // A2 is read by D1's range and by E2 only (not E1 or E3, which read their own rows).
+        select(&s, (1, 0), (1, 0));
+        run(Cmd::Data(DataCmd::Dependents));
+        assert_eq!(at(0), (true, cr(0, 3, 0, 3)));
+        assert_eq!(status(), "Dependents (2): D1, E2.");
+        // Another sheet's cell: its dependent is shown on this sheet.
+        s.show_sheet(1);
+        select(&s, (2, 1), (2, 1));
+        run(Cmd::Data(DataCmd::Dependents));
+        assert_eq!(at(0), (true, cr(0, 3, 0, 3)));
+        // Nothing to trace: said so, the selection kept.
+        select(&s, (2, 1), (2, 1));
+        run(Cmd::Data(DataCmd::Precedents));
+        assert_eq!(status(), "This cell has no formula reading other cells.");
+        run(Cmd::Data(DataCmd::Dependents));
+        assert_eq!(status(), "No formula reads this cell.");
+        assert_eq!(at(0).1, cr(2, 1, 2, 1));
     }
 
     #[test]

@@ -4925,6 +4925,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Alt+Down** on a cell with no validation list now offers that list, sorted, in the list panel (Excel's Pick From Drop-down List). The menu item is now **Pick from List…** (Alt+Down), enabled for either kind of list.
 - Tests: `typing_completes_from_the_source_and_the_next_key_replaces_it` (pergola) and `autocomplete_and_pick_from_list_read_the_column_around_the_cell` (Sheets). All 146 Sheets and 240 pergola lib tests pass.
 
+### 16.120 Go to precedents and dependents: Ctrl+[ and Ctrl+] (2026-11-25)
+
+- **Ctrl+[** selects what the cursor's formula reads directly: the first cell or area on the sheet on screen, or else on another sheet, which is then shown. **Ctrl+]** selects the first formula cell that reads the cursor's cell directly, from any sheet. The status bar names them all, for example "Precedents (2): A1:A2, Sheet2!B3." It lists the first 8 and gives the count of the rest.
+- Excel selects every precedent at once. The grid has one selection range, so Sheets goes to the first one and names the others. Pressing the key again traces on from there.
+- `data::precedents` reads the formula group's footprints at the cursor's row, so names and tables are included. `data::dependents` checks every group's footprints for the row that reads the cell, so a filled-down `=A1*2` gives only the row reading it. At most `MAX_DEPENDENTS` (1,000) are listed. The menu has **Go to Precedents** and **Go to Dependents**.
+- Test: `ctrl_brackets_go_to_precedents_and_dependents`. All 147 Sheets and 240 pergola lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
