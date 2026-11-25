@@ -132,6 +132,12 @@ pub fn role(name: &str) -> Option<&'static Role> {
 
 /// Limits (limen.md §7).
 pub const MAX_EMBEDS_PER_PARENT: usize = 16;
+/// Plugins listed to a parent (`LIST_PLUGINS`).
+pub const MAX_PLUGINS: usize = 64;
+/// A plugin's memory limit and CPU share (dev-tools.md §3.8): portcullisd
+/// applies them, and refuses to start one where it can't.
+pub const PLUGIN_MEMORY_MB: u64 = 256;
+pub const PLUGIN_CPU_PCT: u32 = 50;
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const MAX_MESSAGES_PER_SEC: u32 = 256;
 /// A window opens print sheets freely this many times a minute, then one

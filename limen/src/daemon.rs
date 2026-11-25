@@ -106,9 +106,19 @@ pub trait Launcher: Send {
     fn launch_island_standby(&mut self, _embed: EmbedId, _channel: UnixStream, _parent_uid: u32) -> Result<u32, String> {
         Err("this launcher keeps no standby engines".into())
     }
+    /// A plugin (`editor-extension`) for the parent running as
+    /// `parent_uid`, held to [`catalogue::PLUGIN_MEMORY_MB`] and
+    /// [`catalogue::PLUGIN_CPU_PCT`].
+    fn launch_plugin(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
+        self.launch_for(app_id, embed, channel, parent_uid)
+    }
     /// End the child's jail.
     fn end(&mut self, embed: EmbedId);
 }
+
+/// The installed plugins for a person (limend's reads the installed
+/// manifests).
+pub type PluginList = Box<dyn Fn(&str) -> Vec<proto::PluginInfo> + Send + Sync>;
 
 /// choragusd's attribution tickets (lyra-v1.md §4): an embedded player plays
 /// as its parent, and only if the parent holds `audio`.
@@ -300,6 +310,8 @@ pub struct Shared {
     pane_check: Mutex<Option<PaneCheck>>,
     /// Without one (tests), any app is a plugin.
     plugin_check: Mutex<Option<PaneCheck>>,
+    /// Without one (tests), none are listed.
+    plugin_list: Mutex<Option<PluginList>>,
 }
 
 impl Shared {
@@ -324,6 +336,7 @@ impl Shared {
             target_check: Mutex::new(None),
             pane_check: Mutex::new(None),
             plugin_check: Mutex::new(None),
+            plugin_list: Mutex::new(None),
         })
     }
 
@@ -387,6 +400,10 @@ impl Shared {
     /// is the installed manifests' `[roles] implements`.
     pub fn set_plugin_check(&self, c: PaneCheck) {
         *self.plugin_check.lock().unwrap() = Some(c);
+    }
+
+    pub fn set_plugin_list(&self, l: PluginList) {
+        *self.plugin_list.lock().unwrap() = Some(l);
     }
 
     /// Live embeds (tests and logs).
@@ -479,6 +496,16 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 let p: proto::Plugin = de(payload)?;
                 request(shared, conn, uid, proto::Request { role: "editor-extension".into(), window: p.window, z: p.z },
                         Via::Plugin { app: p.app })
+            }
+            op::LIST_PLUGINS => {
+                // Only a parent that may start plugins learns which there are.
+                let Some((user, app)) = (shared.resolve)(uid) else { return Err(Reply::Refused { reason: refusal::NOT_AN_APP }) };
+                if !shared.embed_check.lock().unwrap().as_ref().is_none_or(|check| check(&app, "editor-extension")) {
+                    return Err(Reply::Refused { reason: refusal::NOT_EMBEDDABLE });
+                }
+                let mut plugins = shared.plugin_list.lock().unwrap().as_ref().map(|l| l(&user)).unwrap_or_default();
+                plugins.truncate(catalogue::MAX_PLUGINS);
+                Ok(Reply::Plugins { plugins })
             }
             op::REQUEST_SMIME_PICKER => {
                 let (sheet, window) = de(payload)?;
@@ -742,6 +769,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
                 match &persona {
                     Some(p) if pane.is_some() => shared.launcher.lock().unwrap().launch_settings(&provider, embed, theirs, uid, p),
                     Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
+                    None if plugin.is_some() => shared.launcher.lock().unwrap().launch_plugin(&provider, embed, theirs, uid),
                     None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
                 }
             };

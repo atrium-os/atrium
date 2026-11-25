@@ -181,6 +181,10 @@ pub enum Act {
     PaletteQuery(String),
     PaletteRun(usize),
     ClosePalette,
+    /// Switch a plugin on or off for this workspace; start a stopped one
+    /// again.
+    PluginSwitch(String, bool),
+    PluginRestart(String),
 }
 
 /// The debugger as the window shows it.
@@ -231,6 +235,8 @@ pub enum Panel {
     Problems,
     Debug,
     References,
+    /// The `i`th of `State::plugin_panels`: a plugin's own window.
+    Plugin(u8),
 }
 
 /// A tab as the bar shows it.
@@ -334,6 +340,23 @@ pub struct State {
     /// The command palette is up: what's typed, and its rows (label, key
     /// or plugin).
     pub palette: Option<(String, Vec<(String, String)>)>,
+    /// The panels plugins show: app, title.
+    pub plugin_panels: Vec<(String, String)>,
+    /// The Plugins view's rows.
+    pub plugin_rows: Vec<PluginRow>,
+}
+
+/// An installed plugin as the Plugins view shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginRow {
+    pub app: String,
+    pub name: String,
+    /// What it asks for, one line each.
+    pub asks: Vec<String>,
+    pub on: bool,
+    /// "Running", or why it stopped; empty while off.
+    pub state: String,
+    pub stopped: bool,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -648,6 +671,8 @@ impl View for ArtifexView {
             if s.composition.is_some() {
                 views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
             }
+            let stopped = s.plugin_rows.iter().filter(|r| r.stopped).count();
+            views.push(("Plugins", phosphor::PUZZLE_PIECE, Act::View(Main::Plugins), s.view == Main::Plugins, stopped));
             // Debug: while a program is debugged, or breakpoints are set; a
             // dot while it is stopped.
             let stopped = s.debug.as_ref().is_some_and(|d| d.stopped && d.live);
@@ -693,6 +718,7 @@ impl View for ArtifexView {
                 Main::Composition => crate::views::composition(ctx, &s, q, area),
                 Main::Assets => crate::views::assets(ctx, &s, q, area),
                 Main::Inspect => crate::views::inspect(ctx, &s, q, area),
+                Main::Plugins => crate::views::plugins(ctx, &s, q, area),
                 Main::Code => {}
             }
             ctx.pop();
@@ -908,6 +934,9 @@ impl View for ArtifexView {
             if !s.refs.is_empty() || s.panel == Panel::References {
                 tabs.push((Panel::References, phosphor::MAGNIFYING_GLASS, format!("References ({})", s.refs.len())));
             }
+            for (i, (_, title)) in s.plugin_panels.iter().enumerate().take(8) {
+                tabs.push((Panel::Plugin(i as u8), phosphor::PUZZLE_PIECE, fit(title, em(160.0), type_size::SM)));
+            }
             for (i, (p, icon, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
                 let bw = em(46.0 + 7.5 * label.len() as f32);
@@ -958,6 +987,13 @@ impl View for ArtifexView {
                 Panel::Debug => {
                     let area = Rect::new(pl, body_y - em(10.0), w - pl, py + panel_of(&s) - (body_y - em(10.0)));
                     crate::views::debug_panel(ctx, &s, q, &self.eval_field, &self.cond_field, &self.bp_chosen, area);
+                }
+                Panel::Plugin(_) => {
+                    // The plugin's own window goes here; Artifex draws
+                    // nothing of it.
+                    ctx.key(5900);
+                    let id = ctx.add(Node::Rect { rect: Rect::new(pl, body_y - em(10.0), w - pl, py + panel_of(&s) - (body_y - em(10.0))), fill: t.bg_surface(), radius: 0.0 });
+                    ctx.slot(id, crate::plugins::PANEL_SLOT);
                 }
                 Panel::References => {
                     if s.refs.is_empty() {

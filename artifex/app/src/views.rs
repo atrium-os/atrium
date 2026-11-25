@@ -24,6 +24,8 @@ pub enum Main {
     Assets,
     /// The inspector's view of the app a Run started.
     Inspect,
+    /// The installed plugins, switched on or off for this workspace.
+    Plugins,
 }
 
 /// The preview pane's width (Move into a worker).
@@ -667,6 +669,53 @@ fn report_line(r: &crate::assets::IconReport) -> (String, bool) {
 
 /// The Assets view: the project's `assets/` on the left, the chosen one
 /// (or an import) on the right.
+/// The Plugins view (dev-tools.md §3.8): each installed plugin with what it
+/// asks for, its switch for this workspace, and why it stopped.
+pub fn plugins(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
+    let t = ctx.theme;
+    let (x0, y0) = (area.x(), area.y());
+    let w = area.w().min(em(760.0));
+    text(ctx, x0 + em(24.0), y0 + em(30.0), "Plugins", type_size::LG, Weight::Semibold, t.text_primary());
+    text(ctx, x0 + em(24.0), y0 + em(54.0), "Each runs in its own jail and sees only the files of its languages you open.",
+         type_size::SM, Weight::Regular, t.text_secondary());
+    if s.plugin_rows.is_empty() {
+        para(ctx, x0 + em(24.0), y0 + em(92.0), "No plugins installed. A plugin is an app whose manifest implements editor-extension; install one like any app.",
+             w - em(48.0), type_size::SM, Weight::Regular, t.text_tertiary(), 3);
+        return;
+    }
+    let mut y = y0 + em(80.0);
+    for (i, r) in s.plugin_rows.iter().enumerate() {
+        if y > area.y() + area.h() - em(90.0) {
+            break;
+        }
+        let rh = em(30.0) + r.asks.len() as f32 * em(18.0) + if r.state.is_empty() { 0.0 } else { em(20.0) } + em(12.0);
+        ctx.add(Node::Rect { rect: Rect::new(x0 + em(16.0), y, w - em(32.0), rh), fill: t.bg_surface(), radius: radius::MD });
+        icon(ctx, x0 + em(32.0), y + em(20.0), phosphor::PUZZLE_PIECE, type_size::MD, t.text_secondary());
+        text(ctx, x0 + em(56.0), y + em(20.0), &r.name, type_size::MD, Weight::Medium, t.text_primary());
+        ctx.key(8600 + i as u64 * 4);
+        let app = r.app.clone();
+        if r.on {
+            Button::secondary("Switch off").at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).on_click(plain(q, Act::PluginSwitch(app, false))).render(ctx);
+        } else {
+            Button::primary("Switch on").at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).on_click(plain(q, Act::PluginSwitch(app, true))).render(ctx);
+        }
+        let mut ly = y + em(44.0);
+        for a in &r.asks {
+            text(ctx, x0 + em(56.0), ly, a, type_size::SM, Weight::Regular, t.text_secondary());
+            ly += em(18.0);
+        }
+        if !r.state.is_empty() {
+            let c = if r.stopped { t.danger_fg() } else { t.text_tertiary() };
+            text(ctx, x0 + em(56.0), ly + em(2.0), &r.state, type_size::SM, Weight::Regular, c);
+            if r.stopped {
+                ctx.key(8601 + i as u64 * 4);
+                Button::ghost("Restart").at(x0 + w - em(150.0), ly - em(12.0)).width(em(118.0)).on_click(plain(q, Act::PluginRestart(r.app.clone()))).render(ctx);
+            }
+        }
+        y += rh + em(10.0);
+    }
+}
+
 pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
     use crate::assets::{Importing, Kind};
     let t = ctx.theme;

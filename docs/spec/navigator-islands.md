@@ -3840,6 +3840,31 @@ every real press and records when one last reached each window
    popover names "a new window with no press in the page". (Positive
    control: with it set, the same injected click opens one.)
 
+**Gate results on arm64 Tessera, 2026-11-25** (main 308a60629; engine
+`c44e3525…` with the open-beside and cache patches). Evidence is in
+`~/atrium-vm/evidence/navigator-i6-8-20261125/` on the Mac.
+
+1. frescod's unit tests, run from the guest's disk: 91 passed, including
+   `a_spent_press_answers_once_and_a_new_press_answers_again`, and 1
+   failed. `consumers_name_their_purposes` fails because `APPROVE` has two
+   default brokers, `root` and `_arca-ui`. 44b4b21c7 (Mail, 2026-11-23)
+   added `_arca-ui`'s, so either the test or that entry needs its owner's
+   decision. Nothing in I6.8 touches it.
+2. Passed. One press put `elsewhere.example` beside the page, the engines
+   kept their pids, and nothing was fetched from it. The timer's
+   `window.open` got `null`, and the popover named "a new window" as
+   before.
+3. Passed. Two presses 0.3 s apart added two entries beside the page.
+4. Passed. frescod was restarted without `FRESCOD_INJECT_ACTIVATION`, and
+   the page ran live from a remembered origin (D8), because an injected
+   press can't start a run either ("the press didn't count"). An injected
+   click on **Open another site** got `null` in the page, and nothing was
+   added beside. navigatord logged `no press to spend for a new window:
+   Refused(19)` and "a new window with no press in the page", and the UI
+   named it too. Steps 2 and 3, run with the variable set, are the
+   positive control. jaild's 9 WARNs (broken pipes) came from stopping
+   portcullisd and limend for that restart.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

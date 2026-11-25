@@ -386,6 +386,9 @@ with it in [artifex.md](artifex.md) §7). Built as `limen::editor_ext`.
   JSON-RPC message (no `Content-Length` header) goes as parts of at most 60 KiB, the last with
   `last: true`, at most 4 MiB in all; both ends refuse more and drop the peer. Files are
   `artifex:///<path in work>`.
+- **Listing and limits.** `LIST_PLUGINS` answers `Reply::Plugins` with the parent's person's
+  installed plugins (at most 64), only to a parent that may embed the role (`NOT_EMBEDDABLE`).
+  A plugin is started with a 256 MiB memory limit and a 50% CPU share.
 - **Panel.** Messages flow before the child has a window; a panel is the child's window, given
   with `READY` and placed by the parent in a `plain` slot like any other.
 
