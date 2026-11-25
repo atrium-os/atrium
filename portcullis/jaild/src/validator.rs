@@ -1282,6 +1282,21 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_pane_mounts_one_apps_data_and_nothing_wider() {
+        let p = load_sample_policy();
+        let rw = |source: &str| validate_mount(&MountSpec { noexec: true, source: source.into(), dest: "/app-data".into(),
+            kind: MountKind::RwNullfs, size_mb: None, owner: None }, &p);
+        for ok in ["/usr/home/ana/.atrium/apps/org.atrium.navigator", "/home/ana/.atrium/persona-apps/work/org.atrium.navigator"] {
+            rw(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for no in ["/usr/home/ana/.atrium/apps", "/usr/home/ana/.atrium/persona-apps/work",
+                   "/usr/home/ana/.atrium/apps/org.atrium.navigator/var", "/usr/home/ana/.atrium/apps/..",
+                   "/usr/home/ana/.atrium/keys"] {
+            assert!(rw(no).is_err(), "{no}");
+        }
+    }
+
+    #[test]
     fn name_accepts_valid() {
         for name in &["atrium-frescod", "system-vestibulum", "user-1001-supervisor", "app-edit-7"] {
             validate_name(name).unwrap_or_else(|e| panic!("{name} rejected: {e}"));

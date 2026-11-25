@@ -505,6 +505,56 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 message: "request is unavailable on the worker-call socket".into() })?;
             return Ok(());
         }
+        /* ★ An app's own settings pane in Settings (curia.md §15): only
+         * limend asks, for an embed whose parent it names, and only for a
+         * parent that is a launched app holding `app-grants` (Settings), in
+         * one of that person's personas. The pane is the app's: its uid in
+         * that persona and its data there, and nothing else of its manifest.
+         * Settings sees only its pixels. */
+        if let Request::ExecSettingsPane { app_id, instance, serves, persona } = &req {
+            let refuse = |why: String| Response::LaunchFailed { stage: "policy".into(), message: why };
+            if owner != LIMEN_USER {
+                eprintln!("portcullisd: settings pane of {app_id} DENIED to uid {uid}: only limend asks");
+                write_response(&mut writer, &refuse("only limend starts a settings pane".into()))?;
+                continue;
+            }
+            let reg = load_registry();
+            let Some((person, parent)) = reg.resolve(*serves).map(|(o, a)| (o.to_string(), a.to_string())) else {
+                write_response(&mut writer, &refuse(format!("uid {serves} is not a launched app")))?;
+                continue;
+            };
+            if !launch::app_manages_grants(&parent) {
+                eprintln!("portcullisd: settings pane of {app_id} for {person}'s {parent} DENIED: not the settings app");
+                write_response(&mut writer, &refuse(format!("cap.app_grants.denied: {parent} may not open apps' settings")))?;
+                continue;
+            }
+            let named = (persona != portcullis_policy::PERSONAL).then_some(persona.as_str());
+            if !Policy::load(&Policy::user_path(&person)).unwrap_or_default().has_persona(named) {
+                write_response(&mut writer, &refuse(format!("{person} has no persona {persona:?}")))?;
+                continue;
+            }
+            static PANE_UIDS: Mutex<()> = Mutex::new(());
+            let held = PANE_UIDS.lock().unwrap_or_else(|e| e.into_inner());
+            let got = launch::settings_pane(&person, app_id, named);
+            drop(held);
+            let (pane_uid, run_as, data) = match got {
+                Ok(x) => x,
+                Err(e) => {
+                    write_response(&mut writer, &Response::LaunchFailed { stage: "pane".into(),
+                        message: format!("{app_id}'s settings for {person} in {persona}: {e:?}") })?;
+                    continue;
+                }
+            };
+            eprintln!("portcullisd: {app_id}'s settings pane for {person} in {persona} runs as {run_as}");
+            let rule = portcullis_policy::WorkerRule {
+                callers: vec![LIMEN_USER.to_string()], caller_apps: Vec::new(), run_as,
+                per_instance: false, concurrent: Some(PROVIDERS_PER_APP),
+            };
+            handle_exec_instance(app_id.clone(), instance.clone(), 16, (Some(PANE_MEMORY_MB), None, true), Some(rule), Vec::new(),
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, Some(pane_uid), None, None, false,
+                                 Some(data))?;
+            continue;
+        }
         if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves, persona: into } = req {
             /* ★ The fetcher only through OpenFetcher: started here, it would
              * skip the caller's `net-fetch` check, and the system grant of the
@@ -629,7 +679,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 as_uid.or_else(|| rule.as_ref().and_then(|r| uid_of_user(&r.run_as))).or(Some(uid))
             } else { None };
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain, false)?;
+                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain, false, None)?;
             continue;
         }
         /* ★ WorkerCall (app-composition.md §4, dev-tools-plan.md M5): one
@@ -683,7 +733,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             };
             handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
                                  &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()),
-                                 Some((person.clone(), persona.clone())), false)?;
+                                 Some((person.clone(), persona.clone())), false, None)?;
             continue;
         }
         /* ★ SystemWorker (app-composition.md C6, dev-tools.md §3.5): one of
@@ -749,7 +799,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: system worker {bundle} {instance} for {app} ({person}) runs as {}", rule.run_as);
             handle_exec_instance(bundle.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false, None)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -793,7 +843,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid), true)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid), true, None)?;
             continue;
         }
         /* ★ OpenPortalFetcher (atrium-net.md §8.1): a captive portal's
@@ -850,7 +900,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             portcullisd::portal::watch(true);
             // The sign-in page is the network's own: never in a tunnel.
             let r = handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false);
+                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false, None);
             portcullisd::portal::watch(false);
             r?;
             continue;
@@ -900,7 +950,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
             handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid), false)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid), false, None)?;
             continue;
         }
         /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
@@ -1256,6 +1306,9 @@ fn handle_exec_instance(
      * tunnel. None: the host's own table (the portal's sign-in fetcher). */
     domain:   Option<(String, Option<String>)>,
     ordinary_fetcher: bool,
+    /* Some: the app's settings pane (`[roles.app-settings]`, curia.md §15),
+     * with this folder of the app's data; like a worker, no capability. */
+    pane:     Option<PathBuf>,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -1312,7 +1365,7 @@ fn handle_exec_instance(
             });
         }
     }
-    let (delta, system_unusable) = if worker.is_some() { (Default::default(), None) } else {
+    let (delta, system_unusable) = if worker.is_some() || pane.is_some() { (Default::default(), None) } else {
         let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
         let tp = match st.get_or_load(user) {
             Ok(tp) => tp,
@@ -1431,6 +1484,7 @@ fn handle_exec_instance(
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
         extra_env,
         worker,
+        pane,
         fib,
     };
     /* ★ A worker does not outlive its caller. The caller holds this
@@ -1480,6 +1534,8 @@ fn handle_exec_instance(
 /// limend's user: the only caller a manifest's `[roles]` provider is
 /// started for without a system rule.
 const LIMEN_USER: &str = "_limen";
+/// A settings pane's memory: a list and its buttons (curia.md §15).
+const PANE_MEMORY_MB: u64 = 256;
 /// How many embeds of one manifest provider may run at once.
 const PROVIDERS_PER_APP: usize = 32;
 
@@ -4440,7 +4496,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
          * socket this handler does not. Reaching here means that routing was
          * removed — refuse rather than fall through to something that cannot
          * receive the caller's descriptors. */
-        Request::ExecInstance { .. } => Response::Error {
+        Request::ExecInstance { .. } | Request::ExecSettingsPane { .. } => Response::Error {
             message: "ExecInstance must be routed through the fd-passing path".into(),
         },
         Request::OpenCdm { .. } => Response::Error {

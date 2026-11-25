@@ -94,32 +94,39 @@ fn not_a_page(app: &str) -> Option<u64> {
 
 impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
-        self.start(app, embed, channel, None, None, None, not_a_page(app))
+        self.start_as(Exec::Instance, app, embed, channel, None, None, None, not_a_page(app))
     }
 
     /// The child serves `parent_uid`: under a `per_instance` worker rule it
     /// runs as a uid of the parent's instance (its person and persona), and
     /// portcullisd says which.
     fn launch_for(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), None, None, not_a_page(app))
+        self.start_as(Exec::Instance, app, embed, channel, Some(parent_uid), None, None, not_a_page(app))
     }
 
     /// The child in another of the parent's person's personas: portcullisd
     /// starts it only while that person's `share` crossing switch from the
     /// parent's persona to `persona` is on (share-sheet.md §7).
     fn launch_in(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), Some(persona), None, not_a_page(app))
+        self.start_as(Exec::Instance, app, embed, channel, Some(parent_uid), Some(persona), None, not_a_page(app))
+    }
+
+    /// The app's own settings pane for Settings (curia.md §15):
+    /// portcullisd checks the parent and the persona, and runs the pane's
+    /// entry as the app's uid there, with its data and no capability.
+    fn launch_settings(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
+        self.start_as(Exec::SettingsPane, app, embed, channel, Some(parent_uid), Some(persona), None, None)
     }
 
     fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32, fetch: UnixStream, memory_mb: Option<u64>) -> Result<u32, String> {
-        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, Some(fetch), memory_mb)
+        self.start_as(Exec::Instance, crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, Some(fetch), memory_mb)
     }
 
     fn launch_island_standby(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
         if !self.standby { return Err("standby engines are off (LIMEN_ISLAND_STANDBY)".into()); }
         // No fetch socket: stdout is /dev/null, which is how the engine
         // knows to warm up and then wait for one on its channel.
-        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, None, Some(crate::web_island::PART_MEMORY_MB))
+        self.start_as(Exec::Instance, crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, None, Some(crate::web_island::PART_MEMORY_MB))
     }
 
     fn end(&mut self, embed: EmbedId) {
@@ -129,18 +136,30 @@ impl Launcher for Portcullis {
     }
 }
 
+/// Which of portcullisd's launches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exec {
+    /// `ExecInstance`: a provider, a worker, an engine.
+    Instance,
+    /// `ExecSettingsPane`: an app's settings pane, which portcullisd runs
+    /// with no capability of the app's, so with no app socket.
+    SettingsPane,
+}
+
 impl Portcullis {
-    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>, memory_mb: Option<u64>) -> Result<u32, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn start_as(&mut self, exec: Exec, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>, memory_mb: Option<u64>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         // A provider from its manifest's [roles] implements has no system
         // rule: portcullisd runs it as a uid of the parent's instance (as a
         // per-instance rule would) and says which.
         let mut uid = match self.run_as(app) {
+            _ if exec == Exec::SettingsPane => None,
             Ok(u) => Some(u),
             Err(_) if serves.is_some() && implements_a_role(app) => None,
             Err(e) => return Err(e),
         };
-        no_app_socket(app)?;
+        if exec == Exec::Instance { no_app_socket(app)? }
         let engine = app == "org.atrium.navigator.engine";
         let go = || -> io::Result<UnixStream> {
             let path = portcullis_ipc::resolve_socket_path()
@@ -152,19 +171,26 @@ impl Portcullis {
                 other => return Err(io::Error::other(format!("hello: {other:?}"))),
             }
             if engine { crate::start_trace("limend", "exec-instance", app) }
-            write_request(&mut s, &Request::ExecInstance {
-                app_id: app.to_string(),
-                instance: Some(format!("limen-{embed:016x}")),
-                tmpfs_mb: 64,
-                // The provider's [resources] set the caps, and `memory_mb`
-                // only tightens them (a part of a page); a machine without
-                // racct refuses rather than runs it uncapped.
-                memory_mb,
-                cpu_pct: None,
-                require_memory_limit: true,
-                serves,
-                persona: persona.map(str::to_string),
-            })?;
+            let instance = Some(format!("limen-{embed:016x}"));
+            let req = match (exec, serves, persona) {
+                (Exec::SettingsPane, Some(serves), Some(persona)) =>
+                    Request::ExecSettingsPane { app_id: app.to_string(), instance, serves, persona: persona.to_string() },
+                (Exec::SettingsPane, ..) => return Err(io::Error::other("a settings pane serves a parent in a persona")),
+                (Exec::Instance, ..) => Request::ExecInstance {
+                    app_id: app.to_string(),
+                    instance,
+                    tmpfs_mb: 64,
+                    // The provider's [resources] set the caps, and `memory_mb`
+                    // only tightens them (a part of a page); a machine without
+                    // racct refuses rather than runs it uncapped.
+                    memory_mb,
+                    cpu_pct: None,
+                    require_memory_limit: true,
+                    serves,
+                    persona: persona.map(str::to_string),
+                },
+            };
+            write_request(&mut s, &req)?;
             match read_response(&mut s)? {
                 Response::ReadyForFds => {}
                 Response::ReadyForFdsAs { uid: u } => uid = Some(u),

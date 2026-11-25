@@ -161,6 +161,16 @@ rw_patterns = [
     "/root/.atrium/persona-apps/*/.fasti/*",
     "/var/run/atrium/fasti/*",
 
+    # An app's own data in one persona (its overlay), read-write at
+    # /app-data in that app's settings pane, which runs as the app's own
+    # uid (curia.md §15; portcullisd's ExecSettingsPane).
+    "/usr/home/*/.atrium/apps/*",
+    "/usr/home/*/.atrium/persona-apps/*/*",
+    "/home/*/.atrium/apps/*",
+    "/home/*/.atrium/persona-apps/*/*",
+    "/root/.atrium/apps/*",
+    "/root/.atrium/persona-apps/*/*",
+
     # A folder of a USB stick granted into an app's jail: dispensatord's
     # FUSE mount of the stick's own server (device-assignment.md §4.8).
     "/media/.grants/*",
