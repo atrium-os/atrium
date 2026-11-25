@@ -931,6 +931,11 @@ impl Live {
                         send(&mut self.w, &Request::Discard { id });
                     }
                 }
+                Event::LivePrint { from } => {
+                    if !s.live_print(&from) {
+                        eprintln!("navigator-ui: a live page's print not taken");
+                    }
+                }
                 Event::LiveRefused { from, what } => {
                     if s.live_refused(&from, &what) {
                         eprintln!("navigator-ui: the live page was refused {what}");

@@ -256,6 +256,8 @@ pub trait Hooks {
     fn refused_api(&mut self, _api: limen::web_island::Api) {}
     /// The file the person picked for the page (I6.4), taken once.
     fn picked(&mut self) -> Option<Vec<u8>> { None }
+    /// The page asked to be printed (I6.4).
+    fn print(&mut self) {}
 }
 
 /// Serve one live page's engine on its fetch channel until it closes it.
@@ -346,6 +348,10 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         if delivered && open.url.starts_with("https://live-page.atrium.invalid/") && open.url != limen::web_island::LIVE_STORAGE {
             let (status, kind, body): (u16, Option<&str>, std::borrow::Cow<[u8]>) = match (reporter_request(&open.url), post) {
                 (Some(Reporter::Script), None) => (200, Some("text/javascript"), REPORTER.into()),
+                (Some(Reporter::Print), None) => {
+                    hooks.print();
+                    (204, None, b"".into())
+                }
                 (Some(Reporter::Refused(api)), None) => {
                     hooks.refused_api(api);
                     (204, None, b"".into())
@@ -446,6 +452,7 @@ const REPORTER: &[u8] = include_bytes!("live_reporter.js");
 #[derive(Debug, PartialEq)]
 enum Reporter {
     Script,
+    Print,
     PickedFile,
     Refused(limen::web_island::Api),
     Download { name: String, kind: String },
@@ -455,6 +462,7 @@ fn reporter_request(url: &str) -> Option<Reporter> {
     use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
     if url == LIVE_REPORTER { return Some(Reporter::Script); }
     if url == limen::web_island::LIVE_FILE { return Some(Reporter::PickedFile); }
+    if url == limen::web_island::LIVE_PRINT { return Some(Reporter::Print); }
     let (at, query) = url.split_once('?')?;
     let u = url::Url::parse(url).ok()?;
     let pairs: Vec<(String, String)> = u.query_pairs().take(4).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
@@ -547,6 +555,8 @@ pub trait Tell: Send + Sync + 'static {
     fn file(&self, file: Offered);
     /// Something the page was refused (I6.4), in the popover's words.
     fn refused(&self, what: String);
+    /// The page asked to be printed (I6.4).
+    fn print(&self);
     /// The run ended by itself (`None`: the engine closed) or failed;
     /// once, and never after [`Live::stop`].
     fn finished(&self, why: Option<String>);
@@ -661,7 +671,12 @@ struct RunHooks {
     apis: std::collections::HashSet<limen::web_island::Api>,
     /// The file the person picked, waiting for the engine's GET.
     picked: Arc<Mutex<Option<Vec<u8>>>>,
+    /// When the page last asked to be printed.
+    printed: Option<Instant>,
 }
+
+/// How long after a print a page may ask for another.
+const PRINT_AGAIN: Duration = Duration::from_secs(5);
 
 impl Hooks for RunHooks {
     fn started(&mut self, page: &str) { let _ = self.delivered.send(page.to_string()); }
@@ -681,6 +696,17 @@ impl Hooks for RunHooks {
     }
     fn refused(&mut self, target: &str) { self.tell.refused(format!("a request to {}", refused_host(target))); }
     fn picked(&mut self) -> Option<Vec<u8>> { self.picked.lock().unwrap().take() }
+    fn print(&mut self) {
+        // Prelum's sheet over the window, at most once every PRINT_AGAIN:
+        // a page can't keep the window under print sheets.
+        let now = Instant::now();
+        if self.printed.is_some_and(|t| now.duration_since(t) < PRINT_AGAIN) {
+            self.tell.refused("a print asked for again at once".into());
+            return;
+        }
+        self.printed = Some(now);
+        self.tell.print();
+    }
     fn refused_api(&mut self, api: limen::web_island::Api) {
         if self.apis.insert(api) {
             eprintln!("navigatord: a live page was refused {}", api.label());
@@ -730,7 +756,7 @@ impl Live {
         let forms = jar.clone();
         let closing = jar.clone();
         let picked = Arc::new(Mutex::new(None));
-        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone() };
+        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone(), printed: None };
         std::thread::spawn(move || {
             let result = match jar {
                 Some(mut jar) => serve(channel, &page, &mut jar, &mut hooks),
@@ -1149,6 +1175,8 @@ mod tests {
     fn the_reporters_requests_are_parsed_strictly() {
         use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
         assert_eq!(reporter_request(LIVE_REPORTER), Some(Reporter::Script));
+        assert_eq!(reporter_request(limen::web_island::LIVE_PRINT), Some(Reporter::Print));
+        assert_eq!(reporter_request(&format!("{}?x", limen::web_island::LIVE_PRINT)), None);
         assert_eq!(reporter_request(&format!("{LIVE_REFUSED}?api=service-worker")), Some(Reporter::Refused(Api::ServiceWorker)));
         assert_eq!(reporter_request(&format!("{LIVE_DOWNLOAD}?name=a%2Fb.csv&type=Text%2FCSV%3Bcharset%3Dutf-8")),
                    Some(Reporter::Download { name: "a/b.csv".into(), kind: "text/csv".into() }), "the name is made safe when it is held");

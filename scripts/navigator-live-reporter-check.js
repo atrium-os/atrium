@@ -16,7 +16,7 @@ const g = {
   fetch: (url, opts) => { sent.push([url, opts && opts.method || "GET"]);
     return Promise.resolve({ blob: () => Promise.resolve({ size: 17, type: "text/plain" }) }); },
   HTMLAnchorElement: Anchor, document: {}, DOMException,
-  window: { open() { sent.push("original-open"); return {}; }, addEventListener: (t, f) => listeners.push([t, f]) },
+  window: { open() { sent.push("original-open"); return {}; }, print() { sent.push("original-print"); }, addEventListener: (t, f) => listeners.push([t, f]) },
 };
 g.window.open = g.window.open;
 const f = new Function(...Object.keys(g), src);
@@ -32,6 +32,10 @@ f(...Object.values(g));
   await assert.rejects(g.navigator.serviceWorker.register("/sw.js"), { name: "SecurityError" });
   await assert.rejects(g.navigator.clipboard.readText(), { name: "NotAllowedError" });
   assert.equal(g.window.open("https://elsewhere.example/"), null);
+  g.window.print();
+  const key = { ctrlKey: true, key: "p", preventDefault() { this.prevented = true; } };
+  listeners.find(l => l[0] === "keydown")[1](key);
+  assert.ok(key.prevented, "Ctrl-P is Navigator's");
   // A blob download by click, and one by a.click() off the document.
   const ev = { target: new Anchor({ href: "blob:https://app.example/1", download: "notes.txt" }, true), defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
   listeners.find(l => l[0] === "click")[1](ev);
@@ -49,5 +53,6 @@ f(...Object.values(g));
   assert.ok(urls.includes("https://live-page.atrium.invalid/download?name=notes.txt&type=text%2Fplain POST"));
   assert.ok(urls.includes("https://live-page.atrium.invalid/download?name=two.txt&type=text%2Fplain POST"));
   assert.ok(urls.includes("original-open"), "a navigation still goes");
+  assert.equal(urls.filter(u => u === "https://live-page.atrium.invalid/print GET").length, 2, "window.print and Ctrl-P");
   console.log("reporter ok");
 })().catch(e => { console.error(e); process.exit(1); });

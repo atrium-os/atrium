@@ -2920,20 +2920,38 @@ on the Mac.
    second is answered empty, and the popover names "a file picker asked
    for again at once".
 
-#### Printing and the clipboard (I6.4, still to build)
+#### I6.4 as built (2026-11-25, third part: printing)
 
-- **Printing.** `window.print()` and the Print command on a live page
-  print the trail entry's document-lane rendering through the existing
-  path (the page child writes the PDF in its jail, Prelum's sheet takes
-  it), so a page printed while it runs prints what its address shows, not
-  its live state. Printing the live state needs the engine to paint to a
-  PDF, which is its own step.
-- **Clipboard.** Copy is the engine's to report (`Report::Copy` with the
-  text, bounded) and the UI's to write through Tabula with the press
-  that made it. Paste needs frescod's activation token for a press that
-  went to the island to reach the UI or the engine: today a token is
-  minted for, and spent by, the window's owner. That is a Fresco change
-  (tabula.md §2) and comes first.
+Host-tested; no engine change.
+
+- The reporter replaces `window.print()` and takes Ctrl-P (Cmd-P) in the
+  page: each GETs `LIVE_PRINT` (`https://live-page.atrium.invalid/print`).
+  navigatord passes it on as `Event::LivePrint` at most once every 5 s (a
+  second ask sooner is named in the popover), and the UI prints only for
+  the run on screen, once at a time, exactly as its own Ctrl-P: the trail
+  entry's document-lane child (hidden under the island, still attached)
+  lays the page out and writes the PDF in its jail, and Prelum's sheet
+  takes it. So a page printed while it runs prints what its address
+  shows, not its live state; printing the live state needs the engine to
+  paint to a PDF, which is its own step. limend's print-sheet slowing
+  (printing.md §5.2) still applies.
+
+**Gate (Mac):** on `app.html` run live, Ctrl-P in the page opens Prelum's
+sheet over the window with the fixture's document-lane rendering; Cancel,
+then a script's `window.print()` twice at once opens one sheet and the
+popover names "a print asked for again at once".
+
+#### The clipboard (I6.4, still to build)
+
+Copy is the engine's to report (the page's text, bounded) and the UI's to
+write through Tabula; paste needs the person's Ctrl-V. Both spend
+frescod's activation token for the press (tabula.md §2), and today a token
+is minted for, and spent by, the window that got the press. A press on a
+live page goes to the island, the engine's window, so neither the UI nor
+navigatord holds a token Tabula will take. The change is Fresco's first:
+frescod lets the parent of an island spend a token minted for a press in
+that island (it knows the embed), and Tabula's check names the parent's
+uid. Then the engine forwards each copy and each Ctrl-V with its token.
 
 #### Costs
 
@@ -3883,4 +3901,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4's first part](#i64-as-built-2026-11-25-first-part-downloads-and-refusals) (downloads from links, forms and scripts; refused APIs answered at once and named in the popover) and [second part](#i64-as-built-2026-11-25-second-part-file-input) (file input through Scrinium's picker) are host-tested and wait for their gates.
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4's first part](#i64-as-built-2026-11-25-first-part-downloads-and-refusals) (downloads from links, forms and scripts; refused APIs answered at once and named in the popover) [second part](#i64-as-built-2026-11-25-second-part-file-input) (file input through Scrinium's picker) and [third part](#i64-as-built-2026-11-25-third-part-printing) (printing) are host-tested and wait for their gates; the [clipboard](#the-clipboard-i64-still-to-build) waits on a Fresco change.
