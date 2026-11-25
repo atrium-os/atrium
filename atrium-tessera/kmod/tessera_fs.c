@@ -4398,6 +4398,10 @@ struct tessera_mount {
 	 * deadlocking. owner == the thread holding it; depth == nesting. */
 	struct thread            *flush_gate_owner;
 	int                       flush_gate_depth;
+	/* The owner's td_pflags as they were before it took the gate
+	 * (curthread_pflags_set): the holder never waits for running buffer
+	 * space, see tessera_fs_gate_owned(). */
+	int                       flush_gate_pflags;
 
 	/* v2-step-2b: dirty-inode write-back cache. Mutations stage
 	 * the new inode record here instead of immediately btree_put-
@@ -9346,9 +9350,8 @@ fail_close:
 	}
 	if (sb_a) free(sb_a, M_TESSERA);
 	if (sb_b) free(sb_b, M_TESSERA);
-	g_topology_lock();
-	g_vfs_close(cp);
-	g_topology_unlock();
+	/* With devvp locked, as g_vfs_close requires (see unmount). */
+	g_vfs_close_unlocked(cp);
 	dev_rel(dev);
 	return (err);
 }
@@ -9988,11 +9991,14 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			(void)VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
 			VOP_UNLOCK(tmp_->devvp);
 		}
-		if (tmp_->cp != NULL) {
-			g_topology_lock();
-			g_vfs_close(tmp_->cp);
-			g_topology_unlock();
-		}
+		/* g_vfs_close invalidates devvp's buffers, syncing any still
+		 * dirty (the FSYNC above can fail, or a late bdwrite land),
+		 * and VOP_FSYNC needs devvp locked: the unlocked call
+		 * panicked a DEBUG_VFS_LOCKS kernel at umount with 5 dirty
+		 * buffers left. g_vfs_close_unlocked takes the lock, as
+		 * ffs_unmount does by hand. */
+		if (tmp_->cp != NULL)
+			g_vfs_close_unlocked(tmp_->cp);
 		if (tmp_->devvp != NULL) vrele(tmp_->devvp);
 		if (tmp_->dev != NULL)   dev_rel(tmp_->dev);
 		/* Release the credential reference taken at mount. */
@@ -17263,6 +17269,29 @@ tessera_fs_dirty_content_append_uio(struct tessera_mount *tmp_,
  * but absent from the registry (leaked sectors), and the inode reverts to
  * its pre-write manifest. flush_in_progress is that mutex; these helpers
  * let non-flush callers claim it the same way flush's own loop does. */
+/*
+ * The gate's holder must not wait for running buffer space. Another
+ * Tessera volume on an md(4) over a file of this one (an app overlay, a
+ * home on a memory disk) keeps buffers in flight that complete only when
+ * its md thread writes into this volume, which needs this gate: a holder
+ * asleep in bufwrite()'s waitrunningbufspace() never wakes, and every
+ * writer of both volumes then sleeps on tessgat. bufwrite() exempts the
+ * syncer and bufdaemon (TDP_NORUNNINGBUF) and md-backed vnodes for the
+ * same reason; the gate's holder is the one more writer that must
+ * finish for those in-flight buffers to.
+ */
+static inline void
+tessera_fs_gate_owned(struct tessera_mount *tmp_)
+{
+	tmp_->flush_gate_pflags = curthread_pflags_set(TDP_NORUNNINGBUF);
+}
+
+static inline void
+tessera_fs_gate_released(struct tessera_mount *tmp_)
+{
+	curthread_pflags_restore(tmp_->flush_gate_pflags);
+}
+
 static void
 tessera_fs_flush_gate_enter(struct tessera_mount *tmp_)
 {
@@ -17286,6 +17315,7 @@ tessera_fs_flush_gate_enter(struct tessera_mount *tmp_)
 	tmp_->flush_gate_owner  = curthread;
 	tmp_->flush_gate_depth  = 1;
 	tmp_->flush_gate_t0     = TPROF_T0();
+	tessera_fs_gate_owned(tmp_);
 	mtx_unlock(&tmp_->flush_mtx);
 }
 
@@ -17303,6 +17333,7 @@ tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
 	     curthread, tmp_->flush_gate_owner));
 	if (--tmp_->flush_gate_depth == 0) {
 		TPROF_ADD(TPROF_GATE_HELD, tmp_->flush_gate_t0);
+		tessera_fs_gate_released(tmp_);
 		tmp_->flush_in_progress = 0;
 		tmp_->flush_gate_owner  = NULL;
 		wakeup(&tmp_->flush_in_progress);
@@ -18321,6 +18352,7 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		tmp_->flush_gate_owner  = curthread;
 		tmp_->flush_gate_depth  = 1;
 		tmp_->flush_gate_t0     = TPROF_T0();
+		tessera_fs_gate_owned(tmp_);
 		break;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
@@ -18791,6 +18823,7 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	    ("tessera flush gate depth %d at release (expected 1) — a nested "
 	     "gate_enter/exit pair is unbalanced", tmp_->flush_gate_depth));
 	TPROF_ADD(TPROF_GATE_HELD, tmp_->flush_gate_t0);
+	tessera_fs_gate_released(tmp_);
 	tmp_->flush_gate_depth  = 0;
 	tmp_->flush_in_progress = 0;
 	tmp_->flush_gate_owner  = NULL;
