@@ -3188,8 +3188,8 @@ What already recycles a whole live page, from I2:
   next open; any other origin needs the chip's "Run this page live"
   again. Unsaved page state is lost, as with a widget.
 
-What this part adds (Shankar was asked for the limit; built as
-recommended, 1 GiB for pages):
+What this part adds (Shankar chose the limits on 2026-11-25: 1 GiB for a
+whole page, 256 MiB for parts):
 
 - **The limit by role.** A whole page asks Limen with
   `REQUEST_PAGE_ISLAND` (`Parent::request_page_island`) and gets the
