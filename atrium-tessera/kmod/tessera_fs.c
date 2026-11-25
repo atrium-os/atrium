@@ -24102,12 +24102,17 @@ next_p:
 	 * one wedged run. A pass that frees nothing must read as unproductive
 	 * so the caller's exponential backoff engages.
 	 */
+	int _gc_crc = 0;
 	if (gone_n > 0 || retired > 0 || compacted > 0) {
 		if (gone_n > 0 || compacted > 0) {
-			(void)tessera_commit_extent(tmp_);
+			_gc_crc = tessera_commit_extent(tmp_);
 			printf("tessera_fs: gc post commit_extent\n");
 		}
-		(void)tessera_commit_sb(tmp_);
+		{
+			int _src = tessera_commit_sb(tmp_);
+			if (_gc_crc == 0)
+				_gc_crc = _src;
+		}
 		printf("tessera_fs: gc post commit_sb\n");
 	}
 	/* ★ #79: close the apply window. Must be AFTER commit_extent /
@@ -24115,6 +24120,14 @@ next_p:
 	 * allocator deltas are committed, so that is the true end of the
 	 * span a publisher must not have straddled. */
 	mtx_lock(&tmp_->flush_mtx);
+	/* A failed commit here leaves the in-memory allocator counting the
+	 * reclaimed sectors free while the on-disk SB still names them: the
+	 * next write could land on them, and a crash before a later commit
+	 * would mount the old generation over overwritten data. Latch the
+	 * cannot-commit state, which refuses new allocations, so nothing is
+	 * handed out until an operator clears it after a repair. */
+	if (_gc_crc != 0 && !tmp_->flush_unmounting)
+		tessera_fs_commit_failed_latch(tmp_, _gc_crc);
 	atomic_store_rel_64(&tmp_->gc_apply_gen, tmp_->gc_apply_gen + 1);
 	KASSERT((tmp_->gc_apply_gen & 1) == 0,
 	    ("tessera gc_apply_gen %ju is odd after closing the apply "
