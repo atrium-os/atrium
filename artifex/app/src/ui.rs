@@ -18,6 +18,7 @@ use pergola::node::Node;
 use pergola::theme::{font, radius, type_size, Weight};
 use pergola::view::{Ctx, View};
 use pergola::text_edit::TextEdit;
+use pergola::widgets::code_grid::{Menu, Tip, MENU_ROWS};
 use pergola::widgets::{phosphor, Button, CodeGrid, CodeView, TextField};
 use pergola::{Color, Mutable, TextStyle};
 use portcullis_ipc::WorkspaceInfo;
@@ -157,6 +158,23 @@ pub enum Act {
     IconFinishPen,
     IconSave,
     IconClose,
+    /// Completion at the caret (Ctrl+Space).
+    Complete,
+    /// Accept the menu's `i`th row (a completion or a quick fix).
+    MenuPick(usize),
+    MenuClose,
+    /// Where the symbol at the caret is used (Shift+F12).
+    References,
+    /// Go to the `i`th of the references.
+    Reference(usize),
+    /// Rename the symbol at the caret (F2): the bar, then its name.
+    StartRename,
+    Rename(String),
+    CancelRename,
+    /// Quick fixes at the caret (Ctrl+.).
+    QuickFix,
+    /// Format the file (Shift+Alt+F).
+    Format,
 }
 
 /// The debugger as the window shows it.
@@ -206,6 +224,7 @@ pub enum Panel {
     Output,
     Problems,
     Debug,
+    References,
 }
 
 /// A tab as the bar shows it.
@@ -232,6 +251,10 @@ pub struct DocCells {
     pub off_breakpoints: Mutable<Vec<usize>>,
     /// A value shown under a name while stopped: line, column, text.
     pub note: Mutable<Option<(usize, usize, String)>>,
+    /// The completion or quick-fix menu at the caret.
+    pub menu: Mutable<Option<Menu>>,
+    /// The signature of the call the caret is in.
+    pub tip: Mutable<Option<Tip>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -293,6 +316,15 @@ pub struct State {
     pub assets: Option<crate::assets::Assets>,
     /// The app a Run started, as the inspector sees it.
     pub inspect: Option<crate::inspector::Inspect>,
+    /// Where the symbol last asked about is used: file in work, 0-based
+    /// line, char column, the line's text.
+    pub refs: Vec<(String, usize, usize, String)>,
+    /// The rename bar is up, for this name.
+    pub renaming: Option<String>,
+    /// The menu at the caret: how many rows, the first one (for the trace).
+    pub menu: Option<(usize, String)>,
+    /// The signature shown (for the trace).
+    pub tip: Option<String>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -317,7 +349,14 @@ fn pressed(q: &Queue, f: impl Fn([u8; 16]) -> Act + Send + Sync + 'static) -> im
 /// The shortcut a key is, when the editor had no use for it.
 pub fn shortcut(key: Key, m: Modifiers, chars: &str) -> Option<Act> {
     let c = chars.chars().next().map(|c| c.to_ascii_lowercase());
+    if key == Key::Char && m.shift && m.alt && !m.ctrl && c == Some('f') {
+        return Some(Act::Format);
+    }
     match (key, m.ctrl, m.shift) {
+        (Key::Char, true, false) if c == Some(' ') => Some(Act::Complete),
+        (Key::Char, true, false) if c == Some('.') => Some(Act::QuickFix),
+        (Key::F(12), _, true) => Some(Act::References),
+        (Key::F(2), false, false) => Some(Act::StartRename),
         (Key::Char, true, false) if c == Some('s') => Some(Act::Save),
         (Key::Char, true, false) if c == Some('b') => Some(Act::Task(0)),
         (Key::Char, true, false) if c == Some('r') => Some(Act::Run),
@@ -339,6 +378,43 @@ pub fn shortcut(key: Key, m: Modifiers, chars: &str) -> Option<Act> {
     }
 }
 
+/// Keys the menu at the caret takes before the editor: Up, Down, Page
+/// Up/Down move its selection, Enter or Tab accept, Escape closes it (or
+/// the signature tip, when that's all there is).
+pub fn menu_keys(menu: Mutable<Option<Menu>>, tip: Mutable<Option<Tip>>, q: Queue) -> pergola::widgets::code_grid::Intercept {
+    Rc::new(move |k, m, _| {
+        if m.ctrl || m.alt || m.meta {
+            return false;
+        }
+        let Some(mut mn) = menu.get_cloned().filter(|mn| !mn.items.is_empty()) else {
+            if k == Key::Escape && tip.get_cloned().is_some() {
+                tip.set(None);
+                return true;
+            }
+            return false;
+        };
+        let last = mn.items.len() - 1;
+        match k {
+            Key::Up => mn.selected = if mn.selected == 0 { last } else { mn.selected - 1 },
+            Key::Down => mn.selected = if mn.selected >= last { 0 } else { mn.selected + 1 },
+            Key::PageUp => mn.selected = mn.selected.saturating_sub(MENU_ROWS),
+            Key::PageDown => mn.selected = (mn.selected + MENU_ROWS).min(last),
+            Key::Enter | Key::Tab => {
+                push(&q, Act::MenuPick(mn.selected.min(last)));
+                return true;
+            }
+            Key::Escape => {
+                menu.set(None);
+                push(&q, Act::MenuClose);
+                return true;
+            }
+            _ => return false,
+        }
+        menu.set(Some(mn));
+        true
+    })
+}
+
 pub struct ArtifexView {
     pub state: Mutable<State>,
     /// New project's name field.
@@ -348,6 +424,8 @@ pub struct ArtifexView {
     pub eval_field: Mutable<TextEdit>,
     pub cond_field: Mutable<TextEdit>,
     pub bp_chosen: Mutable<Option<(String, usize)>>,
+    /// The rename bar's new name.
+    pub rename_field: Mutable<TextEdit>,
     pub doc: Mutable<Option<DocCells>>,
     pub size: Mutable<(f32, f32)>,
     pub queue: Queue,
@@ -742,6 +820,13 @@ impl View for ArtifexView {
                 .stopped(doc.stopped.get_cloned())
                 .off_breakpoints(doc.off_breakpoints.get_cloned())
                 .note(doc.note.get_cloned())
+                .menu(doc.menu.get_cloned())
+                .tip(doc.tip.get_cloned())
+                .on_menu_pick({
+                    let q3 = q.clone();
+                    Rc::new(move |i| push(&q3, Act::MenuPick(i)))
+                })
+                .intercept_keys(menu_keys(doc.menu.clone(), doc.tip.clone(), q.clone()))
                 .on_point({
                     let q3 = q.clone();
                     let last = Rc::new(std::cell::Cell::new(None));
@@ -775,6 +860,25 @@ impl View for ArtifexView {
             }
             ctx.pop();
         }
+        if let Some(old) = &s.renaming {
+            // The rename bar, across the top of the editor.
+            let (bx, by, bw, bh) = (er.x() + em(16.0), er.y() + em(8.0), (er.w() - em(32.0)).min(em(560.0)), em(44.0));
+            ctx.key(3200);
+            ctx.add(Node::Rect { rect: Rect::new(bx, by, bw, bh), fill: t.bg_elevated(), radius: radius::SM });
+            text(ctx, bx + em(12.0), by + bh / 2.0, &fit(&format!("Rename {old} to"), em(150.0), type_size::SM), type_size::SM, Weight::Medium, t.text_primary());
+            let fw = (bw - em(170.0) - em(190.0)).max(em(80.0));
+            ctx.key(3201);
+            let q3 = q.clone();
+            TextField::new(self.rename_field.clone()).key(3201).at(bx + em(165.0), by + em(7.0)).width(fw).autofocus(true)
+                .on_submit(move |text| push(&q3, Act::Rename(text.to_string()))).render(ctx);
+            ctx.key(3202);
+            let q4 = q.clone();
+            let field = self.rename_field.clone();
+            Button::primary("Rename").at(bx + bw - em(184.0), by + em(7.0)).width(em(88.0))
+                .on_click(move || push(&q4, Act::Rename(field.get_cloned().text().to_string()))).render(ctx);
+            ctx.key(3203);
+            Button::ghost("Cancel").at(bx + bw - em(90.0), by + em(7.0)).width(em(80.0)).on_click(plain(q, Act::CancelRename)).render(ctx);
+        }
         }
 
         // The panel: output, problems or the debugger.
@@ -788,6 +892,9 @@ impl View for ArtifexView {
             let mut tabs = vec![(Panel::Output, phosphor::CODE, "Output".to_string()), (Panel::Problems, phosphor::WARNING, format!("Problems ({})", s.problems.len()))];
             if s.debug.is_some() || !s.breakpoints.is_empty() {
                 tabs.push((Panel::Debug, phosphor::BUG, "Debug".to_string()));
+            }
+            if !s.refs.is_empty() || s.panel == Panel::References {
+                tabs.push((Panel::References, phosphor::MAGNIFYING_GLASS, format!("References ({})", s.refs.len())));
             }
             for (i, (p, icon, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
@@ -839,6 +946,27 @@ impl View for ArtifexView {
                 Panel::Debug => {
                     let area = Rect::new(pl, body_y - em(10.0), w - pl, py + panel_of(&s) - (body_y - em(10.0)));
                     crate::views::debug_panel(ctx, &s, q, &self.eval_field, &self.cond_field, &self.bp_chosen, area);
+                }
+                Panel::References => {
+                    if s.refs.is_empty() {
+                        text(ctx, pl + em(12.0), body_y, "No references found.", type_size::SM, Weight::Regular, t.text_tertiary());
+                    }
+                    for (i, (rel, line, col, src)) in s.refs.iter().take(lines_fit).enumerate() {
+                        let y = body_y + i as f32 * em(18.0);
+                        ctx.key(5500 + i as u64);
+                        let id = ctx.push(Node::Rect { rect: Rect::new(pl + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                        if ctx.is_hovered(id) {
+                            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                                *fill = t.state_hover();
+                            }
+                        }
+                        ctx.on_click(id, plain(q, Act::Reference(i)));
+                        let place = format!("{rel}:{}:{}", line + 1, col + 1);
+                        mono(ctx, pl + em(12.0), y, &place, t.info_fg());
+                        let off = em(8.0) * place.chars().count() as f32 + em(24.0);
+                        mono(ctx, pl + off, y, &fit(src.trim(), width - off, type_size::SM), t.text_primary());
+                        ctx.pop();
+                    }
                 }
                 Panel::Problems => {
                     if s.problems.is_empty() {
@@ -1013,6 +1141,38 @@ mod tests {
         assert_eq!(shortcut(Key::Char, m(true, true), "M"), Some(Act::Panel(Panel::Problems)));
         assert_eq!(shortcut(Key::F(12), m(false, false), ""), Some(Act::Definition));
         assert_eq!(shortcut(Key::Char, m(false, false), "s"), None);
+        assert_eq!(shortcut(Key::Char, m(true, false), " "), Some(Act::Complete));
+        assert_eq!(shortcut(Key::Char, m(true, false), "."), Some(Act::QuickFix));
+        assert_eq!(shortcut(Key::F(12), m(false, true), ""), Some(Act::References));
+        assert_eq!(shortcut(Key::F(2), m(false, false), ""), Some(Act::StartRename));
+        assert_eq!(shortcut(Key::Char, Modifiers { shift: true, alt: true, ..Modifiers::default() }, "F"), Some(Act::Format));
+    }
+
+    #[test]
+    fn the_menu_takes_its_keys_first() {
+        let menu = Mutable::new(Some(Menu { line: 0, col: 0, items: vec![("a".into(), String::new()), ("b".into(), String::new()), ("c".into(), String::new())], selected: 0 }));
+        let tip = Mutable::new(Some(Tip { line: 0, col: 0, text: "f(x)".into(), bold: None }));
+        let q: Queue = Default::default();
+        let f = menu_keys(menu.clone(), tip.clone(), q.clone());
+        let none = Modifiers::default();
+        assert!(f(Key::Up, none, ""), "wraps to the last");
+        assert_eq!(menu.get_cloned().unwrap().selected, 2);
+        assert!(f(Key::Down, none, ""));
+        assert_eq!(menu.get_cloned().unwrap().selected, 0);
+        assert!(f(Key::PageDown, none, ""));
+        assert_eq!(menu.get_cloned().unwrap().selected, 2);
+        assert!(!f(Key::Char, none, "x"), "typing goes to the text");
+        assert!(!f(Key::Down, m(true, false), ""));
+        assert!(f(Key::Enter, none, ""));
+        assert_eq!(q.lock().unwrap().drain(..).collect::<Vec<_>>(), vec![Act::MenuPick(2)]);
+        assert!(f(Key::Escape, none, ""));
+        assert!(menu.get_cloned().is_none());
+        assert_eq!(q.lock().unwrap().drain(..).collect::<Vec<_>>(), vec![Act::MenuClose]);
+        // No menu: Escape takes the tip away, then is the editor's again.
+        assert!(!f(Key::Down, none, ""));
+        assert!(f(Key::Escape, none, ""));
+        assert!(tip.get_cloned().is_none());
+        assert!(!f(Key::Escape, none, ""));
     }
 
     #[test]

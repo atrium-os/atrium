@@ -2230,7 +2230,7 @@ origin that saved it.
 7. **I6.6 Hardening.** The remembered choice (D8) in Curia with revoke,
    recycling under memory pressure, the worker audit and check on a
    whole-page engine, and the fuzzed channel's new navigation messages.
-8. **I6.7 IndexedDB kept** (D15; [first part as built](#i67-as-built-2026-11-25-first-part-navigatord-and-the-channel)). A live page's IndexedDB
+8. **I6.7 IndexedDB kept** (D15; [first part as built](#i67-as-built-2026-11-25-first-part-navigatord-and-the-channel); the Cache API, [second part](#i67-as-built-2026-11-25-second-part-the-cache-api)). A live page's IndexedDB
    outlives the run, kept by navigatord as `localStorage` is (D10). Gate:
    the fixture's `indexeddb` line counts visits across Stop, a navigatord
    restart and an engine killed at its memory limit; an Unrecorded trail
@@ -2630,6 +2630,22 @@ Host-tested; the engine side is written, not yet built.
    beside, `null`.
 3. Press **Open another site** twice within a second: one entry beside,
    and the chip's popover names the refused second.
+
+**Gate results on arm64 Tessera, 2026-11-25.** The engine was
+`c2c60510…`, built with the patch at 5b76a7f15 (only `Element.cpp` and
+`Window.cpp` recompiled; the hook is last in `PageClient`, so the
+prebuilt LibWeb keeps its slots) and passing the JIT audit. jaild logged
+no WARNs, and evidence is in
+`~/atrium-vm/evidence/navigator-i6-2-beside-20261125/` on the Mac.
+
+1. Passed. `window-open` read `refused`, `elsewhere.example` showed beside
+   the page in the trail, both engines kept their pids, and the fixture
+   server saw no request for `elsewhere.example`.
+2. Passed. A copy of the fixture calls `window.open` from a timer 3 s after
+   load. It got `null` (`window-open-timer` refused), nothing was added
+   beside, and the popover named "a new window".
+3. Passed. Two presses 0.3 s apart added one entry, and the popover named
+   "a new window, too soon after the last".
 
 **Gate (Mac, arm64 Tessera),** after the I6.1 gate's setup:
 
@@ -3661,6 +3677,64 @@ The trim, rechecked with the fixture's Grow and Release buttons: Grow
 three times took the page's engine from 109 to 306 MB, and Release left it
 there. `kill -INFO` logged the trim, and RSS fell to 110 MB. The page ran
 on.
+
+#### I6.7 as built (2026-11-25, second part: the Cache API)
+
+navigatord side and the engine's Rust side host-tested; the LibWeb patch
+is the Mac step. D10 named `localStorage`, IndexedDB and the Cache API;
+this keeps the third the way D15 keeps the second.
+
+- **The pin.** `Libraries/LibWeb/ServiceWorker/CacheStorage.cpp` and
+  `Cache.cpp` keep every cache in the engine's heap
+  (`m_relevant_name_to_cache_map`, each cache a request response list).
+  `Cache::batch_cache_operations` is where every change lands (`add`,
+  `addAll`, `put`, `delete`), and its step 9, "if the cache write
+  operation ... failed due to exceeding the granted quota limit, throw a
+  QuotaExceededError", is a FIXME at the pin: the commit point.
+- **navigatord.** A second `live_idb::Stores`, apart from IndexedDB's:
+  `<NAVIGATORD_STORE>/live-cache/<site>.idb` and `.idb-log` for the
+  persona's jar, memory for an Unrecorded one, forgotten with the site's
+  other stores. The same bounds (50 MiB a site, its own), the same parts
+  and runs, at `limen::web_island::LIVE_CACHE`
+  (`https://live-page.atrium.invalid/cache-storage`), exempt from the
+  own-address rate as IndexedDB's commits are.
+- **Engine, Rust** (`fixture_fetch.rs`): `navigator_live_cache_load(ctx,
+  on_op)` and `navigator_live_cache_commit()`, with the same
+  `navigator_live_idb_begin` and `navigator_live_idb_op` between.
+
+**The LibWeb patch (`patches/ladybird/live-cache.patch`, Mac),** for
+`ATRIUM_I6_PAGE` and the page's own origin only. Each cache is a database
+named for the cache (`Version(name, 0)`) holding one object store,
+`entries`, whose records are the cache's items: key the item's place as
+a big-endian `u64` (a counter the engine keeps, so order survives), value
+the item as the patch encodes it (request URL, method and headers;
+response type, status, status text, URL list, headers and body bytes).
+navigatord never reads it.
+
+1. *Batch.* At the FIXME for step 9 of `batch_cache_operations`, after
+   the operations ran on the list: `navigator_live_idb_begin`,
+   `Database(name)`, `Store("entries")`, a `Delete` for each item taken
+   out and a `Put` for each item added, then
+   `navigator_live_cache_commit`. On false, restore `backupCache` and
+   throw `QuotaExceededError`, as step 9 says. The item keys live beside
+   the list (a map from item to key) so deletes can name them.
+2. *Open and delete.* `CacheStorage::get_or_create_cache` sends
+   `Version(name, 0)`, `CreateStore("entries", "")` when it makes a
+   cache; `delete_cache` sends `DeleteDatabase(name)`.
+3. *Load.* The first time the page's `CacheStorage` is asked for its
+   map, `navigator_live_cache_load` and rebuild each cache's list in key
+   order, the counter set past the highest key.
+4. A response whose body is not bytes by then (a stream not yet read) is
+   kept for the run only, logged; `put` reads the body before it batches,
+   so this should not happen.
+
+**Gate (Mac),** after the I6.7 gate's setup:
+
+1. Run `app.html` live: `cache-api` reads 1 cached. Stop, run live: 2.
+   Restart navigatord, run live: 3.
+2. An Unrecorded trail: 1 cached, and no `live-cache` file.
+3. `live-cache/app.example.idb-log` is 0600, the persona's Navigator
+   user's, and `live-idb` holds none of it.
 
 #### Costs
 

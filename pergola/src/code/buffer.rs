@@ -840,6 +840,35 @@ impl CodeBuffer {
     }
 
     /// Replace every match; returns how many.
+    /// Make the replacements `parts` (char ranges of the current text) as
+    /// one undo step; the selections move with the text. Ranges past the
+    /// end are clipped, and one that overlaps an earlier one is left out.
+    /// Edits from a language server (a rename, formatting) come this way.
+    pub fn replace(&mut self, parts: Vec<(Range<usize>, String)>) -> bool {
+        let kept = self.kept_parts(parts);
+        self.coalesce = false;
+        self.apply(kept, ChangeKind::Other, After::Mapped { grow: false })
+    }
+
+    /// The edits [`CodeBuffer::replace`] applies of `parts`: clipped to
+    /// the text, in order, an overlapping one left out, CRLF made LF.
+    pub fn kept_parts(&self, mut parts: Vec<(Range<usize>, String)>) -> Vec<(Range<usize>, String)> {
+        let len = self.text.len_chars();
+        for (r, _) in &mut parts {
+            r.end = r.end.min(len);
+            r.start = r.start.min(r.end);
+        }
+        parts.sort_by_key(|(r, _)| (r.start, r.end));
+        let mut kept: Vec<(Range<usize>, String)> = Vec::with_capacity(parts.len());
+        for (r, t) in parts {
+            if kept.last().is_some_and(|(l, _)| l.end > r.start) {
+                continue;
+            }
+            kept.push((r, t.replace("\r\n", "\n")));
+        }
+        kept
+    }
+
     pub fn replace_all(&mut self, needle: &str, with: &str, case: bool) -> usize {
         let parts: Vec<(Range<usize>, String)> = self.find_all(needle, case).into_iter().map(|r| (r, with.to_string())).collect();
         let n = parts.len();

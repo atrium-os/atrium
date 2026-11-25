@@ -61,6 +61,40 @@ pub struct CodeGrid {
     /// The pointer over the text: its line and char index in the line, or
     /// `None` off the text.
     on_point: Option<Rc<dyn Fn(Option<(usize, usize)>)>>,
+    /// A menu under the text (completions).
+    menu: Option<Menu>,
+    /// A press on a menu row, with its index.
+    menu_pick: Option<Rc<dyn Fn(usize)>>,
+    /// A line over the text (a signature).
+    tip: Option<Tip>,
+    /// Sees every key first; `true` keeps it from the buffer.
+    intercept: Option<Intercept>,
+}
+
+/// What [`CodeGrid::intercept_keys`] gets; `true` takes the key.
+pub type Intercept = Rc<dyn Fn(Key, Modifiers, &str) -> bool>;
+
+/// Rows a [`Menu`] shows at once.
+pub const MENU_ROWS: usize = 8;
+
+/// A list shown under the text from (`line`, `col`, a char index of the
+/// line): each item's label and, dimmer, its detail.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Menu {
+    pub line: usize,
+    pub col: usize,
+    pub items: Vec<(String, String)>,
+    pub selected: usize,
+}
+
+/// A line shown over the text at (`line`, `col`), with a char range of it
+/// in bold (a signature and its active parameter).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Tip {
+    pub line: usize,
+    pub col: usize,
+    pub text: String,
+    pub bold: Option<(usize, usize)>,
 }
 
 /// What [`CodeGrid::on_other_key`] gets: the key, its modifiers, its text.
@@ -92,6 +126,10 @@ impl CodeGrid {
             note: None,
             on_point: None,
             gutter_click: None,
+            menu: None,
+            menu_pick: None,
+            tip: None,
+            intercept: None,
         }
     }
     pub fn highlight(mut self, h: Rc<dyn Highlight>) -> Self { self.highlight = h; self }
@@ -110,6 +148,13 @@ impl CodeGrid {
     pub fn on_point(mut self, f: Rc<dyn Fn(Option<(usize, usize)>)>) -> Self { self.on_point = Some(f); self }
     /// A press in the gutter calls `f` with its line (toggle a breakpoint).
     pub fn on_gutter_click(mut self, f: Rc<dyn Fn(usize)>) -> Self { self.gutter_click = Some(f); self }
+    pub fn menu(mut self, m: Option<Menu>) -> Self { self.menu = m; self }
+    /// A press on a menu row calls `f` with its index.
+    pub fn on_menu_pick(mut self, f: Rc<dyn Fn(usize)>) -> Self { self.menu_pick = Some(f); self }
+    pub fn tip(mut self, t: Option<Tip>) -> Self { self.tip = t; self }
+    /// `f` sees each key before the buffer; when it returns `true` the key
+    /// is its own (a menu's Up, Down, Enter, Escape).
+    pub fn intercept_keys(mut self, f: Intercept) -> Self { self.intercept = Some(f); self }
 
     fn style(&self, color: Color) -> TextStyle {
         TextStyle { family: font::MONO.into(), size: self.size, weight: Weight::Regular, color }
@@ -336,6 +381,68 @@ impl View for CodeGrid {
             ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(x + m.pad + 2.0, y + 3.0, sz.w, sz.h), content: text.clone(), style: st });
         }
 
+        // The tip, over its line (under it at the top).
+        if let Some(tp) = self.tip.as_ref().filter(|t| t.line >= v.top && t.line < last && !t.text.is_empty()) {
+            let st = self.style(theme.text_secondary());
+            let strong = TextStyle { weight: Weight::Semibold, ..self.style(theme.accent_fg()) };
+            let chars: Vec<char> = tp.text.chars().collect();
+            let (a, e) = tp.bold.map(|(a, e)| (a.min(chars.len()), e.min(chars.len()))).filter(|(a, e)| a < e).unwrap_or((chars.len(), chars.len()));
+            let parts = [(chars[..a].iter().collect::<String>(), st.clone()), (chars[a..e].iter().collect(), strong), (chars[e..].iter().collect(), st)];
+            let w = parts.iter().map(|(t, s)| Node::measure_text(t, s).w).sum::<f32>() + 2.0 * m.pad + 4.0;
+            let x = x_of(b.display_col(tp.line, tp.col)).max(text_x).min(r.x() + r.w() - w).max(r.x());
+            let above = y_of(tp.line - v.top) - line_h - 8.0;
+            let y = if above < r.y() { y_of(tp.line - v.top) + line_h + 2.0 } else { above };
+            ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x, y, w, line_h + 6.0), fill: theme.border_strong(), radius: 4.0 });
+            ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, w - 2.0, line_h + 4.0), fill: theme.bg_elevated(), radius: 3.0 });
+            let mut tx = x + m.pad + 2.0;
+            for (t, s) in parts {
+                if t.is_empty() {
+                    continue;
+                }
+                let sz = Node::measure_text(&t, &s);
+                ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(tx, y + 3.0, sz.w, sz.h), content: t, style: s });
+                tx += sz.w;
+            }
+        }
+
+        // The menu, under its line (over it near the bottom). Its rows, in
+        // the grid's own coordinates, for a press.
+        let mut menu_rows: Vec<(Rect, usize)> = Vec::new();
+        if let Some(mn) = self.menu.as_ref().filter(|mn| mn.line >= v.top && mn.line < last && !mn.items.is_empty()) {
+            let n = mn.items.len().min(MENU_ROWS);
+            let first = mn.selected.saturating_sub(n - 1).min(mn.items.len() - n);
+            let row_h = line_h + 4.0;
+            let label = self.style(theme.text_primary());
+            let dim = self.style(theme.text_tertiary());
+            let shown = &mn.items[first..first + n];
+            let lw = shown.iter().map(|(l, _)| Node::measure_text(l, &label).w).fold(0.0, f32::max);
+            let dw = shown.iter().map(|(_, d)| Node::measure_text(d, &dim).w).fold(0.0, f32::max);
+            let w = (lw + dw + 4.0 * m.pad + 16.0).clamp(cell * 20.0, (r.w() * 0.7).max(cell * 20.0));
+            let h = n as f32 * row_h + 4.0;
+            let x = x_of(b.display_col(mn.line, mn.col)).max(text_x).min(r.x() + r.w() - w).max(r.x());
+            let below = y_of(mn.line - v.top) + line_h + 2.0;
+            let y = if below + h > r.y() + r.h() && y_of(mn.line - v.top) - h - 2.0 >= r.y() { y_of(mn.line - v.top) - h - 2.0 } else { below };
+            ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x, y, w, h), fill: theme.border_strong(), radius: 4.0 });
+            ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, w - 2.0, h - 2.0), fill: theme.bg_elevated(), radius: 3.0 });
+            for (k, (l, d)) in shown.iter().enumerate() {
+                let i = first + k;
+                let ry = y + 2.0 + k as f32 * row_h;
+                if i == mn.selected {
+                    ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x + 2.0, ry, w - 4.0, row_h), fill: theme.selection_bg(), radius: 3.0 });
+                }
+                let sz = Node::measure_text(l, &label);
+                ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(x + m.pad + 2.0, ry + 2.0, sz.w, sz.h), content: l.clone(), style: label.clone() });
+                let room = w - (lw + 3.0 * m.pad + 12.0);
+                if !d.is_empty() && room > cell * 4.0 {
+                    let keep = ((room / cell).floor() as usize).max(1);
+                    let d: String = if d.chars().count() > keep { d.chars().take(keep.saturating_sub(1)).chain(['…']).collect() } else { d.clone() };
+                    let dz = Node::measure_text(&d, &dim);
+                    ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(x + w - m.pad - 2.0 - dz.w, ry + 2.0, dz.w, dz.h), content: d, style: dim.clone() });
+                }
+                menu_rows.push((Rect::new(x - r.x(), ry - r.y(), w, row_h), i));
+            }
+        }
+
         ctx.focusable(bg);
         ctx.takes_tab(bg);
         if self.autofocus {
@@ -351,9 +458,13 @@ impl View for CodeGrid {
 
         let (buffer, view) = (self.buffer.clone(), self.view.clone());
         let other = self.other_key.clone();
+        let intercept = self.intercept.clone();
         ctx.on_key(bg, move |ev| {
             let Event::Key { kind, key, chars, modifiers } = ev else { return };
             if !kind.pressed() || *kind == KeyEventKind::Up {
+                return;
+            }
+            if intercept.as_ref().is_some_and(|f| f(*key, *modifiers, chars)) {
                 return;
             }
             let mut b = buffer.get_cloned();
@@ -394,7 +505,9 @@ impl View for CodeGrid {
         }
         let (buffer, view) = (self.buffer.clone(), self.view.clone());
         let gutter_click = self.gutter_click.clone();
-        // A press that began in the gutter selects nothing as it moves.
+        let menu_pick = self.menu_pick.clone();
+        // A press that began in the gutter or on the menu selects nothing
+        // as it moves.
         let in_gutter = Rc::new(std::cell::Cell::new(false));
         ctx.on_drag_local(bg, move |phase, p| {
             let mut b = buffer.get_cloned();
@@ -403,6 +516,13 @@ impl View for CodeGrid {
                 return;
             }
             in_gutter.set(false);
+            if phase == DragPhase::Start {
+                if let (Some(f), Some(&(_, i))) = (&menu_pick, menu_rows.iter().find(|(rr, _)| rr.contains(p))) {
+                    in_gutter.set(true);
+                    f(i);
+                    return;
+                }
+            }
             if phase == DragPhase::Start && p.x < m.gutter {
                 if let Some(f) = &gutter_click {
                     in_gutter.set(true);

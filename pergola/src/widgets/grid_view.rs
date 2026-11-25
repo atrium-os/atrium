@@ -575,6 +575,8 @@ pub enum GridAction {
     Sheet(i8),
     /// Shift+F2: the cursor cell's comment, to write or edit.
     Comment,
+    /// A press (and drag) in the cells ended: the selection it made.
+    Selected(CellRange),
     Copy(CellRange),
     Cut(CellRange),
     /// Paste at the active cell; `sel` the selection (a bigger one may be
@@ -1236,7 +1238,18 @@ impl GridView {
                         g.drag = Drag::Cells;
                     }
                     DragPhase::Move if g.drag == Drag::Cells => g.cursor = cell,
-                    DragPhase::End => g.drag = Drag::None,
+                    DragPhase::End => {
+                        let made = g.drag == Drag::Cells;
+                        g.drag = Drag::None;
+                        if made {
+                            let sel = g.selection();
+                            gst.set(g);
+                            if let Some(f) = &act {
+                                f(GridAction::Selected(sel));
+                            }
+                            return;
+                        }
+                    }
                     _ => return,
                 }
                 gst.set(g);
@@ -1474,6 +1487,15 @@ impl GridView {
                         }
                         return;
                     }
+                    (DragPhase::End, Drag::Cols) => {
+                        g.drag = Drag::None;
+                        let sel = g.selection();
+                        gst.set(g);
+                        if let Some(a) = &act {
+                            a(GridAction::Selected(sel));
+                        }
+                        return;
+                    }
                     (DragPhase::End, _) => g.drag = Drag::None,
                     _ => return,
                 }
@@ -1605,6 +1627,15 @@ impl GridView {
                         gst.set(g);
                         if let Some(a) = &act {
                             a(GridAction::ResizeEnd);
+                        }
+                        return;
+                    }
+                    (DragPhase::End, Drag::Rows) => {
+                        g.drag = Drag::None;
+                        let sel = g.selection();
+                        gst.set(g);
+                        if let Some(a) = &act {
+                            a(GridAction::Selected(sel));
                         }
                         return;
                     }
@@ -3508,7 +3539,8 @@ mod tests {
         app.handle_event(Event::PointerDown { at: at(2.0, 3.0) });
         app.handle_event(Event::PointerUp { at: at(2.0, 3.0) });
         app.tick();
-        assert!(log.borrow().is_empty());
+        assert!(!log.borrow().iter().any(|a| matches!(a, GridAction::Fill { .. })));
+        log.borrow_mut().clear();
         grid.fills.set(true);
         let mut g = state.get_cloned();
         g.anchor = (1, 1);
@@ -3923,6 +3955,7 @@ mod tests {
         let p = Point::new(hw + 5.0, HEADER_H + 5.0);
         app.handle_event(Event::PointerDown { at: p });
         app.handle_event(Event::PointerUp { at: p });
+        log.borrow_mut().clear();
         let ctrl = Modifiers { ctrl: true, ..Default::default() };
         let shift = Modifiers { shift: true, ..Default::default() };
         let alt = Modifiers { alt: true, ..Default::default() };
@@ -4119,7 +4152,7 @@ mod tests {
 
     #[test]
     fn dragging_selects_and_the_header_edge_resizes() {
-        let (mut app, grid, _, state, _) = host(100, 20);
+        let (mut app, grid, _, state, log) = host(100, 20);
         app.tick();
         let hw = GridView::header_width(TILE_ROWS * 2);
         let cell = |r: f32, c: f32| Point::new(hw + c * 64.0 + 10.0, HEADER_H + r * 20.0 + 5.0);
@@ -4128,6 +4161,9 @@ mod tests {
         app.handle_event(Event::PointerUp { at: cell(4.0, 3.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 1, c0: 1, r1: 4, c1: 3 });
+        // The press's end reports the selection it made (for Format Painter).
+        assert_eq!(log.borrow().last(), Some(&GridAction::Selected(CellRange { r0: 1, c0: 1, r1: 4, c1: 3 })));
+        assert_eq!(log.borrow().iter().filter(|a| matches!(a, GridAction::Selected(_))).count(), 1, "once, at the end");
         // Column B's right edge in the header, dragged 30 px right.
         let edge = Point::new(hw + 128.0 - 1.0, HEADER_H / 2.0);
         app.handle_event(Event::PointerDown { at: edge });
@@ -4141,6 +4177,7 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(hw + 158.0 + 30.0, HEADER_H / 2.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 2, r1: 99, c1: 2 });
+        assert_eq!(log.borrow().last(), Some(&GridAction::Selected(CellRange { r0: 0, c0: 2, r1: 99, c1: 2 })), "a header press reports its selection");
     }
 
     #[test]

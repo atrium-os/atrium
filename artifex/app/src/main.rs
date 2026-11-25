@@ -48,9 +48,10 @@ fn main() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let new_name = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
     let eval_field = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
+    let rename_field = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
     let view = ArtifexView { state: state.clone(), new_name: new_name.clone(), doc: doc.clone(), size: size.clone(), queue: queue.clone(),
         eval_field: eval_field.clone(), cond_field: Mutable::with_dirty(TextEdit::new(""), dirty.clone()),
-        bp_chosen: Mutable::with_dirty(None, dirty.clone()) };
+        bp_chosen: Mutable::with_dirty(None, dirty.clone()), rename_field: rename_field.clone() };
     let mut app = App::new_with_flag(view, dirty.clone());
     let mut engine = Engine::new(exec);
     engine.set_dirty_flag(dirty);
@@ -86,6 +87,7 @@ fn main() {
         engine.rows = (er.h() / 17.0).ceil().max(1.0) as usize;
         let acts: Vec<Act> = std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
         let mut swap = false;
+        let was_renaming = s.renaming.is_some();
         for a in acts {
             // The form's name goes with Create.
             let a = match a {
@@ -104,6 +106,11 @@ fn main() {
             };
             swap |= engine.act(a, &mut s);
         }
+        if !was_renaming {
+            if let Some(old) = &s.renaming {
+                rename_field.set(TextEdit::new(old));
+            }
+        }
         engine.tick(&mut s);
         let active = engine.active_doc();
         if swap || active.as_ref().map(|d| &d.path) != doc.get_cloned().as_ref().map(|d| &d.path) {
@@ -113,7 +120,7 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?}",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?} menu={:?} tip={:?} refs={} rename={:?}",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -153,7 +160,8 @@ fn main() {
                     v.chosen_row().map(|r| r.kind.clone()),
                     v.chosen_row().and_then(|r| r.site.as_ref()).map(|(f, l, local)| format!("{}:{l}", local.as_deref().unwrap_or(f))),
                     2 + 2 * s.composition.is_some() as usize + s.fuzz.is_some() as usize
-                        + (s.debug.is_some() || !s.breakpoints.is_empty()) as usize)));
+                        + (s.debug.is_some() || !s.breakpoints.is_empty()) as usize)),
+                s.menu, s.tip, s.refs.len(), s.renaming);
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;

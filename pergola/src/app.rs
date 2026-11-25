@@ -57,6 +57,9 @@ pub struct App<V: View> {
     /// The autofocus layer that is up (a dialog, an open menu): Tab stays
     /// inside it, and keys no one in it took go to it.
     modal: Option<NodeId>,
+    /// The layer under the modal one: it is the modal layer again when
+    /// that one goes (an editor under a rename bar keeps hearing keys).
+    modal_return: Option<NodeId>,
     /// When the pointer came onto `hovered`.
     hover_since: f64,
     /// The node whose tooltip is up.
@@ -126,6 +129,7 @@ impl<V: View> App<V> {
             pointing: None,
             focus_return: None,
             modal: None,
+            modal_return: None,
             hover_since: 0.0,
             tip: None,
             tip_warm_until: f64::NEG_INFINITY,
@@ -361,12 +365,15 @@ impl<V: View> App<V> {
             if self.focus_return.is_none() {
                 self.focus_return = self.focused;
             }
+            if self.modal_return.is_none() {
+                self.modal_return = self.modal.filter(|m| *m != id);
+            }
             self.focused = Some(id);
             self.modal = Some(id);
             self.dirty.store(true, Ordering::Release);
         } else {
             if self.modal.is_some_and(|m| next.get(m).is_none()) {
-                self.modal = None;
+                self.modal = self.modal_return.take().filter(|r| next.get(*r).is_some());
             }
             if let Some(f) = self.focused {
                 if next.get(f).is_none() {
@@ -909,6 +916,46 @@ mod tests {
         assert!(app.focus_visible, "Tab shows it");
         app.handle_event(Event::PointerDown { at: crate::geom::Point::new(10.0, 10.0) });
         assert!(!app.focus_visible, "and the pointer hides it again");
+    }
+
+    /// An editor (autofocused, so the layer keys go to) under a bar that
+    /// takes focus for a while: once the bar goes, a key with nothing
+    /// focused reaches the editor again.
+    #[test]
+    fn the_layer_under_a_bar_hears_keys_again_when_it_goes() {
+        struct Editor(Mutable<bool>, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl View for Editor {
+            fn render(&self, ctx: &mut crate::view::Ctx) {
+                ctx.key(1);
+                let ed = ctx.tree.insert(None, Node::Rect { rect: Rect::new(0.0, 0.0, 100.0, 100.0), fill: Color::rgba(0.0, 0.0, 0.0, 1.0), radius: 0.0 });
+                ctx.autofocus(ed);
+                let heard = self.1.clone();
+                ctx.on_key(ed, move |_| { heard.fetch_add(1, Ordering::SeqCst); });
+                if self.0.get() {
+                    ctx.key(2);
+                    let bar = ctx.tree.insert(None, Node::Rect { rect: Rect::new(0.0, 0.0, 50.0, 10.0), fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 0.0 });
+                    ctx.autofocus(bar);
+                }
+            }
+        }
+        let bar = Mutable::new(false);
+        let heard = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut app = App::new(Editor(bar.clone(), heard.clone()));
+        let key = || Event::Key { kind: crate::event::KeyEventKind::Down, key: crate::event::Key::Char, modifiers: Default::default(), chars: "a".into() };
+        app.tick();
+        // A press on nothing focusable: the key still reaches the editor.
+        app.handle_event(Event::PointerDown { at: crate::geom::Point::new(500.0, 500.0) });
+        app.handle_event(key());
+        assert_eq!(heard.load(Ordering::SeqCst), 1);
+        bar.set(true);
+        app.invalidate();
+        app.tick();
+        bar.set(false);
+        app.invalidate();
+        app.tick();
+        app.handle_event(Event::PointerDown { at: crate::geom::Point::new(500.0, 500.0) });
+        app.handle_event(key());
+        assert_eq!(heard.load(Ordering::SeqCst), 2, "the editor is the layer again");
     }
 
     /// A node gone in a tick that also resends everything (a resize) is

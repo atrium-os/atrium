@@ -7,6 +7,7 @@
 //! doesn't.
 
 pub mod assets;
+pub mod assist;
 pub mod composition;
 pub mod dap;
 pub mod engine;

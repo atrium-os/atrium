@@ -254,14 +254,17 @@ pub trait LocalStorage {
     fn load(&mut self, page: &str) -> Result<Vec<u8>, String>;
     fn apply(&mut self, page: &str, batch: &[u8]) -> Result<(), String>;
     /// Its IndexedDB (I6.7): the site's databases, and one part of a commit.
-    fn load_idb(&mut self, _page: &str) -> Result<Vec<u8>, String> { Err("no IndexedDB here".into()) }
-    fn apply_idb(&mut self, _page: &str, _part: &[u8]) -> Result<(), String> { Err("no IndexedDB here".into()) }
+    /// `cache`: the page's Cache API store rather than its IndexedDB
+    /// (I6.7); both are `live_idb` stores.
+    fn load_idb(&mut self, _page: &str, _cache: bool) -> Result<Vec<u8>, String> { Err("no IndexedDB here".into()) }
+    fn apply_idb(&mut self, _page: &str, _part: &[u8], _cache: bool) -> Result<(), String> { Err("no IndexedDB here".into()) }
 }
 
 /// The stores of one jar.
 pub struct JarStores {
     pub stores: Arc<Mutex<crate::live_storage::Stores>>,
     pub idb: Arc<Mutex<crate::live_idb::Stores>>,
+    pub cache: Arc<Mutex<crate::live_idb::Stores>>,
     pub jar: Option<u64>,
 }
 
@@ -274,13 +277,13 @@ impl LocalStorage for JarStores {
         let key = crate::live_storage::Key::of(self.jar, page).ok_or("the page's site has no store")?;
         self.stores.lock().unwrap().apply(&key, batch)
     }
-    fn load_idb(&mut self, page: &str) -> Result<Vec<u8>, String> {
+    fn load_idb(&mut self, page: &str, cache: bool) -> Result<Vec<u8>, String> {
         let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
-        Ok(self.idb.lock().unwrap().load(&key))
+        Ok(if cache { &self.cache } else { &self.idb }.lock().unwrap().load(&key))
     }
-    fn apply_idb(&mut self, page: &str, part: &[u8]) -> Result<(), String> {
+    fn apply_idb(&mut self, page: &str, part: &[u8], cache: bool) -> Result<(), String> {
         let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
-        self.idb.lock().unwrap().apply(&key, part)
+        if cache { &self.cache } else { &self.idb }.lock().unwrap().apply(&key, part)
     }
 }
 
@@ -362,7 +365,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         // An IndexedDB commit is many parts in a row (I6.7: 32 KiB each, so
         // a 30 MiB transaction is about 960); it is bounded by the run's and
         // the site's quota instead of the rate.
-        if own && open.url != limen::web_island::LIVE_IDB {
+        if own && open.url != limen::web_island::LIVE_IDB && open.url != limen::web_island::LIVE_CACHE {
             // A rate, not a lifetime count: a page with frames reads its
             // messages for as long as it runs.
             if own_window.elapsed() >= Duration::from_secs(1) { (own_window, own_count) = (Instant::now(), 0); }
@@ -407,12 +410,13 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         }
         // The page's storage (I6.3): loaded once, changed in batches, kept
         // by navigatord for the page's site.
-        let idb = open.url == limen::web_island::LIVE_IDB;
+        let cache = open.url == limen::web_island::LIVE_CACHE;
+        let idb = open.url == limen::web_island::LIVE_IDB || cache;
         if delivered && (open.url == limen::web_island::LIVE_STORAGE || idb) {
             let answer = match (hooks.storage(), post) {
                 (None, _) => Err("no storage here".to_string()),
-                (Some(l), None) if idb => l.load_idb(&delivered_url).map(|b| (200, b)),
-                (Some(l), Some(b)) if idb => l.apply_idb(&delivered_url, &b.bytes).map(|_| (204, vec![])),
+                (Some(l), None) if idb => l.load_idb(&delivered_url, cache).map(|b| (200, b)),
+                (Some(l), Some(b)) if idb => l.apply_idb(&delivered_url, &b.bytes, cache).map(|_| (204, vec![])),
                 (Some(l), None) => l.load(&delivered_url).map(|b| (200, b)),
                 (Some(l), Some(b)) => l.apply(&delivered_url, &b.bytes).map(|_| (204, vec![])),
             };
@@ -1554,7 +1558,7 @@ mod tests {
         let idb = Arc::new(Mutex::new(crate::live_idb::Stores::new(None)));
         let i2 = idb.clone();
         let server = std::thread::spawn(move || {
-            let mut seen = Seen { local: Some(JarStores { stores: s2, idb: i2, jar: None }), ..Seen::default() };
+            let mut seen = Seen { local: Some(JarStores { stores: s2, idb: i2, cache: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let storage = limen::web_island::LIVE_STORAGE;
@@ -1584,7 +1588,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let i2 = idb.clone();
         let server = std::thread::spawn(move || {
-            let local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: i2, jar: None };
+            let local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: i2, cache: Arc::new(Mutex::new(Stores::new(None))), jar: None };
             let mut seen = Seen { local: Some(local), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
@@ -1616,9 +1620,20 @@ mod tests {
         assert!(back.contains(&Op::Put(b"k".to_vec(), b"v".to_vec())), "the first commit read back");
         let big: usize = back.iter().map(|o| match o { Op::Put(k, v) | Op::Append(k, v) if k == b"big" => v.len(), _ => 0 }).sum();
         assert_eq!(big, (OWN_PER_SECOND as usize + 5) * 32 * 1024, "the many-part commit read back whole");
-        // localStorage is a store of its own.
+        // localStorage is a store of its own, and so is the Cache API's,
+        // which takes the same commits.
         c.open(Open::get(6, limen::web_island::LIVE_STORAGE)).unwrap();
         assert_eq!(body(&mut c).1, b"");
+        let caches = limen::web_island::LIVE_CACHE;
+        c.open(Open::get(7, caches)).unwrap();
+        assert_eq!(body(&mut c).1, b"", "the Cache API store is apart from IndexedDB's");
+        let entry = [Op::Version(b"v1".to_vec(), 0), Op::CreateStore(b"entries".to_vec(), vec![]), Op::Put(1u64.to_be_bytes().to_vec(), b"GET /app.js".to_vec())];
+        c.open(Open::post(8, caches, "application/octet-stream", parts(10, &entry)[0].clone())).unwrap();
+        assert_eq!(body(&mut c).0.map(|h| h.0), Some(204));
+        c.open(Open::get(9, caches)).unwrap();
+        assert_eq!(crate::live_idb::decode_ops(&body(&mut c).1, crate::live_idb::LOAD_MAX).unwrap(), entry);
+        c.open(Open::get(11, at)).unwrap();
+        assert!(!crate::live_idb::decode_ops(&body(&mut c).1, crate::live_idb::LOAD_MAX).unwrap().contains(&entry[2]), "and IndexedDB's holds none of it");
         drop(c);
         server.join().unwrap().unwrap();
     }
@@ -1627,7 +1642,7 @@ mod tests {
     fn storage_is_not_asked_for_before_the_page() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
+            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), cache: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();

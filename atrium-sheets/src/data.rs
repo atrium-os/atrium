@@ -40,6 +40,9 @@ pub enum DataCmd {
     PasteValues,
     PasteFormulas,
     PasteFormats,
+    /// Format Painter: the selection's formats, to paint onto the next cells
+    /// selected (again while on: kept on until Escape).
+    FormatPainter,
     /// The cells last copied here with rows turned into columns.
     PasteTransposed,
     /// The copied cells' comments only.
@@ -402,6 +405,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste Values").enabled(special).separated(), Some(DataCmd::PasteValues)),
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
+        (MenuItem::new("Format Painter"), Some(DataCmd::FormatPainter)),
         (MenuItem::new("Paste Transposed").enabled(special), Some(DataCmd::PasteTransposed)),
         (MenuItem::new("Paste Comments").enabled(special), Some(DataCmd::PasteComments)),
         (MenuItem::new("Paste Skipping Blanks").enabled(special), Some(DataCmd::PasteSkipBlanks)),
@@ -1164,6 +1168,37 @@ pub fn selection_summary(wb: &Workbook, sheet: u16, sel: CellRange, shown: u8) -
         }
         None => officina_grid::value::format_general(x),
     })
+}
+
+/// The most copies of the source Format Painter lays over a selection.
+pub const MAX_PAINT_TILES: u64 = 4096;
+
+/// Format Painter: `clip`'s formats over `sel`, as one undo step: once at its
+/// top left, or repeated over it as many whole times as fit, as Excel's does.
+/// Returns the cells painted.
+pub fn paint_formats(d: &mut Doc, clip: &officina_grid::clip::Clip, src: Rect, sel: CellRange) -> Result<Rect, String> {
+    use officina_grid::clip::{Special, What};
+    let (h, w) = (src.r1 - src.r0 + 1, src.c1 - src.c0 + 1);
+    let one = sel.r0 == sel.r1 && sel.c0 == sel.c1;
+    let (down, across) = if one { (1, 1) } else { (((sel.r1 - sel.r0 + 1) / h).max(1), ((sel.c1 - sel.c0 + 1) / w).max(1)) };
+    if down as u64 * across as u64 > MAX_PAINT_TILES {
+        return Err(format!("That is more than {MAX_PAINT_TILES} copies of the formats; select fewer cells."));
+    }
+    let mut ops = Vec::new();
+    let mut area = Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r0, c1: sel.c0 };
+    for i in 0..down {
+        for j in 0..across {
+            let (r, c) = (sel.r0 + i * h, sel.c0 + j * w);
+            let (o, a) = clip.paste_special(&d.wb, d.sheet, r, c, Special::of(What::Formats))?;
+            ops.extend(o);
+            area.r1 = area.r1.max(a.r1);
+            area.c1 = area.c1.max(a.c1);
+        }
+    }
+    if !d.run_validated("Format Painter", ops) {
+        return Err(d.status.clone());
+    }
+    Ok(area)
 }
 
 /// The most dependents Ctrl+] lists.
@@ -2459,7 +2494,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

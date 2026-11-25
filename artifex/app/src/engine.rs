@@ -13,6 +13,9 @@ use pergola::code::CodeBuffer;
 use pergola::widgets::CodeView;
 use pergola::Mutable;
 
+use pergola::widgets::code_grid::Tip;
+
+use crate::assist;
 use crate::dap;
 use crate::exec::{Exec, Proc};
 use crate::lsp;
@@ -29,6 +32,21 @@ const MARGIN: usize = 120;
 /// Quiet time after typing before the language server hears the text.
 const LSP_SETTLE: Duration = Duration::from_millis(250);
 const GIT_EVERY: Duration = Duration::from_secs(5);
+/// How long a save waits for the server to format the file.
+const FORMAT_WAIT: Duration = Duration::from_secs(3);
+/// The files a project keeps its formatting in, by language: saving a
+/// file formats it first when its project has one.
+fn format_files(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Rust => &["rustfmt.toml", ".rustfmt.toml"],
+        Lang::C | Lang::Cpp => &[".clang-format", "_clang-format"],
+        _ => &[],
+    }
+}
+/// Largest file read to show a reference's line.
+const MAX_REF_FILE: u64 = 4 << 20;
+/// Most files read for the references' lines (the rest are listed bare).
+const MAX_REF_FILES: usize = 64;
 
 struct Doc {
     cells: DocCells,
@@ -87,6 +105,9 @@ pub struct Engine {
     servers: HashMap<&'static str, Server>,
     /// Servers that failed to start: not tried again this session.
     no_server: Vec<&'static str>,
+    /// What each language server is doing, for the status line when the
+    /// active file is its language's.
+    lsp_status: HashMap<&'static str, String>,
     next_git: Instant,
     /// Visible rows, from the window size.
     pub rows: usize,
@@ -106,6 +127,19 @@ pub struct Engine {
     /// When the tree was last asked for, and whether it changed since.
     inspect_asked: Option<Instant>,
     inspect_stale: bool,
+    /// The completion or quick-fix menu open in the active file.
+    popup: Option<assist::Popup>,
+    /// Completion asked for: file, line, where the word starts, asked by
+    /// the person (Ctrl+Space) rather than by typing.
+    asked: Option<(PathBuf, usize, usize, bool)>,
+    /// Quick fixes asked for: file, line, char column.
+    fixing: Option<(PathBuf, usize, usize)>,
+    /// The signature shown: file and line.
+    tip_at: Option<(PathBuf, usize)>,
+    /// Formatting asked for: file, its buffer's version, save after, when.
+    formatting: Option<(PathBuf, u64, bool, Instant)>,
+    /// A rename being named: file, line, column (server encoding).
+    rename_at: Option<(PathBuf, usize, usize)>,
 }
 
 fn title_of(rel: &str) -> String {
@@ -143,6 +177,7 @@ impl Engine {
             pictures: None,
             servers: HashMap::new(),
             no_server: Vec::new(),
+            lsp_status: HashMap::new(),
             next_git: Instant::now(),
             rows: 40,
             debugger: None,
@@ -154,6 +189,12 @@ impl Engine {
             inspector: None,
             inspect_asked: None,
             inspect_stale: false,
+            popup: None,
+            asked: None,
+            fixing: None,
+            tip_at: None,
+            formatting: None,
+            rename_at: None,
         }
     }
 
@@ -199,7 +240,7 @@ impl Engine {
     pub fn act(&mut self, a: Act, s: &mut State) -> bool {
         let before = self.active;
         // What goes to a file, or opens a panel under the code, shows the code.
-        if matches!(a, Act::Open(_) | Act::Tab(_) | Act::Problem(_) | Act::Crash(_) | Act::Frame(_) | Act::Definition
+        if matches!(a, Act::Open(_) | Act::Tab(_) | Act::Problem(_) | Act::Crash(_) | Act::Frame(_) | Act::Definition | Act::References | Act::Reference(_)
             | Act::ReplayCrash(_) | Act::Debug | Act::Panel(_) | Act::Task(_) | Act::Run | Act::CycleTab(_)) {
             s.view = Main::Code;
         }
@@ -329,7 +370,49 @@ impl Engine {
                 let i = if i == usize::MAX { self.active.unwrap_or(usize::MAX) } else { i };
                 self.close(i, s);
             }
-            Act::Save => self.save(s),
+            Act::Save => {
+                if !self.format_then_save(s) {
+                    self.save(s);
+                }
+            }
+            Act::Complete => self.ask_completion(None, true, s),
+            Act::MenuPick(i) => self.menu_pick(i, s),
+            Act::MenuClose => self.close_popup(s),
+            Act::References => {
+                if let Some((key, path, line, _, c)) = self.synced(s, false) {
+                    if let Some(srv) = self.servers.get_mut(key) {
+                        srv.client.references(&path, line, c);
+                    }
+                }
+            }
+            Act::Reference(i) => {
+                if let Some((rel, line, col, _)) = s.refs.get(i).cloned() {
+                    self.open(&rel, s);
+                    self.goto(line, Some(col), None);
+                }
+            }
+            Act::StartRename => self.start_rename(s),
+            Act::Rename(name) => self.rename(name.trim(), s),
+            Act::CancelRename => {
+                s.renaming = None;
+                self.rename_at = None;
+            }
+            Act::QuickFix => {
+                if let Some((key, path, line, col, _)) = self.synced(s, false) {
+                    // The caret's whole line: the fixes for what's marked on it.
+                    let len = self.active_doc().map(|d| d.buffer.get_cloned().line_text(line)).unwrap_or_default();
+                    if let Some(srv) = self.servers.get_mut(key) {
+                        let end = srv.client.encoding.from_char(&len, len.chars().count());
+                        srv.client.code_actions(&path, ((line, 0), (line, end)));
+                        self.fixing = Some((path, line, col));
+                    }
+                }
+            }
+            Act::Format => {
+                if let Some((key, path, ..)) = self.synced(s, false) {
+                    self.ask_format(key, path, false);
+                }
+            }
             Act::Task(i) => self.run_task(i, s),
             Act::AnswerRun(press) => self.answer_run(press, s),
             Act::Run => {
@@ -1192,6 +1275,7 @@ impl Engine {
         self.jobs.clear();
         self.servers.clear();
         self.no_server.clear();
+        self.lsp_status.clear();
         self.remote_root = None;
         self.ws = Some(ws.to_string());
         self.root = root.clone();
@@ -1270,6 +1354,8 @@ impl Engine {
             stopped: self.cell(None),
             off_breakpoints: self.cell(Vec::new()),
             note: self.cell(None),
+            menu: self.cell(None),
+            tip: self.cell(None),
         };
         let mut doc = Doc { cells, rel: rel.to_string(), lang, syntax, seen: 0, spans_at: (u64::MAX, 0), lsp_sent: 0, last_edit: Instant::now() };
         self.highlight(&mut doc, true);
@@ -1277,7 +1363,7 @@ impl Engine {
         self.active = Some(self.docs.len() - 1);
         self.tree.reveal(rel);
         if let Some(l) = lang {
-            self.lsp_open(l, &path, &text, s);
+            self.lsp_open(l, &path, &text);
         }
     }
 
@@ -1588,7 +1674,7 @@ impl Engine {
         }
     }
 
-    fn lsp_open(&mut self, lang: Lang, path: &Path, text: &str, s: &mut State) {
+    fn lsp_open(&mut self, lang: Lang, path: &Path, text: &str) {
         let Some((key, argv)) = lsp::server_for(lang) else { return };
         if !self.servers.contains_key(key) {
             if self.no_server.contains(&key) {
@@ -1600,11 +1686,11 @@ impl Engine {
                 Ok(proc) => {
                     let client = lsp::Client::new(&self.root, &remote);
                     self.servers.insert(key, Server { client, proc });
-                    s.lsp = Some(format!("{name} starting"));
+                    self.lsp_status.insert(key, format!("{name} starting"));
                 }
                 Err(e) => {
                     self.no_server.push(key);
-                    s.lsp = Some(format!("no {} ({e})", argv[0]));
+                    self.lsp_status.insert(key, format!("no {} ({e})", argv[0]));
                     return;
                 }
             }
@@ -1616,31 +1702,398 @@ impl Engine {
         }
     }
 
-    fn ask_server(&mut self, definition: bool, s: &mut State) {
-        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
+    /// The active file's server, told the text the caret is in: its key,
+    /// the file, the caret's line and char column, and that column in the
+    /// server's encoding. `quiet`: say nothing when there's none.
+    fn synced(&mut self, s: &mut State, quiet: bool) -> Option<(&'static str, PathBuf, usize, usize, usize)> {
+        let i = self.active?;
+        let d = self.docs.get(i)?;
+        let mut say = |m: &str| if !quiet { s.note = Some((m.into(), true)) };
         let Some((key, _)) = d.lang.and_then(lsp::server_for) else {
-            s.note = Some(("No language server for this file".into(), true));
-            return;
+            say("No language server for this file");
+            return None;
         };
         let b = d.cells.buffer.get_cloned();
         let (line, col) = b.line_col(b.primary().head);
         let path = d.cells.path.clone();
-        let text = b.to_string();
-        let seen = b.version();
-        let Some(srv) = self.servers.get_mut(key) else {
-            s.note = Some(("The language server isn't running".into(), true));
-            return;
+        let sent = d.lsp_sent;
+        let Some(srv) = self.servers.get_mut(key).filter(|v| v.client.is_ready() && v.client.is_open(&path)) else {
+            say("The language server isn't running yet");
+            return None;
         };
-        // It must have the text the caret is in.
-        if self.docs[self.active.unwrap()].lsp_sent != seen {
-            srv.client.did_change(&path, &text);
-            self.docs[self.active.unwrap()].lsp_sent = seen;
+        if sent != b.version() {
+            srv.client.did_change(&path, &b.to_string());
+            self.docs[i].lsp_sent = b.version();
         }
         let c = srv.client.encoding.from_char(&b.line_text(line), col);
+        Some((key, path, line, col, c))
+    }
+
+    fn ask_server(&mut self, definition: bool, s: &mut State) {
+        let Some((key, path, line, _, c)) = self.synced(s, false) else { return };
+        let Some(srv) = self.servers.get_mut(key) else { return };
         if definition {
             srv.client.definition(&path, line, c);
         } else {
             srv.client.hover(&path, line, c);
+        }
+    }
+
+    /// Ask for completions at the caret: `trigger` is the character typed
+    /// that asked, `explicit` when the person asked (Ctrl+Space).
+    fn ask_completion(&mut self, trigger: Option<char>, explicit: bool, s: &mut State) {
+        let Some((key, path, line, col, c)) = self.synced(s, !explicit) else { return };
+        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
+        let start = assist::word_start(&d.cells.buffer.get_cloned().line_text(line), col);
+        if let Some(srv) = self.servers.get_mut(key) {
+            srv.client.completion(&path, line, c, trigger);
+            self.asked = Some((path, line, start, explicit));
+        }
+    }
+
+    fn ask_format(&mut self, key: &'static str, path: PathBuf, save: bool) -> bool {
+        let Some(d) = self.docs.iter().find(|d| d.cells.path == path) else { return false };
+        let b = d.cells.buffer.get_cloned();
+        let Some(srv) = self.servers.get_mut(key) else { return false };
+        srv.client.format(&path, b.tab_width.max(1), !b.use_tabs);
+        self.formatting = Some((path, b.version(), save, Instant::now()));
+        true
+    }
+
+    /// Save, formatted first when the project asks for it (it has a
+    /// rustfmt or clang-format file) and a server can: false when the
+    /// file wasn't sent to be formatted (save it now).
+    fn format_then_save(&mut self, s: &mut State) -> bool {
+        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return false };
+        let Some(lang) = d.lang else { return false };
+        // As rustfmt and clang-format look: the file's folder and up, in work.
+        let wants = d.cells.path.ancestors().skip(1).take_while(|a| a.starts_with(&self.root))
+            .any(|a| format_files(lang).iter().any(|f| a.join(f).is_file()));
+        if !wants || self.formatting.is_some() {
+            return false;
+        }
+        match self.synced(s, true) {
+            Some((key, path, ..)) => self.ask_format(key, path, true),
+            None => false,
+        }
+    }
+
+    fn start_rename(&mut self, s: &mut State) {
+        let Some((_, path, line, col, c)) = self.synced(s, false) else { return };
+        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
+        let text: Vec<char> = d.cells.buffer.get_cloned().line_text(line).chars().collect();
+        let from = assist::word_start(&text.iter().collect::<String>(), col);
+        let to = (col..text.len()).find(|&i| !assist::is_word(text[i])).unwrap_or(text.len());
+        let word: String = text[from..to].iter().collect();
+        if word.is_empty() {
+            s.note = Some(("Put the caret on a name to rename it".into(), true));
+            return;
+        }
+        self.close_popup(s);
+        s.renaming = Some(word);
+        self.rename_at = Some((path, line, c));
+    }
+
+    fn rename(&mut self, name: &str, s: &mut State) {
+        let Some((path, line, c)) = self.rename_at.take() else { return };
+        s.renaming = None;
+        if name.is_empty() || name.chars().count() > 200 || !name.chars().all(assist::is_word) {
+            s.note = Some((format!("{name:?} isn't a name"), true));
+            return;
+        }
+        let key = self.docs.iter().find(|d| d.cells.path == path).and_then(|d| d.lang).and_then(lsp::server_for).map(|(k, _)| k);
+        match key.and_then(|k| self.servers.get_mut(k)) {
+            Some(srv) => srv.client.rename(&path, line, c, name),
+            None => s.note = Some(("The language server isn't running".into(), true)),
+        }
+    }
+
+    /// The menu changed: show it in its file.
+    fn show_popup(&mut self, s: &mut State) {
+        let Some(p) = &self.popup else { return };
+        let m = p.menu();
+        let shown = (!m.items.is_empty()).then_some(m);
+        s.menu = shown.as_ref().map(|m| (m.items.len(), m.items[0].0.clone()));
+        if let Some(d) = self.docs.iter().find(|d| d.cells.path == p.path) {
+            d.cells.menu.set(shown);
+        }
+    }
+
+    fn close_popup(&mut self, s: &mut State) {
+        if let Some(p) = self.popup.take() {
+            if let Some(d) = self.docs.iter().find(|d| d.cells.path == p.path) {
+                d.cells.menu.set(None);
+            }
+        }
+        s.menu = None;
+    }
+
+    fn close_tip(&mut self, s: &mut State) {
+        if let Some((path, _)) = self.tip_at.take() {
+            if let Some(d) = self.docs.iter().find(|d| d.cells.path == path) {
+                d.cells.tip.set(None);
+            }
+        }
+        s.tip = None;
+    }
+
+    fn encoding_of(&self, path: &Path) -> lsp::Encoding {
+        self.docs.iter().find(|d| d.cells.path == path).and_then(|d| d.lang).and_then(lsp::server_for)
+            .and_then(|(k, _)| self.servers.get(k)).map(|v| v.client.encoding).unwrap_or(lsp::Encoding::Utf16)
+    }
+
+    /// Accept the menu's `i`th row.
+    fn menu_pick(&mut self, i: usize, s: &mut State) {
+        let Some(p) = self.popup.clone() else { return };
+        self.close_popup(s);
+        let Some(&k) = p.shown.get(i) else { return };
+        match p.offer {
+            assist::Offer::Completions(items) => {
+                let Some(d) = self.active.and_then(|a| self.docs.get(a)).filter(|d| d.cells.path == p.path) else { return };
+                let enc = self.encoding_of(&p.path);
+                let mut b = d.cells.buffer.get_cloned();
+                if b.line_col(b.primary().head).0 != p.line {
+                    return;
+                }
+                assist::accept(&mut b, &items[k], p.line, p.start, enc);
+                d.cells.buffer.set(b);
+                // What was typed is a completion now, not a word to ask about.
+                self.asked = None;
+            }
+            assist::Offer::Actions(actions) => {
+                let a = &actions[k];
+                let enc = self.encoding_of(&p.path);
+                self.apply_edits(&a.title, a.edits.clone(), enc, s);
+            }
+        }
+    }
+
+    /// Apply a server's edits, per file: open files change in their buffer
+    /// (one undo step each), others are opened first. Every file changed is
+    /// told to the server. The active file stays active.
+    fn apply_edits(&mut self, what: &str, edits: Vec<(PathBuf, Vec<lsp::TextEdit>)>, enc: lsp::Encoding, s: &mut State) {
+        let back = self.active;
+        let (mut files, mut changes, mut missed) = (0usize, 0usize, 0usize);
+        for (path, es) in edits {
+            if es.is_empty() {
+                continue;
+            }
+            let i = match self.docs.iter().position(|d| d.cells.path == path) {
+                Some(i) => Some(i),
+                None => match tree::relative(&self.root, &path) {
+                    Some(rel) => {
+                        self.open(&rel, s);
+                        self.docs.iter().position(|d| d.cells.path == path)
+                    }
+                    None => None,
+                },
+            };
+            let Some(i) = i else {
+                missed += 1;
+                continue;
+            };
+            let d = &mut self.docs[i];
+            let mut b = d.cells.buffer.get_cloned();
+            let parts = b.kept_parts(assist::to_chars(&b, &es, enc));
+            let n = parts.len();
+            // The listed references in this file, as chars before the edit.
+            let places: Vec<(usize, usize)> = s.refs.iter().enumerate().filter(|(_, r)| r.0 == d.rel)
+                .map(|(k, r)| (k, b.at_line_col(r.1.min(b.len_lines().saturating_sub(1)), r.2))).collect();
+            if b.replace(parts.clone()) {
+                // They follow the text (a rename, a fix, formatting).
+                for (k, at) in places {
+                    let at = assist::map_through(at, &parts).min(b.len_chars());
+                    let (line, col) = b.line_col(at);
+                    s.refs[k] = (d.rel.clone(), line, col, b.line_text(line).chars().take(300).collect());
+                }
+                files += 1;
+                changes += n;
+                if let Some(srv) = d.lang.and_then(lsp::server_for).and_then(|(k, _)| self.servers.get_mut(k)) {
+                    if srv.client.is_open(&path) {
+                        srv.client.did_change(&path, &b.to_string());
+                    }
+                }
+                d.lsp_sent = b.version();
+                d.cells.buffer.set(b);
+            }
+        }
+        if back.is_some() {
+            self.active = back;
+        }
+        self.sync_tabs(s);
+        s.note = Some(match (files, missed) {
+            (0, 0) => (format!("{what}: nothing to change"), false),
+            (_, 0) => (format!("{what}: {changes} change{} in {files} file{}", if changes == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" }), false),
+            _ => (format!("{what}: {missed} file{} outside work left alone", if missed == 1 { "" } else { "s" }), true),
+        });
+    }
+
+    /// After a frame's edits (`typed`: the one char typed, if it was
+    /// that): keep the menu to the word being typed, ask for completions
+    /// or a signature when typing calls for them.
+    fn assist_after(&mut self, typed: Option<char>, edited: bool, s: &mut State) {
+        if self.popup.is_none() && self.tip_at.is_none() && !edited {
+            return;
+        }
+        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else {
+            self.close_popup(s);
+            self.close_tip(s);
+            return;
+        };
+        let b = d.cells.buffer.get_cloned();
+        let path = d.cells.path.clone();
+        let lang = d.lang;
+        let (line, col) = b.line_col(b.primary().head);
+        let text = b.line_text(line);
+        let start = assist::word_start(&text, col);
+        let one = b.selections().len() == 1 && b.primary().anchor == b.primary().head;
+        if let Some(p) = &self.popup {
+            let completing = matches!(p.offer, assist::Offer::Completions(_));
+            let here = p.path == path && p.line == line;
+            // A completion menu stays while the caret is in its word; a
+            // quick-fix one until the text changes or the caret leaves the line.
+            let keep = here && if completing { one && col >= p.start && start <= p.start } else { !edited };
+            if !keep {
+                self.close_popup(s);
+            } else if edited {
+                let typed_word: String = text.chars().skip(p.start).take(col - p.start).collect();
+                let again = p.incomplete;
+                if let Some(p) = &mut self.popup {
+                    p.filter(&typed_word);
+                }
+                if self.popup.as_ref().is_some_and(|p| p.shown.is_empty()) && !again {
+                    self.close_popup(s);
+                } else {
+                    self.show_popup(s);
+                }
+                if again {
+                    self.ask_completion(None, false, s);
+                }
+            }
+        }
+        if self.tip_at.as_ref().is_some_and(|(p, l)| *p != path || *l != line) || typed == Some(')') {
+            self.close_tip(s);
+        }
+        let Some(c) = typed.filter(|_| edited && one) else { return };
+        let before = text.chars().nth(col.wrapping_sub(2));
+        let (trigs, sigs) = match lang.and_then(lsp::server_for).and_then(|(k, _)| self.servers.get(k)) {
+            Some(v) => (v.client.completion_triggers.clone(), v.client.signature_triggers.clone()),
+            None => return,
+        };
+        if self.popup.is_none() {
+            let trigger = trigs.contains(&c) && match c {
+                '.' => true,
+                ':' => before == Some(':'),
+                '>' => before == Some('-'),
+                _ => false,
+            };
+            if trigger {
+                self.ask_completion(Some(c), false, s);
+            } else if assist::is_word(c) && col - start >= 2
+                && self.asked.as_ref().map(|(p, l, st, _)| (p, *l, *st)) != Some((&path, line, start)) {
+                self.ask_completion(None, false, s);
+            }
+        }
+        if sigs.contains(&c) {
+            if let Some((key, path, line, _, cc)) = self.synced(s, true) {
+                if let Some(srv) = self.servers.get_mut(key) {
+                    srv.client.signature_help(&path, line, cc);
+                }
+            }
+        }
+    }
+
+    /// What a server answered, beyond what `read_servers` handles itself.
+    fn answered(&mut self, e: lsp::Event, enc: lsp::Encoding, s: &mut State) {
+        let here = self.active.and_then(|i| self.docs.get(i)).map(|d| {
+            let b = d.cells.buffer.get_cloned();
+            let (l, c) = b.line_col(b.primary().head);
+            (d.cells.path.clone(), l, c, b.line_text(l))
+        });
+        match e {
+            lsp::Event::Completion(items, incomplete) => {
+                let Some((path, line, col, text)) = here else { return };
+                let Some((ap, al, ast, explicit)) = self.asked.clone() else { return };
+                let start = assist::word_start(&text, col);
+                if ap != path || al != line || ast != start {
+                    return;
+                }
+                let typed: String = text.chars().skip(start).take(col - start).collect();
+                self.close_popup(s);
+                self.popup = assist::Popup::completions(path, line, start, items, incomplete, &typed);
+                if self.popup.is_some() {
+                    self.show_popup(s);
+                } else if explicit {
+                    s.note = Some(("No completions here".into(), false));
+                }
+            }
+            lsp::Event::Signature(sig) => {
+                let Some((path, line, col, _)) = here else { return };
+                self.close_tip(s);
+                if let Some(sig) = sig {
+                    if let Some(d) = self.docs.iter().find(|d| d.cells.path == path) {
+                        d.cells.tip.set(Some(Tip { line, col, text: sig.label.clone(), bold: sig.active }));
+                    }
+                    s.tip = Some(sig.label);
+                    self.tip_at = Some((path, line));
+                }
+            }
+            lsp::Event::References(locs) => {
+                let mut texts: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+                s.refs = locs.into_iter().filter_map(|l| {
+                    let rel = tree::relative(&self.root, &l.path)?;
+                    let room = texts.len() < MAX_REF_FILES;
+                    let lines = texts.entry(l.path.clone()).or_insert_with(|| {
+                        if !room {
+                            return None;
+                        }
+                        match self.docs.iter().find(|d| d.cells.path == l.path) {
+                            Some(d) => Some(d.cells.buffer.get_cloned().to_string().lines().map(str::to_string).collect()),
+                            None => std::fs::metadata(&l.path).ok().filter(|m| m.len() <= MAX_REF_FILE)
+                                .and_then(|_| std::fs::read_to_string(&l.path).ok()).map(|t| t.lines().map(str::to_string).collect()),
+                        }
+                    });
+                    let (line, scol) = l.range.0;
+                    let src = lines.as_ref().and_then(|v| v.get(line)).cloned().unwrap_or_default();
+                    Some((rel, line, enc.to_char(&src, scol), src.chars().take(300).collect()))
+                }).collect();
+                s.panel = Panel::References;
+                s.panel_open = true;
+                s.note = Some((format!("{} reference{}", s.refs.len(), if s.refs.len() == 1 { "" } else { "s" }), false));
+            }
+            lsp::Event::Actions(actions) => {
+                let Some((path, line, col, _)) = here else { return };
+                if self.fixing.take() != Some((path.clone(), line, col)) {
+                    return;
+                }
+                self.close_popup(s);
+                self.popup = assist::Popup::actions(path, line, col, actions);
+                if self.popup.is_some() {
+                    self.show_popup(s);
+                } else {
+                    s.note = Some(("No quick fixes here".into(), false));
+                }
+            }
+            lsp::Event::Edits { what, mut edits } if what == "Format" => {
+                let Some((path, version, save, _)) = self.formatting.take() else { return };
+                let Some(i) = self.docs.iter().position(|d| d.cells.path == path) else { return };
+                if self.docs[i].cells.buffer.get_cloned().version() != version {
+                    // Typed since: the edits are for text that's gone.
+                    if save && self.active == Some(i) {
+                        self.save(s);
+                    }
+                    return;
+                }
+                for e in &mut edits {
+                    e.0 = path.clone();
+                }
+                self.apply_edits("Format", edits, enc, s);
+                if save && self.active == Some(i) {
+                    self.save(s);
+                }
+            }
+            lsp::Event::Edits { what, edits } => self.apply_edits(&what, edits, enc, s),
+            _ => {}
         }
     }
 
@@ -1667,11 +2120,14 @@ impl Engine {
         self.crash_input(s);
         self.take_pictures(s);
         // The active file: edits into its tree, colours, the server.
+        let (mut typed, mut edited) = (None, false);
         if let Some(i) = self.active {
             let mut d = std::mem::replace(&mut self.docs[i], placeholder());
             let mut b = d.cells.buffer.get_cloned();
             if b.version() != d.seen {
                 let edits = b.take_edits();
+                typed = assist::typed_char(&b, &edits);
+                edited = true;
                 if !edits.is_empty() {
                     if let Some(sx) = &mut d.syntax {
                         sx.edit(b.text(), &edits);
@@ -1699,6 +2155,15 @@ impl Engine {
                 t.dirty = dirty;
             }
             self.docs[i] = d;
+        }
+        self.assist_after(typed, edited, s);
+        if self.formatting.as_ref().is_some_and(|f| now.duration_since(f.3) >= FORMAT_WAIT) {
+            // No answer: save as it is.
+            if let Some((path, _, save, _)) = self.formatting.take() {
+                if save && self.active.and_then(|i| self.docs.get(i)).is_some_and(|d| d.cells.path == path) {
+                    self.save(s);
+                }
+            }
         }
         self.read_jobs(s);
         self.read_servers(s);
@@ -1954,7 +2419,7 @@ impl Engine {
                             .filter_map(|d| Some((d.lang?, d.cells.path.clone(), d.cells.buffer.get_cloned().to_string())))
                             .collect();
                         for (l, p, t) in open {
-                            self.lsp_open(l, &p, &t, s);
+                            self.lsp_open(l, &p, &t);
                         }
                     }
                 }
@@ -1972,6 +2437,7 @@ impl Engine {
     fn read_servers(&mut self, s: &mut State) {
         let mut dead = Vec::new();
         let mut jumps = Vec::new();
+        let mut later = Vec::new();
         for (key, srv) in self.servers.iter_mut() {
             let out = srv.client.take_output();
             if !out.is_empty() {
@@ -1986,7 +2452,7 @@ impl Engine {
                         for e in events {
                             match e {
                                 lsp::Event::Ready => {
-                                    s.lsp = Some(srv.client.server_name.clone().unwrap_or_else(|| key.to_string()));
+                                    self.lsp_status.insert(key, srv.client.server_name.clone().unwrap_or_else(|| key.to_string()));
                                     let out = srv.client.take_output();
                                     srv.proc.write(&out);
                                 }
@@ -1995,24 +2461,28 @@ impl Engine {
                                 lsp::Event::Definition(None) => s.note = Some(("No definition found".into(), false)),
                                 lsp::Event::Hover(h) => s.hover = h,
                                 lsp::Event::Message(m) => s.note = Some((m, true)),
+                                e => later.push((e, srv.client.encoding)),
                             }
                         }
                     }
                     Err(e) => {
-                        s.lsp = Some(format!("language server stopped: {e}"));
+                        self.lsp_status.insert(key, format!("language server stopped: {e}"));
                         dead.push(*key);
                         continue;
                     }
                 }
             }
             if done {
-                s.lsp = Some("language server ended".into());
+                self.lsp_status.insert(key, "language server ended".into());
                 dead.push(*key);
             }
         }
         for k in dead {
             self.servers.remove(k);
             self.no_server.push(k);
+        }
+        for (e, enc) in later {
+            self.answered(e, enc, s);
         }
         for (p, l, c, enc) in jumps {
             if let Some(rel) = tree::relative(&self.root, &p) {
@@ -2026,6 +2496,12 @@ impl Engine {
 
     /// Gutter marks and the status line's problems for the active file.
     fn marks(&mut self, s: &mut State) {
+        // The status line's server is the active file's.
+        let lsp = self.active.and_then(|i| self.docs.get(i)).and_then(|d| d.lang).and_then(lsp::server_for)
+            .and_then(|(k, _)| self.lsp_status.get(k)).cloned();
+        if s.lsp != lsp {
+            s.lsp = lsp;
+        }
         let Some(d) = self.active.and_then(|i| self.docs.get(i)) else {
             s.diags.clear();
             return;
@@ -2113,6 +2589,8 @@ fn placeholder() -> Doc {
             stopped: Mutable::new(None),
             off_breakpoints: Mutable::new(Vec::new()),
             note: Mutable::new(None),
+            menu: Mutable::new(None),
+            tip: Mutable::new(None),
         },
         rel: String::new(),
         lang: None,
@@ -3084,6 +3562,192 @@ mod tests {
         assert!(s.fuzz.as_ref().unwrap().targets.iter().any(|t| t.name == "worker:read-album" && !t.core), "{:?}", s.fuzz);
         assert_eq!(s.composition.as_ref().map(|c| c.workers.len()), Some(1));
         assert!(std::fs::read_to_string(worker_bin).unwrap().contains("atrium_worker::main!(photos::workers::read_album)"));
+    }
+
+    /// Tick until `done` holds (at most about 5 s).
+    fn tick_until(e: &mut Engine, s: &mut State, done: impl Fn(&State) -> bool) -> bool {
+        for _ in 0..500 {
+            e.tick(s);
+            if done(s) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Type `text` a char at a time, as keys would.
+    fn type_in(e: &mut Engine, s: &mut State, text: &str) {
+        let doc = e.active_doc().unwrap();
+        for c in text.chars() {
+            let mut b = doc.buffer.get_cloned();
+            b.insert(&c.to_string());
+            doc.buffer.set(b);
+            e.tick(s);
+        }
+    }
+
+    fn caret_to(e: &Engine, line: usize, col: usize) {
+        let doc = e.active_doc().unwrap();
+        let mut b = doc.buffer.get_cloned();
+        let at = b.at_line_col(line, col);
+        b.set_caret(at, false);
+        doc.buffer.set(b);
+    }
+
+    #[test]
+    fn language_server_features_with_a_scripted_server() {
+        if !Path::new("/bin/sh").exists() || std::process::Command::new("python3").arg("-c").arg("").status().map_or(true, |s| !s.success()) {
+            return;
+        }
+        let (d, mut e, mut s) = setup("assist");
+        // The scripted server, as the Python server Artifex starts.
+        let bin = d.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("pylsp"), include_str!("../tests/fixtures/fake_lsp.py")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("pylsp"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
+        std::fs::write(d.join("proj/app.py"), "import os\n\ndef main():\n\tprint('hi')\n\t\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("app.py".into()), &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.lsp.as_deref() == Some("fake")), "{:?}", s.lsp);
+        e.act(Act::Open("src/notes.md".into()), &mut s);
+        e.tick(&mut s);
+        assert_eq!(s.lsp, None, "Markdown has no server: the status line says none");
+        e.act(Act::Open("app.py".into()), &mut s);
+        e.tick(&mut s);
+        assert_eq!(s.lsp.as_deref(), Some("fake"));
+        let doc = e.active_doc().unwrap();
+
+        // Typing a word asks at its second letter; the menu keeps to it.
+        caret_to(&e, 4, 1);
+        type_in(&mut e, &mut s, "p");
+        assert!(s.menu.is_none());
+        type_in(&mut e, &mut s, "r");
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.is_some()));
+        assert_eq!(s.menu, Some((2, "print".into())), "open is filtered out");
+        assert_eq!(doc.menu.get_cloned().map(|m| (m.line, m.col)), Some((4, 1)), "under the word's start");
+        type_in(&mut e, &mut s, "intf");
+        assert_eq!(s.menu, Some((1, "printf_ish".into())));
+        // Accepting replaces the word with the snippet as plain text.
+        e.act(Act::MenuPick(0), &mut s);
+        e.tick(&mut s);
+        assert_eq!(doc.buffer.get_cloned().line_text(4), "\tprintf_ish(x)");
+        assert!(s.menu.is_none() && doc.menu.get_cloned().is_none());
+        // A space ends the word, and its menu.
+        let end = doc.buffer.get_cloned().line_len(4);
+        caret_to(&e, 4, end);
+        type_in(&mut e, &mut s, "\n\tpr");
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.is_some()));
+        type_in(&mut e, &mut s, " ");
+        assert!(s.menu.is_none() && doc.menu.get_cloned().is_none());
+
+        // Signature help on "(", gone at ")".
+        type_in(&mut e, &mut s, "print(");
+        assert!(s.menu.is_none(), "( ends the word too");
+        assert!(tick_until(&mut e, &mut s, |s| s.tip.is_some()));
+        assert_eq!(doc.tip.get_cloned().map(|t| (t.text, t.bold)), Some(("print(*values, sep=' ')".into(), Some((6, 13)))));
+        type_in(&mut e, &mut s, ")");
+        assert!(s.tip.is_none() && doc.tip.get_cloned().is_none());
+        assert_eq!(doc.buffer.get_cloned().line_text(5), "\tpr print()");
+
+        // References of print: its two uses, listed, and a click goes there.
+        e.act(Act::Save, &mut s);
+        caret_to(&e, 3, 2);
+        e.act(Act::References, &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| !s.refs.is_empty()));
+        assert_eq!(s.refs.iter().map(|r| (r.0.as_str(), r.1, r.2)).collect::<Vec<_>>(), vec![("app.py", 3, 1), ("app.py", 5, 4)]);
+        assert_eq!((s.panel, s.panel_open), (Panel::References, true));
+        e.act(Act::Reference(1), &mut s);
+        e.tick(&mut s);
+        assert_eq!(s.caret, (6, 5));
+
+        // Rename: the bar names the word; every use changes in one step.
+        caret_to(&e, 3, 3);
+        e.act(Act::StartRename, &mut s);
+        assert_eq!(s.renaming.as_deref(), Some("print"));
+        e.act(Act::Rename("say".into()), &mut s);
+        assert!(s.renaming.is_none());
+        assert!(tick_until(&mut e, &mut s, |s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Rename"))), "{:?}", s.note);
+        let text = doc.buffer.get_cloned().to_string();
+        assert!(text.contains("\tsay('hi')") && text.contains("pr say()") && !text.contains("print("), "{text:?}");
+        assert_eq!(s.refs.iter().map(|r| (r.1, r.2, r.3.as_str())).collect::<Vec<_>>(), vec![(3, 1, "\tsay('hi')"), (5, 4, "\tpr say()")],
+            "the references follow the rename");
+        let mut b = doc.buffer.get_cloned();
+        b.undo();
+        assert!(b.to_string().contains("print('hi')"), "one undo takes the whole rename back");
+        e.act(Act::StartRename, &mut s);
+        e.act(Act::Rename("not a name".into()), &mut s);
+        assert!(s.note.as_ref().is_some_and(|n| n.1), "refused: {:?}", s.note);
+
+        // A quick fix: offered in the menu, applied when picked.
+        e.act(Act::QuickFix, &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.is_some()));
+        assert_eq!(s.menu, Some((1, "Add a comment".into())));
+        e.act(Act::MenuPick(0), &mut s);
+        assert!(doc.buffer.get_cloned().to_string().starts_with("# fixed\nimport os"));
+        assert_eq!(s.refs.iter().map(|r| r.1).collect::<Vec<_>>(), vec![4, 6], "a line above moves them down");
+
+        // Format: the tabs the server turns to spaces.
+        e.act(Act::Format, &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Format"))), "{:?}", s.note);
+        let text = doc.buffer.get_cloned().to_string();
+        assert!(!text.contains('\t') && text.contains("\n    say('hi')"), "{text:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn language_server_features_with_clangd_when_there_is_one() {
+        let llvm = PathBuf::from("/usr/lib/llvm-18/bin");
+        let found = std::env::var("PATH").unwrap_or_default().split(':').any(|d| Path::new(d).join("clangd").is_file());
+        if !found {
+            if !llvm.join("clangd").is_file() {
+                return;
+            }
+            std::env::set_var("PATH", format!("{}:{}", llvm.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let (d, mut e, mut s) = setup("clangd");
+        std::fs::create_dir_all(d.join("proj/lsp")).unwrap();
+        std::fs::write(d.join("proj/lsp/names.c"), "int count_up(int n) {\n\treturn n + 1;\n}\n\nint main(void) {\n\tint total = count_up(1);\n\ttotal = count_up(total)\n\treturn total;\n}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("lsp/names.c".into()), &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| !s.diags.is_empty()), "{:?}", s.lsp);
+        let doc = e.active_doc().unwrap();
+        // Rename, then the fix for the missing ';' at the line's new end.
+        caret_to(&e, 0, 5);
+        e.act(Act::StartRename, &mut s);
+        assert_eq!(s.renaming.as_deref(), Some("count_up"));
+        e.act(Act::Rename("count_up_by_one".into()), &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Rename"))), "{:?}", s.note);
+        assert_eq!(s.note.as_ref().map(|n| n.0.as_str()), Some("Rename: 3 changes in 1 file"));
+        // clangd marks the next token, `return`: the fix is on that line.
+        caret_to(&e, 7, 3);
+        e.tick(&mut s);
+        e.act(Act::QuickFix, &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.is_some()), "{:?}", s.note);
+        e.act(Act::MenuPick(0), &mut s);
+        assert_eq!(doc.buffer.get_cloned().line_text(6), "\ttotal = count_up_by_one(total);");
+        // Completion and the signature.
+        let end = doc.buffer.get_cloned().line_len(6);
+        caret_to(&e, 6, end);
+        type_in(&mut e, &mut s, "\ntotal = coun");
+        assert!(tick_until(&mut e, &mut s, |s| s.menu.as_ref().is_some_and(|m| m.1.starts_with("count_up_by_one"))), "{:?}", s.menu);
+        e.act(Act::MenuPick(0), &mut s);
+        e.tick(&mut s);
+        type_in(&mut e, &mut s, "(");
+        assert!(tick_until(&mut e, &mut s, |s| s.tip.is_some()));
+        assert!(s.tip.as_deref().unwrap().contains("count_up_by_one"), "{:?}", s.tip);
+        type_in(&mut e, &mut s, "2);");
+        // Format on save with a .clang-format.
+        std::fs::write(d.join("proj/lsp/.clang-format"), "BasedOnStyle: LLVM\n").unwrap();
+        e.act(Act::Save, &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| !s.tabs[0].dirty), "{:?}", s.note);
+        let text = std::fs::read_to_string(d.join("proj/lsp/names.c")).unwrap();
+        assert!(!text.contains('\t') && text.contains("\n  int total = count_up_by_one(1);") && text.contains("total = count_up_by_one(2);"), "{text}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

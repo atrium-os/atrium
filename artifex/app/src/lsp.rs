@@ -173,15 +173,90 @@ pub enum Event {
     /// Where a definition is: file, line, column (server encoding).
     Definition(Option<(PathBuf, usize, usize)>),
     Hover(Option<String>),
+    /// Completions at the asked position; `true` when the server says the
+    /// list is incomplete (ask again as the word grows).
+    Completion(Vec<Completion>, bool),
+    /// The signature around the caret: its label, the active parameter's
+    /// char range in it, and documentation.
+    Signature(Option<Signature>),
+    /// Where the symbol is used.
+    References(Vec<Location>),
+    /// Edits to apply, per file (a rename, a code action, formatting).
+    /// `what` says what they came from, for the person.
+    Edits { what: String, edits: Vec<(PathBuf, Vec<TextEdit>)> },
+    /// Code actions on offer at a range.
+    Actions(Vec<Action>),
     /// `window/showMessage`, `window/logMessage` of type error.
     Message(String),
 }
+
+/// A range in a file, columns in the server's encoding.
+pub type Range = ((usize, usize), (usize, usize));
+
+/// One completion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    pub label: String,
+    /// The type or signature, short.
+    pub detail: String,
+    /// LSP `CompletionItemKind`.
+    pub kind: u8,
+    /// What to insert (a snippet's placeholders taken out).
+    pub insert: String,
+    /// What it replaces, if the server says.
+    pub range: Option<Range>,
+    /// What typing is matched against.
+    pub filter: String,
+    pub sort: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Signature {
+    pub label: String,
+    /// The active parameter, as a char range of `label`.
+    pub active: Option<(usize, usize)>,
+    pub doc: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub range: Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    pub range: Range,
+    pub text: String,
+}
+
+/// A code action: its title, and the edits it makes (an action that only
+/// runs a server command is left out: Artifex doesn't run those).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    pub title: String,
+    pub preferred: bool,
+    pub edits: Vec<(PathBuf, Vec<TextEdit>)>,
+}
+
+/// Longest text a completion inserts, in chars.
+const MAX_INSERT: usize = 64 << 10;
+/// Most completions kept from one answer.
+pub const MAX_COMPLETIONS: usize = 1000;
+/// Most locations, actions or edits kept from one answer.
+pub const MAX_LOCATIONS: usize = 2000;
 
 #[derive(Debug, Clone, Copy)]
 enum Pending {
     Initialize,
     Definition,
     Hover,
+    Completion,
+    Signature,
+    References,
+    Rename,
+    Actions,
+    Format,
     Shutdown,
 }
 
@@ -201,6 +276,14 @@ pub struct Client {
     pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     /// Name the server gave in its answer to `initialize`.
     pub server_name: Option<String>,
+    /// Characters that open completion as they are typed.
+    pub completion_triggers: Vec<char>,
+    /// Characters that open signature help.
+    pub signature_triggers: Vec<char>,
+    /// The newest completion and signature requests: an answer to an
+    /// older one is for text that has moved on, and is dropped.
+    last_completion: Option<i64>,
+    last_signature: Option<i64>,
 }
 
 impl Client {
@@ -220,6 +303,10 @@ impl Client {
             encoding: Encoding::Utf16,
             diagnostics: HashMap::new(),
             server_name: None,
+            completion_triggers: Vec::new(),
+            last_completion: None,
+            last_signature: None,
+            signature_triggers: Vec::new(),
         };
         let root = c.remote_uri_of_rel("");
         let params = json!({
@@ -233,9 +320,18 @@ impl Client {
                     "synchronization": { "didSave": true },
                     "publishDiagnostics": { "relatedInformation": false },
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
-                    "definition": { "linkSupport": false }
+                    "definition": { "linkSupport": false },
+                    "completion": {
+                        "completionItem": { "snippetSupport": false, "insertReplaceSupport": false, "labelDetailsSupport": true },
+                        "contextSupport": true
+                    },
+                    "signatureHelp": { "signatureInformation": { "parameterInformation": { "labelOffsetSupport": true } } },
+                    "references": {},
+                    "rename": { "prepareSupport": false },
+                    "codeAction": { "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "refactor", "source"] } } },
+                    "formatting": {}
                 },
-                "workspace": { "workspaceFolders": true, "configuration": true },
+                "workspace": { "workspaceFolders": true, "configuration": true, "workspaceEdit": { "documentChanges": true } },
                 "window": { "workDoneProgress": false }
             }
         });
@@ -343,6 +439,72 @@ impl Client {
         }
     }
 
+    fn at(&self, local: &Path, line: usize, col: usize) -> Option<Value> {
+        let uri = self.uri(local).filter(|_| self.ready)?;
+        Some(json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": col } }))
+    }
+
+    /// Completions at (line, col): [`Event::Completion`] answers.
+    /// `trigger` is the character typed that asked, if one did.
+    pub fn completion(&mut self, local: &Path, line: usize, col: usize, trigger: Option<char>) {
+        if let Some(mut p) = self.at(local, line, col) {
+            p["context"] = match trigger {
+                Some(c) => json!({ "triggerKind": 2, "triggerCharacter": c.to_string() }),
+                None => json!({ "triggerKind": 1 }),
+            };
+            if let Some(old) = self.last_completion.take().filter(|o| self.pending.contains_key(o)) {
+                self.notify("$/cancelRequest", json!({ "id": old }));
+            }
+            self.last_completion = Some(self.request(Pending::Completion, "textDocument/completion", p));
+        }
+    }
+
+    pub fn signature_help(&mut self, local: &Path, line: usize, col: usize) {
+        if let Some(p) = self.at(local, line, col) {
+            self.last_signature = Some(self.request(Pending::Signature, "textDocument/signatureHelp", p));
+        }
+    }
+
+    pub fn references(&mut self, local: &Path, line: usize, col: usize) {
+        if let Some(mut p) = self.at(local, line, col) {
+            p["context"] = json!({ "includeDeclaration": true });
+            self.request(Pending::References, "textDocument/references", p);
+        }
+    }
+
+    pub fn rename(&mut self, local: &Path, line: usize, col: usize, new_name: &str) {
+        if let Some(mut p) = self.at(local, line, col) {
+            p["newName"] = json!(new_name);
+            self.request(Pending::Rename, "textDocument/rename", p);
+        }
+    }
+
+    /// Code actions for `range`, with the diagnostics there.
+    pub fn code_actions(&mut self, local: &Path, range: Range) {
+        let (Some(uri), true) = (self.uri(local), self.ready) else { return };
+        let diags: Vec<Value> = self.diagnostics.get(local).map(|ds| ds.iter()
+            .filter(|d| d.start.0 <= range.1 .0 && d.end.0 >= range.0 .0)
+            .take(50)
+            .map(|d| json!({
+                "range": { "start": { "line": d.start.0, "character": d.start.1 }, "end": { "line": d.end.0, "character": d.end.1 } },
+                "severity": d.severity as u8, "message": d.message,
+            })).collect()).unwrap_or_default();
+        self.request(Pending::Actions, "textDocument/codeAction", json!({
+            "textDocument": { "uri": uri },
+            "range": range_json(range),
+            "context": { "diagnostics": diags },
+        }));
+    }
+
+    /// Format the whole file.
+    pub fn format(&mut self, local: &Path, tab: usize, spaces: bool) {
+        let (Some(uri), true) = (self.uri(local), self.ready) else { return };
+        self.request(Pending::Format, "textDocument/formatting", json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": tab, "insertSpaces": spaces },
+        }));
+    }
+
     /// Ask the server to stop (then `exit` when it answers).
     pub fn shutdown(&mut self) {
         self.request(Pending::Shutdown, "shutdown", Value::Null);
@@ -377,13 +539,26 @@ impl Client {
             }
             (Some(m), None) => self.notification(&m, msg.get("params").unwrap_or(&Value::Null), events),
             (None, Some(id)) => {
-                let Some(kind) = id.as_i64().and_then(|i| self.pending.remove(&i)) else { return };
+                let Some((id, kind)) = id.as_i64().and_then(|i| Some((i, self.pending.remove(&i)?))) else { return };
+                let stale = match kind {
+                    Pending::Completion => self.last_completion != Some(id),
+                    Pending::Signature => self.last_signature != Some(id),
+                    _ => false,
+                };
+                if stale {
+                    return;
+                }
                 let result = msg.get("result").cloned().unwrap_or(Value::Null);
                 if let Some(e) = msg.get("error") {
                     let text = e.get("message").and_then(Value::as_str).unwrap_or("error").to_string();
                     match kind {
                         Pending::Definition => events.push(Event::Definition(None)),
                         Pending::Hover => events.push(Event::Hover(None)),
+                        Pending::Completion => events.push(Event::Completion(Vec::new(), false)),
+                        Pending::Signature => events.push(Event::Signature(None)),
+                        Pending::References => events.push(Event::References(Vec::new())),
+                        Pending::Actions => events.push(Event::Actions(Vec::new())),
+                        Pending::Rename | Pending::Format => events.push(Event::Message(text.chars().take(500).collect())),
                         Pending::Initialize => events.push(Event::Message(format!("The language server failed to start: {text}"))),
                         Pending::Shutdown => self.send(json!({ "jsonrpc": "2.0", "method": "exit" })),
                     }
@@ -404,6 +579,13 @@ impl Client {
                     _ => Encoding::Utf16,
                 };
                 self.server_name = result.pointer("/serverInfo/name").and_then(Value::as_str).map(str::to_string);
+                let chars = |p: &str| -> Vec<char> {
+                    result.pointer(p).and_then(Value::as_array).map(|a| a.iter().take(32)
+                        .filter_map(|v| { let mut c = v.as_str()?.chars(); let first = c.next()?; c.next().is_none().then_some(first) })
+                        .collect()).unwrap_or_default()
+                };
+                self.completion_triggers = chars("/capabilities/completionProvider/triggerCharacters");
+                self.signature_triggers = chars("/capabilities/signatureHelpProvider/triggerCharacters");
                 self.ready = true;
                 self.send(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
                 for v in std::mem::take(&mut self.held) {
@@ -429,6 +611,40 @@ impl Client {
             Pending::Hover => {
                 let text = result.get("contents").map(hover_text).filter(|t| !t.trim().is_empty());
                 events.push(Event::Hover(text));
+            }
+            Pending::Completion => {
+                let (items, incomplete) = match &result {
+                    Value::Array(a) => (a.as_slice(), false),
+                    Value::Object(_) => (result.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+                        result.get("isIncomplete").and_then(Value::as_bool).unwrap_or(false)),
+                    _ => (&[][..], false),
+                };
+                let list = items.iter().take(MAX_COMPLETIONS).filter_map(completion).collect();
+                events.push(Event::Completion(list, incomplete));
+            }
+            Pending::Signature => events.push(Event::Signature(signature(&result))),
+            Pending::References => {
+                let list = result.as_array().map(|a| a.iter().take(MAX_LOCATIONS)
+                    .filter_map(|l| Some(Location { path: self.local(l.get("uri")?.as_str()?)?, range: range_of(l.get("range")?)? }))
+                    .collect()).unwrap_or_default();
+                events.push(Event::References(list));
+            }
+            Pending::Rename => {
+                let edits = self.workspace_edit(&result);
+                events.push(Event::Edits { what: "Rename".into(), edits });
+            }
+            Pending::Format => {
+                let edits = result.as_array().map(|a| a.iter().take(MAX_LOCATIONS).filter_map(text_edit).collect::<Vec<_>>()).unwrap_or_default();
+                events.push(Event::Edits { what: "Format".into(), edits: vec![(PathBuf::new(), edits)] });
+            }
+            Pending::Actions => {
+                let list = result.as_array().map(|a| a.iter().take(200).filter_map(|v| {
+                    let title: String = v.get("title")?.as_str()?.chars().take(200).collect();
+                    // A Command (no "edit"): Artifex doesn't run server commands.
+                    let edits = self.workspace_edit(v.get("edit")?);
+                    (!edits.is_empty()).then(|| Action { title, preferred: v.get("isPreferred").and_then(Value::as_bool).unwrap_or(false), edits })
+                }).collect()).unwrap_or_default();
+                events.push(Event::Actions(list));
             }
             Pending::Shutdown => self.send(json!({ "jsonrpc": "2.0", "method": "exit" })),
         }
@@ -457,6 +673,178 @@ impl Client {
             _ => {}
         }
     }
+}
+
+impl Client {
+    /// A `WorkspaceEdit`'s edits per file, files outside `work` left out.
+    fn workspace_edit(&self, w: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
+        let mut out: Vec<(PathBuf, Vec<TextEdit>)> = Vec::new();
+        let mut add = |uri: &str, list: &Value| {
+            let Some(path) = self.local(uri) else { return };
+            let edits: Vec<TextEdit> = list.as_array().map(|a| a.iter().take(MAX_LOCATIONS).filter_map(text_edit).collect()).unwrap_or_default();
+            if !edits.is_empty() && out.len() < 200 {
+                out.push((path, edits));
+            }
+        };
+        if let Some(dc) = w.get("documentChanges").and_then(Value::as_array) {
+            // Create, rename and delete operations have no "edits": left out.
+            for c in dc {
+                if let (Some(uri), Some(list)) = (c.pointer("/textDocument/uri").and_then(Value::as_str), c.get("edits")) {
+                    add(uri, list);
+                }
+            }
+        } else if let Some(ch) = w.get("changes").and_then(Value::as_object) {
+            for (uri, list) in ch {
+                add(uri, list);
+            }
+        }
+        out
+    }
+}
+
+fn range_json(r: Range) -> Value {
+    json!({ "start": { "line": r.0 .0, "character": r.0 .1 }, "end": { "line": r.1 .0, "character": r.1 .1 } })
+}
+
+fn range_of(r: &Value) -> Option<Range> {
+    let n = |p: &str| r.pointer(p).and_then(Value::as_u64).map(|v| v as usize);
+    Some(((n("/start/line")?, n("/start/character")?), (n("/end/line")?, n("/end/character")?)))
+}
+
+fn text_edit(e: &Value) -> Option<TextEdit> {
+    let text: String = e.get("newText")?.as_str()?.to_string();
+    if text.len() > 1 << 20 {
+        return None;
+    }
+    Some(TextEdit { range: range_of(e.get("range")?)?, text })
+}
+
+fn completion(v: &Value) -> Option<Completion> {
+    // clangd starts a label with its include marker, `•` or a space.
+    let label: String = v.get("label")?.as_str()?.trim_start_matches(['•', ' ']).trim_end().chars().take(200).collect();
+    let snippet = v.get("insertTextFormat").and_then(Value::as_u64) == Some(2);
+    let (insert, range) = match v.get("textEdit") {
+        Some(te) => {
+            let r = te.get("range").or_else(|| te.get("insert")).and_then(range_of);
+            (te.get("newText").and_then(Value::as_str).map(str::to_string), r)
+        }
+        None => (v.get("insertText").and_then(Value::as_str).map(str::to_string), None),
+    };
+    let insert = insert.unwrap_or_else(|| label.clone());
+    let insert: String = insert.chars().take(MAX_INSERT).collect();
+    let insert = if snippet { strip_snippet(&insert) } else { insert };
+    let detail = v.get("detail").and_then(Value::as_str)
+        .or_else(|| v.pointer("/labelDetails/detail").and_then(Value::as_str))
+        .unwrap_or("").chars().take(120).collect();
+    Some(Completion {
+        filter: v.get("filterText").and_then(Value::as_str).map(|t| t.trim().chars().take(200).collect()).unwrap_or_else(|| label.clone()),
+        sort: v.get("sortText").and_then(Value::as_str).map(|t| t.chars().take(200).collect()).unwrap_or_else(|| label.clone()),
+        kind: v.get("kind").and_then(Value::as_u64).unwrap_or(1).min(25) as u8,
+        label,
+        detail,
+        insert: insert.chars().take(4000).collect(),
+        range,
+    })
+}
+
+/// A snippet as plain text: `$1`, `$0` go, `${1:name}` leaves `name`,
+/// `\$` is a `$`.
+pub fn strip_snippet(s: &str) -> String {
+    strip_nested(s, 0)
+}
+
+/// Placeholders nest at most this deep; deeper text is kept as it is.
+const MAX_SNIPPET_DEPTH: usize = 8;
+
+fn strip_nested(s: &str, depth: usize) -> String {
+    if depth > MAX_SNIPPET_DEPTH {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                }
+            }
+            '$' => match it.peek() {
+                Some(d) if d.is_ascii_digit() => {
+                    while it.peek().is_some_and(char::is_ascii_digit) {
+                        it.next();
+                    }
+                }
+                Some('{') => {
+                    it.next();
+                    while it.peek().is_some_and(char::is_ascii_digit) {
+                        it.next();
+                    }
+                    if it.peek() == Some(&':') {
+                        it.next();
+                    } else if it.peek() == Some(&'|') {
+                        // A choice: keep the first.
+                        it.next();
+                        let mut first = String::new();
+                        for c in it.by_ref() {
+                            if c == ',' || c == '|' { break; }
+                            first.push(c);
+                        }
+                        out.push_str(&first);
+                        for c in it.by_ref() {
+                            if c == '}' { break; }
+                        }
+                        continue;
+                    }
+                    // The placeholder's text, itself a snippet.
+                    let (mut open, mut body) = (1usize, String::new());
+                    while let Some(c) = it.next() {
+                        match c {
+                            '\\' => {
+                                body.push(c);
+                                if let Some(n) = it.next() {
+                                    body.push(n);
+                                }
+                            }
+                            '{' => { open += 1; body.push(c); }
+                            '}' => { open -= 1; if open == 0 { break; } body.push(c); }
+                            _ => body.push(c),
+                        }
+                    }
+                    out.push_str(&strip_nested(&body, depth + 1));
+                }
+                _ => out.push('$'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn signature(v: &Value) -> Option<Signature> {
+    let sigs = v.get("signatures")?.as_array()?;
+    let i = v.get("activeSignature").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let sig = sigs.get(i).or_else(|| sigs.first())?;
+    let label: String = sig.get("label")?.as_str()?.chars().take(400).collect();
+    let p = sig.get("activeParameter").or_else(|| v.get("activeParameter")).and_then(Value::as_u64).unwrap_or(0) as usize;
+    let active = sig.get("parameters").and_then(Value::as_array).and_then(|ps| ps.get(p)).and_then(|param| {
+        match param.get("label")? {
+            Value::String(t) => {
+                let b = label.find(t.as_str())?;
+                let start = label[..b].chars().count();
+                Some((start, start + t.chars().count()))
+            }
+            Value::Array(o) => {
+                // Offsets in UTF-16 units of the label.
+                let a = o.first()?.as_u64()? as usize;
+                let e = o.get(1)?.as_u64()? as usize;
+                Some((Encoding::Utf16.to_char(&label, a), Encoding::Utf16.to_char(&label, e)))
+            }
+            _ => None,
+        }
+    });
+    let doc = sig.get("documentation").map(hover_text).unwrap_or_default().chars().take(600).collect();
+    Some(Signature { label, active, doc })
 }
 
 fn diagnostic(d: &Value) -> Option<Diagnostic> {
@@ -622,5 +1010,105 @@ mod tests {
         let id = bodies(&c.take_output())[0]["id"].clone();
         c.feed(&frame(&json!({"jsonrpc":"2.0","id":id,"result":null}))).unwrap();
         assert_eq!(bodies(&c.take_output())[0]["method"], "exit");
+    }
+
+    fn ready() -> Client {
+        let mut c = Client::new(Path::new("/work/proj"), "/home/p/work");
+        c.take_output();
+        c.feed(&frame(&json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{
+            "completionProvider":{"triggerCharacters":[".",":","->"]},
+            "signatureHelpProvider":{"triggerCharacters":["(",","]}}}}))).unwrap();
+        c.did_open(Path::new("/work/proj/src/main.rs"), "rust", "");
+        c.take_output();
+        c
+    }
+
+    fn answer(c: &mut Client, result: Value) -> Vec<Event> {
+        let id = bodies(&c.take_output())[0]["id"].clone();
+        c.feed(&frame(&json!({"jsonrpc":"2.0","id":id,"result":result}))).unwrap()
+    }
+
+    #[test]
+    fn completion_signature_and_triggers() {
+        let mut c = ready();
+        assert_eq!(c.completion_triggers, vec!['.', ':'], "a trigger longer than a character is left out");
+        assert_eq!(c.signature_triggers, vec!['(', ',']);
+        let p = PathBuf::from("/work/proj/src/main.rs");
+        c.completion(&p, 3, 8, Some('.'));
+        let sent = bodies(&c.take_output());
+        assert_eq!(sent[0]["params"]["context"], json!({"triggerKind": 2, "triggerCharacter": "."}));
+        let id = sent[0]["id"].clone();
+        let ev = c.feed(&frame(&json!({"jsonrpc":"2.0","id":id,"result":{"isIncomplete":true,"items":[
+            {"label":"len","kind":2,"detail":"fn(&self) -> usize","insertTextFormat":2,
+             "textEdit":{"range":{"start":{"line":3,"character":8},"end":{"line":3,"character":9}},"newText":"len()$0"}},
+            {"label":"push","insertText":"push(${1:value})","insertTextFormat":2,"sortText":"0"},
+            {"label":"•puts","sortText":"1"},
+            {"nolabel":true}]}}))).unwrap();
+        let Event::Completion(items, incomplete) = &ev[0] else { panic!("{ev:?}") };
+        assert!(*incomplete);
+        assert_eq!(items.len(), 3, "an item with no label is dropped");
+        assert_eq!(items[2].label, "puts", "clangd's include marker taken off");
+        assert_eq!((items[0].insert.as_str(), items[0].range, items[0].kind), ("len()", Some(((3, 8), (3, 9))), 2));
+        assert_eq!((items[1].insert.as_str(), items[1].sort.as_str(), items[1].range), ("push(value)", "0", None));
+
+        c.signature_help(&p, 3, 12);
+        let ev = answer(&mut c, json!({"signatures":[{"label":"fn push(&mut self, value: T)","parameters":[{"label":"&mut self"},{"label":[19,27]}]}],"activeParameter":1}));
+        assert_eq!(ev, vec![Event::Signature(Some(Signature { label: "fn push(&mut self, value: T)".into(), active: Some((19, 27)), doc: String::new() }))]);
+        c.signature_help(&p, 3, 12);
+        assert_eq!(answer(&mut c, Value::Null), vec![Event::Signature(None)]);
+
+        // A newer ask cancels the older, whose late answer is dropped.
+        c.completion(&p, 3, 2, None);
+        let old = bodies(&c.take_output())[0]["id"].clone();
+        c.completion(&p, 3, 8, Some(':'));
+        let sent = bodies(&c.take_output());
+        assert_eq!((sent[0]["method"].as_str(), &sent[0]["params"]["id"]), (Some("$/cancelRequest"), &old));
+        let new = sent[1]["id"].clone();
+        let item = |l: &str| json!({"jsonrpc":"2.0","id":0,"result":[{"label":l}]});
+        let mut late = item("AsyncFnOnce");
+        late["id"] = old;
+        assert!(c.feed(&frame(&late)).unwrap().is_empty(), "the stale answer is dropped");
+        let mut fresh = item("new");
+        fresh["id"] = new;
+        assert!(matches!(&c.feed(&frame(&fresh)).unwrap()[..], [Event::Completion(i, false)] if i[0].label == "new"));
+    }
+
+    #[test]
+    fn references_rename_actions_and_format_stay_in_work() {
+        let mut c = ready();
+        let p = PathBuf::from("/work/proj/src/main.rs");
+        let r = |l: u64, a: u64, b: u64| json!({"start":{"line":l,"character":a},"end":{"line":l,"character":b}});
+        c.references(&p, 1, 4);
+        assert_eq!(bodies(&c.out.clone())[0]["params"]["context"]["includeDeclaration"], true);
+        let ev = answer(&mut c, json!([{"uri":"file:///home/p/work/src/main.rs","range":r(1,4,7)},{"uri":"file:///etc/passwd","range":r(0,0,1)}]));
+        assert_eq!(ev, vec![Event::References(vec![Location { path: p.clone(), range: ((1, 4), (1, 7)) }])]);
+
+        c.rename(&p, 1, 4, "count");
+        let ev = answer(&mut c, json!({"documentChanges":[
+            {"textDocument":{"uri":"file:///home/p/work/src/main.rs","version":2},"edits":[{"range":r(1,4,7),"newText":"count"}]},
+            {"textDocument":{"uri":"file:///home/p/elsewhere/x.rs","version":1},"edits":[{"range":r(0,0,1),"newText":"count"}]},
+            {"kind":"create","uri":"file:///home/p/work/new.rs"}]}));
+        assert_eq!(ev, vec![Event::Edits { what: "Rename".into(), edits: vec![(p.clone(), vec![TextEdit { range: ((1, 4), (1, 7)), text: "count".into() }])] }]);
+
+        c.code_actions(&p, ((1, 0), (1, 9)));
+        let ev = answer(&mut c, json!([
+            {"title":"Import `HashMap`","isPreferred":true,"edit":{"changes":{"file:///home/p/work/src/main.rs":[{"range":r(0,0,0),"newText":"use std::collections::HashMap;\n"}]}}},
+            {"title":"Run a server command","command":{"command":"x"}}]));
+        let Event::Actions(a) = &ev[0] else { panic!() };
+        assert_eq!((a.len(), a[0].title.as_str(), a[0].preferred), (1, "Import `HashMap`", true), "a bare command is not offered");
+
+        c.format(&p, 4, true);
+        let sent = bodies(&c.out.clone());
+        assert_eq!(sent[0]["params"]["options"], json!({"tabSize": 4, "insertSpaces": true}));
+        let ev = answer(&mut c, json!([{"range":r(2,0,2),"newText":"    "}]));
+        assert_eq!(ev, vec![Event::Edits { what: "Format".into(), edits: vec![(PathBuf::new(), vec![TextEdit { range: ((2, 0), (2, 2)), text: "    ".into() }])] }]);
+    }
+
+    #[test]
+    fn snippets_become_plain_text() {
+        assert_eq!(strip_snippet("foo(${1:a}, ${2:b})$0"), "foo(a, b)");
+        assert_eq!(strip_snippet("if ${1:cond} {\n\t$0\n}"), "if cond {\n\t\n}");
+        assert_eq!(strip_snippet("${1|one,two|} \\$x $"), "one $x $");
+        assert_eq!(strip_snippet("${1:Vec<${2:T}>}"), "Vec<T>");
     }
 }

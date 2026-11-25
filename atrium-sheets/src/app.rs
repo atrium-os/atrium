@@ -38,6 +38,10 @@ pub enum Cmd {
     FillOptions,
     /// A press on the status bar's summary: the menu of what it shows.
     StatsMenu,
+    /// Cells were selected with the pointer: Format Painter paints them.
+    Selected,
+    /// Escape: Format Painter off.
+    PainterOff,
     /// Show or hide one of [`crate::data::STAT_NAMES`] in the status bar.
     StatsToggle(u8),
     /// Set, change or remove the document's password.
@@ -390,6 +394,9 @@ pub struct Sheets {
     pub stats_menu: Mutable<MenuState>,
     /// Where the summary was drawn (x, y, width), to put its menu by it.
     stats_at: Rc<Cell<(f32, f32, f32)>>,
+    /// Format Painter, on: the copied cells and where they were, and whether
+    /// it stays on after painting.
+    pub painter: Rc<RefCell<Option<(Rc<officina_grid::clip::Clip>, officina_grid::Rect, bool)>>>,
     /// The Rotation Angle bar is open, with its field.
     pub angling: Mutable<bool>,
     pub angle_text: Mutable<TextEdit>,
@@ -424,13 +431,16 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
     pub fn authoring_escape(&self) -> Option<Cmd> {
         if self.password.get_cloned().open || self.closing.get() || self.ui.get_cloned().asking {
             return None;
+        }
+        if self.painter.borrow().is_some() {
+            return Some(Cmd::PainterOff);
         }
         self.authoring.escape().map(Cmd::Author)
     }
@@ -1839,6 +1849,44 @@ impl Sheets {
         self.set_status(status);
     }
 
+    /// Format Painter on, with the selection's formats; pressed again while
+    /// on, it stays on until Escape.
+    pub fn painter_on(&self) {
+        let again = self.painter.borrow_mut().as_mut().map(|p| p.2 = true).is_some();
+        if again {
+            self.set_status("Format Painter stays on: select cells to paint, Escape to stop.");
+            return;
+        }
+        let sel = self.grid.get_cloned().selection();
+        let d = self.doc.borrow();
+        let src = officina_grid::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+        let clip = officina_grid::clip::Clip::take(&d.wb, src, false);
+        drop(d);
+        *self.painter.borrow_mut() = Some((Rc::new(clip), src, false));
+        self.set_status("Format Painter: select the cells to paint.");
+    }
+
+    /// Paints the selection with Format Painter's formats, then (unless kept
+    /// on) turns it off.
+    pub fn paint(&self) {
+        let Some((clip, src, keep)) = self.painter.borrow().clone() else { return };
+        let sel = self.grid.get_cloned().selection();
+        let done = crate::data::paint_formats(&mut self.doc.borrow_mut(), &clip, src, sel);
+        if !keep {
+            *self.painter.borrow_mut() = None;
+        }
+        match done {
+            Ok(a) => {
+                let mut g = self.grid.get_cloned();
+                g.anchor = (a.r0, a.c0);
+                g.cursor = (a.r1, a.c1);
+                self.grid.set(g);
+                self.set_status(if keep { "Formats painted. Format Painter is still on; Escape stops it." } else { "Formats painted." });
+            }
+            Err(why) => self.set_status(why),
+        }
+    }
+
     /// The status bar's summary of the selection (Average, Count, Sum).
     pub fn selection_summary(&self) -> Option<String> {
         let sel = self.grid.get_cloned().selection();
@@ -2353,6 +2401,7 @@ impl Sheets {
                 }
                 // Ctrl+Alt+V: the Paste Special bar.
                 GridAction::PasteSpecial => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::PasteSpecial)),
+                GridAction::Selected(_) => cmds.lock().unwrap().push(Cmd::Selected),
                 // Shift+F2: the cursor cell's comment.
                 GridAction::Comment => cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Commenting)),
                 // Ctrl+`: formulas shown in their cells, or values again.
@@ -2411,7 +2460,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::PasteSpecial | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Selected(_) | GridAction::PasteSpecial | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -3919,6 +3968,24 @@ impl Sheets {
                     self.closing.set(false);
                     self.changed();
                     true
+                }
+                Cmd::Data(crate::data::DataCmd::FormatPainter) => {
+                    self.painter_on();
+                    self.changed();
+                    false
+                }
+                Cmd::Selected => {
+                    if self.painter.borrow().is_some() {
+                        self.paint();
+                        self.changed();
+                    }
+                    false
+                }
+                Cmd::PainterOff => {
+                    *self.painter.borrow_mut() = None;
+                    self.set_status("Format Painter is off.");
+                    self.changed();
+                    false
                 }
                 Cmd::StatsMenu => {
                     self.stats_menu.set(MenuState::opened(None));
@@ -7975,6 +8042,53 @@ mod tests {
             run(Cmd::StatsToggle(i));
         }
         assert_eq!(s.selection_summary(), None);
+    }
+
+    #[test]
+    fn format_painter_paints_the_next_selection_once_or_until_escape() {
+        use crate::data::DataCmd;
+        use crate::format::FormatCmd;
+        let s = sheets_of(b"1,x\n2,y\n3,z\n4,w\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        let st = |r, c| { let d = s.doc.borrow(); d.wb.style(officina_grid::CellAddr::new(0, r, c)).clone() };
+        select(&s, (0, 0), (0, 0));
+        run(Cmd::Format(FormatCmd::Bold));
+        crate::format::set_code(&mut s.doc.borrow_mut(), CellRange { r0: 0, c0: 0, r1: 0, c1: 0 }, "0.00").unwrap();
+        // A pointer selection with the painter off does nothing.
+        select(&s, (1, 1), (1, 1));
+        run(Cmd::Selected);
+        assert!(!st(1, 1).font.bold);
+        // On: the next selection (B1:B4) gets A1's formats in each cell; values stay.
+        select(&s, (0, 0), (0, 0));
+        run(Cmd::Data(DataCmd::FormatPainter));
+        assert!(s.painter.borrow().is_some());
+        select(&s, (0, 1), (3, 1));
+        run(Cmd::Selected);
+        for r in 0..4 {
+            assert!(st(r, 1).font.bold && &*st(r, 1).num_fmt == "0.00", "B{}", r + 1);
+        }
+        assert_eq!(shown(&s, 2, 1), "z");
+        assert!(s.painter.borrow().is_none(), "once, then off");
+        assert_eq!(s.doc.borrow().status, "Formats painted.");
+        // One undo step takes it all back.
+        assert!(s.doc.borrow_mut().undo());
+        assert!((0..4).all(|r| !st(r, 1).font.bold));
+        // Pressed twice: stays on over several selections, until Escape.
+        select(&s, (0, 0), (0, 0));
+        run(Cmd::Data(DataCmd::FormatPainter));
+        run(Cmd::Data(DataCmd::FormatPainter));
+        for r in [1, 3] {
+            select(&s, (r, 1), (r, 1));
+            run(Cmd::Selected);
+        }
+        assert!(st(1, 1).font.bold && st(3, 1).font.bold && !st(2, 1).font.bold);
+        let esc = s.authoring_escape();
+        assert!(matches!(esc, Some(Cmd::PainterOff)));
+        run(esc.unwrap());
+        assert!(s.painter.borrow().is_none());
+        select(&s, (2, 1), (2, 1));
+        run(Cmd::Selected);
+        assert!(!st(2, 1).font.bold);
     }
 
     #[test]
