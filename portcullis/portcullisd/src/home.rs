@@ -35,6 +35,9 @@ fn group_entry(group: &str) -> Option<(u32, Vec<String>)> {
 
 fn gid_of(group: &str) -> Option<u32> { group_entry(group).map(|g| g.0) }
 
+/// A group's id, from the group database.
+pub fn group_gid(group: &str) -> Option<u32> { gid_of(group) }
+
 fn uid_of(person: &str) -> Option<u32> {
     let o = Command::new("id").args(["-u", person]).output().ok()?;
     if !o.status.success() {
@@ -421,6 +424,39 @@ fn sealed_or_allowed(person: &str, named: Option<&str>, what: &str, at: &Path, a
             }
             Err(format!("{person}'s {which} {what}: not encrypted, and plain is not allowed here: {why}"))
         }
+    }
+}
+
+/// Where `person`'s VPN profiles for `persona` (None: Personal) live
+/// (vpn.md §7.1a): `.crypta` in that persona's app data, root's, 0700. As
+/// Mail's accounts (mail.md §6.4a): a named persona's only when the kernel
+/// reports its app data sealed; Personal's also where its app data may be
+/// plain (the machine's opt-out, or its one migrating login).
+pub fn vpn_profiles_dir(person: &str, persona: Option<&str>) -> Result<PathBuf, String> {
+    let named = persona.filter(|p| *p != "personal");
+    match ensure_app_data(person, named)? {
+        AppData::Sealed => {}
+        AppData::Plain if named.is_none() => {}
+        AppData::Plain => return Err(format!("{person}'s {} app data is plain: no VPN profiles there", named.unwrap_or("personal"))),
+    }
+    let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
+    let parent = match named {
+        None => portcullis_overlay::apps_root(&home)?,
+        Some(p) => portcullis_overlay::persona_apps_dir(&home, p),
+    };
+    match std::fs::symlink_metadata(&parent) {
+        Ok(m) if m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0 => {}
+        _ => return Err(format!("{} is not root's own folder", parent.display())),
+    }
+    let dir = parent.join(".crypta");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create {}: {e}", dir.display())),
+    }
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() && m.uid() == 0 && m.mode() & 0o777 == 0o700 => Ok(dir),
+        _ => Err(format!("{} is not root's, 0700", dir.display())),
     }
 }
 

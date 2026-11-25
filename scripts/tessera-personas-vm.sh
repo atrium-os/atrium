@@ -38,7 +38,10 @@
 #      (E5) the rest of her Work Arca goes too, so a Work stick's key
 #      leaves the kernel and can't be found (the stick shows Locked), and
 #      the volume is scrubbed so the Work app data deleted in the clear is
-#      not on the disk; added again, it gets a new group;
+#      not on the disk; a Work VPN profile kept where cryptad keeps it
+#      (vpn.md §7.1a, `.crypta` in Work's app data folder, in Work's
+#      group) is never on the disk in the clear and is gone with it;
+#      added again, it gets a new group;
 #   6. (E6) b's app data from before (session state, a workspace, an app's
 #      overlay image) moves into his Personal group; a part with an overlay
 #      still mounted waits until it is unmounted; the image stays sparse and
@@ -214,6 +217,18 @@ echo "=== 5. a removes her Work persona"
 r=$(ask e46a work $GA $WA)
 check "Work open again" open "$(state $WA/Documents)"
 check "…a Work file written" yes "$(g "su -m e46a -c 'echo work plans secret > $WA/Documents/work-plans.txt'" && echo yes || echo no)"
+# vpn.md §7.1a: Work's VPN profile, where cryptad keeps it, in .crypta in
+# Work's app data folder (asked for as portcullisd's ensure_app_data does:
+# root's, Work's group), with a marker in its name and its gateway.
+WP=$HA/.atrium/persona-apps/work
+g "mkdir -p $HA/.atrium/persona-apps && chmod 755 $HA/.atrium/persona-apps"
+r=$(g "$CLI $VS folders e46a work 0 0 $WP" 2>/dev/null | tr -d ' \n')
+check "Work's app data folder is ready, encrypted" yes "$(echo "$r" | grep -q '"encrypted":true' && echo yes || echo no)"
+check "…in Work's group" "$GWA" "$(grp $WP)"
+g "mkdir -m 700 $WP/.crypta && printf 'profile name=vpnmarker-acme kind=gp host=vpnmarker-gw.acme.example port=443 path=/ scoped=1\\n' > $WP/.crypta/vpnmarker-acme.profile && chmod 600 $WP/.crypta/vpnmarker-acme.profile"
+check "…Work's VPN profile written there" yes "$(g "grep -q vpnmarker-gw $WP/.crypta/vpnmarker-acme.profile" && echo yes || echo no)"
+ticks
+check "…and not in the clear on the disk" 0 "$(g "grep -ac vpnmarker /dev/$MD")"
 # E5: a Work stick's key in her Work Arca (minted as atrium-volumes would
 # when the stick is formatted), and Work app data in the clear, which
 # portcullisd deletes before it asks for the erase.
@@ -235,10 +250,11 @@ for i in $(seq 1 120); do
 done
 check "…the removal's scrub ran" e "$(g "test -s $T/volumes.scrub && echo q || echo e")"
 echo "  $(g "grep 'scrub:' $T/v.log | tail -1")"
-for w in 'work app cache line' work-app-cache-secret 'work plans secret'; do
+for w in 'work app cache line' work-app-cache-secret 'work plans secret' vpnmarker-acme vpnmarker-gw; do
     check "removed Work '$w' not on the disk" 0 "$(g "grep -ac '$w' /dev/$MD")"
 done
 check "…its folders are gone" no "$(g "test -e $WA/Documents && echo yes || echo no")"
+check "…its VPN profile can't be read" no "$(g "cat $WP/.crypta/vpnmarker-acme.profile >/dev/null 2>&1 && echo yes || echo no")"
 check "…its group is gone" 0 "$(g "dmesg -c >/dev/null; $KL quota-dump $M >/dev/null 2>&1; dmesg | grep -c 'key group $GWA '")"
 check "…and its expectation" 2 "$(g "grep -c '^\[\[group\]\]' $T/groups.toml")"
 check "a's Personal is untouched" "$OLDSUM" "$(g "md5 -q $HA/Documents/letters/old-letter-secret.txt")"

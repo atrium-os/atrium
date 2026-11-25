@@ -52,6 +52,7 @@ use portcullis_ipc::{
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
 mod calendar;
+mod crypta;
 mod console;
 mod dev;
 mod egress;
@@ -158,6 +159,20 @@ fn main() -> ExitCode {
         is the DEV STUB (accepts ANY password). NOT FOR PRODUCTION.");
 
     let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
+
+    // Each person's VPN profile folders, named to cryptad (vpn.md §7.1a).
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || loop {
+            let people: Vec<(String, Vec<String>)> = shared.lock().unwrap_or_else(|e| e.into_inner()).cache.iter()
+                .map(|(u, tp)| (u.clone(), tp.policy.personas.keys().cloned().collect()))
+                .collect();
+            for (u, personas) in people {
+                crypta::publish(&u, &personas);
+            }
+            thread::sleep(crypta::EVERY);
+        });
+    }
 
     /* ★ The worker-call socket (portcullis_ipc::WORKERS_SOCKET_PATH): what
      * an app with [[workers]] gets in its jail. Same daemon, same peer-uid
@@ -3020,6 +3035,11 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         let sticks = portcullisd::home::mounted_sticks(&name);
         if !sticks.is_empty() {
             return refuse(format!("{} of {name} was plugged in meanwhile: eject it first; nothing was removed", sticks.join(", ")));
+        }
+        // Its VPN tunnels down and its profiles forgotten (vpn.md §7.1a);
+        // the profiles' folder goes with the persona's crypto-erase.
+        if let Err(why) = crypta::forget(&owner, &name) {
+            return refuse(why);
         }
     }
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());

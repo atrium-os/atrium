@@ -46,6 +46,7 @@ TGT=${CARGO_TARGET_DIR:-$ROOT/portcullis/target}
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p portcullisd -p portcullis-cli -p opifex \
     --bin portcullisd --bin portcullis --bin opifex --example home_probe --example download_probe) || { echo "build failed"; echo "personas: 1 failed"; exit 1; }
+(cd "$ROOT/crypta" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p cryptad --bin atrium-cryptad) || { echo "cryptad build failed"; echo "personas: 1 failed"; exit 1; }
 if [ -z "${NO_UI:-}" ]; then
     (cd "$ROOT/frescod" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin frescod) || { echo "frescod build failed"; echo "personas: 1 failed"; exit 1; }
     (cd "$ROOT/forum-dock" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin forum-dock --example sample_app) || { echo "forum-dock build failed"; echo "personas: 1 failed"; exit 1; }
@@ -58,6 +59,7 @@ V "pkill -x portcullisd; sleep 1; rm -rf $B; mkdir -p $B"
 for b in release/portcullisd release/portcullis release/opifex release/examples/home_probe release/examples/download_probe; do
     scp -q $K -P 2222 "$TGT/$TARGET/$b" root@localhost:$B/ || exit 1
 done
+scp -q $K -P 2222 "$ROOT/crypta/target/$TARGET/release/atrium-cryptad" root@localhost:$B/ || exit 1
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 PROBE=org.test.personaprobe
 FM=org.test.personafm
@@ -277,6 +279,54 @@ echo "=== frescod's chrome tests"
 scp -q $K -P 2222 "$FT" root@localhost:$B/frescod-tests && R=$(V "$B/frescod-tests chrome:: 2>&1 | grep 'test result'")
 case "$R" in *" 0 failed"*) ok "chrome: $R" ;; *) bad "chrome tests: $R" ;; esac
 fi
+
+echo "=== VPN profiles at rest (vpn.md §7.1a)"
+# cryptad beside portcullisd: portcullisd names each persona's profile
+# folder (.crypta in its app data) while it may hold them; a Work profile
+# then lives only there, never in cryptad's own /var/db folder. Removing
+# the persona asks cryptad to forget it first (persona-forget; the removal
+# itself needs Sigillum, so it is sent here as portcullisd sends it). The
+# raw-disk marker after the crypto-erase is in tessera-personas-vm.sh §5,
+# which needs a Tessera key group (the Mac VM).
+CS=$B/crypta.sock; CDB=$B/crypta-db; MK=vpnmark$(date +%s)
+CTL="env CRYPTA_SOCK=$CS /usr/local/bin/atrium-cryptad ctl"
+V "sh -s" <<EOS
+install -m 0755 $B/atrium-cryptad /usr/local/bin/atrium-cryptad
+pkill -f 'atrium-cryptad -v' 2>/dev/null; pkill -x portcullisd; sleep 1; rm -rf $CDB $CS $PSOCK /home/alice/.atrium/apps/.crypta /home/alice/.atrium/persona-apps/work/.crypta
+id _frescod >/dev/null 2>&1 || pw useradd _frescod -u 65010 -d /nonexistent -s /usr/sbin/nologin -c 'Fresco compositor'
+daemon -f -o $B/cryptad.log /usr/local/bin/atrium-cryptad -v --sock $CS --state $CDB --net-sock $B/no-net.sock --arca $B/no-arca.sock --vpn-state /var/run/atrium/vpn-state
+sleep 1
+PORTCULLISD_CRYPTA_SOCK=$CS daemon -f -o $LOG /usr/local/bin/portcullisd --socket $PSOCK
+sleep 3; chmod 666 $PSOCK
+su -m alice -c 'portcullis personas $PROBE' >/dev/null 2>&1
+EOS
+i=0; while [ $i -lt 30 ] && ! V "grep -q \"alice's personal: \" $B/cryptad.log"; do sleep 1; i=$((i+1)); done
+check "portcullisd names alice's Personal folder to cryptad" "/home/alice/.atrium/apps/.crypta" "$(V "grep \"alice's personal: \" $B/cryptad.log | tail -1 | sed 's/.* in //'")"
+check "…root's, 0700" "root 700" "$(V "stat -f '%Su %Lp' /home/alice/.atrium/apps/.crypta")"
+SEALED=$(V "grep -q \"alice's work: \" $B/cryptad.log && echo yes || echo no")
+if [ "$SEALED" = yes ]; then
+    OWN=work; DIR=/home/alice/.atrium/persona-apps/work/.crypta
+    ok "Work's app data is sealed: its folder is named too"
+else
+    # Plain app data (this VM's opt-out): no Work folder, so no Work profile.
+    check "Work's app data is plain: cryptad has no Work folder" "error why=no-persona-store" "$(V "$CTL create-gp name=${MK}w host=${MK}-gw.acme.example owner=alice/work" | tail -1)"
+    check "…and nothing of it was written" "" "$(V "grep -rl $MK $CDB /home/alice/.atrium 2>/dev/null")"
+    OWN=personal; DIR=/home/alice/.atrium/apps/.crypta
+fi
+check "a profile for alice's $OWN" "ok" "$(V "$CTL create-gp name=$MK host=$MK-gw.acme.example owner=alice/$OWN" | tail -1)"
+check "…kept in $OWN's folder, 0600" "600" "$(V "stat -f %Lp $DIR/$MK.profile")"
+check "…not in cryptad's own folder" "" "$(V "grep -rl $MK $CDB 2>/dev/null; ls $CDB")"
+check "…persona-scoped, its owner listed" "owner=alice/$OWN scoped=1" "$(V "$CTL list" | grep "name=$MK " | grep -o 'owner=[^ ]*\|scoped=[01]' | tr '\n' ' ' | sed 's/ $//')"
+check "…it can't be made machine-wide" "error why=persona-profile" "$(V "$CTL set name=$MK scoped=0" | tail -1)"
+check "a machine profile still lands in cryptad's folder" "ok yes" "$(V "$CTL create-gp name=${MK}m host=${MK}m.acme.example" | tail -1) $(V "test -f $CDB/${MK}m.profile && echo yes")"
+check "persona-vpn is the window manager's alone" "root _frescod 640" "$(V "stat -f '%Su %Sg %Lp' /var/run/atrium/persona-vpn")"
+i=0; while [ $i -lt 10 ] && ! V "test -f /var/run/atrium/vpn-state"; do sleep 1; i=$((i+1)); done
+check "vpn-state too" "root _frescod 640" "$(V "stat -f '%Su %Sg %Lp' /var/run/atrium/vpn-state")"
+check "removing $OWN: cryptad forgets its profiles" "forgot count=1" "$(V "$CTL persona-forget person=alice persona=$OWN" | head -1)"
+check "…gone from its list" "" "$(V "$CTL list" | grep "name=$MK ")"
+check "…and from its folder" "no" "$(V "test -e $DIR/$MK.profile && echo yes || echo no")"
+check "…the machine profile stays" "1" "$(V "$CTL list" | grep -c "name=${MK}m ")"
+V "$CTL delete name=${MK}m >/dev/null; pkill -f 'atrium-cryptad -v'; rm -f /var/run/atrium/vpn-state" || true
 
 echo "personas: $fails failed"
 [ "$fails" -eq 0 ]

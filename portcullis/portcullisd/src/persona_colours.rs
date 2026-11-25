@@ -27,16 +27,25 @@ pub fn routes_path() -> PathBuf {
 /// Replace `person`'s lines with `personas` (name, colour); other people's
 /// lines stay.
 pub fn publish(person: &str, personas: &[(String, String)]) -> std::io::Result<()> {
-    publish_to(&path(), person, personas)
+    publish_to(&path(), person, personas, None)
 }
 
 /// Replace `person`'s lines in the routes file with `routes` (persona, VPN
 /// profile).
+/// Root's, group `_frescod`, 0640 (vpn.md §7.1a): only the window manager
+/// reads which person's persona uses which VPN.
 pub fn publish_routes(person: &str, routes: &[(String, String)]) -> std::io::Result<()> {
-    publish_to(&routes_path(), person, routes)
+    let gid = frescod_gid().ok_or_else(|| std::io::Error::other("no _frescod group: persona-vpn not written"))?;
+    publish_to(&routes_path(), person, routes, Some(gid))
 }
 
-fn publish_to(p: &std::path::Path, person: &str, personas: &[(String, String)]) -> std::io::Result<()> {
+/// The window manager's group.
+fn frescod_gid() -> Option<u32> {
+    crate::home::group_gid("_frescod")
+}
+
+/// `group`: the file is root's with that group, 0640; else 0644.
+fn publish_to(p: &std::path::Path, person: &str, personas: &[(String, String)], group: Option<u32>) -> std::io::Result<()> {
     if !plain(person) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a user name"));
     }
@@ -46,7 +55,8 @@ fn publish_to(p: &std::path::Path, person: &str, personas: &[(String, String)]) 
     lines.extend(personas.iter().filter(|(n, c)| plain(n) && plain(c)).map(|(n, c)| format!("{person} {n} {c}")));
     lines.sort();
     let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    if text == old {
+    let mode = if group.is_some() { 0o640 } else { 0o644 };
+    if text == old && std::fs::metadata(&p).is_ok_and(|m| { use std::os::unix::fs::MetadataExt; m.mode() & 0o777 == mode && group.map_or(true, |g| m.gid() == g) }) {
         return Ok(());
     }
     if let Some(d) = p.parent() {
@@ -55,7 +65,12 @@ fn publish_to(p: &std::path::Path, person: &str, personas: &[(String, String)]) 
     let tmp = p.with_extension("tmp");
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(&tmp)?;
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        if let Some(g) = group {
+            std::os::unix::fs::fchown(&f, None, Some(g))?;
+        }
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         f.write_all(text.as_bytes())?;
     }
     std::fs::rename(&tmp, &p)
@@ -90,8 +105,17 @@ mod tests {
         publish("alice", &[]).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("c")).unwrap(), "bob school green\n");
         std::env::set_var("PORTCULLISD_PERSONA_VPN", d.join("v"));
-        publish_routes("alice", &[("work".into(), "acme".into())]).unwrap();
+        // The routes file is the window manager's group's alone.
+        use std::os::unix::fs::MetadataExt;
+        let g = std::fs::metadata(&d).unwrap().gid();
+        publish_to(&routes_path(), "alice", &[("work".into(), "acme".into())], Some(g)).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("v")).unwrap(), "alice work acme\n");
+        let m = std::fs::metadata(d.join("v")).unwrap();
+        assert_eq!((m.mode() & 0o777, m.gid()), (0o640, g));
+        // An older 0644 file is put right even when the lines are the same.
+        std::fs::set_permissions(d.join("v"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        publish_to(&routes_path(), "alice", &[("work".into(), "acme".into())], Some(g)).unwrap();
+        assert_eq!(std::fs::metadata(d.join("v")).unwrap().mode() & 0o777, 0o640);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

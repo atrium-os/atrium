@@ -39,6 +39,16 @@
 //! - `csr name=N [cn=HEX]`: a P-256 key in Arca and a request for it
 //! - `certificate name=N` with the PEM chain as a descriptor
 //!
+//! Persona profiles (vpn.md §7.1a):
+//!
+//! - `persona-store person= persona= dir=` (portcullisd): that persona's
+//!   profile folder, `.crypta` in its app data, in its key group
+//! - `persona-forget person= persona=` (portcullisd, removing the persona):
+//!   its tunnels down, its profiles and their Arca items gone
+//! - `owner=<person>/<persona>` on `import`, `create`, `create-ac` and
+//!   `create-gp` keeps the profile in that folder, persona-scoped; without
+//!   the folder there is no such profile
+//!
 //! `atrium-cryptad ctl VERB [k=v ...]` sends one (with stdin as the file for
 //! `import`) and prints the answer.
 
@@ -164,6 +174,43 @@ struct Run {
     ac: AcRun,
 }
 
+/// The window manager's group, which alone may read `vpn-state`.
+fn frescod_gid() -> Option<u32> {
+    // SAFETY: getgrnam takes a NUL-terminated name and returns a pointer to
+    // static storage or null; gr_gid is read at once, before any other call.
+    unsafe {
+        let g = libc::getgrnam(c"_frescod".as_ptr());
+        (!g.is_null()).then(|| (*g).gr_gid)
+    }
+}
+
+/// A persona's profile folder: `<persona apps dir>/.crypta`, root's, 0700.
+struct Store {
+    person: String,
+    persona: String,
+    dir: PathBuf,
+}
+
+/// A user or persona name as portcullisd writes them.
+fn plain_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) && !s.starts_with(['.', '-'])
+}
+
+/// A profile folder portcullisd named: absolute, a directory and not a
+/// link, root's, nobody else's to read or write.
+fn private_dir(d: &str) -> Result<PathBuf, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let p = PathBuf::from(d);
+    if !p.is_absolute() || d.len() > 1024 || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("bad-dir");
+    }
+    let m = std::fs::symlink_metadata(&p).map_err(|_| "no-dir")?;
+    if !m.file_type().is_dir() || m.uid() != 0 || m.mode() & 0o077 != 0 {
+        return Err("insecure-dir");
+    }
+    Ok(p)
+}
+
 struct CtlConn {
     s: UnixStream,
     buf: Vec<u8>,
@@ -179,6 +226,9 @@ struct D {
     janitor: Vec<u32>,
     /// The `vpn-state` text last written.
     shown: Option<String>,
+    /// Persons' and personas' profile folders (vpn.md §7.1a), each in that
+    /// persona's key group, as portcullisd names them.
+    stores: Vec<Store>,
     /// Why a tunnel stopped for good (a gateway's refusal, a push
     /// atrium-net refused), until it is turned on again.
     failed: HashMap<String, String>,
@@ -234,6 +284,94 @@ impl D {
         }
     }
 
+    /// The folder holding profile `name`: the machine's, else the persona
+    /// folder that has it.
+    fn dir_of(&self, name: &str) -> Option<PathBuf> {
+        if !profile::valid_name(name) {
+            return None;
+        }
+        std::iter::once(&self.o.state).chain(self.stores.iter().map(|s| &s.dir)).find(|d| Profile::path(d, name).exists()).cloned()
+    }
+
+    fn load(&self, name: &str) -> Option<Profile> {
+        Profile::load(&self.dir_of(name)?, name)
+    }
+
+    /// Back where it was loaded from: a persona's profile never lands in
+    /// the machine's folder.
+    fn save(&self, p: &Profile) -> std::io::Result<()> {
+        let d = self.dir_of(&p.name).ok_or_else(|| std::io::Error::other("no such profile"))?;
+        p.save(&d)
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::iter::once(&self.o.state).chain(self.stores.iter().map(|s| &s.dir)).flat_map(|d| Profile::names(d)).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn owner_of(&self, name: &str) -> Option<&Store> {
+        let d = self.dir_of(name)?;
+        self.stores.iter().find(|s| s.dir == d)
+    }
+
+    /// Where a new profile goes: `owner=<person>/<persona>` is that
+    /// persona's folder (and the profile is persona-scoped), else the
+    /// machine's. A persona whose folder portcullisd hasn't named (its key
+    /// group isn't open) gets none.
+    fn new_home(&self, l: &Line, name: &str) -> Result<(PathBuf, bool), String> {
+        if self.dir_of(name).is_some() {
+            return Err("exists".into());
+        }
+        match l.get("owner") {
+            None => Ok((self.o.state.clone(), false)),
+            Some(o) => {
+                let (person, persona) = o.split_once('/').filter(|(a, b)| plain_name(a) && plain_name(b)).ok_or("bad-owner")?;
+                let s = self.stores.iter().find(|s| s.person == person && s.persona == persona).ok_or("no-persona-store")?;
+                Ok((s.dir.clone(), true))
+            }
+        }
+    }
+
+    /// `persona-store person= persona= dir=` (portcullisd): that persona's
+    /// profile folder, now open.
+    fn persona_store(&mut self, l: &Line) -> Result<Vec<Line>, String> {
+        let person = l.get("person").filter(|p| plain_name(p)).ok_or("bad-person")?.to_string();
+        let persona = l.get("persona").filter(|p| plain_name(p)).ok_or("bad-persona")?.to_string();
+        let dir = private_dir(l.get("dir").ok_or("no-dir")?)?;
+        if dir == self.o.state || self.stores.iter().any(|s| s.dir == dir && (s.person != person || s.persona != persona)) {
+            return Err("dir-taken".into());
+        }
+        self.stores.retain(|s| !(s.person == person && s.persona == persona));
+        let n = Profile::names(&dir).len();
+        self.log(&format!("{person}'s {persona}: {n} profile(s) in {}", dir.display()));
+        self.stores.push(Store { person, persona, dir });
+        Ok(vec![Line::new("profiles").with("count", n)])
+    }
+
+    /// `persona-forget person= persona=` (portcullisd, removing the
+    /// persona): its tunnels go down and its profiles and their Arca items
+    /// go; the folder itself is crypto-erased with the persona.
+    fn persona_forget(&mut self, l: &Line) -> Result<Vec<Line>, String> {
+        let person = l.get("person").filter(|p| plain_name(p)).ok_or("bad-person")?;
+        let persona = l.get("persona").filter(|p| plain_name(p)).ok_or("bad-persona")?;
+        let Some(k) = self.stores.iter().position(|s| s.person == person && s.persona == persona) else {
+            return Ok(vec![Line::new("forgot").with("count", 0)]);
+        };
+        let dir = self.stores[k].dir.clone();
+        let names = Profile::names(&dir);
+        for n in &names {
+            // Only what this folder holds: a machine profile of the same name stays.
+            if self.dir_of(n).as_ref() == Some(&dir) {
+                self.delete(n)?;
+            }
+        }
+        self.stores.retain(|s| s.dir != dir);
+        self.log(&format!("{person}'s {persona}: forgot {} profile(s)", names.len()));
+        Ok(vec![Line::new("forgot").with("count", names.len())])
+    }
+
     fn net(&mut self) -> Result<&mut net::NetCtl, String> {
         if self.net.is_none() {
             self.net = Some(net::NetCtl::connect(&self.o.net_sock).map_err(|e| format!("atrium-net: {e}"))?);
@@ -254,9 +392,7 @@ impl D {
 
     fn import(&mut self, l: &Line, file: Option<OwnedFd>) -> Result<Vec<Line>, String> {
         let name = l.get("name").filter(|n| profile::valid_name(n)).ok_or("bad-name")?.to_string();
-        if Profile::load(&self.o.state, &name).is_some() {
-            return Err("exists".into());
-        }
+        let (home, owned) = self.new_home(l, &name)?;
         let file = file.ok_or("no-file")?;
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
         std::fs::File::from(file).take(crypta_proto::conf::MAX_FILE as u64 + 1).read_to_end(&mut bytes).map_err(|_| "unreadable")?;
@@ -299,7 +435,8 @@ impl D {
         if let Some(b) = l.get("block") {
             p.block = b == "1";
         }
-        if let Err(e) = p.save(&self.o.state) {
+        p.scoped |= owned;
+        if let Err(e) = p.save(&home) {
             self.forget(&items);
             return Err(format!("save: {e}"));
         }
@@ -315,16 +452,15 @@ impl D {
     /// answer's `public` is what the server's admin needs.
     fn create(&mut self, l: &Line) -> Result<Vec<Line>, String> {
         let mut p = Profile::from_create(l)?;
-        if Profile::load(&self.o.state, &p.name).is_some() {
-            return Err("exists".into());
-        }
+        let (home, owned) = self.new_home(l, &p.name)?;
+        p.scoped |= owned;
         let k = self.keys.call(&Line::new("mint").with("account", &p.name)).map_err(|e| e.to_string())?;
         let (Some(id), Some(public)) = (k.hex("id").and_then(|i| <[u8; 16]>::try_from(i).ok()), hex32(&k, "pub")) else {
             return Err(format!("arca-{}", k.get("status").unwrap_or("?")));
         };
         p.key = id;
         p.public = public;
-        if let Err(e) = p.save(&self.o.state) {
+        if let Err(e) = p.save(&home) {
             self.forget(&[id]);
             return Err(format!("save: {e}"));
         }
@@ -345,7 +481,7 @@ impl D {
         if self.runs.len() >= MAX_TUNNELS {
             return Err("too-many".into());
         }
-        let p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        let p = self.load(name).ok_or("no-profile")?;
         self.failed.remove(name);
         // AnyConnect: the gateway's address now; its settings come with the
         // sign-in, and are applied then (`Pushed`).
@@ -510,11 +646,12 @@ impl D {
             if changed {
                 a.username = user.or(a.username.take());
                 a.group = group.or(a.group.take());
-                if let Some(mut saved) = Profile::load(&self.o.state, &r.p.name) {
-                    if let (Some(s), Some(n)) = (saved.ac.as_mut(), r.p.ac.as_ref()) {
-                        s.username = n.username.clone();
-                        s.group = n.group.clone();
-                        let _ = saved.save(&self.o.state);
+                let (name, n) = (r.p.name.clone(), a.clone());
+                if let Some(mut saved) = self.load(&name) {
+                    if let Some(s) = saved.ac.as_mut() {
+                        s.username = n.username;
+                        s.group = n.group;
+                        let _ = self.save(&saved);
                     }
                 }
             }
@@ -647,9 +784,8 @@ impl D {
     /// descriptor besides `ca=`.
     fn create_ac(&mut self, l: &Line, file: Option<OwnedFd>) -> Result<Vec<Line>, String> {
         let mut p = Profile::from_create_ac(l)?;
-        if Profile::load(&self.o.state, &p.name).is_some() {
-            return Err("exists".into());
-        }
+        let (home, owned) = self.new_home(l, &p.name)?;
+        p.scoped |= owned;
         if let Some(f) = file {
             let mut text = String::new();
             std::fs::File::from(f).take(64 * 1024).read_to_string(&mut text).map_err(|_| "unreadable")?;
@@ -660,7 +796,7 @@ impl D {
                 }
             }
         }
-        p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        p.save(&home).map_err(|e| format!("save: {e}"))?;
         // A sign-in jar left by an old profile of this name is not this one's.
         let _ = self.keys.call(&Line::new("forget-jar").with("profile", &p.name));
         self.log(&format!("created {} (corporate VPN, {})", p.name, p.ac.as_ref().map(|a| a.host.as_str()).unwrap_or("")));
@@ -669,7 +805,7 @@ impl D {
 
     /// `csr`: a client key made in Arca, and a request for the IT team.
     fn csr(&mut self, name: &str, l: &Line) -> Result<Vec<Line>, String> {
-        let mut p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        let mut p = self.load(name).ok_or("no-profile")?;
         let a = p.ac.as_mut().ok_or("not-ac")?;
         let account = format!("{name}/tls");
         let (id, public) = match self.keys.call(&Line::new("find").with("account", &account)).ok().filter(|l| l.verb == "ok").and_then(|l| l.hex("id")).and_then(|i| <[u8; 16]>::try_from(i).ok()) {
@@ -694,13 +830,13 @@ impl D {
         let info = csr::info(&cn, &public);
         let s = self.keys.call(&Line::new("sign").with_hex("id", &id).with_hex("digest", &csr::digest(&info))).map_err(|e| e.to_string())?;
         let sig = s.hex("sig").ok_or_else(|| format!("arca-{}", s.get("status").unwrap_or("?")))?;
-        p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        self.save(&p).map_err(|e| format!("save: {e}"))?;
         Ok(vec![Line::new("csr").with_hex("pem", csr::pem(&info, &sig).as_bytes())])
     }
 
     /// `certificate`: the chain the IT team signed, for the key `csr` made.
     fn certificate(&mut self, name: &str, file: Option<OwnedFd>) -> Result<Vec<Line>, String> {
-        let mut p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        let mut p = self.load(name).ok_or("no-profile")?;
         let a = p.ac.as_mut().ok_or("not-ac")?;
         let key = a.cert_key.clone().ok_or("no-key")?;
         let mut text = String::new();
@@ -710,7 +846,7 @@ impl D {
             return Err("not-for-this-key".into());
         }
         a.cert_chain = chain;
-        p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        self.save(&p).map_err(|e| format!("save: {e}"))?;
         Ok(vec![])
     }
 
@@ -752,7 +888,7 @@ impl D {
     }
 
     fn delete(&mut self, name: &str) -> Result<(), String> {
-        let p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        let p = self.load(name).ok_or("no-profile")?;
         self.down(name)?;
         self.failed.remove(name);
         if p.ac.is_some() {
@@ -765,14 +901,17 @@ impl D {
             ids.extend(p.psk);
             self.forget(&ids);
         }
-        std::fs::remove_file(Profile::path(&self.o.state, name)).map_err(|e| e.to_string())
+        std::fs::remove_file(Profile::path(&self.dir_of(name).ok_or("no-profile")?, name)).map_err(|e| e.to_string())
     }
 
     fn list(&self) -> Vec<Line> {
-        Profile::names(&self.o.state)
+        self.names()
             .into_iter()
             .map(|n| {
                 let mut l = Line::new("tunnel").with("name", &n);
+                if let Some(s) = self.owner_of(&n) {
+                    l = l.with("owner", format!("{}/{}", s.person, s.persona));
+                }
                 if let Some(r) = self.runs.iter().find(|r| r.p.name == n) {
                     l = l
                         .with("up", 1)
@@ -801,7 +940,7 @@ impl D {
                 if let Some(why) = self.failed.get(&n) {
                     l = l.with_hex("error", why.as_bytes());
                 }
-                let ac = Profile::load(&self.o.state, &n).filter(|p| p.ac.is_some());
+                let ac = self.load(&n).filter(|p| p.ac.is_some());
                 if let Some(p) = ac {
                     let a = p.ac.as_ref().unwrap();
                     l = l.with("kind", a.kind()).with("host", &a.host).with("port", a.port).with("block", p.block as u8).with("scoped", p.scoped as u8).with("cert", (!a.cert_chain.is_empty()) as u8).with("pinned", a.pin.is_some() as u8);
@@ -811,7 +950,7 @@ impl D {
                     if let Some(g) = &a.group {
                         l = l.with_hex("group", g.as_bytes());
                     }
-                } else if let Some(p) = Profile::load(&self.o.state, &n) {
+                } else if let Some(p) = self.load(&n) {
                     l = l.with("kind", "wg").with("public", crypta_proto::b64::encode(&p.public)).with("endpoint", p.endpoint).with("full", p.full() as u8).with("block", p.block as u8).with("scoped", p.scoped as u8);
                     l = l.with("addrs", p.addrs.iter().map(|a| format!("{}/{}", a.addr, a.len)).collect::<Vec<_>>().join(",")).with("routes", p.allowed.len());
                     if !p.dns.is_empty() {
@@ -873,17 +1012,21 @@ impl D {
                     Some("1") => Ok(Some(true)),
                     _ => Err(()),
                 };
-                match (Profile::load(&self.o.state, &n), flag("block"), flag("insecure"), flag("scoped")) {
+                match (self.load(&n), flag("block"), flag("insecure"), flag("scoped")) {
+                    // A persona's profile is only ever its persona's.
+                    (Some(_), _, _, Ok(Some(false))) if self.owner_of(&n).is_some() => Err("persona-profile".into()),
                     (Some(mut p), Ok(b), Ok(i), Ok(s)) if b.is_some() || i.is_some() || s.is_some() => {
                         p.block = b.unwrap_or(p.block);
                         p.insecure = i.unwrap_or(p.insecure);
                         p.scoped = s.unwrap_or(p.scoped);
-                        p.save(&self.o.state).map(|_| vec![]).map_err(|e| e.to_string())
+                        self.save(&p).map(|_| vec![]).map_err(|e| e.to_string())
                     }
                     _ => Err("bad-request".into()),
                 }
             }
             ("list", _) => Ok(self.list()),
+            ("persona-store", _) => self.persona_store(l),
+            ("persona-forget", _) => self.persona_forget(l),
             _ => Err("bad-request".into()),
         };
         match res {
@@ -1050,7 +1193,7 @@ impl D {
         self.publish_state();
     }
 
-    /// `vpn-state` (vpn.md §7.4), world-readable, for frescod's chip: one
+    /// `vpn-state` (vpn.md §7.4), for frescod's chip only: one
     /// `<profile> up|connecting machine|persona` line per running tunnel; a
     /// profile with no line is down. Written only when it changes.
     fn publish_state(&mut self) {
@@ -1070,7 +1213,17 @@ impl D {
             if let Some(d) = p.parent() {
                 std::fs::create_dir_all(d)?;
             }
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(&tmp)?;
+            let gid = frescod_gid();
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            // Only the window manager reads it (vpn.md §7.1a): root's, group
+            // _frescod, 0640. Without that group, root's alone.
+            match gid {
+                Some(g) => {
+                    std::os::unix::fs::fchown(&f, Some(0), Some(g))?;
+                    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o640))?;
+                }
+                None => eprintln!("atrium-cryptad: no _frescod group: {} is root's alone", p.display()),
+            }
             f.write_all(text.as_bytes())?;
             std::fs::rename(&tmp, p)
         })();
@@ -1160,7 +1313,7 @@ fn daemon(o: Opts) {
     }
     let keys = key::Keys::start(o.key_uid, &o.arca).unwrap_or_else(|e| die(&format!("key helper: {e}")));
     let listener = listen(&o.sock);
-    let mut d = D { o, keys, net: None, runs: Vec::new(), janitor: Vec::new(), shown: None, failed: HashMap::new() };
+    let mut d = D { o, keys, net: None, runs: Vec::new(), janitor: Vec::new(), shown: None, failed: HashMap::new(), stores: Vec::new() };
     #[cfg(target_os = "freebsd")]
     {
         d.janitor = jail::sweep(&d.o.jaild);
