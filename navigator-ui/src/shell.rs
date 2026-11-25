@@ -1932,6 +1932,17 @@ impl Shell {
         true
     }
 
+    /// Where each "Show in Files" button is in the open Downloads list, by
+    /// download id: the rows newest first, a button on each saved into
+    /// Downloads.
+    pub fn show_buttons(&self) -> Vec<(u32, Rect)> {
+        let Some(m) = self.geo().downloads_menu else { return vec![] };
+        self.downloads.iter().rev().enumerate()
+            .filter(|(_, d)| matches!(d.state, DownloadState::Saved(_)) && d.in_downloads.is_some())
+            .map(|(k, d)| (d.id, Rect::new(m.x() + m.w() - em(16.0 + SHOW_IN_FILES_W), m.y() + em(32.0) + k as f32 * em(DOWNLOAD_ROW) + em(10.0), em(SHOW_IN_FILES_W), em(26.0))))
+            .collect()
+    }
+
     /// "Show in Files" on download `id` (§15.3): Files opens a window of
     /// its own on the file in this persona's Downloads.
     pub fn show_in_files(&mut self, id: u32, press: Option<navigator_control::Press>) -> bool {
@@ -3783,6 +3794,7 @@ mod tests {
         assert!(s.download_saved(7, "“plan (1).pdf” in Downloads", Some("plan (1).pdf")));
         assert!(!s.download_saved(99, "x", Some("x")), "no such download");
         s.downloads_open = true;
+        assert_eq!(s.show_buttons().iter().map(|(id, _)| *id).collect::<Vec<_>>(), [7], "a button on the row saved into Downloads");
         assert!(!s.show_in_files(7, None), "no press, no ask");
         assert!(s.show_in_files(7, Some([3; 16])));
         assert!(!s.downloads_open, "the list closes for Files' window");

@@ -1765,3 +1765,22 @@ its own checks (trace lines plus a screenshot at each width the step touches).
   600 pt wide (`NARROW=`). It checks from the trace's `tools=` that Share is on the bar at
   720 and folded into More at 600. A scene now prints one trace line at start for this.
 - Screenshots of steps 1–5 wait for a VM run.
+
+*The installed checks for the memory number and Show in Files* (to run on the installed
+arm64 Tessera guest, as the I6 gates do, with jaild, portcullisd, frescod, limend,
+Scrinium, navigatord and navigator-ui from main at 690b26a72 or later):
+1. Run a fixture page live (as I6.1). After the engine starts, within 10 s navigatord's log
+   has a `LiveMemory` for the page, and the popover's first fact reads `Memory: N MB of
+   1 GB.` with N above 0. The cap matches `rctl jail:<engine jail>`'s smallest
+   `memoryuse` rule, and N is within a mebibyte of `rctl -u`'s `memoryuse`.
+2. The usage ask is rate-limited: two `InstanceUsage` asks less than a second apart on
+   one engine connection get one answer and one `Error` ("too soon"), and the engine jail
+   still goes when limend hangs up.
+3. Save a download (as I6.4), open the Downloads list, and press the `show=` point the
+   trace gives for it. Scrinium logs `showing a file in home:downloads`, a Files window
+   comes up on Downloads with that file selected, and navigator-ui logs `Files is showing
+   the download`. In a Work window the place is `persona:work:downloads`.
+4. Ask Show with a press that was already spent, or none (a test client sending
+   `ToChild::Show` with a stale token): limend logs frescod's refusal, Scrinium answers
+   `Failed` ("needs your press"), and no Files window opens.
+The trace line's `show=` field gives each "Show in Files" button's centre, by download id.

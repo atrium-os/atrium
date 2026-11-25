@@ -103,7 +103,7 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={} tools={} more={}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={} tools={} more={} show={}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
@@ -161,6 +161,13 @@ pub fn trace(s: &mut Shell) {
             s.geo().more_menu.map_or("-".to_string(), |m| {
                 s.more_rows().iter().enumerate().map(|(i, r)| format!("{:?}:{},{}", r, (m.x() + em(60.0)) as i32, (m.y() + em(8.0) + em(shell::MORE_ROW) * (i as f32 + 0.5)) as i32)).collect::<Vec<_>>().join(";")
             }),
+            // Each "Show in Files" button in the Downloads list, by download.
+            {
+                let v = s.show_buttons();
+                if v.is_empty() { "-".to_string() } else {
+                    v.iter().map(|(id, b)| format!("{id}:{},{}", (b.x() + b.w() / 2.0) as i32, (b.y() + b.h() / 2.0) as i32)).collect::<Vec<_>>().join(";")
+                }
+            },
         );
     }
 }
@@ -413,9 +420,9 @@ impl View for ShellView {
         }
         if let Some(r) = g.downloads_menu {
             let st = self.state.clone();
-            let rows = s.downloads.clone();
+            let (rows, buttons) = (s.downloads.clone(), s.show_buttons());
             let st2 = self.state.clone();
-            floating(ctx, r, g.downloads, move || with(&st, |s| s.downloads_open = false), move |ctx| downloads_menu(ctx, r, rows, &st2));
+            floating(ctx, r, g.downloads, move || with(&st, |s| s.downloads_open = false), move |ctx| downloads_menu(ctx, r, rows, buttons, &st2));
         }
         // The share sheet, then the app chosen in it, over the window
         // (share-sheet.md §5).
@@ -957,7 +964,7 @@ fn more_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::MoreRow>, status_on: bool,
 
 /// The Downloads list (§15.1): this run's files, newest first, each with
 /// where it went or why it didn't.
-fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>, st: &Mutable<Shell>) {
+fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>, buttons: Vec<(u32, Rect)>, st: &Mutable<Shell>) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let x = r.x() + em(16.0);
@@ -970,11 +977,10 @@ fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>, st: &Mutab
     let full = r.w() - em(64.0);
     for d in rows.iter().rev() {
         // "Show in Files" at the row's end, for a file in Downloads.
-        let show = matches!(d.state, shell::DownloadState::Saved(_)) && d.in_downloads.is_some();
-        let room = if show { full - em(shell::SHOW_IN_FILES_W + 8.0) } else { full };
-        if show {
+        let show = buttons.iter().find(|(id, _)| *id == d.id).map(|(_, b)| *b);
+        let room = if show.is_some() { full - em(shell::SHOW_IN_FILES_W + 8.0) } else { full };
+        if let Some(b) = show {
             let (st2, id) = (st.clone(), d.id);
-            let b = Rect::new(r.x() + r.w() - em(16.0 + shell::SHOW_IN_FILES_W), y + em(10.0), em(shell::SHOW_IN_FILES_W), em(26.0));
             small_button(ctx, b, None, "Show in Files", false, "", move || with(&st2, |s| { s.show_in_files(id, pergola::clipboard::current_activation()); }));
         }
         let (g, c, line) = match &d.state {
