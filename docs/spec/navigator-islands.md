@@ -3451,9 +3451,17 @@ Follow-up (cloud, 2026-11-25). What became of the rough edges:
   buttons (`fit_runs`, tested). The whole text stays in the
   accessibility tree.
 - **No selection highlight after Ctrl+A.** The selection is made, since
-  typing replaces it, but it isn't drawn. This needs an engine-side look
-  on the Mac: check whether LibWeb's display list carries the selection
-  rects for a text control.
+  typing replaces it, but it isn't drawn. Found (2026-11-25, from the
+  pinned source): the engine's palette was a zero-filled `SystemTheme`,
+  and LibWeb paints a selection with the palette's `Selection` wash
+  (`InactiveSelection` when its navigable lacks focus), so the wash was
+  transparent. `EnginePalette.h` now builds the palette in memory with
+  every role opaque and Atrium's amber for the washes; LibWeb reads only
+  the selection roles and `IsDark` from it. Type-checked against the
+  pinned headers; it needs the Mac's engine build (only `editor-check.cpp`
+  and `fork-check.cpp` recompile). Gate: in the sign-in field, Ctrl+A
+  shows an amber wash over "ana" before "zz" replaces it, and a
+  mouse-dragged selection in the page's text shows the same wash.
 - **`same-site-api` failed on `/route/1`** but passed on `/app.html`. It was
   the same stale connection, not CORS. The run came right after the
   fixture-server restart. No request for `api.app.example` reached the

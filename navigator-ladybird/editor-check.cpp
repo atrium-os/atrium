@@ -11,7 +11,7 @@
 #include <LibURL/Parser.h>
 #include <LibWeb/Loader/LoadRequest.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibGfx/SystemTheme.h>
+#include "EnginePalette.h"
 #include <LibWeb/Bindings/MainThreadVM.h>
 #if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE) || defined(ATRIUM_I6_PAGE)
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
@@ -121,11 +121,10 @@ int main(int argc, char** argv)
     auto& agent = Web::HTML::surrounding_agent();
     agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
 #endif
-    auto theme = Core::AnonymousBuffer::create_with_size(sizeof(Gfx::SystemTheme));
-    if (theme.is_error())
+    auto palette = Navigator::engine_palette();
+    if (palette.is_error())
         return 3;
-    auto palette = Gfx::Palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.release_value()));
-    auto client = Navigator::EditorPage::create(move(palette));
+    auto client = Navigator::EditorPage::create(palette.release_value());
     // Warm: fonts, event loop, JS agent and page client exist, and no site
     // input has been seen. Wait here for the island.
 #ifndef ATRIUM_MAIL_PAGE
