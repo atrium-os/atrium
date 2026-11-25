@@ -967,6 +967,9 @@ pub mod host {
         live_keys: bool,
         key: Option<(u8, u32, u8, bool, [u8; 16])>,
         pasted: Option<String>,
+        /// The primary button is down in the island: its motion is a drag
+        /// (a text selection), handed to the page as action 9.
+        primary_held: bool,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -1604,7 +1607,13 @@ pub mod host {
         }
         match surface.connection().wait_event(Some(std::time::Duration::from_millis(20))) {
             Ok(Some(fresco_client::Event::PointerButton {x: px, y: py, button: 1, pressed, ..})) => {
+                state.primary_held = pressed;
                 *x = px; *y = py; if pressed { 1 } else { 2 }
+            }
+            // Motion only while the button is held: a drag selects; mere
+            // hovering would lay the page out for every move.
+            Ok(Some(fresco_client::Event::PointerMotion { x: px, y: py, .. })) if state.primary_held => {
+                *x = px; *y = py; 9
             }
             Ok(Some(event @ fresco_client::Event::Key { pressed: true, repeat: false, .. })) if state.vpn_page => {
                 use limen::doc_viewer::{ChromeKey, ToParent};

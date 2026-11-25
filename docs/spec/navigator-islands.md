@@ -3469,6 +3469,13 @@ Follow-up (cloud, 2026-11-25). What became of the rough edges:
   `PointerButton`), never pointer motion, so a drag can't make a
   selection; this is unrelated to the palette. Evidence is in
   `~/atrium-vm/evidence/navigator-selection-20261125/` on the Mac.
+  Then (cloud): the island records when the primary button goes down
+  and, while it is held, hands `PointerMotion` to the page as action 9
+  (`navigator_page_pointer`), which calls `handle_mousemove` with the
+  primary button in `buttons`. Motion with no button held is not passed,
+  so hovering doesn't lay the page out on every move. Gate (Mac): drag
+  across a line of the fixture's text: the amber wash follows the
+  pointer, and Ctrl-C copies the dragged words.
 - **`same-site-api` failed on `/route/1`** but passed on `/app.html`. It was
   the same stale connection, not CORS. The run came right after the
   fixture-server restart. No request for `api.app.example` reached the
