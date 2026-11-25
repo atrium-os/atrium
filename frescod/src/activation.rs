@@ -41,6 +41,7 @@ const HID_C: u16 = 0x06;
 const HID_V: u16 = 0x19;
 const HID_X: u16 = 0x1b;
 const HID_ENTER: u16 = 0x28;
+const HID_ESCAPE: u16 = 0x29;
 const HID_INSERT: u16 = 0x49;
 const HID_N: u16 = 0x11;
 const HID_T: u16 = 0x17;
@@ -283,7 +284,12 @@ pub fn mint_for(ev: &mut fresco_scene_server::window::DisplayEvent, uid: Option<
         Some(uid) if window_id != 0 => {
             let mut t = table().lock().unwrap();
             let now = now_ns();
-            t.pressed_at(window_id, now);
+            // Escape and a modifier alone are no activation (HTML's
+            // activation-triggering input): they still get a token, but
+            // prove no press for `PRESSED` or `SPEND_PRESS`.
+            if !(kind == kind::KEY && (hid == HID_ESCAPE || (0xe0..=0xe7).contains(&hid))) {
+                t.pressed_at(window_id, now);
+            }
             let (parent_window, parent_uid) = island.unwrap_or((0, 0));
             t.mint(Entry { window_id, uid, kind, hid, mods, minted_ns: now, counter: 0, drag_id: 0, purpose: 0, parent_window, parent_uid })
         }
@@ -1172,6 +1178,21 @@ mod tests {
         assert!(!t.pressed_within(7, 11 * s + 1, 1000), "a second and a bit later");
         assert!(!t.pressed_within(8, 10 * s, 1000), "another window");
         assert!(!t.pressed_within(7, 16 * s, 60_000), "never past PRESSED_MAX_MS");
+    }
+
+    #[test]
+    fn escape_and_a_lone_modifier_prove_no_press() {
+        use fresco_scene_server::window::{DisplayEvent as E, MINT_HERE};
+        let key = |window_id, hid_usage| E::InputKey { window_id, hid_usage, pressed: true, modifiers: 0, activation: MINT_HERE, repeat: false };
+        for (w, hid) in [(70_001, HID_ESCAPE), (70_002, 0xe0), (70_003, 0xe7)] {
+            let mut ev = key(w, hid);
+            mint_for(&mut ev, Some(1001), None);
+            assert!(matches!(ev, E::InputKey { activation, .. } if activation != [0; 16] && activation != MINT_HERE), "still a token");
+            assert!(!table().lock().unwrap().pressed_within(w, now_ns(), 1000), "{hid:#x}");
+        }
+        let mut ev = key(70_004, HID_ENTER);
+        mint_for(&mut ev, Some(1001), None);
+        assert!(table().lock().unwrap().pressed_within(70_004, now_ns(), 1000), "Enter does");
     }
 
     #[test]

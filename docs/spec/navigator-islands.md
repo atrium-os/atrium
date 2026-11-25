@@ -3805,7 +3805,10 @@ every real press and records when one last reached each window
   window. Spends are bounded as presses are (4096; stale ones go first,
   and when all are fresh it refuses rather than forgets one). A click
   injected without a token (no `FRESCOD_INJECT_ACTIVATION`) records no
-  press, so it proves nothing either.
+  press, so it proves nothing either. Neither does a key repeat (no
+  token), Escape or a modifier alone (a token, but no press: HTML's
+  activation-triggering input leaves them out). Enter and other keys
+  count, so a link works from the keyboard.
 - **Limen**: `op::SPEND_PRESS` (`SpendPress { embed }`): the embed's own
   parent only (`NOT_YOURS` otherwise), a bound web island only, and a
   press on the island's window, not the parent's chrome, within
