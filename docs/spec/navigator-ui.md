@@ -1718,14 +1718,23 @@ its own checks (trace lines plus a screenshot at each width the step touches).
   - how many windows it opened beside, each on a press.
   Then come the refusals (I6.4) and the actions (Run live or Stop, and "Ask before running
   this site live").
-- The canvas's numbers (memory used of the limit, storage used of the quota) need
-  navigatord to report usage per run. That is a new event, `LiveUsage`, not built. The
-  popover says the cap in words until it is.
+- **Storage in numbers** (2026-11-25): after each load or change of the page's stores,
+  navigatord sends `Event::LiveUsage { from, stored, max }`. `stored` is what the site keeps
+  in `localStorage`, IndexedDB and the Cache API, in the bytes their quotas count
+  (`live_storage::Stores::used`, `live_idb::Stores::used`). `max` is the sum of the
+  quotas, 5 MB plus 50 MB. The popover says "Storage: 12 MB of 58 MB, kept on this
+  computer, in your Personal persona". The UI drops a count for another page, or one
+  over its max.
+- **Memory** stays in words ("capped by its jail"). Its use is the engine jail's
+  `memoryuse`, which only rctl reads (as memfed does), and navigatord, unprivileged and
+  jailed, can't. A number would need limend or portcullisd to report it to the island's
+  parent.
 - **Opened beside**: a page a live page opened beside on a press (I6.8) is marked with an
   app-window glyph in the rail's path while the run lasts. At most 64 are tracked, which
   is navigatord's own cap.
-- **Downloads** got its popover in step 1. "Show in Files" waits on a Files hand-off from
-  the Navigator.
+- **Downloads** got its popover in step 1. "Show in Files" is not built: no app can yet
+  ask Files to show a file. That is a generic primitive for Files (Scrinium), not a
+  Navigator feature, and it waits on that design.
 - Host test:
   `the_live_popover_says_what_the_running_page_holds_and_the_rail_marks_its_windows`.
 

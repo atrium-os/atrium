@@ -181,6 +181,11 @@ impl Stores {
         self.open.get_mut(key).expect("inserted above")
     }
 
+    /// What the site's store holds, in the bytes its quota counts.
+    pub fn used(&mut self, key: &Key) -> usize {
+        size(self.map(key))
+    }
+
     /// The site's store, as the engine loads it.
     pub fn load(&mut self, key: &Key) -> Vec<u8> {
         encode(self.map(key))
@@ -301,6 +306,16 @@ mod tests {
         assert_ne!(s.load(&key(Some(7))), b"");
         s.forget_jar(7);
         assert_eq!(s.load(&key(Some(7))), b"");
+    }
+
+    #[test]
+    fn used_counts_what_the_quota_counts() {
+        let mut s = Stores::new(None);
+        assert_eq!(s.used(&key(None)), 0);
+        s.apply(&key(None), &encode_ops(&[Op::Set("k".into(), "vvvv".into())])).unwrap();
+        let n = s.used(&key(None));
+        assert!(n >= 5 && n <= QUOTA, "{n}");
+        assert_eq!(s.used(&key(Some(3))), 0, "another jar's");
     }
 
     #[test]

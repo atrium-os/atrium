@@ -1022,6 +1022,9 @@ impl Live {
                         eprintln!("navigator-ui: a live page's print not taken");
                     }
                 }
+                Event::LiveUsage { from, stored, max } => {
+                    s.live_usage(&from, stored, max);
+                }
                 Event::LiveRefused { from, what } => {
                     if s.live_refused(&from, &what) {
                         eprintln!("navigator-ui: the live page was refused {what}");

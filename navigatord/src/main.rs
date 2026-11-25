@@ -3034,6 +3034,7 @@ impl live_page::Tell for LiveTell {
         send(&self.w, &Event::LiveRefused { from: self.from.clone(), what });
     }
     fn finished(&self, why: Option<String>) { send(&self.w, &Event::LiveEnded { url: self.from.clone(), why }); }
+    fn usage(&self, stored: u64, max: u64) { send(&self.w, &Event::LiveUsage { from: self.from.clone(), stored, max }); }
     fn print(&self) { send(&self.w, &Event::LivePrint { from: self.from.clone() }); }
     fn copy(&self, text: String, token: [u8; 16]) { send(&self.w, &Event::LiveCopy { from: self.from.clone(), text, token }); }
     fn paste(&self, token: [u8; 16]) { send(&self.w, &Event::LivePaste { from: self.from.clone(), token }); }

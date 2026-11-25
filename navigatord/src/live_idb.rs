@@ -455,6 +455,18 @@ impl Stores {
     /// The site's IndexedDB, as the engine loads it.
     pub fn load(&mut self, key: &Key) -> Vec<u8> { self.load_kind(key, Kind::Idb) }
 
+    /// What the site's IndexedDB and Cache API stores hold together, in
+    /// the bytes their one quota counts.
+    pub fn used(&mut self, key: &Key) -> usize {
+        let mut n = 0;
+        for kind in [Kind::Idb, Kind::Cache] {
+            let slot = (key.clone(), kind);
+            n += self.site(&slot).size;
+            self.trim(&slot);
+        }
+        n
+    }
+
     /// The site's store of `kind`, as the engine loads it.
     pub fn load_kind(&mut self, key: &Key, kind: Kind) -> Vec<u8> {
         let slot = (key.clone(), kind);

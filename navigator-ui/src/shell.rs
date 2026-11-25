@@ -398,6 +398,15 @@ pub struct LiveRun {
     /// The entries it opened beside on a press (I6.8), at most
     /// [`LIVE_BESIDE_MAX`]: the rail marks them, the popover counts them.
     pub beside: Vec<(u64, PageId)>,
+    /// What its site keeps in its stores, of what it may (bytes), as
+    /// navigatord last said.
+    pub stored: Option<(u64, u64)>,
+}
+
+/// A size as the popover says it: "12 MB", "340 KB", "0 KB".
+pub fn bytes_words(n: u64) -> String {
+    const MB: u64 = 1_000_000;
+    if n >= MB { format!("{} MB", (n + MB / 2) / MB) } else { format!("{} KB", n.div_ceil(1000)) }
 }
 
 /// navigatord's own cap on windows one run opens (I6.8).
@@ -969,7 +978,7 @@ impl Shell {
             || !matches!(&self.live, Some(LivePage::Shown(u)) if u == url) {
             return false;
         }
-        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new() });
+        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new(), stored: None });
         let jar = self.store.trail().jar();
         self.outbox.push(Out::ContinueLive { url: url.to_string(), jar });
         true
@@ -1029,6 +1038,15 @@ impl Shell {
         true
     }
 
+    /// navigatord's count of what the running page's site keeps; false
+    /// for another page's, or a count that can't be (more than it may).
+    pub fn live_usage(&mut self, from: &str, stored: u64, max: u64) -> bool {
+        let Some(run) = self.live_run.as_mut().filter(|r| r.url == from && r.origin.is_some()) else { return false };
+        if max == 0 || stored > max { return false; }
+        run.stored = Some((stored, max));
+        true
+    }
+
     /// Whether the page `key` was opened beside by the page running live.
     pub fn opened_beside(&self, key: (u64, PageId)) -> bool {
         self.live_run.as_ref().is_some_and(|r| r.beside.contains(&key))
@@ -1042,7 +1060,10 @@ impl Shell {
         let n = run.beside.len();
         vec![
             "Memory: capped by its jail. Past the cap, the page stops.".into(),
-            if self.store.trail().unrecorded { "Storage: kept only until this trail closes.".into() } else { format!("Storage: kept on this computer, in your {persona} persona.") },
+            {
+                let used = run.stored.map_or(String::new(), |(n, max)| format!("{} of {}, ", bytes_words(n), bytes_words(max)));
+                if self.store.trail().unrecorded { format!("Storage: {used}kept only until this trail closes.") } else { format!("Storage: {used}kept on this computer, in your {persona} persona.") }
+            },
             match n {
                 0 => "New windows: none. One opens only on your press in the page.".into(),
                 1 => "New windows: 1 opened beside, on your press.".into(),
@@ -1354,7 +1375,7 @@ impl Shell {
             }
             (Prompt::RunPageLive { recorded, .. }, "Run live" | "Always for this site") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
-                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new() });
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new(), stored: None });
                     let jar = self.store.trail().jar();
                     let remember = *recorded && what == "Always for this site" && !jar.unrecorded();
                     self.outbox.push(Out::RunPageLive { url, press, jar, remember });
@@ -3864,6 +3885,13 @@ mod tests {
         assert_eq!(t.pages[key.1].url, "https://app.example/b.html");
         assert!(s.opened_beside(key) && !s.opened_beside((key.0, 0)));
         assert!(s.live_facts()[2].contains("1 opened beside"));
+        // navigatord's count of the site's stores.
+        assert!(!s.live_usage("https://other.example/", 1, 2), "another page's");
+        assert!(!s.live_usage(url, 3, 2), "more than it may");
+        assert!(s.live_usage(url, 12_400_000, 57_671_680));
+        assert!(s.live_facts()[1].starts_with("Storage: 12 MB of 58 MB, kept"), "{:?}", s.live_facts());
+        assert_eq!(bytes_words(0), "0 KB");
+        assert_eq!(bytes_words(340_001), "341 KB");
         // The popover makes room for its lines.
         s.popover = true;
         let with = popover_height(&s, 360.0);
