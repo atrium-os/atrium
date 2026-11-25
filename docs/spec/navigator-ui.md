@@ -1565,3 +1565,68 @@ Each step runs in the VM on headless frescod before the next.
      decode), a Sections button in the find bar lists them and a press scrolls to one (unit
      tests `sections_are_headings_with_anchors`, `jump_to_section_lists_the_pages_headings`;
      live script: the Atrium fixture's "The peristyle").
+
+---
+
+## 15. The window, redrawn (proposed 2026-11-25)
+
+**Proposed, waiting for Shankar.** Drawn on the
+[design canvas](https://claude.ai/artifact/1oFaV95u3LVaUmQHkk9t2m) (the window, Start, a live
+page, asking, and the toolbar states with dark and the icon map), the same way Artifex's was
+(dev-tools.md §3.5). It keeps every decision in §13 (trails, rail and one toolbar, local-only
+suggestions, monograms, the three tier words) and changes how they are drawn. Built from
+Atrium's tokens, IBM Plex and the Phosphor font the base already ships; the canvas's icon map
+names each glyph.
+
+### 15.1 What changes
+
+- **The Where field says what runs, then who.** A chip at its left names the tier with its
+  icon: Document, Parts live · N, Live code (accent), Sign-in (the atrium-net window), Not
+  private (warning). Then the registrable domain in `text-primary` and the path in
+  `text-tertiary`. The page title leaves the field: it is in the rail and the window title,
+  and the field has room for the address, which is the part that matters for trust. Keep
+  (bookmark) sits inside the field's right end. Ctrl-L turns it into the editable URL as
+  today. The chip opens the tier popover.
+- **Presence is a labelled pill**, not a lone glyph: "Not known here" (eye-slash), "Signed in
+  as ana" (user, accent-tinted), "Remembers you" (cookies, no login).
+- **Toolbar right**: Reading (Aa), **Downloads** (a dot while one runs or is new), **Share**
+  (the system share sheet), More. Toolbar height 44 px.
+- **The rail** (272 px): the persona chip and an accent **Trail** button; **Find in trails**
+  (filters the rail locally); **Pinned** as a grid of monogram tiles; **Today** with the
+  current trail expanded as a path tree, an accent bar on the current page, and the trail's
+  glyphs (live code, signed in, playing); repeated visits to one page fold into one row;
+  **Earlier**; **All history** at the foot. Collapsed (Ctrl-B, or narrow) it is 56 px of site
+  tiles with the same glyphs.
+- **Start** ("Where to?"): the field large and focused with "nothing leaves until Enter" under
+  it; suggestions in groups, Open (go to the trail), Kept and visited, and the search row last
+  saying "sent when you press Enter"; Pinned as cards with "Pin the page you're on"; **Put
+  away today** with Bring back on each.
+- **The prompt row** gets an icon, a one-sentence title, one line of why, and at most three
+  buttons with the primary on the right (for live code: Always for this site, Not now, Run
+  live). No button without a label.
+- **The Live code popover** shows what the running page holds and has done: memory of its
+  1 GiB, storage of its quota and which persona holds it, windows opened beside, what was
+  refused this run, Always for this site, and Stop live code.
+- **Downloads popover**: progress, "checked, plain text" for a finished file with Open, "Not
+  kept" with the reason for a refused one, Show in Files.
+- **A window opened beside** (I6.8) shows as a row under its trail naming its site.
+- **Narrow windows drop**, in order: the rail folds; the path, then the presence label (its
+  icon stays); Share and Reading move into More. Back, the chip, the domain and More always
+  stay.
+- **Dark**: the same layout on Pergola's dark tokens; the accent and the tier colours keep
+  their meaning.
+
+### 15.2 Build steps
+
+Each step keeps `scripts/navigator-ui-vm.sh` and `scripts/navigator-live-vm.sh` green and adds
+its own checks (trace lines plus a screenshot at each width the step touches).
+
+1. **Toolbar and Where field**: the tier chip, domain and path, Keep inside, the presence pill,
+   Downloads and Share buttons, 44 px, the narrow-window drop order.
+2. **Rail**: Find in trails, Pinned tiles, the path tree with folded repeats and the current
+   bar, All history, the collapsed site tiles.
+3. **Start**: grouped suggestions, Pinned cards, Put away today.
+4. **Prompt row and popovers**: the prompt row layout, the Live code popover, the Downloads
+   popover, the opened-beside row.
+5. **Dark and narrow**: dark tokens everywhere, and screenshots at 1440, 1024 and 720 px in
+   light and dark.
