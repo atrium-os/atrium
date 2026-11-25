@@ -679,16 +679,25 @@ pub fn address_change(page: Option<&str>, to: &str) -> Option<String> {
     (page.and_then(crate::origin).is_some() && page.and_then(crate::origin) == crate::origin(&to)).then_some(to)
 }
 
-/// How often a page may open a window beside it: once a second.
+/// How a page may open windows beside it: at most one a second and
+/// [`Beside::MAX`] in a run. The engine's word that the person pressed is
+/// all navigatord has, so these bound what a hostile page can add to the
+/// trail.
 #[derive(Default)]
-pub struct Beside(Option<std::time::Instant>);
+pub struct Beside {
+    last: Option<std::time::Instant>,
+    opened: usize,
+}
 
 impl Beside {
     pub const GAP: std::time::Duration = std::time::Duration::from_secs(1);
-    pub fn allow(&mut self, now: std::time::Instant) -> bool {
-        if self.0.is_some_and(|last| now.saturating_duration_since(last) < Self::GAP) { return false; }
-        self.0 = Some(now);
-        true
+    pub const MAX: usize = 16;
+    pub fn allow(&mut self, now: std::time::Instant) -> Result<(), &'static str> {
+        if self.opened >= Self::MAX { return Err("a new window past the run's 16"); }
+        if self.last.is_some_and(|last| now.saturating_duration_since(last) < Self::GAP) { return Err("a new window, too soon after the last"); }
+        self.last = Some(now);
+        self.opened += 1;
+        Ok(())
     }
 }
 
@@ -1137,11 +1146,13 @@ impl Live {
                         // most one a second, since the engine's word that the
                         // person pressed is all there is.
                         Some(Report::OpenBeside(to)) => match navigation(page.as_deref(), to) {
-                            Some(to) if beside.allow(std::time::Instant::now()) => tell.open_beside(to),
-                            Some(to) => {
-                                eprintln!("navigatord: a live page's new window refused, too soon ({})", crate::refused_target(&to));
-                                tell.refused("a new window, too soon after the last".into());
-                            }
+                            Some(to) => match beside.allow(std::time::Instant::now()) {
+                                Ok(()) => tell.open_beside(to),
+                                Err(why) => {
+                                    eprintln!("navigatord: a live page's new window refused: {why} ({})", crate::refused_target(&to));
+                                    tell.refused(why.into());
+                                }
+                            },
                             None => {
                                 eprintln!("navigatord: a live page's new window refused ({})", crate::refused_target(to));
                                 tell.refused("an address it could not open".into());
@@ -1657,10 +1668,14 @@ mod tests {
     fn a_page_opens_at_most_one_window_beside_it_a_second() {
         let mut b = Beside::default();
         let t = std::time::Instant::now();
-        assert!(b.allow(t));
-        assert!(!b.allow(t + std::time::Duration::from_millis(500)));
-        assert!(b.allow(t + Beside::GAP));
-        assert!(!b.allow(t), "a clock that went back counts as no time at all");
+        assert!(b.allow(t).is_ok());
+        assert!(b.allow(t + std::time::Duration::from_millis(500)).is_err());
+        assert!(b.allow(t + Beside::GAP).is_ok());
+        assert!(b.allow(t).is_err(), "a clock that went back counts as no time at all");
+        // At most 16 in a run, however slowly.
+        let mut b = Beside::default();
+        for i in 0..Beside::MAX as u32 { assert!(b.allow(t + Beside::GAP * i).is_ok()); }
+        assert_eq!(b.allow(t + Beside::GAP * 100), Err("a new window past the run's 16"));
     }
 
     /// A run's `Tell` that keeps what it was told was refused.

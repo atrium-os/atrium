@@ -2599,16 +2599,21 @@ Host-tested; the engine side is written, not yet built.
   makes no window: `window.open()` returns `null`, as for a blocked popup.
   `EditorPage` answers true for a live page and reports
   `Report::OpenBeside(url)` (`navigator_live_open_beside`) when the
-  address is plain HTTPS. A form with `target=_blank` and a named new
-  target stay refused. The I6 build must apply the patch, since
+  address is plain HTTPS. A form with `target=_blank`, a named new target
+  (`_new`, an unknown name, a `<base target>`) get no window, as before,
+  and `EditorPage`'s `page_did_request_new_web_view` logs each, since
+  LibWeb drops them quietly. The I6 build must apply the patch, since
   `EditorPage` overrides the hook.
 - **Limen** takes `OpenBeside` only while the page runs, with the same
   address checks as `Navigate`; a frame's is refused by navigatord, as
   its navigations are.
 - **navigatord** checks the address as for a navigation and sends
-  `LiveOpenBeside { from, url }`, at most one a second (`Beside`): the
-  engine's word that the person pressed is all it has, so a page that
-  opens faster is refused, named in the popover.
+  `LiveOpenBeside { from, url }`, at most one a second and 16 in a run
+  (`Beside`): the engine's word that the person pressed is all it has, so
+  a page past either is refused, named in the popover. Proving the press
+  needs frescod to tell an island's parent that the island had one, as
+  Tabula learns it for a copy; until then these two bounds are what holds
+  a hostile page to a few entries.
 - **The UI** (`Shell::live_opened_beside`) adds the address beside the
   live page's entry, as Ctrl-click does for a link; the page stays on
   screen and runs on. Going there opens it in the document lane (live

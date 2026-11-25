@@ -126,6 +126,14 @@ public:
             warnln("live page: new window for {} not reported", address);
         return true;
     }
+    // Any other new window (a form with target=_blank, a named target such
+    // as _new or a <base target>) gets none, as without a host: said here,
+    // since LibWeb drops it quietly.
+    NewWebViewResult page_did_request_new_web_view(Web::HTML::ActivateTab, Web::HTML::WebViewHints, Web::HTML::CrossProcessId, Utf16String const& name, Web::HTML::TokenizedFeature::NoOpener, Optional<URL::URL>) override
+    {
+        warnln("live page: a new window named {} refused: only window.open and links to _blank open beside", name);
+        return {};
+    }
     // A file input (I6.4): navigatord opens Scrinium's picker over the
     // window, and the answer comes back through drive_page (action 6).
     // One file, read-only, whatever the input asked for.
