@@ -226,16 +226,23 @@ pub enum Request {
     /// `rect`: the page area in the window. Answered by `LiveStarted`
     /// and later `LiveEnded`, or `LiveEnded` with why it could not start.
     /// `jar`: the trail's, whose partition for the page's site keeps its
-    /// cookies (I6.3, D9).
-    RunPageLive { url: String, rect: [u32; 4], press: Press, jar: Jar },
+    /// cookies (I6.3, D9). `remember`: the person pressed "Always for this
+    /// site" (D8): pages of this origin in recorded trails run live from
+    /// now on without a press. navigatord ignores it for an Unrecorded jar.
+    RunPageLive { url: String, rect: [u32; 4], press: Press, jar: Jar, remember: bool },
     /// The page area moved (`Some`), or Stop / leaving the page (`None`:
     /// the engine ends and no `LiveEnded` follows).
     PlaceLive { url: String, rect: Option<[u32; 4]> },
     /// The trail moved to another page of the origin running live (a link
     /// the live page proposed, Back, Forward; I6.2): run it live too,
     /// without a press. navigatord refuses unless the person ran this
-    /// origin live in this window and has not stopped it.
+    /// origin live in this window and has not stopped it, or chose to run
+    /// it live every time (D8, `Event::LiveRemembered`) and `jar` is
+    /// `Personal`.
     ContinueLive { url: String, rect: [u32; 4], jar: Jar },
+    /// The chip's "Ask before running live" (D8): the origin of the page
+    /// at `url` is no longer run live unasked. A page running live goes on.
+    ForgetLive { url: String },
     /// The text Tabula gave for a live page's paste (`Event::LivePaste`,
     /// I6.4), for the live page at `url`.
     LivePasted { url: String, text: String },
@@ -427,6 +434,11 @@ pub enum Event {
     /// `RunPageLive`'s page runs live: the engine delivered it and reported
     /// `origin`, the page's own. The chip reads "Live code".
     LiveStarted { url: String, origin: String },
+    /// The page just `Opened` at `url` is of an origin the person chose to
+    /// run live every time (D8), in a recorded trail: the UI asks
+    /// `ContinueLive` for it. Also sent after a `RunPageLive` that
+    /// remembered it.
+    LiveRemembered { url: String },
     /// The live page ended by itself or failed (`why`), or never started:
     /// the trail shows the document lane again.
     LiveEnded { url: String, why: Option<String> },

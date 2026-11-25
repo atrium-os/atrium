@@ -3112,6 +3112,54 @@ typing in the main page, then the frame, then the main page again landed
 each time in the field clicked, and Ctrl-C/Ctrl-V in the main page still
 worked. jaild logged no WARNs.
 
+#### I6.6 as built (2026-11-25, first part: D8, the remembered choice)
+
+- **Prompt.** In a recorded trail, the run-live prompt asks "Not now",
+  "Always for this site" and "Run live". "Run live" stays the primary
+  answer. An Unrecorded trail only gets "Not now" and "Run live". Either
+  answer needs the counted press, the same as before.
+- **What "Always" sends.** "Always for this site" sends `RunPageLive` with
+  `remember: true`.
+  - navigatord adds the page's origin to the persona's list once the run
+    has started (the press spent and the engine asked for), and answers
+    `LiveRemembered`.
+  - It ignores `remember` for an Unrecorded jar and in a sign-in window.
+- **The list.** It lives in `navigatord/src/live_remembered.rs`, in the
+  file `live-origins` under navigatord's store directory.
+  - That directory is on the persona's encrypted volume, so the list is
+    per persona and is removed with the persona.
+  - Each line is one `https://host[:port]` origin. The list holds at most
+    256 (`REMEMBERED_MAX`); remembering one more drops the oldest.
+  - It is written whole: a fresh 0600 file, synced, then renamed. This is
+    the same writer as the localStorage stores.
+  - It is read again on every check, so another window of the same
+    persona sees a change at once.
+  - A file that is too long, has too many lines, or has any line that is
+    not exactly such an origin counts as empty. An unreadable list never
+    runs anything unasked.
+- **A later visit.** After `Opened` for an HTTPS page of a remembered
+  origin in a recorded trail, with live pages on and not in a sign-in
+  window, navigatord sends `LiveRemembered { url }`.
+  - The UI then asks `ContinueLive` for the page, if that page is the one
+    on screen and nothing runs live.
+  - navigatord accepts `ContinueLive` when the origin is the one run live
+    in this window, as in I6.2, or when it is remembered and the jar is
+    `Personal`. Either way it checks again itself.
+- **Revoking.** While the page on screen is of a remembered origin, the
+  chip's popover has the row "Ask before running this site live".
+  - The row sends `ForgetLive { url }`, and navigatord takes the origin
+    off the list.
+  - A page that already runs live goes on running until Stop or until
+    the person leaves it.
+- **Left for later.** Listing and revoking from Curia waits for
+  Navigator's Curia integration, which does not exist yet. Until then the
+  chip is the only place to revoke.
+- **Tests.**
+  - navigatord: `live_remembered` (kept across navigatords until
+    forgotten, bounded with the oldest dropped, bad lists count as empty
+    with a positive control).
+  - navigator-ui: `a_site_chosen_always_runs_live_unasked_until_the_chip_asks_again`.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

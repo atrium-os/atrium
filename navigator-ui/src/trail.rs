@@ -171,7 +171,9 @@ pub enum Prompt {
     /// Run the whole page live (navigator-islands.md I6.1), asked when the
     /// person pressed "Run this page live" in the tier popover; `site` is
     /// the page's registrable site, which its scripts may reach (D12).
-    RunPageLive { site: String },
+    /// `recorded`: the trail is recorded, so the person may choose to run
+    /// the site live every time (D8); an Unrecorded trail only asks.
+    RunPageLive { site: String, recorded: bool },
     Widget { runnable: bool, key: u32, src: String, origin: String, rect: [f32; 4] },
     WidgetUnload { key: u32, start: navigator_control::Press, query: u32, origin: String },
     WidgetFailed { key: u32, failure: navigator_control::WidgetFailure },
@@ -219,6 +221,7 @@ impl Prompt {
             Prompt::Widget { runnable: true, .. } => &["Not now", "Start"],
             Prompt::Widget { .. } | Prompt::WidgetFailed { .. } => &["Close"],
             Prompt::RunLive => &["Not now", "Run live"],
+            Prompt::RunPageLive { recorded: true, .. } => &["Not now", "Always for this site", "Run live"],
             Prompt::RunPageLive { .. } => &["Not now", "Run live"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::PasteTooLong => &["Close"],

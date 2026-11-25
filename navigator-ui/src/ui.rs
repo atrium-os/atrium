@@ -330,7 +330,7 @@ impl View for ShellView {
         // frescod (the page's window is above this one), else drawn here.
         if let (Some(r), Some(p)) = (g.popover, page.clone()) {
             let (st, st2) = (self.state.clone(), self.state.clone());
-            let (action, refused) = (shell::popover_action(&s), s.live_refusals());
+            let (action, refused) = (shell::popover_actions(&s), s.live_refusals());
             floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p, action, refused.as_deref(), &st2));
         }
         if let (Some(r), Some(p)) = (g.presence_menu, &page) {
@@ -911,7 +911,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
 
 /// The tier chip's popover (§6.5): Connection, What runs, the reasons,
 /// and the line that says what green does not mean.
-fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, action: Option<shell::PopoverAction>, refused: Option<&str>, st: &Mutable<Shell>) {
+fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, actions: Vec<shell::PopoverAction>, refused: Option<&str>, st: &Mutable<Shell>) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let f = &*p.display_facts();
@@ -947,22 +947,26 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, action: Option<shell::Popove
     }
     y += em(6.0);
     y = wrapped(ctx, x, y, w, shell::popover_last(f), t.text_tertiary());
-    // Run this page live, or Stop (navigator-islands.md I6.1): the whole
-    // width pressable, as the presence menu's rows are.
-    if let Some(a) = action {
+    // Run this page live or Stop (navigator-islands.md I6.1), and Ask
+    // before running live (D8): the whole width pressable, as the presence
+    // menu's rows are.
+    for a in actions {
         let (label, glyph, c) = match a {
             shell::PopoverAction::RunLive => ("Run this page live", ph::LIGHTNING, t.text_primary()),
             shell::PopoverAction::Stop => ("Stop running live", ph::LIGHTNING, t.warning_fg()),
+            shell::PopoverAction::Forget => ("Ask before running this site live", ph::LIGHTNING, t.text_secondary()),
         };
         y += em(6.0);
         let st = st.clone();
         area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(32.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st, |s| match a {
             shell::PopoverAction::RunLive => { s.offer_live(now_ms()); }
             shell::PopoverAction::Stop => s.stop_live(),
+            shell::PopoverAction::Forget => s.forget_live(),
         }));
         icon(ctx, x, y + em(8.0), glyph, 16.0, c);
         text(ctx, x + em(24.0), y + em(16.0), label, type_size::SM, Weight::Medium, c);
         ctx.pop();
+        y += em(32.0);
     }
 }
 
