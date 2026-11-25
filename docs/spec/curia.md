@@ -448,3 +448,49 @@ A mutation spends a Fresco APPROVE activation and rechecks the record.
 Portcullisd sends the owner, persona, item ID and workspace to the SSH agent's
 root control protocol. Curia receives credential labels and grant state.
 See [arca.md](arca.md) §9.1.
+
+## 15. App settings panes (accepted 2026-11-25, for Navigator D8)
+
+navigator-islands.md D8 says that "run this site live" stays revocable in
+Curia as well as from the chip. The list of sites is the Navigator's own
+data: a file in its overlay, in the persona's key group. Curia can't read
+it, and AGENTS.md rules out a Navigator verb in portcullisd. The proposal
+is a generic primitive: an app shows its own settings pane inside Curia's
+window, as a Limen embed.
+
+- **The role.** The new Limen role is `app-settings`, in a `Plain` slot in
+  Curia's page area.
+  - Its provider is the app Curia names: `REQUEST_APP_SETTINGS { window,
+    app, persona }`.
+  - limend refuses unless the parent is Curia (registry id
+    `org.atrium.curia`, with `app-settings` in its `embeds`) and the named
+    app's installed manifest `[roles] implements` lists `app-settings`.
+- **Who the pane runs as.** It runs as the app's per-instance uid for
+  Curia's person, in the persona Curia names, with that persona's overlay.
+  It reads and changes the app's own data, and Curia sees only pixels.
+  - Curia runs once per person, so a persona-scoped launch is new:
+    portcullisd starts it only for a launched `app-grants` caller, about
+    the person it runs for. That is the same rule as `ApproveAccess`.
+- **No press.** The pane needs no press for changes that only take
+  something away, like "Ask again". A change that grants something spends
+  an `APPROVE` press in the pane's own window, as Settings' Allow does.
+- **Curia's side.** On the Apps page, an app whose manifest implements
+  `app-settings` gets a "Settings" row that opens the pane. A person with
+  named personas picks the persona first.
+- **Navigator's pane.** It is a small Pergola binary in the Navigator
+  bundle, `bin/navigator-settings`.
+  - It lists "Sites that run live" from `live-origins` under the store
+    directory named in the bundle's `navigatord.conf`, newest first. Each
+    row has "Ask again", and there is also "Ask again for every site".
+  - It shares `live_remembered` with navigatord, moved into a small crate
+    so both use the same parser, lock and atomic write.
+
+Status: accepted. Shankar chose app panes in Settings on 2026-11-25, over a
+list in Navigator only or the chip alone. Build order:
+
+1. The shared crate.
+2. The Limen role, with daemon tests.
+3. portcullisd's persona-scoped launch for an `app-grants` caller.
+4. Navigator's pane.
+5. Curia's row and embed.
+6. A VM check.

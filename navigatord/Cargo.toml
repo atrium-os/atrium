@@ -25,6 +25,7 @@ fresco-protocol = { path = "../fresco-protocol" }
 aqueduct = { path = "../aqueduct" }
 postcard = { version = "1", features = ["use-std"] }
 url = "2"
+navigator-live-origins = { path = "../navigator-live-origins" }
 libc = "0.2"
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 monstrator = { path = "../monstrator" }

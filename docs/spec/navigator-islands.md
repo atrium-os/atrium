@@ -3367,9 +3367,13 @@ Follow-up (cloud, 2026-11-25). What became of the rough edges:
   typing replaces it, but it isn't drawn. This needs an engine-side look
   on the Mac: check whether LibWeb's display list carries the selection
   rects for a text control.
-- **`same-site-api` failed on `/route/1`** but passed on `/app.html`. Open:
-  the fixture server's log line (its `origin` field) and navigatord's log
-  for that request are needed.
+- **`same-site-api` failed on `/route/1`** but passed on `/app.html`. It was
+  the same stale connection, not CORS. The run came right after the
+  fixture-server restart. No request for `api.app.example` reached the
+  server, navigatord logged `CourierRefused("Http")` for it, and LibWeb
+  reports a failed `cors` fetch as a CORS failure (to a script, a network
+  error looks the same, as the Fetch standard requires). The courier fix
+  above covers it.
 - **The frame's box is black in the document lane.** This is the D14
   island box: a document-lane `<iframe>` becomes a press-to-start box.
   Left as it is.
