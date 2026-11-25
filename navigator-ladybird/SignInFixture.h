@@ -20,6 +20,9 @@
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <sys/resource.h>
+#include <csignal>
+#include <malloc_np.h>
+#include <LibGC/Heap.h>
 #if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #endif
@@ -149,8 +152,38 @@ inline unsigned live_modifiers(u8 hid)
 }
 #endif
 
+// memoryd's first rung under pressure is TRIM, SIGINFO: "shed your caches
+// but keep running" (atrium-memory-pressure.md). The handler only notes it;
+// the page loop sheds between pumps, with no script on the stack: a full
+// garbage collection, then jemalloc hands every arena's dirty pages back.
+// An engine that ignored it would be asked to exit, then killed.
+inline volatile sig_atomic_t trim_asked = 0;
+
+inline void note_trim(int) { trim_asked = 1; }
+
+inline void listen_for_trim()
+{
+    struct sigaction sa {};
+    sa.sa_handler = note_trim;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGINFO, &sa, nullptr) != 0)
+        warnln("island: no SIGINFO handler; memoryd's trim will go unheard");
+}
+
+inline void trim_if_asked()
+{
+    if (!trim_asked) return;
+    trim_asked = 0;
+    GC::Heap::the().collect_garbage(GC::Heap::CollectionType::CollectGarbage);
+    // MALLCTL_ARENAS_ALL is 4096 in jemalloc.
+    int purged = mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
+    warnln("island: trimmed for memory pressure (garbage collected, arenas purged: {})", purged == 0 ? "yes" : "no");
+}
+
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
 {
+    listen_for_trim();
     auto doc = client.page().local_traversable()->active_document();
     auto tree = doc->dom_tree_version();
     auto text = doc->character_data_version();
@@ -183,6 +216,7 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         // between the I5 page's steps (navigator-islands.md, I5 trace).
         // Bounded, so a page that keeps posting tasks still reads input.
         for (int drained = 0; drained < 256 && loop.pump(Core::EventLoop::WaitMode::PollForEvents) > 0; ++drained) { }
+        trim_if_asked();
 #ifdef ATRIUM_I1_COUNTER
         if (client.closed) break;
 #endif

@@ -3237,8 +3237,18 @@ whole page, 256 MiB for parts):
   that a page leaves the standby waiting. The delegated UI is refused the
   new request too.
 - **Left for later.**
-  - The engine's own cooperative trim when memoryd sends SIGINFO (drop
-    caches before it is killed). That is engine-side, a Mac build.
+  - The engine's own cooperative trim when memoryd sends SIGINFO is
+    built, but not yet compiled (it needs the Mac's Ladybird build). It
+    is in `SignInFixture.h`, so every engine's page loop has it:
+    - the handler only sets a flag;
+    - between pumps, with no script running, the loop runs a full
+      garbage collection and purges every jemalloc arena
+      (`arena.4096.purge`);
+    - it then logs `island: trimmed for memory pressure`.
+
+    Check on the Mac: `kill -INFO <engine pid>` on a live page, then look
+    for that line, the page still running, and a lower RSS
+    (`ps -o rss`).
   - A Mac check: a fixture page that grows past 256 MiB keeps running up
     to 1 GiB and then falls back to the document lane, and a widget is
     still killed at 256 MiB.
