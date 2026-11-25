@@ -9,7 +9,11 @@
 #      write is then refused (fsync fails);
 #   2. flush: a sync while writes fail prints "delayed writes did not land"
 #      and commits no superblock;
-#   3. after each, with writes allowed again, the volume unmounts and
+#   3. a sync while writes fail with ENXIO (which the buffer cache drops
+#      rather than re-dirties), then another with the provider back:
+#      commit_failed latches and no later SB is written over the dropped
+#      write, so tessera-fsck finds the volume clean;
+#   4. after each, with writes allowed again, the volume unmounts and
 #      tessera-fsck finds it clean (the on-disk SB names only durable
 #      sectors).
 # Positive control: the same GC and sync with writes allowed print neither
@@ -30,7 +34,7 @@ M=/tcref
 IMG=$T/scratch.img
 MKFS=/root/sealed/tessera-mkfs-sealed
 GC=/root/sealed/tessera-gc
-gate_begin tessera-commit-refusal 13
+gate_begin tessera-commit-refusal 16
 
 g "test -x $MKFS && test -x $GC && command -v tessera-fsck >/dev/null && kldstat -q -n tessera_fs.ko" \
     || gate_abort "needs tessera_fs loaded, /root/sealed and tessera-fsck (see the header)"
@@ -48,7 +52,7 @@ fresh() {
     MD=$(g "mdconfig -a -t vnode -f $IMG")
     g "gnop create /dev/$MD && mount -t tessera /dev/$MD.nop $M" || gate_abort "mount on $MD.nop failed"
 }
-writes() { g "gnop configure -w $1 /dev/$MD.nop"; }
+writes() { g "gnop configure -w $1 -e ${2:-5} /dev/$MD.nop"; }
 churn() { # a file written, synced and removed, so GC has packs to reclaim
     g "dd if=/dev/random of=$M/churn bs=1m count=16 status=none && sync && rm $M/churn && sync && sleep 2 && sync"
 }
@@ -94,6 +98,20 @@ writes 100
 g "sync; sleep 2; sync; true"
 [ "$(console_has 'delayed writes did not land')" -gt "$d0" ] && ok "flush: the superblock commit is refused" || bad "flush: no refused-commit line: $(g "dmesg | tail -8 | tr '\n' ';'")"
 clean_after flush
+
+echo "=== 3. flush while writes fail ENXIO (dropped, not re-dirtied), then a sync with the provider back"
+fresh
+c0=$(counter)
+g "dd if=/dev/random of=$M/e bs=1m count=8 status=none"
+writes 100 6
+g "sync; sleep 2; sync; true"
+writes 0
+g "dd if=/dev/random of=$M/e2 bs=1m count=1 status=none 2>/dev/null; sync; sleep 2; sync; true"
+[ "$(counter)" -gt "$c0" ] && ok "ENXIO: commit_failed latched ($c0 -> $(counter))" || bad "ENXIO: commit_failed stayed $c0"
+g "umount -f $M" && ok "ENXIO: unmounts (forced)" || bad "ENXIO: umount -f failed"
+r=$(g "tessera-fsck /dev/$MD 2>&1")
+n=$(printf '%s\n' "$r" | grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|torn|bad root|lost')
+check "ENXIO: tessera-fsck finds the volume clean (no SB over a dropped write)" 0 "$n"
 
 teardown
 g "rm -rf $T; sysctl kern.tessera.gc_grace_seconds=$GRACE >/dev/null"

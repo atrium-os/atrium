@@ -13540,6 +13540,14 @@ tessera_fs_snapshot_retire_gen(struct tessera_mount *tmp_, uint64_t gen)
 static int
 tessera_commit_sb(struct tessera_mount *tmp_)
 {
+	/* A volume that could not commit once (#135) commits nothing more
+	 * until a remount (after tessera-fsck) or an operator clear: the
+	 * buffer cache drops a delayed write that failed with ENXIO, or one
+	 * already B_INVAL/B_NOCACHE, instead of re-dirtying it, so a later
+	 * fsync can return 0 with a node the next SB would name never
+	 * written. */
+	if (tmp_->commit_failed)
+		return (EIO);
 	tessera_stat_sb_commits++;
 	tmp_->sb.generation++;
 	sbintime_t _sbt = TPROF_T0();
