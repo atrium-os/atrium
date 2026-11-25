@@ -3534,6 +3534,28 @@ only:
    holds them by reference, the commit gives an out-of-shape change (the
    commit fails, logged) rather than keeping a dangling reference.
 
+**The patch as written (2026-11-25).** `patches/ladybird/live-idb.patch`,
+behind the bindings crate's cargo feature `atrium-live-idb` (the painter's
+`live-idb` feature turns it on; `Painter.toml.in`). It builds against the
+pinned Ladybird, and the engine built with it passes the JIT audit.
+
+- `internal/live.rs`: the encodings (names as UTF-16LE code units; keys as
+  type and value, arrays nested at most 64 deep; a store's description as
+  auto-increment and key path; an index's as unique, multi-entry and key
+  path), the commit, the delete and the load.
+- Commit: `MutationLog::send_live_changes` turns each store's log into
+  changes in log order. A change names a store or index as it was at that
+  change, which is the old name of its next rename or its name now. A key
+  generator's value is the old value of its next change or its value now.
+  `RecordStored` sends the value now in the store, and nothing if the
+  record is gone.
+- Load: on the first non-opaque storage key that makes a factory. If
+  navigatord has no store for the engine (a frame, a widget), IndexedDB
+  is the run's and nothing is sent. A load out of shape is dropped,
+  loudly, and that run sends nothing either.
+- Blob and File values are their bytes inline (their serialization steps
+  write the byte sequence), so step 4 holds without a check.
+
 **Gate (Mac),** with `NAVIGATORD_STORE` set, on the fixture's
 `indexeddb` line ("N stored", the `i6` database's `items`) and its Add
 button:
@@ -3547,6 +3569,41 @@ button:
    and the next run reads the store as it was.
 5. `live-idb/app.example.idb-log` (and `.idb` after a fold) is 0600,
    owned by the persona's Navigator user.
+6. navigatord's own bound and a fold (added after the first run, whose
+   60 MiB value was refused by the engine's per-change bound instead):
+   press Fill 30 MiB (`indexeddb-fill` passes, and the log folds into
+   `app.example.idb`), then Fill again (`indexeddb-fill` fails with
+   `QuotaExceededError`, navigatord logging the quota), then Stop and run
+   live: one fill is stored. Empty clears it.
+
+
+**Gate results on arm64 Tessera, 2026-11-25.** The engine was
+`a9204225…`, built with `live-idb.patch` (6d1f75ede) and passing the JIT
+audit, and navigatord was at 951f1b4df. Evidence is in
+`~/atrium-vm/evidence/navigator-i6-7-20261125/` on the Mac. jaild logged no
+WARNs.
+
+1. Passed. 0 stored; after Add, Stop and a new live run, 1; after Add, a
+   navigatord restart and a live run, 2.
+2. Passed. After Add, 14 presses of Grow took the page to 1009 MiB and it
+   was killed. The next live run read 3 stored.
+3. Passed. An Unrecorded trail read 0 stored, Add worked on the page, and
+   no file was written (the recorded log stayed at 301 bytes).
+4. Passed. A 60 MiB put, from a button on a copy of the fixture (kept
+   with the evidence), aborted with `QuotaExceededError`, and the next run
+   read 3 stored. The engine refused it before sending:
+   `Op::from_fields` takes no value past its bound, so the change was out
+   of shape and nothing reached navigatord. navigatord's 50 MiB a site was
+   not exercised; that needs values under the per-change bound that add up
+   past it.
+5. Passed. `live-idb/app.example.idb-log` was 0600, owned by the
+   Navigator's uid for the person. The log never passed 1 MiB, so there
+   was no fold.
+
+The trim, rechecked with the fixture's Grow and Release buttons: Grow
+three times took the page's engine from 109 to 306 MB, and Release left it
+there. `kill -INFO` logged the trim, and RSS fell to 110 MB. The page ran
+on.
 
 #### Costs
 

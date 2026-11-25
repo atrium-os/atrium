@@ -19,6 +19,10 @@
   <input name="user" value="ana"> <button>Sign in</button>
 </form>
 <form id="add"><input id="item" value="first item"> <button>Add</button></form>
+<!-- I6.7: Fill stores 30 MiB in one transaction; twice is past the site's
+     50 MiB, which navigatord refuses (one value stays under the engine's
+     per-change bound). Empty clears the store. -->
+<p><button id="fill">Fill 30 MiB</button> <button id="empty">Empty</button></p>
 <ul id="items"></ul>
 <p><input type="file" id="file"> <span id="file-out">no file</span></p>
 <p><a id="dl-blob" download="notes.txt" href="#">Download notes</a>

@@ -8,7 +8,11 @@
 //! usage: lyra-play <choragus_sock> <role> <secs> [ignored...]
 //!   LYRA_PLAY_FREQ (Hz, default by role), LYRA_PLAY_RATE (default 48000),
 //!   LYRA_PLAY_CHANNELS (1, 2, 6 or 8; default 2), LYRA_PLAY_VOLUME (0..1),
-//!   LYRA_PLAY_ONLY (a channel index: the tone in that channel only).
+//!   LYRA_PLAY_ONLY (a channel index: the tone in that channel only),
+//!   LYRA_PLAY_SIGNAL=counter (in place of the tone: frame n carries the
+//!   16-bit word n mod 65536 in channel 0 and its complement in channel 1,
+//!   exactly, so a recording shows every dropped, repeated or corrupted frame;
+//!   play it at volume 1 on a bit-perfect path; qemu-xhci-isoch.md §4 A).
 
 use lyra_protocol::client::Client;
 use lyra_protocol::wire::{Role, StreamParams, ToApp};
@@ -56,8 +60,22 @@ fn main() {
     let total = (secs * rate as f32) as u64;
     let mut written = 0u64;
     let mut started = false;
+    let counter = std::env::var("LYRA_PLAY_SIGNAL").is_ok_and(|v| v == "counter");
+    if counter {
+        eprintln!("lyra-play: counter signal in place of the tone");
+    }
     while written < total {
+        if counter {
+            for f in 0..CHUNK {
+                let n = (written + f as u64) as u16 as i16;
+                for k in 0..ch {
+                    let w = match k { 0 => n, 1 => !n, _ => 0 };
+                    buf[f * ch + k] = w as f32 / 32_768.0;
+                }
+            }
+        }
         for f in 0..CHUNK {
+            if counter { break; }
             let v = phase.sin() * 0.25;
             for k in 0..ch {
                 buf[f * ch + k] = if only.is_none_or(|o| o == k) { v } else { 0.0 };

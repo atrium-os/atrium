@@ -1071,6 +1071,50 @@ pub fn paste_names(d: &Doc) -> Vec<String> {
     v
 }
 
+/// What the status bar sums up about a selection, as Excel's does.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SelStats {
+    /// Cells holding anything.
+    pub count: u64,
+    /// Cells holding a number, and their total.
+    pub nums: u64,
+    pub sum: f64,
+}
+
+impl SelStats {
+    /// "Average: 2   Count: 3   Sum: 6", or "Count: 2" with no numbers;
+    /// None for one cell or nothing to count.
+    pub fn text(&self, cells: u64) -> Option<String> {
+        if cells < 2 || self.count == 0 {
+            return None;
+        }
+        let n = |x: f64| officina_grid::value::format_general(x);
+        Some(if self.nums > 0 {
+            format!("Average: {}   Count: {}   Sum: {}", n(self.sum / self.nums as f64), self.count, n(self.sum))
+        } else {
+            format!("Count: {}", self.count)
+        })
+    }
+}
+
+/// The selection's count, and the count and sum of its numbers. Empty
+/// stretches of the sheet are skipped unseen, so a whole column is cheap.
+pub fn selection_stats(wb: &Workbook, sheet: u16, sel: CellRange) -> SelStats {
+    let mut st = SelStats::default();
+    let r = Rect { sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    wb.each(&r, &mut |_, _, v| match v {
+        Value::Empty => {}
+        Value::Num(x) => {
+            st.count += 1;
+            st.nums += 1;
+            st.sum += x;
+        }
+        Value::Str(t) if t.is_empty() => {}
+        _ => st.count += 1,
+    });
+    st
+}
+
 /// The most dependents Ctrl+] lists.
 pub const MAX_DEPENDENTS: usize = 1000;
 

@@ -378,6 +378,9 @@ pub struct Sheets {
     pub seek_text: Mutable<TextEdit>,
     /// The last command F4 repeats.
     pub last_repeat: Cell<Option<Cmd>>,
+    /// The status bar's selection summary, kept until the document, sheet or
+    /// selection changes.
+    stats_cache: Rc<RefCell<Option<((u64, u16, CellRange), Option<String>)>>>,
     /// The Rotation Angle bar is open, with its field.
     pub angling: Mutable<bool>,
     pub angle_text: Mutable<TextEdit>,
@@ -412,7 +415,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1827,6 +1830,23 @@ impl Sheets {
         self.set_status(status);
     }
 
+    /// The status bar's summary of the selection (Average, Count, Sum).
+    pub fn selection_summary(&self) -> Option<String> {
+        let sel = self.grid.get_cloned().selection();
+        let sheet = self.doc.borrow().sheet;
+        let key = (self.rev.get(), sheet, sel);
+        if let Some((k, v)) = &*self.stats_cache.borrow() {
+            if *k == key {
+                return v.clone();
+            }
+        }
+        let cells = (sel.r1 - sel.r0) as u64 + 1;
+        let cells = cells.saturating_mul((sel.c1 - sel.c0) as u64 + 1);
+        let v = if cells < 2 { None } else { crate::data::selection_stats(&self.doc.borrow().wb, sheet, sel).text(cells) };
+        *self.stats_cache.borrow_mut() = Some((key, v.clone()));
+        v
+    }
+
     /// Opens the list of functions (Shift+F3) or of names (F3) for the
     /// cursor cell's formula. A cell being edited stays open.
     pub fn formula_list(&self, kind: ListKind) {
@@ -2687,6 +2707,14 @@ impl View for Sheets {
         }).or(gs.extending().then_some("Extend Selection"));
         let mode_w = if mode == Some("Extend Selection") { 120.0 } else { 60.0 };
         let mut room = if mode.is_some() { mode_w + 12.0 } else { 0.0 };
+        // The selection's Average, Count and Sum, at the right as in Excel.
+        if let Some(summary) = self.selection_summary() {
+            let style = st(type_size::XS, Weight::Regular, t.text_primary());
+            let width = Node::measure_text(&summary, &style).w.ceil() + 2.0;
+            let x = (w - 12.0 - room - width).max(12.0);
+            ctx.add(Node::Text { rect: Rect::new(x, sy + 4.0, width, 18.0), content: summary, style });
+            room += width + 16.0;
+        }
         if self.doc.borrow().wb.recalc_pending() {
             let notice = "Calculating…";
             let style = st(type_size::XS, Weight::Semibold, t.text_secondary());
@@ -7862,6 +7890,27 @@ mod tests {
         app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::F(8), modifiers: Modifiers::default(), chars: String::new() });
         app.tick();
         assert!(!has(&app));
+    }
+
+    #[test]
+    fn the_status_bar_sums_up_the_selection() {
+        let s = sheets_of(b"a,1\nb,2\n,3.5\n");
+        select(&s, (0, 0), (2, 1));
+        assert_eq!(s.selection_summary().as_deref(), Some("Average: 2.16666666666667   Count: 5   Sum: 6.5"));
+        let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content.starts_with("Average: "))));
+        // Text only: just the count. One cell: nothing.
+        select(&s, (0, 0), (2, 0));
+        assert_eq!(s.selection_summary().as_deref(), Some("Count: 2"));
+        select(&s, (1, 1), (1, 1));
+        assert_eq!(s.selection_summary(), None);
+        select(&s, (5, 5), (9, 9));
+        assert_eq!(s.selection_summary(), None, "nothing to count");
+        // A whole column; an edit shows at once.
+        select(&s, (0, 1), (officina_grid::addr::MAX_ROWS - 1, 1));
+        assert_eq!(s.selection_summary().as_deref(), Some("Average: 2.16666666666667   Count: 3   Sum: 6.5"));
+        Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Commit { row: 3, col: 1, text: "10".into() });
+        assert_eq!(s.selection_summary().as_deref(), Some("Average: 4.125   Count: 4   Sum: 16.5"));
     }
 
     #[test]
