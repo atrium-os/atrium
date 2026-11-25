@@ -4918,6 +4918,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Shift+F3** opens a searchable list of the functions Sheets has (**Insert Function…**). **F3** lists the names the sheet can use: the workbook's and this sheet's own, without Excel's built-in `_xlnm.` ones (**Paste Name…**). A pick goes into the open editor at its caret (a function as `NAME(`), or starts a formula with `=` when no cell is being edited. F3 with no names says so. The lists reuse the validation list panel (`ListKind`).
 - Test: `f9_calculates_and_f3_lists_go_into_the_formula`. All 145 Sheets and 122 officina-grid lib tests pass.
 
+### 16.119 AutoComplete and Pick From Drop-down List (2026-11-25)
+
+- **AutoComplete.** Typing text in a cell finishes it when exactly one entry of the column's list begins with what was typed, ignoring case. The guessed rest is selected, so the next key replaces it, Backspace drops it, and Enter keeps it. The entry's own case is used, as in Excel. Formulas (`=`) and numbers are never completed. pergola's grid asks `GridSource::complete` after each typed character at the end of the editor; the default offers nothing.
+- **The column's list** (`data::column_entries`) is the filled cells next to the cell, above and below until the first empty one, at most `MAX_ENTRY_LOOK` (10,000) each way. Only text counts, each entry once ignoring case.
+- **Alt+Down** on a cell with no validation list now offers that list, sorted, in the list panel (Excel's Pick From Drop-down List). The menu item is now **Pick from List…** (Alt+Down), enabled for either kind of list.
+- Tests: `typing_completes_from_the_source_and_the_next_key_replaces_it` (pergola) and `autocomplete_and_pick_from_list_read_the_column_around_the_cell` (Sheets). All 146 Sheets and 240 pergola lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

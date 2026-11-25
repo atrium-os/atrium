@@ -433,7 +433,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
         (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }).shortcut("Ctrl+K"), Some(DataCmd::Link)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Remove Links" } else { "Remove Link" }).enabled(links_in(wb, s, sel).next().is_some()), Some(DataCmd::RemoveLinks)),
-        (MenuItem::new("Choose from List…").enabled(wb.validation_at(CellAddr::new(s, row, col)).is_some_and(|v| v.allow == officina_grid::validation::Allow::List)).separated(), Some(DataCmd::ChooseFromList)),
+        (MenuItem::new("Pick from List…").shortcut("Alt+Down").enabled(wb.validation_at(CellAddr::new(s, row, col)).is_some_and(|v| v.allow == officina_grid::validation::Allow::List) || !column_entries(wb, s, row, col).is_empty()).separated(), Some(DataCmd::ChooseFromList)),
         if wb.sheet(s).freeze != (0, 0) {
             (MenuItem::new("Unfreeze Panes").separated(), Some(DataCmd::Unfreeze))
         } else {
@@ -1061,6 +1061,48 @@ pub fn paste_names(d: &Doc) -> Vec<String> {
     v.sort_by_key(|n| n.to_lowercase());
     v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     v
+}
+
+/// The most cells AutoComplete and Pick From List read each way from the cell.
+pub const MAX_ENTRY_LOOK: u32 = 10_000;
+
+/// The text entries of the column's list around (`row`, `col`): the filled
+/// cells next to it above and below, as Excel's AutoComplete and Pick From
+/// Drop-down List read them. Each once (ignoring case), in sheet order.
+pub fn column_entries(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Vec<String> {
+    let filled = |r: u32| match wb.value(sheet, r, col) {
+        Value::Empty => false,
+        Value::Str(t) => !t.is_empty(),
+        _ => true,
+    };
+    let (mut top, mut bottom) = (row, row);
+    while top > 0 && row - top < MAX_ENTRY_LOOK && filled(top - 1) {
+        top -= 1;
+    }
+    let last = wb.extent(sheet).0.saturating_sub(1);
+    while bottom < last && bottom - row < MAX_ENTRY_LOOK && filled(bottom + 1) {
+        bottom += 1;
+    }
+    let mut seen = std::collections::HashSet::new();
+    (top..=bottom)
+        .filter(|&r| r != row)
+        .filter_map(|r| match wb.value(sheet, r, col) {
+            Value::Str(t) if !t.is_empty() && seen.insert(t.to_lowercase()) => Some(t.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AutoComplete: the one entry that `typed` begins (ignoring case) and is
+/// longer than. None when there is no such entry, or more than one.
+pub fn complete_entry(entries: &[String], typed: &str) -> Option<String> {
+    let t = typed.to_lowercase();
+    if t.is_empty() || t.starts_with('=') || t.parse::<f64>().is_ok() {
+        return None;
+    }
+    let mut hits = entries.iter().filter(|e| e.chars().count() > typed.chars().count() && e.to_lowercase().starts_with(&t));
+    let one = hits.next()?;
+    hits.next().is_none().then(|| one.clone())
 }
 
 /// Every function a formula can call, sorted, without internal ones.

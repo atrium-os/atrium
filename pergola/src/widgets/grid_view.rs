@@ -347,6 +347,11 @@ pub trait GridSource {
     fn now_text(&self, _time: bool) -> Option<String> {
         None
     }
+    /// AutoComplete: the one entry near (`r`, `c`) that what was typed,
+    /// `prefix`, begins (ignoring case), to finish it. None: no completion.
+    fn complete(&self, _r: u32, _c: u32, _prefix: &str) -> Option<String> {
+        None
+    }
     fn data_edge(&self, r: u32, c: u32, dr: i32, dc: i32) -> (u32, u32) {
         let r = match dr.signum() {
             -1 => 0,
@@ -2543,6 +2548,23 @@ fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
     }
 }
 
+/// AutoComplete after a character typed at the end: the rest of the entry
+/// the source offers, selected, so the next key replaces it and Enter keeps it.
+fn complete(src: &dyn GridSource, at: (u32, u32), ed: &mut TextEdit) {
+    let typed = ed.text().to_string();
+    if typed.is_empty() || typed.starts_with('=') || ed.has_selection() || ed.caret() != typed.len() {
+        return;
+    }
+    let Some(full) = src.complete(at.0, at.1, &typed) else { return };
+    let Some((cut, _)) = full.char_indices().nth(typed.chars().count()) else { return };
+    if full[..cut].to_lowercase() != typed.to_lowercase() {
+        return;
+    }
+    ed.set_text(&full);
+    ed.set_caret(cut, false);
+    ed.set_caret(full.len(), true);
+}
+
 /// Close the editor, sending what it holds.
 fn commit(g: &mut GridState, act: &Option<ActionFn>) {
     if let Some(ed) = g.edit.take() {
@@ -2719,7 +2741,12 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             }
             _ => {
                 return match ed.key(key, m, chars) {
-                    KeyOutcome::Changed => true,
+                    KeyOutcome::Changed => {
+                        if key == Key::Char && !(m.ctrl || m.meta || m.alt) {
+                            complete(src, g.cursor, ed);
+                        }
+                        true
+                    }
                     KeyOutcome::Submit => {
                         finish(g, st, 1, 0);
                         true
@@ -2924,6 +2951,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             // (for Ctrl+Enter).
             let mut ed = TextEdit::new("");
             ed.insert(chars);
+            complete(src, g.cursor, &mut ed);
             g.edit = Some(ed);
             g.entering = true;
             reveal(src, geom, st, g.cursor);
@@ -3062,6 +3090,13 @@ mod tests {
     }
 
     impl GridSource for Sheet {
+        fn complete(&self, _r: u32, c: u32, prefix: &str) -> Option<String> {
+            let p = prefix.to_lowercase();
+            let cells = self.cells.borrow();
+            let mut hits: Vec<&String> = cells.iter().filter(|((_, cc), t)| *cc == c && t.len() > p.len() && t.to_lowercase().starts_with(&p)).map(|(_, t)| t).collect();
+            hits.dedup();
+            (hits.len() == 1).then(|| hits[0].clone())
+        }
         fn rows(&self) -> u32 {
             self.rows
         }
@@ -3861,6 +3896,58 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&GridAction::PasteSpecial));
         key(&mut app, Key::Char, "v", ctrl);
         assert!(matches!(log.borrow().last(), Some(GridAction::Paste { plain: false, .. })));
+    }
+
+    #[test]
+    fn typing_completes_from_the_source_and_the_next_key_replaces_it() {
+        let (mut app, grid, _, state, log) = host(100, 30);
+        grid.cells.borrow_mut().insert((0, 1), "Apple".into());
+        grid.cells.borrow_mut().insert((1, 1), "Banana".into());
+        grid.cells.borrow_mut().insert((2, 1), "Bandana".into());
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 5.0, HEADER_H + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        let mut g = state.get_cloned();
+        g.select(5, 1);
+        state.set(g);
+        let none = Modifiers::default();
+        let text = |st: &Mutable<GridState>| st.get_cloned().edit.map(|e| (e.text().to_string(), e.selected_text().to_string()));
+        // One entry: finished, the rest selected; the case is the entry's.
+        key(&mut app, Key::Char, "a", none);
+        assert_eq!(text(&state), Some(("Apple".into(), "pple".into())));
+        key(&mut app, Key::Enter, "", none);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Commit { row: 5, col: 1, text: "Apple".into() }));
+        // Two entries: nothing until one is left.
+        let mut g = state.get_cloned();
+        g.select(6, 1);
+        state.set(g);
+        for (ch, want) in [("b", ("b", "")), ("a", ("ba", "")), ("n", ("ban", "")), ("d", ("Bandana", "ana"))] {
+            key(&mut app, Key::Char, ch, none);
+            assert_eq!(text(&state), Some((want.0.into(), want.1.into())), "after {ch}");
+        }
+        // Typing on replaces the guess; Backspace drops it.
+        key(&mut app, Key::Char, "x", none);
+        assert_eq!(text(&state), Some(("Bandx".into(), "".into())));
+        key(&mut app, Key::Escape, "", none);
+        let mut g = state.get_cloned();
+        g.select(7, 1);
+        state.set(g);
+        key(&mut app, Key::Char, "a", none);
+        key(&mut app, Key::Backspace, "", none);
+        assert_eq!(text(&state), Some(("A".into(), "".into())));
+        // Another column has nothing to offer; formulas are never completed.
+        key(&mut app, Key::Escape, "", none);
+        let mut g = state.get_cloned();
+        g.select(7, 2);
+        state.set(g);
+        key(&mut app, Key::Char, "a", none);
+        assert_eq!(text(&state), Some(("a".into(), "".into())));
+        key(&mut app, Key::Escape, "", none);
+        grid.cells.borrow_mut().insert((0, 2), "=Apple".into());
+        key(&mut app, Key::Char, "=", none);
+        assert_eq!(text(&state), Some(("=".into(), "".into())));
     }
 
     #[test]

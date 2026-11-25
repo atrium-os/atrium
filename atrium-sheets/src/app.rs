@@ -1772,9 +1772,14 @@ impl Sheets {
         let (r, c) = self.grid.get_cloned().cursor;
         let mut d = self.doc.borrow_mut();
         let a = officina_grid::addr::CellAddr::new(d.sheet, r, c);
-        let items: Vec<String> = d.wb.list_items(a).iter().map(|v| v.display()).filter(|t| !t.is_empty()).collect();
+        let mut items: Vec<String> = d.wb.list_items(a).iter().map(|v| v.display()).filter(|t| !t.is_empty()).collect();
         if items.is_empty() {
-            d.status = "This cell has no list to choose from.".into();
+            // Excel's Pick From Drop-down List: the column's own entries, sorted.
+            items = crate::data::column_entries(&d.wb, d.sheet, r, c);
+            items.sort_by_key(|t| t.to_lowercase());
+        }
+        if items.is_empty() {
+            d.status = "There is nothing in this column to pick from.".into();
             return;
         }
         let sheet = d.sheet;
@@ -7656,6 +7661,40 @@ mod tests {
         let items = crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (4, 0));
         let key = |c| items.iter().find(|(_, x)| *x == Some(c)).and_then(|(m, _)| m.shortcut.clone());
         assert_eq!([key(DataCmd::CalculateNow), key(DataCmd::CalculateSheet), key(DataCmd::InsertFunction), key(DataCmd::PasteName)].map(|k| k.unwrap_or_default()), ["F9", "Shift+F9", "Shift+F3", "F3"]);
+    }
+
+    #[test]
+    fn autocomplete_and_pick_from_list_read_the_column_around_the_cell() {
+        use pergola::widgets::GridSource;
+        let s = sheets_of(b"fruit,n\nApple,1\nbanana,2\nBandana,3\napple,4\n12,5\n,6\nCherry,7\n");
+        let wb = |f: &dyn Fn(&officina_grid::Workbook) -> Vec<String>| f(&s.doc.borrow().wb);
+        // Row 6 is empty: the cells next to it above (0-5) and below (7) are its list;
+        // entries once each, ignoring case; numbers left out.
+        assert_eq!(wb(&|w| crate::data::column_entries(w, 0, 6, 0)), ["fruit", "Apple", "banana", "Bandana", "Cherry"]);
+        assert_eq!(wb(&|w| crate::data::column_entries(w, 0, 8, 0)), ["Cherry"]);
+        assert_eq!(s.source.complete(6, 0, "ap").as_deref(), Some("Apple"));
+        assert_eq!(s.source.complete(6, 0, "ban"), None, "two entries");
+        assert_eq!(s.source.complete(6, 0, "band").as_deref(), Some("Bandana"));
+        assert_eq!(s.source.complete(6, 0, "apple"), None, "nothing left to add");
+        assert_eq!(s.source.complete(6, 0, "1"), None);
+        assert_eq!(s.source.complete(6, 0, "=a"), None);
+        assert_eq!(s.source.complete(6, 1, "a"), None, "another column");
+        // Alt+Down with no validation list: the column's entries, sorted.
+        select(&s, (6, 0), (6, 0));
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList));
+        s.take_cmds();
+        let p = s.list.get_cloned();
+        assert!(p.open);
+        assert_eq!(p.items, ["Apple", "banana", "Bandana", "Cherry", "fruit"]);
+        s.cmds.lock().unwrap().push(Cmd::ListPick(1));
+        s.take_cmds();
+        assert_eq!(shown(&s, 6, 0), "banana");
+        // A column with nothing: says so.
+        select(&s, (3, 5), (3, 5));
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList));
+        s.take_cmds();
+        assert!(!s.list.get_cloned().open);
+        assert_eq!(s.doc.borrow().status, "There is nothing in this column to pick from.");
     }
 
     #[test]
