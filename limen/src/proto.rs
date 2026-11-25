@@ -59,6 +59,9 @@ pub mod op {
     /// [`Choose`](super::Choose): the share sheet names the app the person
     /// chose for its parent's next `share-target`.
     pub const CHOOSE: u16 = 0x16;
+    /// [`ShowPress`](super::ShowPress): Files spends the press that came
+    /// with a "Show in Files" ask (scrinium.md §4.5).
+    pub const SPEND_SHOW: u16 = 0x17;
     // events
     pub const EV_PARENT: u16 = 0x80;
     pub const EV_CHILD: u16 = 0x81;
@@ -185,6 +188,11 @@ pub struct Pip { pub embed: EmbedId, pub on: bool, pub aspect: [u32; 2] }
 /// engine's own word that the person pressed is not proof: this is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendPress { pub embed: EmbedId }
+
+/// Files, the picker, spends `press`, which the parent of its embed
+/// `embed` sent with `picker::ToChild::Show`: `Ok`, or `NO_PRESS`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowPress { pub embed: EmbedId, pub press: [u8; 16] }
 
 /// The parent asks how much memory its embed's jail uses now. Only for an
 /// embed limend started; at most one answer a second per embed.

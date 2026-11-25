@@ -975,7 +975,7 @@ fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>, st: &Mutab
         if show {
             let (st2, id) = (st.clone(), d.id);
             let b = Rect::new(r.x() + r.w() - em(16.0 + shell::SHOW_IN_FILES_W), y + em(10.0), em(shell::SHOW_IN_FILES_W), em(26.0));
-            small_button(ctx, b, None, "Show in Files", false, "", move || with(&st2, |s| { s.show_in_files(id); }));
+            small_button(ctx, b, None, "Show in Files", false, "", move || with(&st2, |s| { s.show_in_files(id, pergola::clipboard::current_activation()); }));
         }
         let (g, c, line) = match &d.state {
             shell::DownloadState::Saving => (ph::DOWNLOAD, t.accent_fg(), format!("{} · saving · {}", d.size, d.origin)),

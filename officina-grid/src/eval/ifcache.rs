@@ -31,6 +31,9 @@ pub struct Agg {
     /// The numbers among the values beside them, and how many there were.
     pub sum: f64,
     pub nums: u64,
+    /// The largest and smallest of those numbers (MAXIFS, MINIFS).
+    pub max: Option<f64>,
+    pub min: Option<f64>,
     /// The first matching error, in range traversal order.
     pub error: Option<ErrorKind>,
 }
@@ -42,6 +45,8 @@ impl Agg {
             Some(Value::Num(x)) => {
                 self.sum += x;
                 self.nums += 1;
+                self.max = Some(self.max.map_or(x, |m| m.max(x)));
+                self.min = Some(self.min.map_or(x, |m| m.min(x)));
             }
             Some(Value::Err(error)) => { self.error.get_or_insert(error); }
             _ => {}
@@ -99,7 +104,7 @@ impl Sorted {
             return Agg::default();
         }
         let sum = if exact { self.sums[hi] - self.sums[lo] } else { f64::NAN };
-        Agg { count: (hi - lo) as u64, sum: if sum == 0.0 { 0.0 } else { sum }, nums: self.nums[hi] - self.nums[lo], error: None }
+        Agg { count: (hi - lo) as u64, sum: if sum == 0.0 { 0.0 } else { sum }, nums: self.nums[hi] - self.nums[lo], max: None, min: None, error: None }
     }
 }
 

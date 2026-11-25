@@ -373,6 +373,13 @@ impl Child {
         self.0.ok(op::CHOOSE, &proto::Choose { embed, app: app.into(), persona: Some(persona.into()) })
     }
 
+    /// Files spends the press that came with a "Show in Files" ask on its
+    /// embed (scrinium.md §4.5); refused with `NO_PRESS` when it isn't a
+    /// fresh press of the parent's.
+    pub fn spend_show_press(&mut self, embed: EmbedId, press: [u8; 16]) -> Result<(), Error> {
+        self.0.ok(op::SPEND_SHOW, &proto::ShowPress { embed, press })
+    }
+
     /// Ask for picture-in-picture (`on`) or to go back into the slot.
     pub fn pip(&mut self, embed: EmbedId, on: bool, aspect: [u32; 2]) -> Result<(), Error> {
         self.0.ok(op::PIP, &proto::Pip { embed, on, aspect })

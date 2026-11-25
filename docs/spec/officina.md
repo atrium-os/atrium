@@ -5040,6 +5040,18 @@ Sheets had 128 functions; Excel's everyday ones it lacked now work, in `eval/mor
 - Tests: 106 new conformance cases with the results on Microsoft's function pages (`tests/conformance.rs`, 326 in all, each printed and parsed back); the `.xlsx` and `.ods` name tests; Sheets' `every_function_has_its_arguments_and_they_match_its_counts`. `tests/budget.rs`' `sliced_recalc_stops_in_time_and_ends_where_one_call_does` fails here the same way before this change (a 64 ms slice in a debug build on a busy cloud box).
 - Not yet: MAXIFS and MINIFS, XMATCH, TEXTBEFORE and TEXTSPLIT, OFFSET and INDIRECT, LOOKUP, ADDRESS, RANK, PERCENTILE, QUARTILE, MODE, the financial functions (PMT, FV, PV, NPV, IRR, RATE, NPER), YEARFRAC and the rest of the long tail.
 
+### 16.133 MAXIFS, ranks and percentiles, XMATCH, and the loan and cash-flow functions (2026-11-25)
+
+Twenty-three more functions, after §16.132's so function ids stay put:
+
+- **MAXIFS and MINIFS** (0 when nothing matches; an error among the matching values is the result). They share SUMIFS' criteria and its equal-key index, which now keeps each key's largest and smallest number too (`ifcache::Agg::max`, `min`); the sorted index keeps only running totals, so they don't use it.
+- **RANK, RANK.EQ and RANK.AVG** (Excel takes only a reference for the numbers; #N/A when the number isn't among them), **PERCENTILE, PERCENTILE.INC and PERCENTILE.EXC**, **QUARTILE, QUARTILE.INC and QUARTILE.EXC** (interpolated as Excel does; .EXC refuses what the data doesn't reach), **MODE and MODE.SNGL** (the first of equally frequent numbers; #N/A when none repeats).
+- **XMATCH**, sharing XLOOKUP's search (`funcs::xfind`): match modes 0, -1, 1 and 2, search modes 1 and -1, and the binary modes 2 and -2 searched the same way, which gives Excel's result on sorted data. A search mode outside those is #VALUE!, for XLOOKUP too (it was taken as 1).
+- **PMT, IPMT, PPMT, FV, PV, NPER, RATE, NPV and IRR** (`eval/fin.rs`) on Excel's sign convention, payments at the end of a period or, with type 1, its start. RATE and IRR use Newton's method from the guess (0.1 by default): at most 100 steps, #NUM! when it doesn't settle or a rate reaches -100 %. IRR needs a positive and a negative flow; NPV and IRR take at most 2^20 flows.
+- Argument tips for all of them. `.xlsx` writes the dotted statistics names (RANK.EQ, PERCENTILE.INC, …, MODE.SNGL) with `_xlfn.`; `.ods` writes them and MAXIFS and MINIFS in Microsoft's namespace, as LibreOffice does.
+- Tests: 49 conformance cases with the results on Microsoft's function pages (money rounded to the cents the pages show), and `maxifs_and_minifs_agree_with_and_without_the_index`.
+- Not yet: TEXTBEFORE and TEXTSPLIT, OFFSET and INDIRECT, LOOKUP, ADDRESS, YEARFRAC, the depreciation functions, MODE.MULT and the rest of the long tail.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

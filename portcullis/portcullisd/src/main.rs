@@ -1648,12 +1648,17 @@ fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time:
                 let one: Vec<u8> = line.drain(..=at).collect();
                 let resp = match serde_json::from_slice::<Request>(one.trim_ascii_end()) {
                     Ok(Request::InstanceUsage { seq }) => {
-                        // One answer a gap: each is a jaild round trip.
+                        // One answer a gap, each a jaild round trip; one asked
+                        // sooner is refused, never waited out, so the hang-up
+                        // and the time bound stay watched.
                         let gap = std::time::Duration::from_millis(portcullis_ipc::INSTANCE_USAGE_GAP_MS);
-                        if let Some(wait) = answered.and_then(|t| gap.checked_sub(t.elapsed())) { std::thread::sleep(wait) }
-                        answered = Some(std::time::Instant::now());
-                        let (memory, memory_cap) = portcullisd::jaild_jail::memory(&name);
-                        Response::InstanceUsage { seq, memory, memory_cap }
+                        if answered.is_some_and(|t| t.elapsed() < gap) {
+                            Response::Error { message: "InstanceUsage asked again too soon".into() }
+                        } else {
+                            answered = Some(std::time::Instant::now());
+                            let (memory, memory_cap) = portcullisd::jaild_jail::memory(&name);
+                            Response::InstanceUsage { seq, memory, memory_cap }
+                        }
                     }
                     _ => Response::Error { message: "only InstanceUsage is asked on an instance's connection".into() },
                 };

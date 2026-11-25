@@ -61,7 +61,7 @@ fn files_is_asked_to_show_a_name_in_a_folder_and_says_only_whether_it_took_it() 
     files.provide_role("picker").unwrap();
     let embeds = Embeds::wrap(limen::client::Parent::wrap(connect(&shared, APP)));
 
-    let ask = pergola::files::show(&embeds, W_APP, SLOT, Folder::Downloads, "plan (1).pdf").unwrap();
+    let ask = pergola::files::show(&embeds, W_APP, SLOT, Folder::Downloads, "plan (1).pdf", [5; 16]).unwrap();
     let ChildEvent::Attach { embed, role, .. } = next_c(&mut files) else { panic!() };
     assert_eq!((embed, role.as_str()), (ask, "picker"));
     let ev = loop {
@@ -71,12 +71,12 @@ fn files_is_asked_to_show_a_name_in_a_folder_and_says_only_whether_it_took_it() 
         }
     };
     let ChildEvent::Message { bytes, .. } = ev else { panic!("{ev:?}") };
-    assert_eq!(ToChild::decode(&bytes), Some(ToChild::Show { folder: Folder::Downloads, name: "plan (1).pdf".into() }));
+    assert_eq!(ToChild::decode(&bytes), Some(ToChild::Show { folder: Folder::Downloads, name: "plan (1).pdf".into(), press: [5; 16] }));
     files.emit(embed, ToParent::Done { files: 0 }.encode()).unwrap();
     assert_eq!(answer(&embeds, ask), Ok(()));
 
     // A refusal comes back as Files' words.
-    let ask = pergola::files::show(&embeds, W_APP, SLOT, Folder::Downloads, "b.pdf").unwrap();
+    let ask = pergola::files::show(&embeds, W_APP, SLOT, Folder::Downloads, "b.pdf", [6; 16]).unwrap();
     let embed = loop {
         if let ChildEvent::Attach { embed, .. } = next_c(&mut files) { break embed; }
     };
@@ -84,5 +84,5 @@ fn files_is_asked_to_show_a_name_in_a_folder_and_says_only_whether_it_took_it() 
     assert_eq!(answer(&embeds, ask), Err("Too many Files windows are open".into()));
 
     // A name with a folder in it is refused before anything is asked.
-    assert!(pergola::files::show(&embeds, W_APP, SLOT, Folder::Downloads, "../secret").is_err());
+    assert!(pergola::files::show(&embeds, W_APP, SLOT, Folder::Downloads, "../secret", [7; 16]).is_err());
 }

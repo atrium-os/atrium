@@ -121,6 +121,22 @@ impl Compositor for Frescod {
         }
     }
 
+    fn spend_token(&mut self, token: [u8; 16], presenter_uid: u32, purpose: u8) -> bool {
+        use fresco_protocol::activation::{op, Consume, ConsumeResult};
+        match self.call::<_, ConsumeResult>(op::CONSUME, &Consume { token, presenter_uid, purpose }) {
+            Ok(ConsumeResult::Ok { .. }) => true,
+            Ok(ConsumeResult::Refused { reason }) => {
+                eprintln!("limend: frescod refused the press ({reason})");
+                false
+            }
+            Err(e) => {
+                eprintln!("limend: frescod press: {e}");
+                self.conn = None;
+                false
+            }
+        }
+    }
+
     /// Unbind but keep shown (`keep_shown`), for Forum's `pip` layer.
     fn release(&mut self, parent: WindowToken, child: WindowToken) -> Result<(), u8> {
         // The kind and z don't matter for an unbind.

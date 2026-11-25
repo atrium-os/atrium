@@ -53,6 +53,13 @@ pub trait Compositor: Send {
         false
     }
 
+    /// Spend the activation `token` that `presenter_uid`'s window minted,
+    /// for `purpose` (frescod's `CONSUME`): a real press, once. No frescod
+    /// support: never.
+    fn spend_token(&mut self, _token: [u8; 16], _presenter_uid: u32, _purpose: u8) -> bool {
+        false
+    }
+
     /// Take `child` out of `parent`'s slot but keep it shown, for Forum to
     /// place in the `pip` layer. A later `bind` puts it back.
     fn release(&mut self, _parent: WindowToken, _child: WindowToken) -> Result<(), u8> {
@@ -583,6 +590,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             op::SPEND_PRESS => spend_press(shared, conn, de(payload)?),
             op::USAGE => usage(shared, conn, de(payload)?),
             op::CHOOSE => choose(shared, conn, de(payload)?),
+            op::SPEND_SHOW => spend_show(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
                 let st = shared.state.lock().unwrap();
@@ -1297,6 +1305,28 @@ fn spend_press(shared: &Arc<Shared>, conn: ConnId, p: proto::SpendPress) -> Resu
     // Only a press in the island itself: one on the parent's own chrome
     // is not the page's.
     if shared.compositor.lock().unwrap().spend_press(child_w, catalogue::ISLAND_PRESS_MS) {
+        Ok(Reply::Ok)
+    } else {
+        Err(Reply::Refused { reason: refusal::NO_PRESS })
+    }
+}
+
+/// Files, for a "Show in Files" ask on one of its picker embeds, spends
+/// the press the parent sent with it: frescod checks that the parent's own
+/// window minted it, for a button or Enter, and that it is unspent.
+fn spend_show(shared: &Arc<Shared>, conn: ConnId, p: proto::ShowPress) -> Result<Reply, Reply> {
+    let st = shared.state.lock().unwrap();
+    let Some(e) = st.embeds.get(&p.embed).filter(|e| e.child == conn) else {
+        return Err(Reply::Refused { reason: refusal::NOT_YOURS });
+    };
+    if e.role.name != "picker" {
+        return Err(Reply::Refused { reason: refusal::NO_PRESS });
+    }
+    let parent_uid = e.parent_uid;
+    // Not held across frescod's answer.
+    drop(st);
+    let show = fresco_protocol::activation::purpose::SHOW;
+    if shared.compositor.lock().unwrap().spend_token(p.press, parent_uid, show) {
         Ok(Reply::Ok)
     } else {
         Err(Reply::Refused { reason: refusal::NO_PRESS })

@@ -503,7 +503,7 @@ pub enum Out {
     /// the press on Share, which the sheet spends (share-sheet.md §5).
     Share { url: String, title: String, press: navigator_control::Press },
     /// Ask Files to show the file `name` in this persona's Downloads.
-    ShowInFiles { name: String },
+    ShowInFiles { name: String, press: navigator_control::Press },
     /// A branch made its own trail (§4.2): the moved pages' keys, old to
     /// new, so their live children follow them.
     Moved { keys: Vec<((u64, PageId), (u64, PageId))> },
@@ -1934,10 +1934,12 @@ impl Shell {
 
     /// "Show in Files" on download `id` (§15.3): Files opens a window of
     /// its own on the file in this persona's Downloads.
-    pub fn show_in_files(&mut self, id: u32) -> bool {
+    pub fn show_in_files(&mut self, id: u32, press: Option<navigator_control::Press>) -> bool {
         let Some(name) = self.downloads.iter().find(|d| d.id == id).and_then(|d| d.in_downloads.clone()) else { return false };
+        // Files opens a window only on the person's press, which it spends.
+        let Some(press) = press else { return false };
         self.downloads_open = false;
-        self.outbox.push(Out::ShowInFiles { name });
+        self.outbox.push(Out::ShowInFiles { name, press });
         true
     }
 
@@ -3777,15 +3779,16 @@ mod tests {
         assert!(s.download_done(7, DownloadState::Saved("Downloads/plan.pdf".into())));
         assert!(!s.download_done(8, DownloadState::Failed("x".into())), "an answer for no download in the list");
         assert_eq!(s.downloads[0].state, DownloadState::Saved("Downloads/plan.pdf".into()));
-        assert!(!s.show_in_files(7), "saved somewhere Files can't be asked about");
+        assert!(!s.show_in_files(7, Some([3; 16])), "saved somewhere Files can't be asked about");
         assert!(s.download_saved(7, "“plan (1).pdf” in Downloads", Some("plan (1).pdf")));
         assert!(!s.download_saved(99, "x", Some("x")), "no such download");
         s.downloads_open = true;
-        assert!(s.show_in_files(7));
+        assert!(!s.show_in_files(7, None), "no press, no ask");
+        assert!(s.show_in_files(7, Some([3; 16])));
         assert!(!s.downloads_open, "the list closes for Files' window");
-        assert_eq!(s.outbox.pop(), Some(Out::ShowInFiles { name: "plan (1).pdf".into() }));
+        assert_eq!(s.outbox.pop(), Some(Out::ShowInFiles { name: "plan (1).pdf".into(), press: [3; 16] }));
         assert!(s.download_saved(7, "x", Some("../etc/passwd")));
-        assert!(!s.show_in_files(7), "a name with a folder in it is never asked for");
+        assert!(!s.show_in_files(7, Some([3; 16])), "a name with a folder in it is never asked for");
         s.toggle_downloads();
         assert!(s.downloads_open && !s.downloads_new && s.geo().downloads_menu.is_some());
         assert!(s.escape() && !s.downloads_open);

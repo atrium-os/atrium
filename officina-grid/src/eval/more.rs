@@ -535,3 +535,121 @@ pub(super) fn t_fn(c: &Ctx, a: &[Expr]) -> Ev {
         _ => Ev::V(Value::str("")),
     }
 }
+
+// ---------- conditional extremes and statistics ----------
+
+fn extreme_if(c: &Ctx, a: &[Expr], max: bool) -> Ev {
+    let range = tri!(super::funcs::rect_arg(c, &a[0]));
+    let agg = tri!(super::funcs::matching_extremes(c, range, &a[1..]));
+    if let Some(k) = agg.error {
+        return e(k);
+    }
+    // No matching number gives 0, as Excel.
+    n(if max { agg.max } else { agg.min }.unwrap_or(0.0))
+}
+pub(super) fn maxifs(c: &Ctx, a: &[Expr]) -> Ev {
+    extreme_if(c, a, true)
+}
+pub(super) fn minifs(c: &Ctx, a: &[Expr]) -> Ev {
+    extreme_if(c, a, false)
+}
+
+/// The numbers of one argument as SUM reads them, at most [`super::MAX_ARRAY`].
+fn numbers(c: &Ctx, a: &Expr) -> Result<Vec<f64>, ErrorKind> {
+    let mut v = Vec::new();
+    let mut over = false;
+    each_num(c, std::slice::from_ref(a), &mut |x| {
+        if v.len() < super::MAX_ARRAY as usize { v.push(x) } else { over = true }
+    })?;
+    if over { Err(ErrorKind::Limit) } else { Ok(v) }
+}
+
+/// RANK, RANK.EQ (`avg` false) and RANK.AVG: the number's place in the
+/// reference's numbers, largest first unless `order` is non-zero.
+fn rank_of(c: &Ctx, a: &[Expr], avg: bool) -> Ev {
+    let x = tri!(num(c, &a[0]));
+    // Excel takes only a reference here.
+    let Ev::R(_) = c.eval(&a[1]) else { return e(ErrorKind::Value) };
+    let v = tri!(numbers(c, &a[1]));
+    let ascending = tri!(opt_num(c, a, 2, 0.0)) != 0.0;
+    let ties = v.iter().filter(|&&y| y == x).count();
+    if ties == 0 {
+        return e(ErrorKind::NA);
+    }
+    let before = v.iter().filter(|&&y| if ascending { y < x } else { y > x }).count();
+    let first = before as f64 + 1.0;
+    n(if avg { first + (ties as f64 - 1.0) / 2.0 } else { first })
+}
+pub(super) fn rank_eq(c: &Ctx, a: &[Expr]) -> Ev {
+    rank_of(c, a, false)
+}
+pub(super) fn rank_avg(c: &Ctx, a: &[Expr]) -> Ev {
+    rank_of(c, a, true)
+}
+
+/// The `k` percentile of the numbers in `a[0]`: inclusive (0 to 1), or
+/// exclusive (strictly between, and only where the data reaches).
+fn percentile_of(c: &Ctx, a: &Expr, k: f64, exclusive: bool) -> Ev {
+    let mut v = tri!(numbers(c, a));
+    if v.is_empty() {
+        return e(ErrorKind::Num);
+    }
+    v.sort_by(f64::total_cmp);
+    let len = v.len() as f64;
+    let h = if exclusive {
+        if k <= 0.0 || k >= 1.0 {
+            return e(ErrorKind::Num);
+        }
+        let h = (len + 1.0) * k - 1.0;
+        if h < 0.0 || h > len - 1.0 {
+            return e(ErrorKind::Num);
+        }
+        h
+    } else {
+        if !(0.0..=1.0).contains(&k) {
+            return e(ErrorKind::Num);
+        }
+        (len - 1.0) * k
+    };
+    let lo = h.floor() as usize;
+    let hi = (lo + 1).min(v.len() - 1);
+    n(v[lo] + (h - lo as f64) * (v[hi] - v[lo]))
+}
+pub(super) fn percentile_inc(c: &Ctx, a: &[Expr]) -> Ev {
+    let k = tri!(num(c, &a[1]));
+    percentile_of(c, &a[0], k, false)
+}
+pub(super) fn percentile_exc(c: &Ctx, a: &[Expr]) -> Ev {
+    let k = tri!(num(c, &a[1]));
+    percentile_of(c, &a[0], k, true)
+}
+pub(super) fn quartile_inc(c: &Ctx, a: &[Expr]) -> Ev {
+    let q = tri!(num(c, &a[1])).trunc();
+    if !(0.0..=4.0).contains(&q) {
+        return e(ErrorKind::Num);
+    }
+    percentile_of(c, &a[0], q / 4.0, false)
+}
+pub(super) fn quartile_exc(c: &Ctx, a: &[Expr]) -> Ev {
+    let q = tri!(num(c, &a[1])).trunc();
+    if !(1.0..=3.0).contains(&q) {
+        return e(ErrorKind::Num);
+    }
+    percentile_of(c, &a[0], q / 4.0, true)
+}
+
+/// MODE and MODE.SNGL: the number that occurs most, the first met among
+/// equals; #N/A when none repeats.
+pub(super) fn mode_sngl(c: &Ctx, a: &[Expr]) -> Ev {
+    let mut v = Vec::new();
+    tri!(each_num(c, a, &mut |x| v.push(x)));
+    let mut counts: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
+    for (i, x) in v.iter().enumerate() {
+        let key = if *x == 0.0 { 0u64 } else { x.to_bits() };
+        counts.entry(key).or_insert((0, i)).0 += 1;
+    }
+    match counts.values().filter(|c| c.0 > 1).max_by(|p, q| p.0.cmp(&q.0).then(q.1.cmp(&p.1))) {
+        Some(&(_, i)) => n(v[i]),
+        None => e(ErrorKind::NA),
+    }
+}

@@ -149,8 +149,8 @@ pub enum Request {
     /// after `ReadyForFds`): how much memory that instance's jail uses now.
     /// Holding the connection is the authority, since only the launcher
     /// has it. Answered with [`Response::InstanceUsage`] echoing `seq`, at
-    /// most one every [`INSTANCE_USAGE_GAP_MS`]; anything else written
-    /// there gets an `Error`.
+    /// most one every [`INSTANCE_USAGE_GAP_MS`] (one asked sooner gets an
+    /// `Error`); anything else written there gets an `Error` too.
     InstanceUsage { seq: u32 },
     /// "Can app `app_id` (with this manifest hash and these caps)
     /// launch right now?" Daemon returns `Authorized` if the policy
