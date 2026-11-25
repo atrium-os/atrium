@@ -255,8 +255,8 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         }
         // The keyboard (I6.4). Ctrl-C and Ctrl-V are the clipboard's: the
         // selection, or the paste, goes with the press's token to
-        // navigatord, and the UI spends it on Tabula. Anything else is the
-        // page's.
+        // navigatord, and the UI spends it on Tabula. Ctrl-A selects all
+        // unless the page took it. Anything else is the page's.
         if (action == 7) {
             u8 special = 0, mods = 0;
             u32 code_point = 0;
@@ -272,6 +272,15 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
                 } else if (pressed && ctrl && (code_point == 'v' || code_point == 'V')) {
                     if (!navigator_live_paste(scene, token))
                         warnln("live page: the paste was not asked for");
+                } else if (pressed && ctrl && (code_point == 'a' || code_point == 'A')) {
+                    // Select all is the browser's, as Ladybird's own
+                    // WebContent does it, unless the page took the key
+                    // first (preventDefault, or a key it handled).
+                    auto result = client.page().handle_keydown(live_key_code(special), live_modifiers(mods), code_point, false, false);
+                    if (result == Web::EventResult::Accepted) {
+                        if (auto navigable = client.page().hosted_focused_navigable())
+                            navigable->select_all();
+                    }
                 } else if (pressed) {
                     client.page().handle_keydown(live_key_code(special), live_modifiers(mods), code_point, false, true);
                 } else {

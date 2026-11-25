@@ -2995,6 +2995,18 @@ passed), then arcad, the courier and navigatord from ac5ba59b9. Evidence is in
   Ctrl-C then Ctrl-V copied "anaxy" from one field into the other. Ctrl+A does not select
   all yet.
 
+Follow-up (2026-11-25, host only):
+
+- **Ctrl+A.** The engine now gives Ctrl+A to the page first, as a keydown
+  without text. If the page leaves it `Accepted` (no `preventDefault`, not
+  handled), the engine selects all in the focused navigable, the way
+  Ladybird's WebContent does for its Select All. This is in
+  `SignInFixture.h`. It needs the Mac's engine build and a rerun of the
+  keys line.
+- **A cancelled pick.** Keeping the earlier file after Cancel is right, so
+  it stays. The HTML standard leaves an input's files unchanged when the
+  picker is cancelled (it fires `cancel`), and Firefox does the same.
+
 Fixed on the way: navigatord ended the run when a finished picker detached (only the
 island's own embed ends it now); the engine stopped after 15,000 input polls, about five
 minutes (now a 12-hour bound); a few engine compile fixes against the pinned LibWeb
