@@ -20,8 +20,25 @@ use std::time::{Duration, Instant};
 
 use limen::daemon::Launcher;
 
+/// The names of the jails `jls` lists to this user.
+fn jails() -> Vec<String> {
+    Command::new("jls").arg("name").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 fn jail_exists(name: &str) -> bool {
-    Command::new("jls").args(["-j", name, "jid"]).output().is_ok_and(|o| o.status.success())
+    jails().iter().any(|j| j == name)
+}
+
+/// Waits up to `secs` for the jail to be there (`there`) or gone.
+fn wait_jail(name: &str, there: bool, secs: u64) -> bool {
+    let until = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if jail_exists(name) == there { return true; }
+        if Instant::now() >= until { return false; }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// The uid the engine serves: `LIMEN_PROBE_SERVES`, else navigatord's.
@@ -57,7 +74,12 @@ fn main() {
             std::process::exit(1);
         }
     }
-    check(jail_exists(&jail), "its jail is there");
+    // The jail comes up after the descriptors are handed over: wait for it.
+    let up = wait_jail(&jail, true, 10);
+    check(up, &format!("its jail is there{}", if up { String::new() } else { format!(" (jls lists {:?})", jails()) }));
+    // The answers are one a second from when the instance started: wait
+    // out that first gap so the first ask is the one answered.
+    std::thread::sleep(Duration::from_millis(1100));
     let mut ask = || p.usage(embed).and_then(|mut u| u.ask());
     let cap = limen::web_island::PART_MEMORY_MB << 20;
     let first = ask();
@@ -69,11 +91,7 @@ fn main() {
     check(later.is_some_and(|(m, _)| m > 0), &format!("asked after the gap: answered ({later:?})"));
     drop(ours);
     p.end(embed);
-    let until = Instant::now() + Duration::from_secs(10);
-    while jail_exists(&jail) && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    check(!jail_exists(&jail), "the jail goes when the connection does");
+    check(up && wait_jail(&jail, false, 10), "the jail goes when the connection does");
 
     const DECLARED: u32 = 5;
     if failed > 0 || ran != DECLARED {

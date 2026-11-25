@@ -1809,7 +1809,12 @@ Tessera guest (Files opened on Downloads with report.csv selected), check 1's lo
 there, and the tag no longer covers the prompt. The show probe got 3 of 6: one ask's
 message was read by the next ask, so each spent the press before its own. Each ask now
 names its own file and spends only its own message. The usage probe was refused because
-it asked for an engine serving no app instance; it now serves one.
+it asked for an engine serving no app instance; it now serves one. Recheck at 5edf1a7bc:
+the show probe passes (`navigator-live-vm.sh` 0 failed); the usage probe got 3 of 5. Its
+first ask came inside the first second after the start and was refused, and its jail check
+(`jls -j`, at once) missed a jail that was there, so the "gone" check proved nothing. It now
+waits for the jail by name in `jls name`'s list (printing the list if it never shows),
+then waits out the first second before asking.
 
 The Mac run also showed frescod's "live code" tag, drawn in a pill just above the island,
 covering the prompt row's file name (the island started right under the row). While the
