@@ -3469,6 +3469,11 @@ Follow-up (cloud, 2026-11-25). What became of the rough edges:
   `PointerButton`), never pointer motion, so a drag can't make a
   selection; this is unrelated to the palette. Evidence is in
   `~/atrium-vm/evidence/navigator-selection-20261125/` on the Mac.
+  Drag, after eb8cfb4e3 (pointer motion while the button is held), on
+  arm64 Tessera with engine `f48c82c3…` (JIT audit passed): dragging across
+  the heading drew the amber wash under the pointer as it moved. Ctrl-C
+  then copied "Not signed i", which Ctrl-V pasted into the item field.
+  Evidence is in `~/atrium-vm/evidence/navigator-drag-select-20261125/`.
   Then (cloud): the island records when the primary button goes down
   and, while it is held, hands `PointerMotion` to the page as action 9
   (`navigator_page_pointer`), which calls `handle_mousemove` with the
