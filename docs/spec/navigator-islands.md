@@ -3252,9 +3252,13 @@ whole page, 256 MiB for parts):
       (`arena.4096.purge`);
     - it then logs `island: trimmed for memory pressure`.
 
-    Check on the Mac: `kill -INFO <engine pid>` on a live page, then look
-    for that line, the page still running, and a lower RSS
-    (`ps -o rss`).
+    Mac check, 2026-11-25: it compiled against the pinned Ladybird with no
+    change, and the JIT audit passed. `kill -INFO` on a live page's
+    engine logged `island: trimmed for memory pressure (garbage
+    collected, arenas purged: yes)`, and the page and its frame ran on.
+    RSS did not drop: about 101 MB before and 102.5 MB after. The fixture
+    page holds almost no garbage, so a lower RSS still needs a page that
+    lets go of a large allocation first.
   - A Mac check: a fixture page that grows past 256 MiB keeps running up
     to 1 GiB and then falls back to the document lane, and a widget is
     still killed at 256 MiB.

@@ -499,8 +499,14 @@ list in Navigator only or the chip alone. Build order:
 
 Steps 1 to 5 are on main. The VM check is
 `scripts/navigator-settings-pane-check.sh PERSON [PERSONA]` (19 checks). It
-runs while someone opens the pane in Settings and presses Ask again, and
-has not been run yet.
+runs while someone opens the pane in Settings and presses Ask again. It
+passed 19 of 19 on arm64 Tessera on 2026-11-25 (2f234fc25), with Settings
+installed as a signed bundle that held graphics, app-grants and the
+app-settings embed. The pane ran in a Navigator one-shot jail as the
+Navigator's uid, with only its pane data mounted at /app-data (read-write,
+noexec). Each Ask again changed the list in place, and Back to Apps ended
+the pane and its jail. Evidence is in
+`~/atrium-vm/evidence/navigator-settings-pane-20261125/` on the Mac.
 
 - **The list's crate.** `navigator-live-origins` holds the parser and the
   lock for navigatord and the pane. The pane sees the Navigator's pane data
