@@ -24,6 +24,9 @@ use crate::live_frames::{FrameAsk, Mailbox};
 /// The most requests one live page makes before its engine is ended: a
 /// map or an editor makes hundreds; thousands is a page that loops.
 pub const MAX_REQUESTS: usize = 4096;
+/// The most requests a second for navigatord's own addresses (the
+/// reporter's, storage, frames' messages); more are refused, not counted.
+pub const OWN_PER_SECOND: u32 = 20;
 /// The most bytes one live page is served in all.
 pub const MAX_BYTES: u64 = 512 << 20;
 /// How long the engine has to ask for its page after it is placed.
@@ -323,6 +326,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
     let mut served = Served::default();
     let first = Instant::now();
     let mut delivered = false;
+    let (mut own_window, mut own_count) = (Instant::now(), 0u32);
     loop {
         let request = match input.recv() {
             Ok(Some(r)) => r,
@@ -343,9 +347,19 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         // Navigatord's own addresses are counted apart: a page with frames
         // asks for its messages every quarter second.
         let own = delivered && open.url.starts_with("https://live-page.atrium.invalid/");
+        if own {
+            // A rate, not a lifetime count: a page with frames reads its
+            // messages for as long as it runs.
+            if own_window.elapsed() >= Duration::from_secs(1) { (own_window, own_count) = (Instant::now(), 0); }
+            own_count += 1;
+            if own_count > OWN_PER_SECOND {
+                output.send(Event::Error { id: open.id, code: ErrorCode::Policy }).map_err(|e| e.to_string())?;
+                continue;
+            }
+        }
         served.requests += 1;
         if !own { served.network += 1; }
-        if served.network > MAX_REQUESTS || served.requests > MAX_REQUESTS * 64 {
+        if served.network > MAX_REQUESTS {
             return Err("the page made too many requests".into());
         }
         let id = open.id;
@@ -1624,6 +1638,10 @@ mod tests {
         assert_eq!(body(&mut frame).2, Some(ErrorCode::Policy));
         page.open(post(5, format!("{LIVE_MESSAGE}?target=*"), "1")).unwrap();
         assert_eq!(body(&mut page).2, Some(ErrorCode::Policy));
+        // navigatord's own addresses are held to a rate: past it, refused,
+        // and the page runs on.
+        let refused = (10..40).filter(|&i| { page.open(Open::get(i, LIVE_MESSAGES)).unwrap(); body(&mut page).2.is_some() }).count();
+        assert!(refused >= 30 - OWN_PER_SECOND as usize, "{refused} refused");
         // Messages are not network requests.
         drop((page, frame));
         let (page, frame) = (page_server.join().unwrap().unwrap(), frame_server.join().unwrap().unwrap());

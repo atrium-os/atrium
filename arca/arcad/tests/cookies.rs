@@ -674,3 +674,20 @@ fn a_password_typed_in_the_brokers_window_goes_with_its_form_only() {
     let h: [u8; 16] = r.body.bytes().try_into().unwrap();
     assert_eq!(for_(&mut s, &broker(), h, "idp.example", "vpn-corp.idp.example").status, status::DENIED);
 }
+
+/// A request's Origin (navigator-islands.md I6.5) is allowed only from the
+/// ticket's initiator's site; a refusal leaves the ticket unspent.
+#[test]
+fn an_origin_is_one_claim_with_the_tickets_initiator() {
+    let (_d, mut s) = setup();
+    let c = web("api.app.example", "app.example");
+    let with = |s: &mut State, t: [u8; 16], origin: &str| s.handle(&c, cop::COOKIES, &body(|w| {
+        w.str("/status"); w.raw(&t); w.u8(1); w.str(""); w.str(origin);
+    })).status;
+    let t = ticket(&mut s, "api.app.example", "app.example", 1, "/status", 2, "app.example");
+    assert_eq!(with(&mut s, t, "https://evil.example"), status::DENIED, "another site");
+    assert_eq!(with(&mut s, t, "http://app.example"), status::DENIED, "not https");
+    assert_eq!(with(&mut s, t, "https://www.app.example"), status::OK, "the initiator's site, and the refusals didn't spend it");
+    let t = ticket(&mut s, "api.app.example", "app.example", 1, "/status", 1, "");
+    assert_eq!(with(&mut s, t, "https://app.example"), status::DENIED, "no initiator, no origin");
+}
