@@ -50,6 +50,18 @@ impl Embeds {
         Ok(e)
     }
 
+    /// Settings only: `app`'s own settings pane (`app-settings`) in
+    /// `persona` ("personal" or a named one), in the slot `slot`
+    /// (curia.md §15).
+    pub fn request_app_settings(&mut self, window: WindowToken, slot: SlotKey, app: &str, persona: &str) -> Result<EmbedId, Error> {
+        let e = self.parent.request_app_settings(window, app, persona)?;
+        self.by_slot.insert(slot, e);
+        if let Some(r) = self.rects.get(&slot).copied() {
+            self.parent.place(e, Some(r))?;
+        }
+        Ok(e)
+    }
+
     pub fn embed_of(&self, slot: SlotKey) -> Option<EmbedId> { self.by_slot.get(&slot).copied() }
 
     /// Take the slot's embed out of view, keeping the child: it stays

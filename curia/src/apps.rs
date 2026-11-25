@@ -14,6 +14,11 @@
 //! offers, in its order; Hide takes one off the sheet, Move up puts it
 //! higher. Each change goes with a press, which portcullisd spends.
 //!
+//! An app with a settings pane of its own (curia.md §15) gets Settings on
+//! its row: the app's pane, which limend starts for Curia in the persona
+//! the person picks, shows in the page in place of the list. Curia sees
+//! only its pixels.
+//!
 //! Its Between personas section (personas.md §6): a switch per persona,
 //! direction and kind ("Work may send links to Personal"). Off by default;
 //! turning one on goes with a press and then the person confirming it's
@@ -100,8 +105,30 @@ pub struct AppsPage {
     pub persona_confirm: Option<String>,
     /// The colour chosen for a new persona.
     pub new_colour: Option<String>,
+    /// An app's own settings pane, open in the page.
+    pub pane: Option<Pane>,
+    /// The app whose Settings asks which persona first.
+    pub pane_pick: Option<String>,
+    /// Why an app's pane closed or didn't open, under its row.
+    pub pane_note: Option<(String, String)>,
     pub wants: Vec<Want>,
 }
+
+/// An app's settings pane: whose, in which persona, and whether its
+/// window is in the slot yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pane {
+    pub app: String,
+    pub name: String,
+    /// "personal" or a named persona.
+    pub persona: String,
+    pub up: bool,
+}
+
+/// The pane's slot, and its size: the pane draws a window this big.
+pub const PANE_SLOT: pergola::slot::SlotKey = 0x5345_5431;
+pub const PANE_W: f32 = 560.0;
+pub const PANE_H: f32 = 420.0;
 
 /// The colours a persona may take (portcullis-policy's `PERSONA_COLOURS`).
 pub const COLOURS: &[&str] = &["blue", "green", "orange", "purple", "red", "teal", "pink", "yellow"];
@@ -514,6 +541,48 @@ impl AppsPage {
         self.confirm = None;
     }
 
+    /// Settings on an app's row: its pane, after the persona when the
+    /// person has named ones.
+    pub fn open_settings(&mut self, id: &str) {
+        if !self.find(id).is_some_and(|e| e.settings) {
+            return;
+        }
+        self.pane_note = None;
+        if self.named().is_empty() {
+            self.settings_in(id, "personal");
+        } else {
+            self.pane_pick = if self.pane_pick.as_deref() == Some(id) { None } else { Some(id.into()) };
+        }
+    }
+
+    /// The pane of `id` in `persona`: Personal or one of the person's.
+    pub fn settings_in(&mut self, id: &str, persona: &str) {
+        let Some(e) = self.find(id).filter(|e| e.settings) else { return };
+        if persona != "personal" && !self.named().iter().any(|(n, _)| n == persona) {
+            return;
+        }
+        let name = e.name.clone();
+        self.pane_pick = None;
+        self.pane = Some(Pane { app: id.into(), name, persona: persona.into(), up: false });
+    }
+
+    /// Back to the list.
+    pub fn close_settings(&mut self) {
+        self.pane = None;
+    }
+
+    /// The pane's window is in its slot.
+    pub fn pane_up(&mut self) {
+        if let Some(p) = self.pane.as_mut() { p.up = true }
+    }
+
+    /// The pane went, or never came: back to the list, saying so.
+    pub fn pane_gone(&mut self, why: &str) {
+        if let Some(p) = self.pane.take() {
+            self.pane_note = Some((p.app, why.into()));
+        }
+    }
+
     /// "12 apps, 2 waiting for you".
     pub fn summary(&self) -> String {
         let v = self.apps();
@@ -536,7 +605,34 @@ mod tests {
             missing: missing.iter().map(|s| s.to_string()).collect(),
             yours: yours.then(|| "2026-11-15T10:00:00Z".into()),
             restricted: restricted.iter().map(|s| s.to_string()).collect(),
+            settings: false,
         }
+    }
+
+    #[test]
+    fn settings_opens_an_apps_own_pane_in_the_persona_picked() {
+        let mut p = AppsPage::default();
+        let web = AccessEntry { settings: true, name: "Navigator".into(), ..e("org.atrium.navigator", None, &[], false, &[]) };
+        p.apply(Got::List(Ok(vec![web, e("org.example.notes", None, &[], false, &[])])));
+        p.apply(Got::Crossings(Ok((vec![], vec![]))));
+        p.open_settings("org.example.notes");
+        assert_eq!(p.pane, None, "no pane of its own");
+        p.open_settings("org.atrium.navigator");
+        assert_eq!(p.pane, Some(Pane { app: "org.atrium.navigator".into(), name: "Navigator".into(), persona: "personal".into(), up: false }), "Personal only: no question");
+        p.pane_up();
+        p.pane_gone("Its settings closed");
+        assert_eq!((p.pane.clone(), p.pane_note.clone()), (None, Some(("org.atrium.navigator".into(), "Its settings closed".into()))));
+
+        p.apply(Got::Crossings(Ok((vec![("work".into(), "blue".into())], vec![]))));
+        p.open_settings("org.atrium.navigator");
+        assert_eq!((p.pane.clone(), p.pane_pick.as_deref()), (None, Some("org.atrium.navigator")), "which persona first");
+        p.settings_in("org.atrium.navigator", "school");
+        assert_eq!(p.pane, None, "not one of theirs");
+        p.settings_in("org.atrium.navigator", "work");
+        assert_eq!(p.pane.as_ref().map(|x| x.persona.as_str()), Some("work"));
+        assert_eq!(p.pane_pick, None);
+        p.close_settings();
+        assert_eq!(p.pane, None);
     }
 
     fn page() -> AppsPage {

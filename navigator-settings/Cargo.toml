@@ -1,0 +1,18 @@
+[package]
+name        = "navigator-settings"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The Navigator's settings pane in Settings (curia.md §15): the sites that run live, each revocable. `bin/navigator-settings` in the Navigator bundle, its [roles.app-settings] entry."
+
+[[bin]]
+name = "navigator-settings"
+path = "src/main.rs"
+
+[dependencies]
+limen                 = { path = "../limen" }
+pergola               = { path = "../pergola" }
+fresco-protocol       = { path = "../fresco-protocol" }
+fresco-client         = { path = "../fresco-client" }
+navigator-live-origins = { path = "../navigator-live-origins" }

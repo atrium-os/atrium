@@ -845,6 +845,10 @@ pub struct AccessEntry {
     /// The restricted capabilities it asks for: only the system grants
     /// these, so Settings can't approve it.
     pub restricted: Vec<String>,
+    /// It has a settings pane of its own (`[roles.app-settings]`), which
+    /// Settings shows inside its window (curia.md §15).
+    #[serde(default)]
+    pub settings: bool,
 }
 
 

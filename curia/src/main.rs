@@ -579,6 +579,9 @@ fn main() {
     let mut vpn_pick_ask = false;
     // The picker for the work-network sheet (a CA, our certificate).
     let mut net_pick: Option<limen::proto::EmbedId> = None;
+    // An app's own settings pane on the Apps page (curia.md §15): the
+    // embed, and the (app, persona) it is.
+    let mut pane_embed: Option<(limen::proto::EmbedId, (String, String))> = None;
     let workspaces = Mutable::with_dirty(curia::workspace_access::Page::default(), dirty.clone());
     let (workspaces_tx, workspaces_rx) = channel();
     let mut workspace_page_open = false;
@@ -943,6 +946,37 @@ fn main() {
                     }
                 }
             }
+            // An app's pane: asked for once per open, while the Apps page
+            // shows it; gone when it closes or the page goes.
+            {
+                let mut a = apps.get_cloned();
+                let want = a.pane.as_ref().filter(|_| which.get() == curia::view::Which::Apps).map(|x| (x.app.clone(), x.persona.clone()));
+                if pane_embed.as_ref().map(|(_, w)| w) != want.as_ref() {
+                    if let Some((id, _)) = pane_embed.take() {
+                        let _ = e.borrow_mut().detach_embed(id);
+                    }
+                    match (&want, win.embed_token()) {
+                        (Some((app, persona)), Some(token)) => {
+                            let asked = e.borrow_mut().request_app_settings(token, curia::apps::PANE_SLOT, app, persona);
+                            match asked {
+                                Ok(id) => pane_embed = Some((id, (app.clone(), persona.clone()))),
+                                Err(err) => {
+                                    eprintln!("curia: {app}'s settings in {persona}: {err:?}");
+                                    a.pane_gone("Its settings didn't open");
+                                    apps.set(a.clone());
+                                }
+                            }
+                        }
+                        (Some(_), None) => {}
+                        (None, _) => {
+                            if a.pane.is_some() {
+                                a.close_settings();
+                                apps.set(a.clone());
+                            }
+                        }
+                    }
+                }
+            }
             if let (Some(what), None) = (p.pick, net_pick) {
                 let asked = win.embed_token().ok_or(()).and_then(|token| {
                     let title = match what {
@@ -1038,6 +1072,14 @@ fn main() {
                             _ => {}
                         }
                     }
+                    Ok(Some(limen::proto::ParentEvent::Attached { embed })) if pane_embed.as_ref().is_some_and(|(id, _)| *id == embed) => {
+                        curia::view::with_apps(&apps, |a| a.pane_up());
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. } | limen::proto::ParentEvent::Detached { embed }))
+                        if pane_embed.as_ref().is_some_and(|(id, _)| *id == embed) => {
+                        pane_embed = None;
+                        curia::view::with_apps(&apps, |a| a.pane_gone("Its settings closed"));
+                    }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == vpn_pick => {
                         vpn_pick = None;
                         let _ = vtx.send(curia::vpn::Got::Picked(Err("the picker went away".into())));
@@ -1084,6 +1126,9 @@ fn main() {
                 }
                 if vpn_pick.take().is_some() {
                     let _ = vtx.send(curia::vpn::Got::Picked(Err("the picker went away".into())));
+                }
+                if pane_embed.take().is_some() {
+                    curia::view::with_apps(&apps, |a| a.pane_gone("Its settings closed"));
                 }
                 embeds = None;
                 cred_embed = None;

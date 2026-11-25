@@ -494,3 +494,67 @@ list in Navigator only or the chip alone. Build order:
 4. Navigator's pane.
 5. Curia's row and embed.
 6. A VM check.
+
+### 15.1 As built (2026-11-25)
+
+Steps 1 to 5 are on main; the VM check is next.
+
+- **The list's crate.** `navigator-live-origins` holds the parser and the
+  lock for navigatord and the pane. The pane sees the Navigator's data
+  through a nullfs mount of its own. A rename made through the app's
+  unionfs may not reach a name the other view has already looked up, so
+  the file is changed in place, never replaced. A change holds an
+  exclusive flock on the file itself, and a read holds a shared one. A
+  forget never creates the file. A last line cut short makes the list
+  empty, because it could be a shorter origin than the one chosen.
+- **Limen.** The `app-settings` role uses `Provider::Named`, in a `Plain`
+  slot.
+  - `REQUEST_APP_SETTINGS` (0x0b) carries `AppSettings { window, z, app,
+    persona }`.
+  - limend refuses with `NO_PANE` (17) unless all of these hold:
+    - the parent is `org.atrium.curia`;
+    - the app id and persona are well formed;
+    - `Installed::may_provide(person, app, "app-settings")` holds.
+  - A plain `REQUEST` for the role is `NO_PROVIDER`.
+  - There is one pane per Settings window.
+  - `Launcher::launch_settings` sends portcullisd `ExecSettingsPane`.
+  - Covered by the daemon test
+    `only_settings_opens_an_apps_own_pane_and_the_launcher_decides_the_persona`.
+- **The manifest.** `[roles.app-settings] entry = "bin/..."` must come
+  with `"app-settings"` in `implements`. The entry is checked like a
+  worker's and may not be the app's own entry.
+- **portcullisd's `ExecSettingsPane { app_id, instance, serves, persona }`.**
+  - It is refused unless all of these hold:
+    - the caller is `_limen`;
+    - `serves` resolves to a launched app whose installed manifest holds
+      `app-grants`;
+    - the persona is the person's.
+  - `launch::settings_pane` checks the signed manifest, resolves the app's
+    uid in that persona with the same publisher's binding as its
+    launches, and mounts its overlay with the helper the app launch uses.
+  - The one-shot lane's `Spec::pane` then runs it this way:
+    - `as_pane` swaps in the pane's entry and clears every capability,
+      the workers and the setup;
+    - the overlay is mounted read-write and noexec at `/app-data`
+      (`ATRIUM_PANE_DATA`);
+    - memory is 256 MiB;
+    - the answer is `ReadyForFdsAs` with the app's uid.
+  - jaild's policy allows exactly one app's overlay as an rw source:
+    `~/.atrium/apps/*` and `~/.atrium/persona-apps/*/*`.
+- **The Navigator's pane.** `navigator-settings` reads `NAVIGATORD_STORE`
+  from the bundle's `etc/navigatord.conf`. The path must be absolute,
+  with nothing but plain components, and is found under
+  `ATRIUM_PANE_DATA`. The pane shows the list newest first, six to a
+  page, re-read every 2 s. Each row has "Ask again", and there is "Ask
+  again for every site". With no store, it says the list lives only
+  while Navigator runs.
+  - `scripts/navigator-broker-bundle.sh` takes the pane binary as an
+    optional fifth argument and adds the `[roles]` block.
+- **Curia.** `AccessEntry.settings` comes from portcullisd's Apps list.
+  - A row whose app has a pane gets a "Settings" button.
+  - With named personas, a row of persona buttons comes first.
+  - The page then shows "Back to Apps", the app's name, "Its own
+    settings, for <persona>", and the slot (560×420, `PANE_SLOT`).
+  - Leaving the page closes the pane. If the child is lost or limend
+    goes, the pane returns to the list with a note under the row.
+  - Curia's manifest `embeds` gains `app-settings`.
