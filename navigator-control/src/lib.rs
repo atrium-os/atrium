@@ -468,6 +468,10 @@ pub enum Event {
     /// The person pressed Ctrl-V in the live page at `from` (I6.4): the UI
     /// spends `token` on a paste and answers `Request::LivePasted`.
     LivePaste { from: String, token: Press },
+    /// The live page at `from` asked for `url` in a new window
+    /// (`window.open`, `target=_blank`, I6.2): the UI opens it beside the
+    /// page in its trail, in the document lane, and the page runs on.
+    LiveOpenBeside { from: String, url: String },
 }
 
 /// The longest refusal a [`Event::LiveRefused`] names.

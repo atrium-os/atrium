@@ -15,6 +15,7 @@
 struct NavigatorScene;
 #ifdef ATRIUM_I6_PAGE
 extern "C" bool navigator_live_propose(NavigatorScene*, u8 const*, size_t);
+extern "C" bool navigator_live_open_beside(NavigatorScene*, u8 const*, size_t);
 extern "C" bool navigator_live_submit(NavigatorScene*, u8 const*, size_t, u8 const*, size_t);
 extern "C" bool navigator_live_pick_file(NavigatorScene*);
 #endif
@@ -109,6 +110,21 @@ public:
         }
         warnln("live page: navigation to {} refused (top-level={} get={} same-document={})", url.serialize(),
             target == Web::NavigationTarget::TopLevel, get, same_document);
+    }
+    // A new window it asks for on the person's activation (window.open, a
+    // target=_blank link, I6.2; patches/ladybird/live-open-beside.patch):
+    // navigatord opens it beside the page in the trail. The page gets no
+    // window, as with a blocked popup.
+    bool page_did_propose_new_window(URL::URL const& url) override
+    {
+        if (!island_scene || url.scheme() != "https"sv) {
+            warnln("live page: new window for {} refused", url.serialize());
+            return true;
+        }
+        auto address = url.serialize();
+        if (!navigator_live_open_beside(island_scene, address.bytes().data(), address.bytes().size()))
+            warnln("live page: new window for {} not reported", address);
+        return true;
     }
     // A file input (I6.4): navigatord opens Scrinium's picker over the
     // window, and the answer comes back through drive_page (action 6).

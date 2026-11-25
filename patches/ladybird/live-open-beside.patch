@@ -1,0 +1,49 @@
+diff -ruN a/Libraries/LibWeb/DOM/Element.cpp b/Libraries/LibWeb/DOM/Element.cpp
+--- a/Libraries/LibWeb/DOM/Element.cpp
++++ b/Libraries/LibWeb/DOM/Element.cpp
+@@ -672,6 +672,11 @@
+     // 6. Let noopener be the result of getting an element's noopener with subject, urlRecord, and targetAttributeValue.
+     auto noopener = get_an_elements_noopener(*url_record, target_attribute_value);
+ 
++    // ATRIUM (I6.2): a link to a new window that the person followed may be opened by the host instead.
++    if (target_attribute_value.equals_ignoring_ascii_case(u"_blank"sv) && user_involvement != HTML::UserNavigationInvolvement::None
++        && document().navigable() && document().navigable()->page().client().page_did_propose_new_window(*url_record))
++        return;
++
+     // 7. Let targetNavigable be the first return value of applying the rules for choosing a navigable given
+     //    targetAttributeValue, subject's node navigable, and noopener.
+     auto target_navigable = document().navigable()->choose_a_navigable(target_attribute_value, noopener).navigable;
+diff -ruN a/Libraries/LibWeb/HTML/Window.cpp b/Libraries/LibWeb/HTML/Window.cpp
+--- a/Libraries/LibWeb/HTML/Window.cpp
++++ b/Libraries/LibWeb/HTML/Window.cpp
+@@ -506,8 +506,16 @@
+     auto const user_involvement = source_window->has_transient_activation()
+         ? UserNavigationInvolvement::Activation
+         : UserNavigationInvolvement::None;
+-    // 13. Let targetNavigable and windowType be the result of applying the rules for choosing a navigable given target, sourceDocument's node navigable, and noopener.
++    // ATRIUM (I6.2): a new window, asked for with the person's activation, may be opened by the host instead: then
++    //     there is no window here, and window.open() returns null, as for a blocked popup.
+     VERIFY(source_document.navigable());
++    if (target.equals_ignoring_ascii_case(u"_blank"sv) && url_record.has_value() && source_window->has_transient_activation()
++        && source_document.navigable()->page().client().page_did_propose_new_window(*url_record)) {
++        source_window->consume_user_activation();
++        return OpenedWindow {};
++    }
++
++    // 13. Let targetNavigable and windowType be the result of applying the rules for choosing a navigable given target, sourceDocument's node navigable, and noopener.
+     auto [target_navigable, window_type] = source_document.navigable()->choose_a_navigable(target, no_opener, ActivateTab::Yes, tokenized_features);
+ 
+     // 14. If targetNavigable is null, then return null.
+diff -ruN a/Libraries/LibWeb/Page/Page.h b/Libraries/LibWeb/Page/Page.h
+--- a/Libraries/LibWeb/Page/Page.h
++++ b/Libraries/LibWeb/Page/Page.h
+@@ -929,6 +929,9 @@
+         HTML::WindowType window_type { HTML::WindowType::NewAndUnrestricted };
+     };
+     virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] HTML::CrossProcessId current_navigable_id, [[maybe_unused]] Utf16String const& name, [[maybe_unused]] HTML::TokenizedFeature::NoOpener no_opener, [[maybe_unused]] Optional<URL::URL> current_document_base_url) { return {}; }
++    // ATRIUM (navigator-islands.md I6.2): a page asked for a new window at url on the person's activation. A host
++    // that opens it elsewhere answers true, and no window is made here.
++    virtual bool page_did_propose_new_window([[maybe_unused]] URL::URL const& url) { return false; }
+     virtual void page_did_close() { }
+     virtual void page_did_update_session_history_entry_navigation_api_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::StorageSerializationRecord const& navigation_api_state) { }
+     virtual void page_did_update_session_history_entry_scroll_restoration_mode([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::ScrollRestorationMode scroll_restoration_mode) { }
