@@ -8,5 +8,13 @@ entry = "bin/counter"
 network = "none"
 
 [resources]
-memory = "256M"
+# A whole live page's limit (navigator-islands.md I6.6). limend holds a
+# part of a page (a widget, a frame) and a standby to 256 MiB.
+memory = "1G"
 cpu = 100
+
+# Every engine is one pool in the memory federation: frames and windows
+# divide its share rather than add to it.
+[resources.pool]
+weight = 1.0
+floor = "256M"

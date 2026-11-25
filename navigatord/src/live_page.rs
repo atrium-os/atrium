@@ -1013,7 +1013,7 @@ impl Live {
         let rect = crate::widget::bounds(rect)?;
         limen::start_trace("navigatord", "live-start", &url);
         let mut parent = Parent::at(socket).map_err(|e| format!("Limen: {e:?}"))?;
-        let embed = parent.request_island(window, 1).map_err(|e| format!("engine launch: {e:?}"))?;
+        let embed = parent.request_page_island(window, 1).map_err(|e| format!("engine launch: {e:?}"))?;
         let until = Instant::now() + Duration::from_secs(10);
         loop {
             let left = until.saturating_duration_since(Instant::now());
@@ -1251,9 +1251,13 @@ impl Live {
                     // run already finished (and detached) reports its detach
                     // too, after `pick.embed` is cleared.
                     Ok(Some(ParentEvent::ChildLost { embed: id } | ParentEvent::Detached { embed: id })) if id != embed => {}
-                    Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_) => {
+                    ref ev @ (Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_)) => {
+                        // The engine exited by itself: most often it reached
+                        // its memory limit (rctl kills it; Limen can't say).
+                        let lost = matches!(ev, Ok(Some(ParentEvent::ChildLost { .. })));
                         let why = match fetched.recv_timeout(Duration::from_millis(100)) {
                             Ok(Err(e)) => e,
+                            _ if lost => "the page's engine stopped; it may have used more memory than a live page may".into(),
                             _ => "the page's engine stopped".into(),
                         };
                         break Some(why);

@@ -103,7 +103,7 @@ impl Launcher for Fixture {
         self.spawn(embed, channel, stdout)
     }
 
-    fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, _: u32, fetch: UnixStream) -> Result<u32, String> {
+    fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, _: u32, fetch: UnixStream, _: Option<u64>) -> Result<u32, String> {
         self.spawn(embed, channel, Stdio::from(OwnedFd::from(fetch)))
     }
 

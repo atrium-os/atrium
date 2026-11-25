@@ -75,12 +75,16 @@ pub trait Launcher: Send {
         Err(format!("this launcher starts nothing in another persona ({persona})"))
     }
     /// Start the fixed Navigator engine with its private fetch transport.
-    fn launch_island(&mut self, _embed: EmbedId, _channel: UnixStream, _parent_uid: u32, _fetch: UnixStream) -> Result<u32, String> {
+    /// `memory_mb`: a tighter memory limit than the engine manifest's (a
+    /// part of a page, [`crate::web_island::PART_MEMORY_MB`]); `None` for a
+    /// whole page, which gets the manifest's.
+    fn launch_island(&mut self, _embed: EmbedId, _channel: UnixStream, _parent_uid: u32, _fetch: UnixStream, _memory_mb: Option<u64>) -> Result<u32, String> {
         Err("this launcher does not support an island fetch channel".into())
     }
     /// Start the engine as a standby for `parent_uid`'s next island
     /// (navigator-islands.md D7): the same jail, uid and limits as
-    /// [`Launcher::launch_island`], but with no fetch socket yet. The engine
+    /// [`Launcher::launch_island`] for a part of a page (its memory limit is
+    /// [`crate::web_island::PART_MEMORY_MB`]), but with no fetch socket yet. The engine
     /// warms up and then waits on `channel` for the fetch socket, which
     /// limend sends when an island is asked for. Without one (the default),
     /// every island starts cold.
@@ -426,7 +430,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
     }
     let r = (|| -> Result<Reply, Reply> {
         match opc {
-            op::REQUEST => request(shared, conn, uid, de(payload)?, false),
+            op::REQUEST => request(shared, conn, uid, de(payload)?, None),
             op::REQUEST_SMIME_PICKER => {
                 let (sheet, window) = de(payload)?;
                 request_smime_picker(shared, conn, uid, sheet, window)
@@ -434,7 +438,12 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             op::REQUEST_ISLAND => {
                 let (window, z) = de(payload)?;
                 crate::start_trace("limend", "request-island", &format!("uid={uid}"));
-                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, true)
+                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, Some(Island::Part))
+            }
+            op::REQUEST_PAGE_ISLAND => {
+                let (window, z) = de(payload)?;
+                crate::start_trace("limend", "request-page-island", &format!("uid={uid}"));
+                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, Some(Island::Page))
             }
             op::PLACE => {
                 let p: proto::Place = de(payload)?;
@@ -497,7 +506,20 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
     r.unwrap_or_else(|e| e)
 }
 
-fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, with_fetch: bool) -> Result<Reply, Reply> {
+/// Which engine an island request starts (navigator-islands.md I6.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Island {
+    /// A part of a page (a widget, a live page's frame): held to
+    /// [`crate::web_island::PART_MEMORY_MB`], and may take a standby, which
+    /// is launched with that limit.
+    Part,
+    /// A whole live page: the engine manifest's own memory limit; never a
+    /// standby, whose limit is a part's.
+    Page,
+}
+
+fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, island: Option<Island>) -> Result<Reply, Reply> {
+    let with_fetch = island.is_some();
     let refuse = |reason| Err(Reply::Refused { reason });
     let print_pin = req.role == "credential"
         && shared.system_uids.lock().unwrap().get(catalogue::PRELUM) == Some(&uid);
@@ -590,7 +612,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
             let Some((provider, persona)) = provider else { return refuse(refusal::NO_PROVIDER) };
             // A warmed engine for this Navigator takes the island if it is
             // still there; otherwise it starts cold, as before.
-            let warm = if with_fetch { take_standby(shared, &mut st, uid) } else { None };
+            let warm = if island == Some(Island::Part) { take_standby(shared, &mut st, uid) } else { None };
             let (ours, theirs, warm_uid) = match warm {
                 Some((standby, broker)) => {
                     embed = standby.embed;
@@ -612,7 +634,8 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
                 let theirs = theirs.expect("a cold launch has a channel");
                 UnixStream::pair().map_err(|e| e.to_string()).and_then(|(broker, worker)| {
                     broker_fetch = Some(broker);
-                    shared.launcher.lock().unwrap().launch_island(embed, theirs, uid, worker)
+                    let memory_mb = (island == Some(Island::Part)).then_some(crate::web_island::PART_MEMORY_MB);
+                    shared.launcher.lock().unwrap().launch_island(embed, theirs, uid, worker, memory_mb)
                 })
             } else {
                 let theirs = theirs.expect("a cold launch has a channel");
