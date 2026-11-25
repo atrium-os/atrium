@@ -180,12 +180,15 @@ main(int argc, char **argv)
 			perror("TESSERA_IOC_GROUP_INFO");
 			return (1);
 		}
-		/* One line: domain, root?, group, key id, state. */
+		/* One line: domain, root?, group, key id, volume-groups?, state. */
 		printf("domain %ju%s group %ju key ", (uintmax_t)gi.domain_id,
 		    (gi.flags & TESSERA_GROUP_INFO_ROOT) ? " root" : "",
 		    (uintmax_t)gi.group_id);
 		for (int i = 0; i < 16; i++)
 			printf("%02x", gi.key_id[i]);
+		/* Before the state, which stays the last word. */
+		if (gi.flags & TESSERA_GROUP_INFO_VOLUME_GROUPS)
+			printf(" volume-groups");
 		printf(" %s\n",
 		    (gi.flags & TESSERA_GROUP_INFO_OPEN) ? "open" :
 		    (gi.flags & TESSERA_GROUP_INFO_LOCKED) ? "locked" :

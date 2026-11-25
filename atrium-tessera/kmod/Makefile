@@ -33,7 +33,10 @@ SRCS=       tessera_fs.c \
             tessera_keyring.c \
             tessera_format.c \
             volume.c \
-            vnode_if.h
+            vnode_if.h \
+            device_if.h \
+            bus_if.h \
+            cryptodev_if.h
 
 CFLAGS+=    -I${.CURDIR}/../core/include
 CFLAGS+=    -I${.CURDIR}/../core/src
