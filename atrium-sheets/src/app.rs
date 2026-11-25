@@ -410,6 +410,36 @@ impl Sheets {
         self.authoring.escape().map(Cmd::Author)
     }
 
+    /// A key for the whole window (its USB HID usage and Fresco's modifier
+    /// bits): Excel's file, find, print and Name Manager keys. A cell being
+    /// edited is entered first, as Excel does. None leaves the key to the view.
+    pub fn window_key(&self, usage: u16, modifiers: u8) -> Option<Cmd> {
+        const CTRL: u8 = 0b0001_0001;
+        const SHIFT: u8 = 0b0010_0010;
+        const ALT_GUI: u8 = 0b1100_1100;
+        if self.password.get_cloned().open || self.closing.get() || self.ui.get_cloned().asking || modifiers & ALT_GUI != 0 {
+            return None;
+        }
+        let (ctrl, shift) = (modifiers & CTRL != 0, modifiers & SHIFT != 0);
+        let cmd = match (usage, ctrl, shift) {
+            (0x12, true, false) => Cmd::Open,
+            (0x11, true, false) => Cmd::NewWorkbook(pergola::clipboard::current_activation()),
+            _ if self.launcher => return None,
+            (0x16, true, false) => Cmd::Save,
+            (0x45, false, false) => Cmd::SaveAs,
+            (0x13, true, false) => Cmd::Print,
+            (0x09 | 0x0b, true, _) => Cmd::Author(AuthorCmd::FindOpen),
+            (0x3c, true, false) => Cmd::Data(crate::data::DataCmd::NameManager),
+            _ => return None,
+        };
+        let mut grid = self.grid.get_cloned();
+        if let Some(edit) = grid.edit.take() {
+            Sheets::act(&self.doc, &self.source, &self.rev, GridAction::Commit { row: grid.cursor.0, col: grid.cursor.1, text: edit.text().to_owned() });
+            self.grid.set(grid);
+        }
+        Some(cmd)
+    }
+
     /// The picked chart's index, if a chart is picked and still there.
     pub fn picked_chart(&self) -> Option<usize> {
         let k = self.grid.get_cloned().picked? as usize;
@@ -7455,6 +7485,38 @@ mod tests {
         assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 3, 1)), None);
         assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 0, -1)), None);
         assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 0, 0)), None);
+    }
+
+    #[test]
+    fn window_keys_save_open_find_and_enter_the_cell_being_edited() {
+        let s = sheets_of(b"a,b\n1,2\n");
+        let ctrl = 0b0000_0001;
+        // Ctrl+S with a cell open: the text is entered, then Save.
+        let mut g = s.grid.get_cloned();
+        g.select(1, 0);
+        let mut ed = pergola::text_edit::TextEdit::new("");
+        ed.insert("42");
+        g.edit = Some(ed);
+        s.grid.set(g);
+        assert!(matches!(s.window_key(0x16, ctrl), Some(Cmd::Save)));
+        assert!(s.grid.get_cloned().edit.is_none());
+        assert_eq!(shown(&s, 1, 0), "42");
+        assert!(matches!(s.window_key(0x16, 0b0001_0000), Some(Cmd::Save)), "right Ctrl too");
+        assert!(matches!(s.window_key(0x45, 0), Some(Cmd::SaveAs)));
+        assert!(matches!(s.window_key(0x12, ctrl), Some(Cmd::Open)));
+        assert!(matches!(s.window_key(0x11, ctrl), Some(Cmd::NewWorkbook(_))));
+        assert!(matches!(s.window_key(0x13, ctrl), Some(Cmd::Print)));
+        assert!(matches!(s.window_key(0x09, ctrl), Some(Cmd::Author(AuthorCmd::FindOpen))));
+        assert!(matches!(s.window_key(0x0b, ctrl | 0b10), Some(Cmd::Author(AuthorCmd::FindOpen))));
+        assert!(matches!(s.window_key(0x3c, ctrl), Some(Cmd::Data(crate::data::DataCmd::NameManager))));
+        // Other keys and modifiers stay with the view: plain S, Ctrl+Alt+S, Ctrl+Shift+S.
+        for (u, m) in [(0x16, 0), (0x16, ctrl | 0b100), (0x16, ctrl | 0b10), (0x45, ctrl), (0x04, ctrl)] {
+            assert!(s.window_key(u, m).is_none(), "{u:#x} {m:#b}");
+        }
+        // Nothing while the close question is up.
+        s.closing.set(true);
+        assert!(s.window_key(0x16, ctrl).is_none());
+        s.closing.set(false);
     }
 
     #[test]

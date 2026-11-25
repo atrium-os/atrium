@@ -501,7 +501,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let sel_rect = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
     let validated = wb.validations().iter().any(|v| v.ranges.iter().any(|r| r.sheet == s && r.r0 <= sel_rect.r1 && sel_rect.r0 <= r.r1 && r.c0 <= sel_rect.c1 && sel_rect.c0 <= r.c1));
     v.push((MenuItem::new("Define Name…").separated(), Some(DataCmd::DefineName)));
-    v.push((MenuItem::new("Name Manager…"), Some(DataCmd::NameManager)));
+    v.push((MenuItem::new("Name Manager…").shortcut("Ctrl+F3"), Some(DataCmd::NameManager)));
     v.push((MenuItem::new("Data Validation…"), Some(DataCmd::Validation)));
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
@@ -524,7 +524,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     use crate::app::{AuthorCmd, OutlineCmd, Split};
     use officina_grid::shift::Axis;
     let mut authoring = Vec::new();
-    authoring.push((MenuItem::new("Find and Replace…").separated(), Some(DataCmd::Author(AuthorCmd::FindOpen))));
+    authoring.push((MenuItem::new("Find and Replace…").shortcut("Ctrl+F").separated(), Some(DataCmd::Author(AuthorCmd::FindOpen))));
     for (label, mode) in [("Split Horizontally", Split::Rows), ("Split Vertically", Split::Columns),
         ("Split Both Ways", Split::Both), ("Remove Split", Split::None)] {
         authoring.push((MenuItem::new(label), Some(DataCmd::Author(AuthorCmd::Split(mode)))));
