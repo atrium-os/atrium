@@ -26,7 +26,8 @@
 #     in the session), Ctrl+PageUp goes back; the terminal going away only
 #     detaches (the shells run on); Terminal on the app again reattaches,
 #     with the screen as it was;
-#   - `exit`: that shell ends and is reaped.
+#   - `exit`: that shell ends and is reaped;
+#   - stoad ran with a state folder: no console was written to it.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$ROOT/console-shots}
@@ -85,7 +86,8 @@ mk $LAUNCHER Launcher console_probe console_probe 'graphics = "fresco"\napp-laun
 mk $TERM_ID Terminal atrium-term-socket atrium-term-socket 'graphics = "fresco"\nconsoles = true' 'on\n' .trace
 mkdir -p /atrium/sockets/portcullis /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
 : > $LOG
-daemon -f -o $B/stoad.log env STOA_CTL=/var/run/atrium/stoad.sock STOA_STATE=off $B/stoad
+mkdir -m 700 $B/stoa-state
+daemon -f -o $B/stoad.log env STOA_CTL=/var/run/atrium/stoad.sock STOA_STATE=$B/stoa-state $B/stoad
 sleep 1; chmod 600 /var/run/atrium/stoad.sock
 daemon -f -o $LOG env PORTCULLISD_FRESCO_ACTIVATION=$B/activation.sock /usr/local/bin/portcullisd --socket $PSOCK
 sleep 3; test -S $PSOCK; chmod 666 $PSOCK
@@ -226,6 +228,13 @@ typ "exit
 i=0; while [ $i -lt 20 ] && [ "$(shells)" != 2 ]; do sleep 2; i=$((i+2)); done
 check "the shell ended" "2" "$(shells)"
 check "no zombie shells" "0" "$(V "ps -ax -o jid= -o stat= | awk '\$1==$JID && \$2 ~ /^Z/' | wc -l" | tr -d ' ')"
+
+echo "=== consoles are never kept (stoa.md §5.4a, §10a)"
+# stoad had a state folder all along (a dev one): an app's console session
+# must have left nothing in it, neither in the table nor as scrollback.
+check "no console in stoad's session table" "0" "$(V "cat $B/stoa-state/meta.json 2>/dev/null | grep -c 'console\\.'" | tr -d ' ')"
+check "no console scrollback" "0" "$(V "find $B/stoa-state -name 'w*.txt' | wc -l" | tr -d ' ')"
+check "nor the mark it showed" "0" "$(V "grep -rl stay-mark $B/stoa-state | wc -l" | tr -d ' ')"
 
 V "pkill -f console_probe; pkill -f stay_probe; pkill -f atrium-term-socket; pkill -x stoad" >/dev/null 2>&1
 echo "console: $fails failed"

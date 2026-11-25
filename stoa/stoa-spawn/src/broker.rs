@@ -111,6 +111,32 @@ impl ShellSpawner for BrokerSpawner {
     }
 }
 
+/// The directory `uid`'s sessions in `persona` are kept in (stoa.md
+/// §5.4a), opened by portcullisd in that persona's key group; `Err` says
+/// why they are kept in memory only.
+pub fn session_state_dir(uid: u32, persona: &str) -> io::Result<std::os::fd::OwnedFd> {
+    let sock = std::env::var("STOA_BROKER").unwrap_or_else(|_| BROKER_SOCK_DEFAULT.to_string());
+    let mut c = UnixStream::connect(&sock)
+        .map_err(|e| io::Error::other(format!("connect broker {sock}: {e}")))?;
+    c.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    write_request(&mut c, &Request::Hello { version: PROTO_VERSION })?;
+    match read_response_line(&mut c)? {
+        Response::Hello { .. } => {}
+        other => return Err(io::Error::other(format!("broker handshake: {other:?}"))),
+    }
+    write_request(&mut c, &Request::SessionStateDir { uid, persona: persona.to_string() })?;
+    match read_response_line(&mut c)? {
+        Response::SessionStateDirReady => {}
+        Response::Error { message } => return Err(io::Error::other(message)),
+        other => return Err(io::Error::other(format!("SessionStateDir: unexpected {other:?}"))),
+    }
+    let mut fds = recv_fds(&c, 1)?;
+    match (fds.pop(), fds.is_empty()) {
+        (Some(fd), true) => Ok(fd),
+        _ => Err(io::Error::other("SessionStateDir: not one descriptor")),
+    }
+}
+
 /// Read one newline-terminated JSON response WITHOUT buffering past the
 /// newline (see the SCM_RIGHTS hazard noted in `spawn`).
 fn read_response_line(c: &mut UnixStream) -> io::Result<Response> {

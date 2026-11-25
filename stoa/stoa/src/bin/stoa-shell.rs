@@ -26,16 +26,22 @@ use std::os::unix::net::UnixStream;
 use stoa::default_ctl;
 
 fn main() {
-    // args: <name> [--jail <id>]
+    // args: <name> [--jail <id>] [--persona <persona>]
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut name = "default".to_string();
     let mut target = "session".to_string();
+    let mut persona = "personal".to_string();
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--jail" => {
                 if let Some(id) = it.next() {
                     target = format!("jail:{id}");
+                }
+            }
+            "--persona" => {
+                if let Some(p) = it.next() {
+                    persona = p.clone();
                 }
             }
             other => name = other.to_string(),
@@ -52,7 +58,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = (&stream).write_all(format!("MINT {name} {target}\n").as_bytes()) {
+    if let Err(e) = (&stream).write_all(format!("MINT {name} {target} {persona}\n").as_bytes()) {
         eprintln!("stoa-shell: mint request: {e}");
         std::process::exit(1);
     }
@@ -68,7 +74,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // reply = "<port> <keyhex>"; emit it tagged so the client can find it
+    // reply = "<port> <keyhex>[ nokeep]"; emit it tagged so the client can find it
     // amid any SSH/login banner noise on the channel.
     println!("STOA_SESSION {reply}");
 }

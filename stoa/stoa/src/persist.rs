@@ -15,9 +15,12 @@
 //! `rename` (atomic on the same filesystem), so a crash mid-write leaves the
 //! previous good snapshot intact.
 
+use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +46,12 @@ pub struct PersistState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistSession {
     pub name: String,
+    /// Whose shell it runs (the minting uid) and in which persona. A store
+    /// portcullisd handed over holds one (person, persona)'s alone.
+    #[serde(default)]
+    pub owner: u32,
+    #[serde(default = "personal")]
+    pub persona: String,
     /// Spawn target string (`"session"` or `"jail:<id>"`) — same form `stoad`
     /// already keeps in `SessionState.target`.
     pub target: String,
@@ -51,6 +60,10 @@ pub struct PersistSession {
     pub active: usize,
     pub last_active: usize,
     pub windows: Vec<PersistWindow>,
+}
+
+fn personal() -> String {
+    "personal".into()
 }
 
 /// One window: liveness (closed windows stay as tombstones so `Ctrl-B <n>`
@@ -91,21 +104,179 @@ impl PersistState {
     pub fn new() -> PersistState {
         PersistState { version: VERSION, sessions: Vec::new() }
     }
+}
 
-    /// Atomically write the metadata to `<dir>/meta.json`: temp file, fsync,
-    /// `rename`. A crash mid-write leaves the prior snapshot — never torn.
-    pub fn save_atomic(&self, dir: &Path) -> io::Result<()> {
-        fs::create_dir_all(dir)?;
-        let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        write_atomic(&dir.join(META), &json)
+impl Default for PersistState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where sessions are kept: an open directory (stoa.md §5.4a). For a
+/// person's sessions it is the one portcullisd opened in that persona's
+/// key group and handed over; stoad never names a path of its own for it.
+/// Every file is reached relative to it, never through a link: `meta.json`
+/// and `scrollback/<hex(session)>/w<idx>.txt`.
+pub struct Store {
+    dir: OwnedFd,
+    /// What it is, for the log (never a path stoad opens again).
+    pub label: String,
+    /// One writer at a time: the temporary names are per process.
+    lock: Mutex<()>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Store({})", self.label)
+    }
+}
+
+fn cstr(name: &str) -> io::Result<CString> {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file name"));
+    }
+    CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a name"))
+}
+
+/// `openat` below `dir`, never following a link.
+fn open_at(dir: RawFd, name: &str, flags: libc::c_int, mode: libc::c_uint) -> io::Result<OwnedFd> {
+    let c = cstr(name)?;
+    // SAFETY: a NUL-terminated single component, relative to an open
+    // directory; the descriptor is ours alone on success.
+    let fd = unsafe { libc::openat(dir, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: just opened.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The subdirectory `name` of `dir`, made (0700) if `create`.
+fn subdir(dir: RawFd, name: &str, create: bool) -> io::Result<OwnedFd> {
+    if create {
+        let c = cstr(name)?;
+        // SAFETY: a NUL-terminated single component relative to `dir`.
+        if unsafe { libc::mkdirat(dir, c.as_ptr(), 0o700) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
+    }
+    open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+}
+
+fn unlink_at(dir: RawFd, name: &str, flags: libc::c_int) -> io::Result<()> {
+    let c = cstr(name)?;
+    // SAFETY: a NUL-terminated single component relative to `dir`.
+    if unsafe { libc::unlinkat(dir, c.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The names in the directory open on `dir` (not `.` or `..`).
+fn names(dir: RawFd) -> io::Result<Vec<String>> {
+    // SAFETY: fdopendir takes over a descriptor of its own (a dup), closed
+    // by closedir; readdir's entries are read before the next call.
+    unsafe {
+        let d = libc::dup(dir);
+        if d < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dp = libc::fdopendir(d);
+        if dp.is_null() {
+            let e = io::Error::last_os_error();
+            libc::close(d);
+            return Err(e);
+        }
+        libc::rewinddir(dp);
+        let mut out = Vec::new();
+        loop {
+            let e = libc::readdir(dp);
+            if e.is_null() {
+                break;
+            }
+            let n = std::ffi::CStr::from_ptr((*e).d_name.as_ptr()).to_string_lossy().into_owned();
+            if n != "." && n != ".." {
+                out.push(n);
+            }
+        }
+        libc::closedir(dp);
+        Ok(out)
+    }
+}
+
+/// Write `name` in `dir` whole or not at all: a fresh temporary (0600,
+/// O_EXCL), fsync, `renameat` over the old one.
+fn write_atomic(dir: RawFd, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = format!(".{name}.tmp.{}", std::process::id());
+    let _ = unlink_at(dir, &tmp, 0);
+    let fd = open_at(dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+    let mut f = fs::File::from(fd);
+    let r = f.write_all(bytes).and_then(|_| f.sync_all());
+    if let Err(e) = r {
+        let _ = unlink_at(dir, &tmp, 0);
+        return Err(e);
+    }
+    let (a, b) = (cstr(&tmp)?, cstr(name)?);
+    // SAFETY: two NUL-terminated single components relative to `dir`.
+    if unsafe { libc::renameat(dir, a.as_ptr(), dir, b.as_ptr()) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = unlink_at(dir, &tmp, 0);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn read_at(dir: RawFd, name: &str, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let f = fs::File::from(open_at(dir, name, libc::O_RDONLY, 0)?);
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a file"));
+    }
+    let mut out = Vec::new();
+    f.take(max).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// The most read back of one file (meta or one window's scrollback).
+const READ_MAX: u64 = 16 << 20;
+
+impl Store {
+    /// A directory handed over (portcullisd's, in a key group).
+    pub fn from_fd(dir: OwnedFd, label: impl Into<String>) -> Store {
+        Store { dir, label: label.into(), lock: Mutex::new(()) }
     }
 
-    /// Load metadata from `<dir>/meta.json`. Returns empty state (not an error)
-    /// when absent or a different [`VERSION`] — a fresh/upgraded `stoad` starts
-    /// clean.
-    pub fn load(dir: &Path) -> io::Result<PersistState> {
-        let bytes = match fs::read(dir.join(META)) {
+    /// A directory named explicitly for a dev run (`$STOA_STATE`), made if
+    /// missing.
+    pub fn open_path(path: &Path) -> io::Result<Store> {
+        fs::create_dir_all(path)?;
+        let c = CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in the path"))?;
+        // SAFETY: a NUL-terminated path; the descriptor is ours alone.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: just opened.
+        Ok(Store::from_fd(unsafe { OwnedFd::from_raw_fd(fd) }, path.display().to_string()))
+    }
+
+    /// Atomically write the session table (`meta.json`). A crash mid-write
+    /// leaves the previous one.
+    pub fn save_state(&self, st: &PersistState) -> io::Result<()> {
+        let json = serde_json::to_vec_pretty(st).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        write_atomic(self.dir.as_raw_fd(), META, &json)
+    }
+
+    /// The session table: empty (not an error) when absent, unreadable as
+    /// JSON or of another [`VERSION`].
+    pub fn load_state(&self) -> io::Result<PersistState> {
+        let bytes = match read_at(self.dir.as_raw_fd(), META, READ_MAX) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(PersistState::new()),
             Err(e) => return Err(e),
@@ -115,81 +286,66 @@ impl PersistState {
             _ => Ok(PersistState::new()),
         }
     }
-}
 
-/// Atomic file write (temp beside target + fsync + rename). Same-fs rename is
-/// atomic, so readers see either the old or the new whole file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+    /// A window's scrollback (its last [`SCROLLBACK_MAX`] lines).
+    pub fn save_scrollback(&self, session: &str, win_idx: usize, lines: &[String]) -> io::Result<()> {
+        let start = lines.len().saturating_sub(SCROLLBACK_MAX);
+        let body = lines[start..].join("\n");
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let sb = subdir(self.dir.as_raw_fd(), "scrollback", true)?;
+        let d = subdir(sb.as_raw_fd(), &crate::to_hex(session.as_bytes()), true)?;
+        write_atomic(d.as_raw_fd(), &format!("w{win_idx}.txt"), body.as_bytes())
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        use std::io::Write;
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+
+    /// A window's scrollback; empty when missing or unreadable.
+    pub fn load_scrollback(&self, session: &str, win_idx: usize) -> Vec<String> {
+        let read = || -> io::Result<Vec<u8>> {
+            let sb = subdir(self.dir.as_raw_fd(), "scrollback", false)?;
+            let d = subdir(sb.as_raw_fd(), &crate::to_hex(session.as_bytes()), false)?;
+            read_at(d.as_raw_fd(), &format!("w{win_idx}.txt"), READ_MAX)
+        };
+        match read() {
+            Ok(b) if !b.is_empty() => String::from_utf8_lossy(&b).split('\n').map(str::to_string).collect(),
+            _ => Vec::new(),
+        }
     }
-    fs::rename(&tmp, path)
-}
 
-/// Per-window scrollback file: `<dir>/scrollback/<hex(session)>/w<idx>.txt`.
-/// The session name is hex-encoded so any name is a safe, collision-free path.
-fn scrollback_file(dir: &Path, session: &str, win_idx: usize) -> std::path::PathBuf {
-    dir.join("scrollback")
-        .join(crate::to_hex(session.as_bytes()))
-        .join(format!("w{win_idx}.txt"))
-}
-
-/// Persist a window's scrollback (newline-separated text, last
-/// [`SCROLLBACK_MAX`] lines), atomically. Best-effort at the call site.
-pub fn save_scrollback(dir: &Path, session: &str, win_idx: usize, lines: &[String]) -> io::Result<()> {
-    let start = lines.len().saturating_sub(SCROLLBACK_MAX);
-    let body = lines[start..].join("\n");
-    write_atomic(&scrollback_file(dir, session, win_idx), body.as_bytes())
-}
-
-/// Load a window's persisted scrollback. Best-effort: a missing or unreadable
-/// file yields an empty Vec (the session reconstructs without that history).
-pub fn load_scrollback(dir: &Path, session: &str, win_idx: usize) -> Vec<String> {
-    match fs::read_to_string(scrollback_file(dir, session, win_idx)) {
-        Ok(s) if !s.is_empty() => s.split('\n').map(str::to_string).collect(),
-        _ => Vec::new(),
+    /// Remove a session's scrollback. Best-effort.
+    pub fn remove_scrollback(&self, session: &str) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(sb) = subdir(self.dir.as_raw_fd(), "scrollback", false) else { return };
+        let hex = crate::to_hex(session.as_bytes());
+        if let Ok(d) = subdir(sb.as_raw_fd(), &hex, false) {
+            for n in names(d.as_raw_fd()).unwrap_or_default() {
+                let _ = unlink_at(d.as_raw_fd(), &n, 0);
+            }
+        }
+        let _ = unlink_at(sb.as_raw_fd(), &hex, libc::AT_REMOVEDIR);
     }
 }
 
-/// Remove a session's persisted scrollback subtree (on kill / GC). Best-effort.
-pub fn remove_scrollback(dir: &Path, session: &str) {
-    let _ = fs::remove_dir_all(dir.join("scrollback").join(crate::to_hex(session.as_bytes())));
-}
-
-impl Default for PersistState {
-    fn default() -> Self {
-        Self::new()
+/// The directory a dev run keeps every session in: `$STOA_STATE` when it is
+/// set (and not `off`), else none. There is no default: a person's sessions
+/// are kept only in the directory portcullisd hands over (stoa.md §5.4a).
+pub fn dev_state_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("STOA_STATE") {
+        Some(s) if !s.is_empty() && s != "off" => Some(s.into()),
+        _ => None,
     }
-}
-
-/// Default session-state **directory** (holds `meta.json` + `scrollback/`):
-/// `$STOA_STATE`, else a per-uid dir under the temp dir (dev). Production
-/// points `$STOA_STATE` at stoad's persistent data volume (`/atrium-data`).
-pub fn default_state_dir() -> std::path::PathBuf {
-    if let Ok(s) = std::env::var("STOA_STATE") {
-        return std::path::PathBuf::from(s);
-    }
-    let uid = unsafe { libc::getuid() };
-    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(format!("{}/stoad-{uid}.state", tmp.trim_end_matches('/')))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn sample() -> PersistState {
         PersistState {
             version: VERSION,
             sessions: vec![PersistSession {
                 name: "work".into(),
+                owner: 1001,
+                persona: "work".into(),
                 target: "session".into(),
                 cols: 120,
                 rows: 40,
@@ -244,12 +400,19 @@ mod tests {
         std::env::temp_dir().join(format!("stoa-persist-{tag}-{}", std::process::id()))
     }
 
+    fn store(dir: &Path) -> Store {
+        Store::open_path(dir).unwrap()
+    }
+
     #[test]
     fn save_then_load_is_identity() {
         let dir = scratch("id");
         let s = sample();
-        s.save_atomic(&dir).unwrap();
-        let back = PersistState::load(&dir).unwrap();
+        let st = store(&dir);
+        st.save_state(&s).unwrap();
+        let back = st.load_state().unwrap();
+        assert!(!dir.join(".meta.json.tmp").exists());
+        assert_eq!(fs::metadata(dir.join(META)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(s, back);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -258,9 +421,10 @@ mod tests {
     fn missing_dir_is_empty_state() {
         let dir = scratch("missing-xyz");
         let _ = fs::remove_dir_all(&dir);
-        let s = PersistState::load(&dir).unwrap();
+        let s = store(&dir).load_state().unwrap();
         assert!(s.sessions.is_empty());
         assert_eq!(s.version, VERSION);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -268,7 +432,7 @@ mod tests {
         let dir = scratch("ver");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(META), br#"{"version":999,"sessions":[]}"#).unwrap();
-        let s = PersistState::load(&dir).unwrap();
+        let s = store(&dir).load_state().unwrap();
         assert!(s.sessions.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -278,7 +442,7 @@ mod tests {
         let dir = scratch("junk");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(META), b"not json at all }{").unwrap();
-        let s = PersistState::load(&dir).unwrap();
+        let s = store(&dir).load_state().unwrap();
         assert!(s.sessions.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -287,11 +451,12 @@ mod tests {
     fn scrollback_round_trips_and_caps() {
         let dir = scratch("scroll");
         let lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
-        save_scrollback(&dir, "my/sess:1", 2, &lines).unwrap();
-        let back = load_scrollback(&dir, "my/sess:1", 2);
+        let st = store(&dir);
+        st.save_scrollback("my/sess:1", 2, &lines).unwrap();
+        let back = st.load_scrollback("my/sess:1", 2);
         assert_eq!(back, lines);
         // Different session / window is independent + missing → empty.
-        assert!(load_scrollback(&dir, "other", 0).is_empty());
+        assert!(st.load_scrollback("other", 0).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -299,8 +464,9 @@ mod tests {
     fn scrollback_retention_drops_oldest() {
         let dir = scratch("retain");
         let lines: Vec<String> = (0..SCROLLBACK_MAX + 50).map(|i| format!("L{i}")).collect();
-        save_scrollback(&dir, "s", 0, &lines).unwrap();
-        let back = load_scrollback(&dir, "s", 0);
+        let st = store(&dir);
+        st.save_scrollback("s", 0, &lines).unwrap();
+        let back = st.load_scrollback("s", 0);
         assert_eq!(back.len(), SCROLLBACK_MAX);
         assert_eq!(back[0], "L50"); // first 50 dropped
         assert_eq!(back.last().unwrap(), &format!("L{}", SCROLLBACK_MAX + 49));
@@ -310,10 +476,33 @@ mod tests {
     #[test]
     fn remove_scrollback_clears_session() {
         let dir = scratch("rm");
-        save_scrollback(&dir, "doomed", 0, &["x".to_string()]).unwrap();
-        assert!(!load_scrollback(&dir, "doomed", 0).is_empty());
-        remove_scrollback(&dir, "doomed");
-        assert!(load_scrollback(&dir, "doomed", 0).is_empty());
+        let st = store(&dir);
+        st.save_scrollback("doomed", 0, &["x".to_string()]).unwrap();
+        st.save_scrollback("doomed", 1, &["y".to_string()]).unwrap();
+        assert!(!st.load_scrollback("doomed", 0).is_empty());
+        st.remove_scrollback("doomed");
+        assert!(st.load_scrollback("doomed", 0).is_empty());
+        assert!(!dir.join("scrollback").join(crate::to_hex(b"doomed")).exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_in_the_store_is_not_followed() {
+        let dir = scratch("link");
+        let out = scratch("link-out");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink(&out, dir.join("scrollback")).unwrap();
+        let st = store(&dir);
+        assert!(st.save_scrollback("s", 0, &["secret".to_string()]).is_err());
+        assert!(fs::read_dir(&out).unwrap().next().is_none(), "nothing written through the link");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn no_state_dir_without_stoa_state() {
+        std::env::remove_var("STOA_STATE");
+        assert!(dev_state_dir().is_none());
     }
 }

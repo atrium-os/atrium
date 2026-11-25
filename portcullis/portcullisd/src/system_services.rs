@@ -205,6 +205,12 @@ pub struct Capabilities {
     /// refused even from a `jail_exec` holder.
     #[serde(default)]
     pub jail_exec_root: bool,
+
+    /// If true, portcullisd hands this service (Stoa's `_stoad`) the
+    /// directory a person's sessions are kept in, in that persona's key
+    /// group (`SessionStateDir`, stoa.md §5.4a). Default-deny.
+    #[serde(default)]
+    pub session_state: bool,
 }
 
 fn default_true() -> bool { true }
