@@ -114,6 +114,23 @@ pub fn to_chars(b: &CodeBuffer, edits: &[TextEdit], enc: Encoding) -> Vec<(std::
     edits.iter().map(|e| (at(e.range.0)..at(e.range.1).max(at(e.range.0)), e.text.clone())).collect()
 }
 
+/// Where char `at` lands once `kept` (as [`CodeBuffer::kept_parts`] gives
+/// them) replaced their ranges: moved by what changed before it (an insert
+/// at its place too), or to the start of an edit it was inside.
+pub fn map_through(at: usize, kept: &[(std::ops::Range<usize>, String)]) -> usize {
+    let mut shift = 0isize;
+    for (r, t) in kept {
+        if r.end <= at && (r.start < at || r.is_empty()) {
+            shift += t.chars().count() as isize - r.len() as isize;
+        } else if r.start < at {
+            return (r.start as isize + shift).max(0) as usize;
+        } else {
+            break;
+        }
+    }
+    (at as isize + shift).max(0) as usize
+}
+
 /// Accept completion `c` in `b`, whose caret is at char `caret` of `line`
 /// and whose word starts at `start`: replace from the server's range start
 /// (or the word's) to the caret. The caret ends after the text.
@@ -196,6 +213,17 @@ mod tests {
         assert_eq!(typed_char(&b, &e), None);
         assert_eq!(word_start("let foo_b", 9), 4);
         assert_eq!(score("HashMap", "hm"), Some(2));
+    }
+
+    #[test]
+    fn places_move_with_edits() {
+        // "let count = count + 1;" with both counts renamed to n.
+        let kept = vec![(4..9, "n".to_string()), (12..17, "n".to_string())];
+        assert_eq!(map_through(4, &kept), 4, "a renamed name keeps its start");
+        assert_eq!(map_through(12, &kept), 8, "after one shorter name");
+        assert_eq!(map_through(14, &kept), 8, "inside an edit: its start");
+        assert_eq!(map_through(20, &kept), 12);
+        assert_eq!(map_through(0, &[(0..0, "# a\n".to_string())]), 4, "an insert at a place goes before it");
     }
 
     #[test]

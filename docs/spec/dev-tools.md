@@ -499,7 +499,8 @@ checked with rust-analyzer and clangd. As built:
   Page Up/Down move in it, Enter or Tab accept, Escape closes it. The
   server's trigger characters for signatures (`(`, `,`) show the tip; `)`,
   leaving the line or Escape hide it. Shift+F12 lists references in a
-  References panel (a click goes there); F2 opens a rename bar over the
+  References panel (a click goes there; a rename, fix or formatting moves
+  the listed places with the text); F2 opens a rename bar over the
   editor (Enter or Rename; only a plain name is sent); Ctrl+. offers quick
   fixes for the caret's line in the same menu, the server's preferred one
   first (clangd marks a missing `;` on the next token, so its fix is
@@ -510,7 +511,8 @@ checked with rust-analyzer and clangd. As built:
   and saves as it is if the server hasn't answered in 3 s or the text
   changed meanwhile. Edits to files not open open them; every changed file
   is told to the server, and the note says how many changes in how many
-  files.
+  files. The status line shows the active file's server and what it is
+  doing (starting, ready, ended), or none.
 - **Checks**: `engine::tests::language_server_features_with_a_scripted_server`
   drives every feature against `artifex/app/tests/fixtures/fake_lsp.py`
   (started as the Python server), and

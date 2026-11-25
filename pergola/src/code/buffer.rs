@@ -844,7 +844,15 @@ impl CodeBuffer {
     /// one undo step; the selections move with the text. Ranges past the
     /// end are clipped, and one that overlaps an earlier one is left out.
     /// Edits from a language server (a rename, formatting) come this way.
-    pub fn replace(&mut self, mut parts: Vec<(Range<usize>, String)>) -> bool {
+    pub fn replace(&mut self, parts: Vec<(Range<usize>, String)>) -> bool {
+        let kept = self.kept_parts(parts);
+        self.coalesce = false;
+        self.apply(kept, ChangeKind::Other, After::Mapped { grow: false })
+    }
+
+    /// The edits [`CodeBuffer::replace`] applies of `parts`: clipped to
+    /// the text, in order, an overlapping one left out, CRLF made LF.
+    pub fn kept_parts(&self, mut parts: Vec<(Range<usize>, String)>) -> Vec<(Range<usize>, String)> {
         let len = self.text.len_chars();
         for (r, _) in &mut parts {
             r.end = r.end.min(len);
@@ -858,8 +866,7 @@ impl CodeBuffer {
             }
             kept.push((r, t.replace("\r\n", "\n")));
         }
-        self.coalesce = false;
-        self.apply(kept, ChangeKind::Other, After::Mapped { grow: false })
+        kept
     }
 
     pub fn replace_all(&mut self, needle: &str, with: &str, case: bool) -> usize {

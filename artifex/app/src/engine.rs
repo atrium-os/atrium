@@ -105,6 +105,9 @@ pub struct Engine {
     servers: HashMap<&'static str, Server>,
     /// Servers that failed to start: not tried again this session.
     no_server: Vec<&'static str>,
+    /// What each language server is doing, for the status line when the
+    /// active file is its language's.
+    lsp_status: HashMap<&'static str, String>,
     next_git: Instant,
     /// Visible rows, from the window size.
     pub rows: usize,
@@ -174,6 +177,7 @@ impl Engine {
             pictures: None,
             servers: HashMap::new(),
             no_server: Vec::new(),
+            lsp_status: HashMap::new(),
             next_git: Instant::now(),
             rows: 40,
             debugger: None,
@@ -1271,6 +1275,7 @@ impl Engine {
         self.jobs.clear();
         self.servers.clear();
         self.no_server.clear();
+        self.lsp_status.clear();
         self.remote_root = None;
         self.ws = Some(ws.to_string());
         self.root = root.clone();
@@ -1358,7 +1363,7 @@ impl Engine {
         self.active = Some(self.docs.len() - 1);
         self.tree.reveal(rel);
         if let Some(l) = lang {
-            self.lsp_open(l, &path, &text, s);
+            self.lsp_open(l, &path, &text);
         }
     }
 
@@ -1669,7 +1674,7 @@ impl Engine {
         }
     }
 
-    fn lsp_open(&mut self, lang: Lang, path: &Path, text: &str, s: &mut State) {
+    fn lsp_open(&mut self, lang: Lang, path: &Path, text: &str) {
         let Some((key, argv)) = lsp::server_for(lang) else { return };
         if !self.servers.contains_key(key) {
             if self.no_server.contains(&key) {
@@ -1681,11 +1686,11 @@ impl Engine {
                 Ok(proc) => {
                     let client = lsp::Client::new(&self.root, &remote);
                     self.servers.insert(key, Server { client, proc });
-                    s.lsp = Some(format!("{name} starting"));
+                    self.lsp_status.insert(key, format!("{name} starting"));
                 }
                 Err(e) => {
                     self.no_server.push(key);
-                    s.lsp = Some(format!("no {} ({e})", argv[0]));
+                    self.lsp_status.insert(key, format!("no {} ({e})", argv[0]));
                     return;
                 }
             }
@@ -1889,9 +1894,18 @@ impl Engine {
             };
             let d = &mut self.docs[i];
             let mut b = d.cells.buffer.get_cloned();
-            let parts = assist::to_chars(&b, &es, enc);
+            let parts = b.kept_parts(assist::to_chars(&b, &es, enc));
             let n = parts.len();
-            if b.replace(parts) {
+            // The listed references in this file, as chars before the edit.
+            let places: Vec<(usize, usize)> = s.refs.iter().enumerate().filter(|(_, r)| r.0 == d.rel)
+                .map(|(k, r)| (k, b.at_line_col(r.1.min(b.len_lines().saturating_sub(1)), r.2))).collect();
+            if b.replace(parts.clone()) {
+                // They follow the text (a rename, a fix, formatting).
+                for (k, at) in places {
+                    let at = assist::map_through(at, &parts).min(b.len_chars());
+                    let (line, col) = b.line_col(at);
+                    s.refs[k] = (d.rel.clone(), line, col, b.line_text(line).chars().take(300).collect());
+                }
                 files += 1;
                 changes += n;
                 if let Some(srv) = d.lang.and_then(lsp::server_for).and_then(|(k, _)| self.servers.get_mut(k)) {
@@ -2405,7 +2419,7 @@ impl Engine {
                             .filter_map(|d| Some((d.lang?, d.cells.path.clone(), d.cells.buffer.get_cloned().to_string())))
                             .collect();
                         for (l, p, t) in open {
-                            self.lsp_open(l, &p, &t, s);
+                            self.lsp_open(l, &p, &t);
                         }
                     }
                 }
@@ -2438,7 +2452,7 @@ impl Engine {
                         for e in events {
                             match e {
                                 lsp::Event::Ready => {
-                                    s.lsp = Some(srv.client.server_name.clone().unwrap_or_else(|| key.to_string()));
+                                    self.lsp_status.insert(key, srv.client.server_name.clone().unwrap_or_else(|| key.to_string()));
                                     let out = srv.client.take_output();
                                     srv.proc.write(&out);
                                 }
@@ -2452,14 +2466,14 @@ impl Engine {
                         }
                     }
                     Err(e) => {
-                        s.lsp = Some(format!("language server stopped: {e}"));
+                        self.lsp_status.insert(key, format!("language server stopped: {e}"));
                         dead.push(*key);
                         continue;
                     }
                 }
             }
             if done {
-                s.lsp = Some("language server ended".into());
+                self.lsp_status.insert(key, "language server ended".into());
                 dead.push(*key);
             }
         }
@@ -2482,6 +2496,12 @@ impl Engine {
 
     /// Gutter marks and the status line's problems for the active file.
     fn marks(&mut self, s: &mut State) {
+        // The status line's server is the active file's.
+        let lsp = self.active.and_then(|i| self.docs.get(i)).and_then(|d| d.lang).and_then(lsp::server_for)
+            .and_then(|(k, _)| self.lsp_status.get(k)).cloned();
+        if s.lsp != lsp {
+            s.lsp = lsp;
+        }
         let Some(d) = self.active.and_then(|i| self.docs.get(i)) else {
             s.diags.clear();
             return;
@@ -3593,6 +3613,12 @@ mod tests {
         e.wait_jobs(&mut s);
         e.act(Act::Open("app.py".into()), &mut s);
         assert!(tick_until(&mut e, &mut s, |s| s.lsp.as_deref() == Some("fake")), "{:?}", s.lsp);
+        e.act(Act::Open("src/notes.md".into()), &mut s);
+        e.tick(&mut s);
+        assert_eq!(s.lsp, None, "Markdown has no server: the status line says none");
+        e.act(Act::Open("app.py".into()), &mut s);
+        e.tick(&mut s);
+        assert_eq!(s.lsp.as_deref(), Some("fake"));
         let doc = e.active_doc().unwrap();
 
         // Typing a word asks at its second letter; the menu keeps to it.
@@ -3647,6 +3673,8 @@ mod tests {
         assert!(tick_until(&mut e, &mut s, |s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Rename"))), "{:?}", s.note);
         let text = doc.buffer.get_cloned().to_string();
         assert!(text.contains("\tsay('hi')") && text.contains("pr say()") && !text.contains("print("), "{text:?}");
+        assert_eq!(s.refs.iter().map(|r| (r.1, r.2, r.3.as_str())).collect::<Vec<_>>(), vec![(3, 1, "\tsay('hi')"), (5, 4, "\tpr say()")],
+            "the references follow the rename");
         let mut b = doc.buffer.get_cloned();
         b.undo();
         assert!(b.to_string().contains("print('hi')"), "one undo takes the whole rename back");
@@ -3660,6 +3688,7 @@ mod tests {
         assert_eq!(s.menu, Some((1, "Add a comment".into())));
         e.act(Act::MenuPick(0), &mut s);
         assert!(doc.buffer.get_cloned().to_string().starts_with("# fixed\nimport os"));
+        assert_eq!(s.refs.iter().map(|r| r.1).collect::<Vec<_>>(), vec![4, 6], "a line above moves them down");
 
         // Format: the tabs the server turns to spaces.
         e.act(Act::Format, &mut s);
