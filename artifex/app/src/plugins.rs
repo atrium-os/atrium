@@ -31,6 +31,14 @@ pub struct Info {
     pub commands: Vec<String>,
     pub panel: Option<String>,
     pub workspace_read: bool,
+    /// Where it may connect, as limend lists it (empty: nowhere).
+    pub network: Vec<String>,
+}
+
+impl From<limen::proto::PluginInfo> for Info {
+    fn from(p: limen::proto::PluginInfo) -> Self {
+        Info { app: p.app, name: p.name, languages: p.languages, commands: p.commands, panel: p.panel, workspace_read: p.workspace_read, network: p.network }
+    }
 }
 
 impl Info {
@@ -60,6 +68,10 @@ pub trait Link {
     /// Show `id`'s panel (its window) in the panel's slot, or none.
     fn show(&mut self, id: Option<Id>) {
         let _ = id;
+    }
+    /// The plugins installed for the person.
+    fn list(&mut self) -> Result<Vec<Info>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -99,11 +111,16 @@ pub struct Host {
     pub stopped: Vec<(String, String)>,
     /// Whose panel is shown.
     shown: Option<Id>,
+    /// What's installed, as limend last listed it.
+    pub installed: Vec<Info>,
+    /// Which plugins are on in which workspace: Artifex's own file.
+    store: Option<PathBuf>,
 }
 
 impl Default for Host {
     fn default() -> Self {
-        Host { link: None, root: PathBuf::new(), workspace: String::new(), on: Vec::new(), read: Vec::new(), runs: Vec::new(), stopped: Vec::new(), shown: None }
+        Host { link: None, root: PathBuf::new(), workspace: String::new(), on: Vec::new(), read: Vec::new(), runs: Vec::new(), stopped: Vec::new(), shown: None,
+               installed: Vec::new(), store: None }
     }
 }
 
@@ -122,6 +139,60 @@ impl Host {
         self.root = root.to_path_buf();
         self.workspace = workspace.to_string();
         self.stopped.clear();
+        self.load_on();
+    }
+
+    /// Keep which plugins are on in `path` (one `workspace<TAB>app` a line).
+    pub fn set_store(&mut self, path: PathBuf) {
+        self.store = Some(path);
+    }
+
+    /// Ask limend what's installed, and switch on what was on here.
+    pub fn refresh(&mut self) -> Result<(), String> {
+        let Some(link) = self.link.as_mut() else { return Ok(()) };
+        self.installed = link.list()?;
+        self.load_on();
+        Ok(())
+    }
+
+    /// The installed plugins switched on in this workspace, in the order
+    /// they were switched on.
+    fn load_on(&mut self) {
+        let lines = self.store.as_ref().map(|p| read_store(p)).unwrap_or_default();
+        let mut on = Vec::new();
+        for (ws, app) in lines {
+            if ws == self.workspace {
+                if let Some(i) = self.installed.iter().find(|i| i.app == app) {
+                    if !on.iter().any(|o: &Info| o.app == app) {
+                        on.push(i.clone());
+                    }
+                }
+            }
+        }
+        // Without a store (tests), what was set by hand stays.
+        if self.store.is_some() {
+            self.on = on;
+        }
+    }
+
+    /// Switch `app` on or off in this workspace, and keep that.
+    pub fn switch(&mut self, app: &str, on: bool) -> Result<(), String> {
+        if on {
+            let info = self.installed.iter().find(|i| i.app == app).cloned().ok_or("it isn't installed")?;
+            if !self.on.iter().any(|o| o.app == app) {
+                self.on.push(info);
+            }
+            self.stopped.retain(|(a, _)| a != app);
+        } else {
+            self.on.retain(|o| o.app != app);
+            self.stop(app, "");
+        }
+        if let Some(p) = &self.store {
+            let mut lines: Vec<(String, String)> = read_store(p).into_iter().filter(|(w, _)| *w != self.workspace).collect();
+            lines.extend(self.on.iter().map(|o| (self.workspace.clone(), o.app.clone())));
+            write_store(p, &lines)?;
+        }
+        Ok(())
     }
 
     pub fn stop_all(&mut self) {
@@ -349,6 +420,42 @@ impl Host {
     }
 }
 
+/// Largest store file read.
+const MAX_STORE: u64 = 64 << 10;
+
+/// A workspace name or app id as the store keeps it: one line, no tab.
+fn store_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 255 && !s.chars().any(|c| c.is_control())
+}
+
+fn read_store(p: &Path) -> Vec<(String, String)> {
+    let Ok(f) = std::fs::File::open(p) else { return Vec::new() };
+    let mut text = String::new();
+    if std::io::Read::read_to_string(&mut std::io::Read::take(f, MAX_STORE), &mut text).is_err() {
+        return Vec::new();
+    }
+    text.lines().filter_map(|l| l.split_once('\t')).filter(|(w, a)| store_token(w) && store_token(a))
+        .map(|(w, a)| (w.to_string(), a.to_string())).collect()
+}
+
+/// Written whole to a fresh file, then renamed over the old one.
+fn write_store(p: &Path, lines: &[(String, String)]) -> Result<(), String> {
+    let mut text = String::new();
+    for (w, a) in lines {
+        // The renderer refuses what it can't write as one line.
+        if !store_token(w) || !store_token(a) {
+            return Err(format!("{w:?} {a:?} can't be kept"));
+        }
+        text.push_str(&format!("{w}\t{a}\n"));
+    }
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let tmp = p.with_extension(format!("new-{}", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, p).map_err(|e| e.to_string())
+}
+
 /// The client's queued messages to the plugin, as `Lsp` parts.
 fn flush(r: &mut Run, link: &mut dyn Link) -> Result<(), String> {
     let out = r.client.take_output();
@@ -398,6 +505,11 @@ impl Link for LimenLink {
 
     fn stop(&mut self, id: Id) {
         let _ = self.embeds.borrow_mut().detach_embed(id);
+    }
+
+    fn list(&mut self) -> Result<Vec<Info>, String> {
+        let got = self.embeds.borrow_mut().list_plugins().map_err(|e| format!("{e:?}"))?;
+        Ok(got.into_iter().map(Info::from).collect())
     }
 
     fn show(&mut self, id: Option<Id>) {
@@ -570,7 +682,8 @@ pub mod testing {
         pub queued: std::rc::Rc<std::cell::RefCell<Vec<(Id, LinkEvent)>>>,
         pub sent: std::rc::Rc<std::cell::RefCell<Vec<(Id, Vec<u8>)>>>,
         pub stopped: std::rc::Rc<std::cell::RefCell<Vec<Id>>>,
-        next: Id,
+        pub installed: Vec<Info>,
+        pub next: Id,
     }
 
     impl Link for Script {
@@ -588,6 +701,9 @@ pub mod testing {
         fn poll(&mut self) -> Vec<(Id, LinkEvent)> {
             std::mem::take(&mut *self.queued.borrow_mut())
         }
+        fn list(&mut self) -> Result<Vec<Info>, String> {
+            Ok(self.installed.clone())
+        }
     }
 }
 
@@ -597,7 +713,7 @@ mod tests {
     use super::*;
 
     fn todo() -> Info {
-        Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["rust".into()], commands: vec!["todo.list".into()], panel: Some("TODOs".into()), workspace_read: false }
+        Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["rust".into()], commands: vec!["todo.list".into()], panel: Some("TODOs".into()), workspace_read: false, network: vec![] }
     }
 
     #[test]
@@ -655,5 +771,44 @@ mod tests {
         h.pump();
         assert!(h.runs.is_empty());
         assert_eq!(h.stopped[0].1, "sent a message over 4 MiB");
+    }
+
+    #[test]
+    fn switched_on_per_workspace_and_kept() {
+        let d = std::env::temp_dir().join(format!("artifex-plugins-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let store = d.join(".config/artifex/plugins");
+        let mut md = todo();
+        md.app = "org.example.md".into();
+        let host = |ws: &str| {
+            let mut h = Host::default();
+            h.set_link(Box::new(Script { installed: vec![todo(), md.clone()], ..Script::default() }));
+            h.set_store(store.clone());
+            h.refresh().unwrap();
+            h.reset(Path::new("/w"), ws);
+            h
+        };
+        let mut h = host("hello");
+        assert!(h.on.is_empty());
+        h.switch("org.example.md", true).unwrap();
+        h.switch("org.example.todo", true).unwrap();
+        assert!(h.switch("org.example.gone", true).is_err(), "only what's installed");
+        // Kept, in the order switched on, for this workspace only.
+        assert_eq!(host("hello").on.iter().map(|o| o.app.as_str()).collect::<Vec<_>>(), vec!["org.example.md", "org.example.todo"]);
+        assert!(host("other").on.is_empty());
+        let mut o = host("other");
+        o.switch("org.example.todo", true).unwrap();
+        // Off stops it and is kept too; the other workspace keeps its own.
+        let mut h = host("hello");
+        h.open("rust", Path::new("/w/a.rs"), 1, "");
+        assert_eq!(h.runs.len(), 2);
+        h.switch("org.example.md", false).unwrap();
+        assert_eq!(h.runs.iter().map(|r| r.info.app.as_str()).collect::<Vec<_>>(), vec!["org.example.todo"]);
+        assert_eq!(host("hello").on.len(), 1);
+        assert_eq!(host("other").on.len(), 1);
+        // A line the store can't hold is refused, not written.
+        assert!(write_store(&store, &[("a\nb".into(), "x".into())]).is_err());
+        assert_eq!(host("hello").on.len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

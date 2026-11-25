@@ -56,6 +56,10 @@ fn main() {
     let mut app = App::new_with_flag(view, dirty.clone());
     let mut engine = Engine::new(exec);
     engine.set_dirty_flag(dirty);
+    // Which plugins are on where: in Artifex's own home (its overlay).
+    if let Some(home) = std::env::var_os("HOME") {
+        engine.plugins.set_store(std::path::PathBuf::from(home).join(".config/artifex/plugins"));
+    }
 
     let mut s = State::default();
     engine.list(&mut s);
@@ -122,9 +126,9 @@ fn main() {
                 rename_field.set(TextEdit::new(old));
             }
         }
-        // Plugins reach limend once one is switched on and frescod has
-        // named the window (its embed token).
-        if !limen_tried && !engine.plugins.on.is_empty() {
+        // Plugins reach limend once frescod has named the window (its
+        // embed token).
+        if !limen_tried {
             if let Some(token) = win.embed_token() {
                 limen_tried = true;
                 match artifex::plugins::LimenLink::connect(token) {

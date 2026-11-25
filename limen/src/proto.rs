@@ -37,6 +37,8 @@ pub mod op {
     /// [`Plugin`]: one of the parent's plugins (`editor-extension`,
     /// dev-tools.md §3.8), the app it names.
     pub const REQUEST_PLUGIN: u16 = 0x0c;
+    /// The parent's person's installed plugins: [`Reply::Plugins`].
+    pub const LIST_PLUGINS: u16 = 0x0e;
     /// [`SpendPress`]: did the person press in this web island lately?
     /// Spends that press (navigator-islands.md I6.8).
     pub const SPEND_PRESS: u16 = 0x0d;
@@ -188,11 +190,29 @@ pub struct Choose {
     pub persona: Option<String>,
 }
 
+/// An installed plugin, from its manifest (`[app] name`,
+/// `[roles.editor-extension]`, `[capabilities] network`), checked by
+/// portcullisd at install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub app: String,
+    pub name: String,
+    pub languages: Vec<String>,
+    pub commands: Vec<String>,
+    pub panel: Option<String>,
+    pub workspace_read: bool,
+    /// Where it may connect: empty for nowhere, `loopback`, `anywhere`,
+    /// or its destinations (`host[:port]`).
+    pub network: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
     Embed { embed: EmbedId },
     Refused { reason: u8 },
+    /// `LIST_PLUGINS`: at most [`crate::catalogue::MAX_PLUGINS`].
+    Plugins { plugins: Vec<PluginInfo> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

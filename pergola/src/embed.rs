@@ -69,6 +69,11 @@ impl Embeds {
         self.parent.request_plugin(window, app)
     }
 
+    /// The plugins installed for this app's person.
+    pub fn list_plugins(&mut self) -> Result<Vec<limen::proto::PluginInfo>, Error> {
+        self.parent.list_plugins()
+    }
+
     pub fn embed_of(&self, slot: SlotKey) -> Option<EmbedId> { self.by_slot.get(&slot).copied() }
 
     /// Take the slot's embed out of view, keeping the child: it stays

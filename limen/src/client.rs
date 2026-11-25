@@ -128,7 +128,7 @@ impl Parent {
         match self.0.call(op::REQUEST, &proto::Request { role: role.into(), window, z })? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
-            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
         }
     }
 
@@ -148,7 +148,7 @@ impl Parent {
         match self.0.call(opc, &(window, z))? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
-            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
         }
     }
 
@@ -159,7 +159,7 @@ impl Parent {
         match self.0.call(op::REQUEST_APP_SETTINGS, &req)? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
-            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
         }
     }
 
@@ -170,7 +170,17 @@ impl Parent {
         match self.0.call(op::REQUEST_PLUGIN, &req)? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
-            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
+        }
+    }
+
+    /// The plugins installed for the parent's person (dev-tools.md §3.8):
+    /// only for a parent whose manifest embeds `editor-extension`.
+    pub fn list_plugins(&mut self) -> Result<Vec<proto::PluginInfo>, Error> {
+        match self.0.call(op::LIST_PLUGINS, &())? {
+            Reply::Plugins { plugins } => Ok(plugins),
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
         }
     }
 
@@ -180,7 +190,7 @@ impl Parent {
         match self.0.call(op::REQUEST_SMIME_PICKER, &(sheet, window))? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
-            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
         }
     }
 

@@ -647,6 +647,22 @@ panel (up to 8), and the shown one's window is placed in one Limen
 others hidden but kept. The plugin is told `PanelShown(bool)`. A panel
 closed or a plugin stopped takes its tab, and the panel goes back to
 Output.
+P5 (2026-11-25): limend's `LIST_PLUGINS` gives a parent whose manifest
+embeds the role the person's installed plugins (name, languages,
+commands, panel, `workspace-read`, network; at most 64). Artifex's
+Plugins view (the strip's puzzle piece) shows each with what it asks
+for, switches it on or off for the workspace (kept one
+`workspace<TAB>app` a line in `~/.config/artifex/plugins`, in Artifex's
+overlay), and shows a stopped one's reason with Restart; the strip
+counts stopped ones. limend starts a plugin with
+`ExecInstance { memory_mb: 256, cpu_pct: 50 }`
+(`catalogue::PLUGIN_MEMORY_MB`, `PLUGIN_CPU_PCT`); one over limend's
+256 messages a second is stopped. **Not built yet:** the
+`workspace-read` mount. Artifex shows the ask as not given, and `Init`
+says `read: false`. Building it means an `ExecInstance` field naming the
+workspace, which portcullisd checks against the parent's picks and the
+plugin's manifest before it nullfs-mounts that workspace's `work`
+read-only at `/work` in the plugin's jail.
 
 **Decisions.**
 

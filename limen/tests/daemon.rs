@@ -903,6 +903,18 @@ fn a_plugin_is_any_app_the_parent_names_that_is_one_for_its_person() {
     assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: a });
     assert!(w.fresco.binds().iter().any(|x| x.0 == W_APP && x.1 == W_NOTES && x.2 == SlotKind::Plain));
 
+    // Which plugins there are: only for a parent that may embed them.
+    let info = limen::proto::PluginInfo { app: "org.example.notes".into(), name: "Notes".into(), languages: vec!["markdown".into()],
+        commands: vec![], panel: None, workspace_read: false, network: vec![] };
+    let listed = info.clone();
+    w.shared.set_plugin_list(Box::new(move |person: &str| if person == "ana" { vec![listed.clone(); 100] } else { vec![] }));
+    assert_eq!(app.list_plugins().unwrap(), vec![info; catalogue::MAX_PLUGINS], "at most MAX_PLUGINS");
+    w.shared.set_embed_check(Box::new(|app: &str, role: &str| app == "org.example.other" && role == "editor-extension"));
+    assert_eq!(refused(app.list_plugins()), refusal::NOT_EMBEDDABLE);
+    let mut other = w.parent(OTHER);
+    assert_eq!(other.list_plugins().unwrap().len(), catalogue::MAX_PLUGINS);
+    w.shared.set_embed_check(Box::new(|_: &str, _: &str| true));
+
     // Once it is gone the same plugin can start again (Restart).
     app.detach(a).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: a });

@@ -27,6 +27,24 @@ fn manifest(dir: &Path, app: &str) -> Option<portcullis_toml::Manifest> {
     portcullis_toml::Manifest::from_str(&text).ok()
 }
 
+/// Where an app may connect, for a person to read before switching it on.
+fn network_of(n: Option<&portcullis_toml::network::NetworkSpec>) -> Vec<String> {
+    use portcullis_toml::network::{NetworkSpec, Outbound};
+    use portcullis_toml::schema::NetworkCap;
+    match n {
+        None | Some(NetworkSpec::Mode(NetworkCap::None)) => Vec::new(),
+        Some(NetworkSpec::Mode(NetworkCap::Loopback)) => vec!["loopback".into()],
+        Some(NetworkSpec::Mode(NetworkCap::Full)) => vec!["anywhere".into()],
+        Some(NetworkSpec::Grants(g)) => match &g.outbound {
+            Outbound::Any => vec!["anywhere".into()],
+            Outbound::List(d) => d.iter().take(32).map(|d| match d.port {
+                Some(p) => format!("{}:{p}", d.host),
+                None => d.host.clone(),
+            }).collect(),
+        },
+    }
+}
+
 /// A `share-target` the share sheet can offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -116,6 +134,31 @@ impl Installed {
             .collect()
     }
 
+    /// The plugins (`editor-extension`) installed for `person`, by app id,
+    /// at most [`crate::catalogue::MAX_PLUGINS`].
+    pub fn plugins(&self, person: &str) -> Vec<crate::proto::PluginInfo> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let mut ids: Vec<String> = rd.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect();
+        ids.sort();
+        ids.into_iter()
+            .filter(|id| self.may_provide(person, id, "editor-extension"))
+            .filter_map(|id| {
+                let m = manifest(&self.dir, &id)?;
+                let x = m.roles.as_ref()?.editor_extension.clone()?;
+                Some(crate::proto::PluginInfo {
+                    app: id,
+                    name: m.app.name.clone(),
+                    languages: x.languages,
+                    commands: x.commands,
+                    panel: x.panel,
+                    workspace_read: x.workspace_read,
+                    network: network_of(m.capabilities.network.as_ref()),
+                })
+            })
+            .take(crate::catalogue::MAX_PLUGINS)
+            .collect()
+    }
+
     /// The provider of `role` for `person` when no default is set (until
     /// Curia holds the person's choice, limen.md §3.2): a platform bundle
     /// that implements it, else the one other app that does. A dev build
@@ -147,6 +190,25 @@ mod tests {
         std::fs::create_dir_all(dir.join(id)).unwrap();
         std::fs::write(dir.join(id).join("atrium.toml"),
             format!("[app]\nid = \"{id}\"\nname = \"X\"\nversion = \"1\"\nentry = \"bin/x\"\n{extra}")).unwrap();
+    }
+
+    #[test]
+    fn plugins_with_what_they_ask_for() {
+        let d = std::env::temp_dir().join(format!("limen-plugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let plugin = "\n[roles]\nimplements = [\"editor-extension\"]\n\n[roles.editor-extension]\nlanguages = [\"rust\"]\ncommands = [\"todo.list\"]\npanel = \"TODOs\"\nworkspace-read = true\n";
+        app(&d, "org.example.todo", &format!("\n[capabilities]\nnetwork = \"none\"\n{plugin}"));
+        app(&d, "dev.alice.ws.org.example.lint", &format!("\n[capabilities.network]\noutbound = [\"lint.example.org:443\"]\n{plugin}"));
+        app(&d, "com.example.viewer", "\n[roles]\nimplements = [\"doc-viewer\"]\n");
+        let i = Installed::at(&d);
+        let bob = i.plugins("bob");
+        assert_eq!(bob.len(), 1, "alice's dev build is hers");
+        assert_eq!(bob[0], crate::proto::PluginInfo { app: "org.example.todo".into(), name: "X".into(), languages: vec!["rust".into()],
+            commands: vec!["todo.list".into()], panel: Some("TODOs".into()), workspace_read: true, network: vec![] });
+        let alice = i.plugins("alice");
+        assert_eq!(alice.iter().map(|p| p.app.as_str()).collect::<Vec<_>>(), vec!["dev.alice.ws.org.example.lint", "org.example.todo"]);
+        assert_eq!(alice[0].network, vec!["lint.example.org:443".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

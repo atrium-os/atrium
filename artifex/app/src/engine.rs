@@ -285,6 +285,12 @@ impl Engine {
                 if v == Main::Inspect {
                     self.ask_tree();
                 }
+                if v == Main::Plugins {
+                    if let Err(e) = self.plugins.refresh() {
+                        s.note = Some((format!("Couldn't list the plugins: {e}"), true));
+                    }
+                    self.plugin_rows(s);
+                }
                 // A full view has the window to itself.
                 if v != Main::Code {
                     s.panel_open = false;
@@ -459,6 +465,18 @@ impl Engine {
                         }
                     }
                 }
+            }
+            Act::PluginSwitch(app, on) => {
+                if let Err(e) = self.plugins.switch(&app, on) {
+                    s.note = Some((format!("{app}: {e}"), true));
+                }
+                self.plugins_open_all();
+                self.plugin_rows(s);
+            }
+            Act::PluginRestart(app) => {
+                self.plugins.restart(&app);
+                self.plugins_open_all();
+                self.plugin_rows(s);
             }
             Act::ClosePalette => {
                 s.palette = None;
@@ -2337,6 +2355,9 @@ impl Engine {
         self.read_jobs(s);
         self.read_servers(s);
         self.plugin_panels(s);
+        if s.view == Main::Plugins || !s.plugin_rows.is_empty() {
+            self.plugin_rows(s);
+        }
         self.read_debugger(s);
         self.read_inspector(s);
         // Background fuzzing: the next target, never while a task runs
@@ -2759,6 +2780,40 @@ impl Engine {
         }
     }
 
+    /// The Plugins view's rows, from what's installed and running.
+    fn plugin_rows(&mut self, s: &mut State) {
+        let h = &self.plugins;
+        let rows: Vec<crate::ui::PluginRow> = h.installed.iter().map(|i| {
+            let mut asks = vec![format!("For {}", if i.languages.iter().any(|l| l == "*") { "every file".to_string() } else { i.languages.join(", ") })];
+            if !i.commands.is_empty() {
+                asks.push(format!("{} command{} in the palette", i.commands.len(), if i.commands.len() == 1 { "" } else { "s" }));
+            }
+            if let Some(p) = &i.panel {
+                asks.push(format!("A panel, {p}"));
+            }
+            asks.push(match i.network.as_slice() {
+                [] => "No network".to_string(),
+                n => format!("Network: {}", n.join(", ")),
+            });
+            if i.workspace_read {
+                asks.push("Asks to read the whole workspace: not given yet, it sees only the files you open".into());
+            }
+            let on = h.on.iter().any(|o| o.app == i.app);
+            let why = h.stopped.iter().find(|(a, _)| *a == i.app).map(|(_, w)| w.clone());
+            let running = h.runs.iter().any(|r| r.info.app == i.app);
+            let (state, stopped) = match (on, why, running) {
+                (false, ..) => (String::new(), false),
+                (true, Some(w), _) => (format!("Stopped: {w}"), true),
+                (true, None, true) => ("Running".to_string(), false),
+                (true, None, false) => ("On: starts with a file of its languages".to_string(), false),
+            };
+            crate::ui::PluginRow { app: i.app.clone(), name: i.name.clone(), asks, on, state, stopped }
+        }).collect();
+        if s.plugin_rows != rows {
+            s.plugin_rows = rows;
+        }
+    }
+
     /// The plugins' panel tabs, and the one shown in the slot.
     fn plugin_panels(&mut self, s: &mut State) {
         let panels = self.plugins.panels();
@@ -2792,6 +2847,9 @@ impl Engine {
     /// those for their languages.
     pub fn set_plugin_link(&mut self, link: Box<dyn plugins::Link>) {
         self.plugins.set_link(link);
+        if let Err(e) = self.plugins.refresh() {
+            eprintln!("artifex: plugins: {e}");
+        }
         self.plugins_open_all();
     }
 
@@ -3847,6 +3905,40 @@ mod tests {
     }
 
     #[test]
+    fn the_plugins_view_switches_them_on_and_restarts_a_stopped_one() {
+        let (_d, mut e, mut s) = setup("plugins-view");
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        let md = plugins::Info { app: "org.example.md".into(), name: "Links".into(), languages: vec!["markdown".into()], commands: vec![],
+            panel: None, workspace_read: true, network: vec!["example.org:443".into()] };
+        let link = plugins::testing::Script { installed: vec![md], ..Default::default() };
+        let queued = link.queued.clone();
+        e.set_plugin_link(Box::new(link));
+        e.act(Act::Open("src/notes.md".into()), &mut s);
+        e.act(Act::View(Main::Plugins), &mut s);
+        assert_eq!(s.plugin_rows.len(), 1);
+        let r = &s.plugin_rows[0];
+        assert_eq!((r.name.as_str(), r.on, r.state.as_str()), ("Links", false, ""));
+        assert!(r.asks.contains(&"Network: example.org:443".to_string()) && r.asks.iter().any(|a| a.starts_with("Asks to read the whole workspace")), "{:?}", r.asks);
+        assert!(e.plugins.runs.is_empty(), "off: not started");
+        // On: it starts at once for the Markdown file that's open.
+        e.act(Act::PluginSwitch("org.example.md".into(), true), &mut s);
+        assert_eq!(e.plugins.runs.len(), 1);
+        assert_eq!(s.plugin_rows[0].state, "Running");
+        // Stopped: the row says why, the strip counts it, Restart starts it.
+        let id = e.plugins.runs[0].id;
+        queued.borrow_mut().push((id, plugins::LinkEvent::Gone("it used more than 256 MiB".into())));
+        e.tick(&mut s);
+        assert_eq!((s.plugin_rows[0].state.as_str(), s.plugin_rows[0].stopped), ("Stopped: it used more than 256 MiB", true));
+        e.act(Act::PluginRestart("org.example.md".into()), &mut s);
+        assert_eq!(e.plugins.runs.len(), 1);
+        assert_eq!(s.plugin_rows[0].state, "Running");
+        e.act(Act::PluginSwitch("org.example.md".into(), false), &mut s);
+        assert!(e.plugins.runs.is_empty());
+        assert!(!s.plugin_rows[0].on);
+    }
+
+    #[test]
     fn a_plugin_answers_beside_the_server_and_its_answers_are_merged() {
         if std::process::Command::new("python3").arg("-c").arg("").status().map_or(true, |s| !s.success()) {
             return;
@@ -3859,7 +3951,7 @@ mod tests {
         std::fs::set_permissions(bin.join("pylsp"), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
         std::fs::write(d.join("plugin.py"), include_str!("../tests/fixtures/fake_plugin.py")).unwrap();
-        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec!["todo.count".into()], panel: Some("TODOs".into()), workspace_read: false };
+        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec!["todo.count".into()], panel: Some("TODOs".into()), workspace_read: false, network: vec![] };
         e.plugins.on = vec![todo];
         let link = plugins::testing::Stdio::new(&d.join("plugin.py"));
         let shown = link.shown.clone();

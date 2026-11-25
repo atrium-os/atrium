@@ -181,6 +181,10 @@ pub enum Act {
     PaletteQuery(String),
     PaletteRun(usize),
     ClosePalette,
+    /// Switch a plugin on or off for this workspace; start a stopped one
+    /// again.
+    PluginSwitch(String, bool),
+    PluginRestart(String),
 }
 
 /// The debugger as the window shows it.
@@ -338,6 +342,21 @@ pub struct State {
     pub palette: Option<(String, Vec<(String, String)>)>,
     /// The panels plugins show: app, title.
     pub plugin_panels: Vec<(String, String)>,
+    /// The Plugins view's rows.
+    pub plugin_rows: Vec<PluginRow>,
+}
+
+/// An installed plugin as the Plugins view shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginRow {
+    pub app: String,
+    pub name: String,
+    /// What it asks for, one line each.
+    pub asks: Vec<String>,
+    pub on: bool,
+    /// "Running", or why it stopped; empty while off.
+    pub state: String,
+    pub stopped: bool,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -652,6 +671,8 @@ impl View for ArtifexView {
             if s.composition.is_some() {
                 views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
             }
+            let stopped = s.plugin_rows.iter().filter(|r| r.stopped).count();
+            views.push(("Plugins", phosphor::PUZZLE_PIECE, Act::View(Main::Plugins), s.view == Main::Plugins, stopped));
             // Debug: while a program is debugged, or breakpoints are set; a
             // dot while it is stopped.
             let stopped = s.debug.as_ref().is_some_and(|d| d.stopped && d.live);
@@ -697,6 +718,7 @@ impl View for ArtifexView {
                 Main::Composition => crate::views::composition(ctx, &s, q, area),
                 Main::Assets => crate::views::assets(ctx, &s, q, area),
                 Main::Inspect => crate::views::inspect(ctx, &s, q, area),
+                Main::Plugins => crate::views::plugins(ctx, &s, q, area),
                 Main::Code => {}
             }
             ctx.pop();
