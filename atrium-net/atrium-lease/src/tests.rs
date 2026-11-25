@@ -197,6 +197,19 @@ fn roam_confirms_with_init_reboot() {
 }
 
 #[test]
+fn restart_drops_the_lease_and_discovers() {
+    let mut c = Client::new(MAC, rng(4));
+    bound(&mut c);
+    let out = c.restart(30_000);
+    assert_eq!(out[0], Out::Lost("network-changed"));
+    let s = sent(&out[1..]);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].1.kind, Kind::Discover, "not a REQUEST for the old address");
+    assert_eq!(c.state(), "selecting");
+    assert!(!c.restart(31_000).contains(&Out::Lost("network-changed")), "nothing held, nothing lost");
+}
+
+#[test]
 fn ignores_other_xid_mac_and_server() {
     let mut c = Client::new(MAC, rng(11));
     let d = sent(&c.start(0)).remove(0).1;

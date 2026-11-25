@@ -148,6 +148,20 @@ impl Client {
         self.deadline = None;
     }
 
+    /// The network behind the link changed without the link dropping (an
+    /// 802.1X port opened or shut, so another VLAN): the lease belongs to
+    /// the old one. Drop it and ask from scratch, not INIT-REBOOT.
+    pub fn restart(&mut self, now: u64) -> Vec<Out> {
+        let mut out = match self.held.take() {
+            Some(_) => vec![Out::Lost("network-changed")],
+            None => Vec::new(),
+        };
+        self.fresh(now);
+        self.st = St::Selecting;
+        out.extend(self.send_discover(now));
+        out
+    }
+
     /// atrium-net refused the lease (§5.2): forget it, start over later.
     pub fn refused(&mut self, now: u64) {
         self.held = None;

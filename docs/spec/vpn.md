@@ -396,6 +396,15 @@ boot, before login.
   is neither on the disk nor readable. That harness plays portcullisd, so
   its part is the folder's erase. The cryptad and portcullisd wiring is
   the personas check's part.
+- *Results.*
+  - Cloud amd64 VM (main's jaild, plain app data): `vm-personas-check.sh`
+    passed with 0 failed (49 checks).
+  - Mac arm64 VM (kernel.atrium, main's tessera_fs.ko, 050a52614):
+    `tessera-personas-vm.sh` passed with 0 failed (87 checks). That
+    includes the four VPN checks of §5. Evidence:
+    `~/atrium-vm/evidence/vpn-at-rest-20261125/`.
+  - Not yet run: the personas check's sealed (Work) branch. It needs a
+    guest whose homes are on sealed Tessera, and the dev VM's are on UFS.
 
 ### 7.2 CLASS_VPN (new Aqueduct class 19)
 

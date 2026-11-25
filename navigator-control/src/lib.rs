@@ -437,6 +437,9 @@ pub enum Event {
     /// a request beyond its scope, a form. `what` is the popover's words,
     /// at most [`REFUSED_MAX`] bytes.
     LiveRefused { from: String, what: String },
+    /// The live page at `from` asked to be printed (I6.4): the UI prints
+    /// its trail entry's document-lane rendering, as Ctrl-P does.
+    LivePrint { from: String },
 }
 
 /// The longest refusal a [`Event::LiveRefused`] names.

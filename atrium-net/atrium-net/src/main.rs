@@ -1443,10 +1443,9 @@ mod imp {
                         }
                     }
                     Do::RestartLease(k) => {
-                        self.log(&format!("{}: 802.1X authorized; DHCP again", self.ifs[k].name));
+                        self.log(&format!("{}: 802.1X {}; DHCP again", self.ifs[k].name, self.dot1x.state.word()));
                         if self.ifs[k].link && self.manual_for(k).is_none() {
-                            let _ = self.ifs[k].lease.send(&Line::new("down"));
-                            let _ = self.ifs[k].lease.send(&Line::new("up"));
+                            let _ = self.ifs[k].lease.send(&Line::new("restart"));
                         }
                     }
                     Do::Report(k) => {

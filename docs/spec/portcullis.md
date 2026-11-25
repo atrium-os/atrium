@@ -2851,3 +2851,19 @@ never a filtered jail (jail-sysfil.md §2). `server::cores_allowed` is the
 rule. ExecInJail reads both from jaild's jail record (`class`, `filtered`,
 kept at create); a record from before `filtered` reads as unfiltered.
 
+### The launch registry is kept across boots
+
+Shankar's choice, 2026-11-25. `/var/run/atrium/app-registry` (the copy
+every service reads and mounts) is cleared by a boot, while the
+`atrium-app-<uid>` accounts and anything they own are not, so a fresh
+binding could give one identity's uid to another: its groups (cleared since
+9d989f8b3) and the files the old app left in a person's folders. Every
+binding is now written first to `/var/db/atrium/app-registry` (root's, 0700
+directory, 0600 file, synced), and portcullisd puts that copy back at
+startup, under the registry lock, before anything allocates
+(`portcullis_peer::restore_registry`). A binding that can't be kept is not
+made, and a kept copy that can't be read stops portcullisd. The file holds
+only account mappings (uid, person, app id, publisher, persona), like
+passwd, not a person's data, so the at-rest rule for personal data doesn't
+apply to it.
+

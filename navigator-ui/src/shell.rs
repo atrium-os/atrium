@@ -887,6 +887,16 @@ impl Shell {
         true
     }
 
+    /// The live page at `from` asked to be printed (I6.4): its entry's
+    /// document-lane rendering prints, as Ctrl-P does; only while it is
+    /// the page on screen.
+    pub fn live_print(&mut self, from: &str) -> bool {
+        if !self.live_run.as_ref().is_some_and(|r| r.url == from && r.origin.is_some() && Some(r.key) == self.shown_key()) { return false; }
+        let before = self.outbox.len();
+        self.print();
+        self.outbox.len() > before
+    }
+
     /// The popover's line for what the live page on screen was refused.
     pub fn live_refusals(&self) -> Option<String> {
         let run = self.live_run.as_ref().filter(|r| Some(r.key) == self.shown_key() && !r.refused.is_empty())?;
@@ -2776,6 +2786,12 @@ mod tests {
         // Save on it sends the held file's id.
         assert!(s.answer_pressed(2, 20_000.0, Some([3; 16])));
         assert_eq!(s.outbox.pop(), Some(Out::Save { id: 1 << 31, press: [3; 16] }));
+        // window.print(): the entry's rendering prints, once at a time; not
+        // for a page that isn't the one running.
+        assert!(!s.live_print("https://app.example/other.html"));
+        assert!(s.live_print(url));
+        assert_eq!(s.outbox.pop(), Some(Out::Print));
+        assert!(!s.live_print(url), "one print at a time");
         // Refusals: each once, bounded, and in the popover while it is shown.
         assert_eq!(s.live_refusals(), None);
         assert!(s.live_refused(url, "notifications"));

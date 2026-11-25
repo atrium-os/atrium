@@ -1117,6 +1117,19 @@ w8() {
     wait_st 'dot1x=authorized' 180 && ok "EAP-TLS with the key in Arca: authorized" || fail "EAP-TLS: $(st)"
     "$V" "grep -c 'EAP (tls) on vtnet2' $KLOG" | grep -q '[1-9]' && ok "that sign-in was EAP-TLS" || fail "no EAP-TLS run"
 
+    # The switch asks again on its own (re-authentication, what its
+    # reauth timer does; hostapd_cli triggers it now): signed in again over
+    # the open port, the address kept, no new lease.
+    wait_st 'state=bound addr=10\.79\.0\.' 150 || fail "no lease before re-authentication: $(st)"
+    a0=$(st | grep -o 'addr=[0-9./]*')
+    n0=$("$V" "grep -c 'DHCP again' /tmp/aura/net.log")
+    e0=$("$V" "grep -c 'EAP succeeded on vtnet2' $KLOG")
+    sh "$AP" ssh 'n=$(grep -l 02:4e:00:00:02:01 /sys/class/net/*/address | cut -d/ -f5); hostapd_cli -p /run/hostapd-wired -i $n raw EAPOL_REAUTH 02:4e:00:00:02:02' | grep -q OK || fail "hostapd_cli eapol_reauth"
+    i=0; until [ "$("$V" "grep -c 'EAP succeeded on vtnet2' $KLOG")" -gt "$e0" ]; do i=$((i + 3)); [ $i -lt 120 ] || fail "no second EAP run: $(st)"; sleep 3; done
+    sleep 5
+    st | grep -q "dot1x=authorized.*" && st | grep -q "$a0" && [ "$("$V" "grep -c 'DHCP again' /tmp/aura/net.log")" = "$n0" ] \
+        && ok "the switch asked again: signed in again, same address ($a0), no new lease" || fail "after re-authentication: $(st); DHCP again $n0 -> $("$V" "grep -c 'DHCP again' /tmp/aura/net.log")"
+
     # Cable out and in: the port signs in again by itself.
     cablex off
     wait_st 'link=down' 30 && ok "cable pulled: link down" || fail "link still up: $(st)"
@@ -1127,6 +1140,9 @@ w8() {
     r=$("$V" "$H; echo wrong | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/eap-ca.der) --secret-stdin" 2>&1) || fail "remember 3: $r"
     wait_st 'dot1x=failed' 180 && ok "a wrong password: refused ($(st | grep -o 'dot1x_why=[a-z-]*'))" || fail "wrong password: $(st)"
     plog | tail -n 1 | grep -q closed && ok "the switch closed the port" || fail "port: $(plog | tail -n 2)"
+    # The old lease went with the open port: DHCP starts over (and gets nothing).
+    n=0; while st | grep -q 'addr=10\.79\.' && [ $n -lt 30 ]; do sleep 2; n=$((n + 1)); done
+    st | grep -q 'addr=10\.79\.' && fail "the closed port kept its address: $(st)" || ok "the closed port's address dropped ($(st | grep -o 'state=[a-z]*'))"
     r=$("$V" "$H; echo s3cret | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/evil-ca.der) --secret-stdin" 2>&1) || fail "remember 4: $r"
     # The switch's quiet period after the wrong password (60 s) first.
     wait_st 'dot1x_why=eap-' 240 && sleep 20 && st | grep -q 'dot1x=failed' && ok "a server outside the network's CA: refused before the password ($(st | grep -o 'dot1x_why=[a-z-]*'))" || fail "evil CA: $(st)"

@@ -73,6 +73,11 @@ impl FilePicked {
     }
 }
 
+/// A whole page asked to be printed (`window.print()`, Ctrl-P in the page;
+/// I6.4): a GET here. The UI prints the trail entry's document-lane
+/// rendering through Prelum's sheet.
+pub const LIVE_PRINT: &str = "https://live-page.atrium.invalid/print";
+
 /// A web API a whole page asked for that I6 refuses (navigator-islands.md
 /// "What the page can reach"), so the popover can say what the page was
 /// refused; nothing is refused silently.

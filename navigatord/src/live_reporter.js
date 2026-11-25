@@ -81,6 +81,18 @@
         return null;
     });
 
+    // Printing prints the page's address through Navigator (its
+    // document-lane rendering, Prelum's sheet); Ctrl-P in the page too.
+    replace(window, "print", () => function () {
+        try { fetch(base + "print", { mode: "no-cors", credentials: "omit" }).catch(() => {}); } catch (_) {}
+    });
+    window.addEventListener("keydown", e => {
+        if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "p" || e.key === "P")) {
+            e.preventDefault();
+            window.print();
+        }
+    });
+
     // A file the page made: its bytes go to navigatord, which asks the
     // person; nothing is saved without their answer.
     const download = a => {

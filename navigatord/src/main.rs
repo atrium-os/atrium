@@ -2954,4 +2954,5 @@ impl live_page::Tell for LiveTell {
         send(&self.w, &Event::LiveRefused { from: self.from.clone(), what });
     }
     fn finished(&self, why: Option<String>) { send(&self.w, &Event::LiveEnded { url: self.from.clone(), why }); }
+    fn print(&self) { send(&self.w, &Event::LivePrint { from: self.from.clone() }); }
 }
