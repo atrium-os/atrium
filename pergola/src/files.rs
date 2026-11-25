@@ -6,7 +6,9 @@
 //! the ask: not the folder's contents, nor whether the file is still there.
 //!
 //! ```ignore
-//! let ask = files::show(&embeds, token, SHOW_SLOT, Folder::Downloads, "report.pdf")?;
+//! // In the button's handler: the press, which Files spends.
+//! let press = pergola::clipboard::current_activation();
+//! let ask = files::show(&embeds, token, SHOW_SLOT, Folder::Downloads, "report.pdf", press)?;
 //! // then, for each event from embeds.poll():
 //! if let Some(answer) = files::shown(&embeds, ask, &ev) { ... }
 //! ```
@@ -16,13 +18,16 @@ use std::rc::Rc;
 
 pub use limen::picker::Folder;
 
+use crate::clipboard::Token;
 use crate::embed::{EmbedId, Embeds, Error, ParentEvent, WindowToken};
 use crate::slot::SlotKey;
 
 /// Ask Files to show `name` in the person's `folder`, in this app's
-/// persona. `slot` is never drawn: Files answers in a window of its own.
-pub fn show(embeds: &Rc<RefCell<Embeds>>, window: WindowToken, slot: SlotKey, folder: Folder, name: &str) -> Result<EmbedId, Error> {
-    let ask = limen::picker::ToChild::Show { folder, name: name.to_string() };
+/// persona, with `press`, the person's press on the app's button (Files
+/// refuses without one). `slot` is never drawn: Files answers in a window
+/// of its own.
+pub fn show(embeds: &Rc<RefCell<Embeds>>, window: WindowToken, slot: SlotKey, folder: Folder, name: &str, press: Token) -> Result<EmbedId, Error> {
+    let ask = limen::picker::ToChild::Show { folder, name: name.to_string(), press };
     if limen::picker::ToChild::decode(&ask.encode()).is_none() {
         return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "a file's own name, with no folder in it (limen::picker::plain_name)")));
     }

@@ -605,13 +605,17 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                     }
                 }
                 Some(ChildEvent::Message { embed, bytes }) => {
-                    if let Some(ToChild::Show { folder, name }) = ToChild::decode(&bytes) {
+                    if let Some(ToChild::Show { folder, name, press }) = ToChild::decode(&bytes) {
                         let Some(e) = embeds.get_mut(&embed) else { continue };
                         if e.requested { continue; }
                         e.requested = true;
                         // Not a sheet: the picker's own window never comes up.
                         let _ = e.to_pane.send(ToPane::Close);
+                        // A window of ours comes up only on the person's own
+                        // press in the app (frescod's, through limend).
+                        let pressed = child.spend_show_press(embed, press).is_ok();
                         let reply = match e.persona.clone() {
+                            _ if !pressed => ToParent::Failed { why: "Show in Files needs your press".into() },
                             None => ToParent::Failed { why: "Cannot tell whose files to show".into() },
                             Some(persona) => {
                                 let ask = (Browser::shown_place(&persona, folder), name);

@@ -35,7 +35,7 @@ const W_CURIA: WindowToken = [11; 16];
 struct Fresco(Arc<Mutex<(HashMap<WindowToken, u32>, Vec<(WindowToken, WindowToken, SlotKind, Option<[f32; 4]>)>, Vec<(u32, UnixStream)>)>>, Arc<Mutex<Presses>>);
 /// Windows that saw a press lately, and the slots released for PiP.
 #[derive(Default)]
-struct Presses { pressed: Vec<WindowToken>, released: Vec<WindowToken> }
+struct Presses { pressed: Vec<WindowToken>, released: Vec<WindowToken>, tokens_spent: Vec<[u8; 16]> }
 impl Compositor for Fresco {
     fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>, _z: u8) -> Result<(u32, u32), u8> {
         let mut g = self.0.lock().unwrap();
@@ -62,6 +62,13 @@ impl Compositor for Fresco {
         let before = g.pressed.len();
         g.pressed.retain(|&p| p != w);
         g.pressed.len() != before
+    }
+    /// Only APP's button press [5; 16] is real, for SHOW, once.
+    fn spend_token(&mut self, t: [u8; 16], uid: u32, purpose: u8) -> bool {
+        let mut g = self.1.lock().unwrap();
+        let fresh = t == [5; 16] && uid == APP && purpose == fresco_protocol::activation::purpose::SHOW && !g.tokens_spent.contains(&t);
+        if fresh { g.tokens_spent.push(t) }
+        fresh
     }
     fn release(&mut self, _p: WindowToken, c: WindowToken) -> Result<(), u8> {
         self.1.lock().unwrap().released.push(c);
@@ -1145,6 +1152,19 @@ fn an_islands_parent_spends_a_press_in_the_island_once() {
     assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS);
     w.fresco.1.lock().unwrap().pressed.push(W_VIEWER);
     app.spend_press(id).unwrap();
+}
+
+#[test]
+fn files_spends_the_parents_press_for_show_in_files_once() {
+    let w = World::new();
+    let mut app = w.parent(APP);
+    let mut picker = provider(w.connect(SCRINIUM_UID), "picker").unwrap();
+    let e = app.request("picker", W_APP).unwrap();
+    assert!(matches!(next_c(&mut picker), ChildEvent::Attach { .. }));
+    assert_eq!(refused(picker.spend_show_press(e + 1, [5; 16])), refusal::NOT_YOURS);
+    assert_eq!(refused(picker.spend_show_press(e, [6; 16])), refusal::NO_PRESS, "not a press of the parent's");
+    picker.spend_show_press(e, [5; 16]).unwrap();
+    assert_eq!(refused(picker.spend_show_press(e, [5; 16])), refusal::NO_PRESS, "spent");
 }
 
 #[test]

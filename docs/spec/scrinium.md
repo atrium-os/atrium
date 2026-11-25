@@ -247,6 +247,13 @@ folder, name }` on a `picker` embed, or `pergola::files::show`.
   characters, at most 255 bytes). Never a path, and never another persona's
   folder: Scrinium uses the persona limend sent (`ParentPersona`), so a Work
   app's ask opens Work's Downloads. No persona: refused.
+- Only on the person's press. The app sends the activation token of its
+  button press (`press`); Scrinium has limend spend it (`SPEND_SHOW`), and
+  limend asks frescod to `CONSUME` it for purpose `SHOW` with the parent's
+  uid as presenter. frescod lists `_limen` as `SHOW`'s only broker and takes
+  a button press or Enter from the parent's own window, once. No press: the
+  ask fails with "Show in Files needs your press", and no window opens or
+  moves.
 - Scrinium opens a Files window of its own (the file manager, not a sheet)
   on that folder with the file selected, or says in it that the file is not
   there any more. The picker's sheet never comes up.
@@ -257,7 +264,8 @@ folder, name }` on a `picker` embed, or `pergola::files::show`.
   at once, across apps; past that the ask is refused.
 - Ejecting a stick is left to the Files app's own window.
 
-Tests: `show_takes_a_plain_name_in_one_of_the_persons_folders` (limen),
+Tests: `show_takes_a_plain_name_in_one_of_the_persons_folders` and
+`files_spends_the_parents_press_for_show_in_files_once` (limen),
 `show_in_files_opens_the_personas_folder_on_the_file` (scrinium),
 `files_is_asked_to_show_a_name_in_a_folder_and_says_only_whether_it_took_it`
 (pergola, against limend in process).

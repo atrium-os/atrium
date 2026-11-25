@@ -2735,6 +2735,10 @@ pub mod activation {
         /// that window has a guard (`OP_WINDOW_GUARD`, the Navigator's
         /// prompt row), the guard must have been seen as for `PROMPT`.
         pub const LINK: u8 = 13;
+        /// "Show in Files" (scrinium.md §4.5): a click, or Enter, in the
+        /// asking app's window, spent by limend for Files, which may then
+        /// open a window of its own.
+        pub const SHOW: u8 = 14;
     }
 
     /// What minted a token.

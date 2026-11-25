@@ -132,10 +132,12 @@ pub enum ToChild {
     OpenInPersona { filter: Filter, persona: String },
     /// Show the person the file `name` in their `folder`, in the asking
     /// app's persona, in a Files window of its own (navigator-ui.md §15.3,
-    /// scrinium.md §4.5): "Show in Files". Nothing comes back but `Done {
-    /// files: 0 }` once the window is asked for, or `Failed`: the app
-    /// learns neither the folder's contents nor whether the file is there.
-    Show { folder: Folder, name: String },
+    /// scrinium.md §4.5): "Show in Files". `press` is the person's press on
+    /// the app's button, which Files spends (through limend) before it
+    /// opens or moves a window. Nothing comes back but `Done { files: 0 }`
+    /// once the window is asked for, or `Failed`: the app learns neither the
+    /// folder's contents nor whether the file is there.
+    Show { folder: Folder, name: String, press: [u8; 16] },
 }
 
 /// One of the person's own folders, by name: the app never names a path.
@@ -294,10 +296,10 @@ mod show_tests {
 
     #[test]
     fn show_takes_a_plain_name_in_one_of_the_persons_folders() {
-        let m = ToChild::Show { folder: Folder::Downloads, name: "report (2).pdf".into() };
+        let m = ToChild::Show { folder: Folder::Downloads, name: "report (2).pdf".into(), press: [3; 16] };
         assert_eq!(ToChild::decode(&m.encode()), Some(m));
         for bad in ["", ".", "..", "../etc/passwd", "a/b", "a\u{0}b", "a\nb", &"x".repeat(MAX_NAME + 1)] {
-            let m = ToChild::Show { folder: Folder::Downloads, name: bad.into() };
+            let m = ToChild::Show { folder: Folder::Downloads, name: bad.into(), press: [3; 16] };
             assert_eq!(ToChild::decode(&m.encode()), None, "{bad:?}");
         }
         assert_eq!(Folder::Downloads.label(), "Downloads");

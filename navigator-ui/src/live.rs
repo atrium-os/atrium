@@ -495,9 +495,9 @@ impl Live {
     /// Ask Files to show `name` in this persona's Downloads (§15.3): a
     /// picker embed that never comes up, whose only answer is whether
     /// Files took the ask.
-    fn show_in_files(&mut self, s: &mut Shell, name: &str) {
+    fn show_in_files(&mut self, s: &mut Shell, name: &str, press: navigator_control::Press) {
         let r = match (&self.embeds, self.window) {
-            (Some(e), Some(w)) => pergola::files::show(e, w, crate::shell::SHOW_SLOT, limen::picker::Folder::Downloads, name)
+            (Some(e), Some(w)) => pergola::files::show(e, w, crate::shell::SHOW_SLOT, limen::picker::Folder::Downloads, name, press)
                 .map_err(|e| format!("{e:?}")),
             _ => Err("Limen isn't running".into()),
         };
@@ -1467,7 +1467,7 @@ impl Live {
                     self.ask_print(s, w, h, m, false);
                 }
                 Out::Share { url, title, press } => self.share(s, &url, &title, press),
-                Out::ShowInFiles { name } => self.show_in_files(s, &name),
+                Out::ShowInFiles { name, press } => self.show_in_files(s, &name, press),
                 Out::Jump { anchor } => {
                     if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
                         eprintln!("navigator-ui: jump to section #{anchor}");

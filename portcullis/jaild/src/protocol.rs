@@ -119,7 +119,9 @@ pub enum Request {
 
     /// Where a jaild-created jail is: [`Response::JailInfo`], answered from
     /// jaild's state and the kernel. A name jaild did not create is
-    /// `PolicyDenied`, as for [`Request::ExecInJail`].
+    /// `PolicyDenied`, as for [`Request::ExecInJail`]. ★ For a running jail
+    /// each answer forks rctl(8) twice (its memory use and cap): fine at
+    /// portcullisd's one a second per instance, not for a polling loop.
     JailInfo { name: String },
 
     /// A TCP socket listening on `127.0.0.1:port` inside a jaild-created

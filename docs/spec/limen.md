@@ -488,6 +488,12 @@ parent                    limend                 portcullisd       frescod      
   portcullisd with `InstanceUsage` on the connection holding that
   instance's `ExecInstance`, outside its locks, with a 2 s timeout
   (navigator-ui.md §15.3).
+- `SPEND_SHOW` (0x17, child op, `ShowPress { embed, press }`): Files, the
+  picker's provider, spends the press a parent sent with
+  `picker::ToChild::Show` before it opens a window (scrinium.md §4.5).
+  limend asks frescod to `CONSUME` it for purpose `SHOW` with the embed's
+  parent uid as presenter; only for a `picker` embed of the caller's, else
+  `NOT_YOURS` or `NO_PRESS`.
 - **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
   caller unless the system policy has a worker rule for it, so every provider needs one:
   `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch

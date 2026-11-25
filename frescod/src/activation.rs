@@ -121,6 +121,9 @@ fn fits(e: &Entry, p: u8) -> bool {
                 || (ctrl && e.mods & MOD_SHIFT != 0 && (e.hid == HID_T || e.hid == HID_N))
         }
         // Allowing an app from Settings: Allow pressed, or Enter on it.
+        // Show in Files: the app's button, or Enter on it.
+        (kind::BUTTON, purpose::SHOW) => true,
+        (kind::KEY, purpose::SHOW) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         (kind::BUTTON, purpose::APPROVE) => true,
         (kind::KEY, purpose::APPROVE) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         // A prompt's answer (navigator-ui.md §6.4): a click, or Enter.
@@ -450,6 +453,8 @@ pub const DEFAULT_CONSUMERS: &[(&str, &[u8])] = &[
     ("_praeco", &[purpose::ACTION]),
     ("_arca-ui", &[purpose::FILL, purpose::APPROVE]),
     ("_sigillum-ui", &[purpose::IDENTITY]),
+    // limend, for Files' "Show in Files" (scrinium.md §4.5).
+    ("_limen", &[purpose::SHOW]),
 ];
 
 /// A purpose by its name in `FRESCOD_ACTIVATION_UIDS`, or its number.
@@ -468,6 +473,7 @@ fn purpose_named(n: &str) -> Option<u8> {
         "approve" => purpose::APPROVE,
         "prompt" => purpose::PROMPT,
         "link" => purpose::LINK,
+        "show" => purpose::SHOW,
         n => return n.parse().ok(),
     })
 }
@@ -1072,7 +1078,7 @@ mod tests {
         assert!(may_spend(&Some(vec![purpose::PROMPT]), purpose::PROMPT));
         assert!(!may_spend(&Some(vec![purpose::PROMPT]), purpose::PASTE), "navigatord can't paste");
         let named: Vec<u8> = DEFAULT_CONSUMERS.iter().flat_map(|(_, p)| p.iter().copied()).collect();
-        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::LINK] {
+        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::LINK, purpose::SHOW] {
             assert_eq!(named.iter().filter(|&&q| q == p).count(), 1, "purpose {p}: exactly one default broker");
         }
         // APPROVE has two: portcullisd (root) for Allow in Settings' window,

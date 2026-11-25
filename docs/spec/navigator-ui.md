@@ -1732,8 +1732,9 @@ its own checks (trace lines plus a screenshot at each width the step touches).
   - portcullisd answers `InstanceUsage { seq }` only on the connection that holds an
     `ExecInstance`, while the jail runs: holding that connection is the authority, and
     only the launcher (here limend) has it. The hang-up watcher reads it (lines of at most
-    128 bytes, one answer a second, sent without blocking under a lock it shares with the
-    launch's last answer); anything else written there gets an `Error`.
+    128 bytes, one answer a second and an `Error` for one asked sooner, sent without blocking
+    under a lock it shares with the launch's last answer); anything else written there gets
+    an `Error`.
   - limend's parent op `USAGE` (`Reply::Usage { memory, cap }`) answers only an embed's
     own parent, and only for an embed it spawned; `NO_USAGE` otherwise.
   - navigatord asks every 5 s while the page runs and sends `Event::LiveMemory { from,
@@ -1747,8 +1748,8 @@ its own checks (trace lines plus a screenshot at each width the step touches).
   "Show in Files" button when portcullisd saved it into the persona's Downloads
   (`Event::Saved` carries its own `name`). The press asks Files through the generic
   primitive in [scrinium.md](scrinium.md) §4.5 (`pergola::files::show`, Downloads, that
-  name); Files opens its own window on the file. Navigator learns only whether Files took
-  the ask.
+  name, and the press on the button); Files spends the press and opens its own window on
+  the file. Navigator learns only whether Files took the ask.
 - Host tests:
   `the_live_popover_says_what_the_running_page_holds_and_the_rail_marks_its_windows`,
   `downloads_list_what_was_answered_and_how_it_ended` (Show in Files), navigatord's
