@@ -85,23 +85,30 @@ fn uid_of(name: &str) -> Option<u32> {
     (!pw.is_null()).then(|| unsafe { (*pw).pw_uid })
 }
 
+/// The memory limit for an engine started any other way than as a whole
+/// live page (a plain `web-island` request, the I0 fixtures): a part's.
+/// Only [`Launcher::launch_island`] with `None` gets the manifest's own.
+fn not_a_page(app: &str) -> Option<u64> {
+    (app == crate::catalogue::NAVIGATOR_ENGINE).then_some(crate::web_island::PART_MEMORY_MB)
+}
+
 impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
-        self.start(app, embed, channel, None, None, None, None)
+        self.start(app, embed, channel, None, None, None, not_a_page(app))
     }
 
     /// The child serves `parent_uid`: under a `per_instance` worker rule it
     /// runs as a uid of the parent's instance (its person and persona), and
     /// portcullisd says which.
     fn launch_for(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), None, None, None)
+        self.start(app, embed, channel, Some(parent_uid), None, None, not_a_page(app))
     }
 
     /// The child in another of the parent's person's personas: portcullisd
     /// starts it only while that person's `share` crossing switch from the
     /// parent's persona to `persona` is on (share-sheet.md §7).
     fn launch_in(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), Some(persona), None, None)
+        self.start(app, embed, channel, Some(parent_uid), Some(persona), None, not_a_page(app))
     }
 
     fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32, fetch: UnixStream, memory_mb: Option<u64>) -> Result<u32, String> {
@@ -180,5 +187,14 @@ impl Portcullis {
         let uid = uid.ok_or_else(|| format!("portcullisd didn't say whom {app} runs as"))?;
         self.jails.insert(embed, s);
         Ok(uid)
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    #[test]
+    fn only_a_whole_page_launch_gets_the_engine_manifests_limit() {
+        assert_eq!(super::not_a_page(crate::catalogue::NAVIGATOR_ENGINE), Some(crate::web_island::PART_MEMORY_MB));
+        assert_eq!(super::not_a_page("org.example.viewer"), None, "other providers keep their manifest's");
     }
 }

@@ -3197,6 +3197,9 @@ recommended, 1 GiB for pages):
   - `REQUEST_ISLAND`, used for widgets and a live page's frames, now
     passes `limen::web_island::PART_MEMORY_MB` (256) to portcullisd.
     portcullisd can only tighten the manifest's limit with it.
+  - Every other start of the engine (a plain `web-island` request, as the
+    I0 fixtures make) also gets the part's limit. Only
+    `REQUEST_PAGE_ISLAND` gets the manifest's.
   - A standby engine (D7) is launched with the part's limit. A whole page
     therefore never takes the standby and always starts cold, which
     leaves the standby for the next widget.
