@@ -7,12 +7,20 @@
 //! The list is a file under navigatord's store directory, on the persona's
 //! encrypted volume, so it is per persona and goes with it (Tessera E5).
 //! It is read again on every check, so another window of the same persona,
-//! served by another navigatord, sees a change at once. A change holds an
-//! exclusive lock on a sibling file from its read to its write, so a revoke
-//! in one navigatord and a remember in another can't lose either. Without
-//! a store it is kept in memory only.
-//! A file that doesn't read as a list of origins counts as empty: an
-//! unreadable list never runs anything unasked.
+//! served by another navigatord, or the Settings pane (curia.md §15), sees
+//! a change at once. Without a store it is kept in memory only.
+//!
+//! The file is changed in place, never replaced: the pane sees the app's
+//! data through a mount of its own, and a rename made through one view of
+//! the directory may not reach a name another view has already looked up.
+//! A change holds an exclusive lock on the file itself from its read to
+//! its write, and a read holds a shared one, so a revoke in one process
+//! and a remember in another can't lose either, and no read sees half a
+//! write. Only a remember creates the file; nothing removes it.
+//!
+//! A file that doesn't read as a list of whole lines of origins counts as
+//! empty: an unreadable list, or one cut short, never runs anything
+//! unasked.
 
 use std::path::PathBuf;
 
@@ -28,27 +36,6 @@ pub fn origin(url: &str) -> Option<String> {
     o.bytes().all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'.' | b':' | b'/' | b'-' | b'[' | b']' | b'_')).then_some(o)
 }
 
-/// Write `bytes` to `file` whole or not at all: a fresh 0600 file beside
-/// it (never one already there), synced, then renamed over it.
-pub fn write(file: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = file.parent().ok_or("no directory")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{}.{}.{n}", file.file_name().and_then(|n| n.to_str()).unwrap_or("store"), std::process::id()));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, file)
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
-    result.map_err(|e| format!("{}: {e}", file.display()))
-}
-
-
 /// The most origins remembered; remembering one more forgets the oldest.
 pub const REMEMBERED_MAX: usize = 256;
 /// The longest origin kept.
@@ -60,6 +47,27 @@ const FILE_MAX: u64 = (REMEMBERED_MAX * (ORIGIN_MAX + 1)) as u64;
 /// `https://host:port`, nothing else.
 fn origin_ok(o: &str) -> bool {
     o.len() <= ORIGIN_MAX && o.starts_with("https://") && origin(o).as_deref() == Some(o)
+}
+
+/// At most [`FILE_MAX`] and one bytes of `file`, from its start.
+fn read_all(file: &std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(FILE_MAX + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The list in `bytes`: whole lines, each an origin, at most
+/// [`REMEMBERED_MAX`] of them; anything else is empty.
+fn parse(path: &std::path::Path, bytes: &[u8]) -> Vec<String> {
+    let list = (bytes.len() as u64 <= FILE_MAX && (bytes.is_empty() || bytes.ends_with(b"\n")))
+        .then(|| std::str::from_utf8(bytes).ok()).flatten()
+        .map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+        .filter(|l| l.len() <= REMEMBERED_MAX && l.iter().all(|o| origin_ok(o)));
+    list.unwrap_or_else(|| {
+        eprintln!("navigator: {} is not a list of origins; no site runs live unasked", path.display());
+        Vec::new()
+    })
 }
 
 pub struct Remembered {
@@ -74,55 +82,46 @@ impl Remembered {
     fn load(&self) -> Vec<String> {
         let Some(f) = &self.file else { return self.memory.clone() };
         let read = || -> std::io::Result<Vec<u8>> {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::fs::File::open(f)?.take(FILE_MAX + 1).read_to_end(&mut bytes)?;
-            Ok(bytes)
+            let file = std::fs::File::open(f)?;
+            file.lock_shared()?;
+            read_all(&file)
         };
-        let bytes = match read() {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-            Err(e) => { eprintln!("navigatord: {}: {e}; no site runs live unasked", f.display()); return Vec::new(); }
-        };
-        let list = (bytes.len() as u64 <= FILE_MAX).then(|| std::str::from_utf8(&bytes).ok()).flatten()
-            .map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
-            .filter(|l| l.len() <= REMEMBERED_MAX && l.iter().all(|o| origin_ok(o)));
-        list.unwrap_or_else(|| {
-            eprintln!("navigatord: {} is not a list of origins; no site runs live unasked", f.display());
-            Vec::new()
-        })
-    }
-
-    /// Change the list under the lock: no other navigatord's change lands
-    /// between this read and this write.
-    fn change(&mut self, f: impl FnOnce(&mut Vec<String>) -> bool) -> Result<(), String> {
-        let _lock = match &self.file {
-            None => None,
-            Some(file) => {
-                use std::os::unix::fs::OpenOptionsExt;
-                let name = format!(".{}.lock", file.file_name().and_then(|n| n.to_str()).unwrap_or("live-origins"));
-                let path = file.with_file_name(name);
-                if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?; }
-                let l = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(&path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                l.lock().map_err(|e| format!("{}: {e}", path.display()))?;
-                Some(l)
-            }
-        };
-        let mut list = self.load();
-        if !f(&mut list) { return Ok(()); }
-        self.save(list)
-    }
-
-    fn save(&mut self, list: Vec<String>) -> Result<(), String> {
-        match &self.file {
-            None => { self.memory = list; Ok(()) }
-            Some(f) => {
-                let mut text = list.join("\n");
-                if !text.is_empty() { text.push('\n'); }
-                write(f, text.as_bytes())
-            }
+        match read() {
+            Ok(b) => parse(f, &b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => { eprintln!("navigator: {}: {e}; no site runs live unasked", f.display()); Vec::new() }
         }
+    }
+
+    /// Change the list under the lock: no other change lands between this
+    /// read and this write. `create`: make the file if it isn't there (a
+    /// change that only takes away has nothing to do then).
+    fn change(&mut self, create: bool, f: impl FnOnce(&mut Vec<String>) -> bool) -> Result<(), String> {
+        let Some(path) = self.file.clone() else {
+            let mut list = self.memory.clone();
+            if f(&mut list) { self.memory = list; }
+            return Ok(());
+        };
+        use std::io::{Seek, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+        let at = |e: std::io::Error| format!("{}: {e}", path.display());
+        if create {
+            if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?; }
+        }
+        let mut file = match std::fs::OpenOptions::new().read(true).write(true).create(create).mode(0o600).open(&path) {
+            Ok(file) => file,
+            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(at(e)),
+        };
+        file.lock().map_err(at)?;
+        let mut list = parse(&path, &read_all(&file).map_err(at)?);
+        if !f(&mut list) { return Ok(()); }
+        let mut text = list.join("\n");
+        if !text.is_empty() { text.push('\n'); }
+        file.set_len(0).map_err(at)?;
+        file.rewind().map_err(at)?;
+        file.write_all(text.as_bytes()).map_err(at)?;
+        file.sync_data().map_err(at)
     }
 
     /// Every remembered origin, the newest first (the Settings pane's list).
@@ -134,7 +133,7 @@ impl Remembered {
 
     /// Ask again before running any site live.
     pub fn forget_all(&mut self) -> Result<(), String> {
-        self.change(|list| { let had = !list.is_empty(); list.clear(); had })
+        self.change(false, |list| { let had = !list.is_empty(); list.clear(); had })
     }
 
     /// Whether the page at `url` is of an origin the person chose to run
@@ -146,7 +145,7 @@ impl Remembered {
     /// Remember the origin of the page at `url`: last, so it is the newest.
     pub fn remember(&mut self, url: &str) -> Result<(), String> {
         let o = origin(url).filter(|o| origin_ok(o)).ok_or("not an HTTPS origin")?;
-        self.change(|list| {
+        self.change(true, |list| {
             list.retain(|x| *x != o);
             list.push(o);
             if list.len() > REMEMBERED_MAX { list.drain(..list.len() - REMEMBERED_MAX); }
@@ -157,7 +156,7 @@ impl Remembered {
     /// Ask again before running the page at `url`'s origin live.
     pub fn forget(&mut self, url: &str) -> Result<(), String> {
         let Some(o) = origin(url) else { return Ok(()) };
-        self.change(|list| {
+        self.change(false, |list| {
             let before = list.len();
             list.retain(|x| *x != o);
             list.len() != before
@@ -227,6 +226,24 @@ mod tests {
     }
 
     #[test]
+    fn a_change_keeps_the_file_and_a_forget_makes_none() {
+        use std::os::unix::fs::MetadataExt;
+        let d = Dir::new("inode");
+        let file = d.0.join("live-origins");
+        let mut m = Remembered::new(Some(file.clone()));
+        m.forget("https://app.example/").unwrap();
+        m.forget_all().unwrap();
+        assert!(!file.exists(), "taking away from nothing makes nothing");
+        m.remember("https://app.example/").unwrap();
+        let ino = std::fs::metadata(&file).unwrap().ino();
+        m.remember("https://b.example/").unwrap();
+        m.forget("https://app.example/").unwrap();
+        m.forget_all().unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), ino, "changed in place, never replaced");
+        assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1, "no lock or temporary file beside it");
+    }
+
+    #[test]
     fn the_list_is_bounded_and_the_oldest_goes() {
         let mut m = Remembered::new(None);
         for i in 0..REMEMBERED_MAX + 1 { m.remember(&format!("https://s{i}.example/")).unwrap(); }
@@ -252,6 +269,8 @@ mod tests {
         assert!(!m.holds("https://app.example/"), "too many lines");
         std::fs::write(&file, vec![b'a'; FILE_MAX as usize + 1]).unwrap();
         assert!(!m.holds("https://app.example/"), "too long");
+        std::fs::write(&file, "https://app.example").unwrap();
+        assert!(!m.holds("https://app.example/"), "a last line cut short: it may be a shorter origin than the one chosen");
         std::fs::write(&file, "https://app.example\n").unwrap();
         assert!(m.holds("https://app.example/"), "the control");
     }

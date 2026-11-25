@@ -152,6 +152,17 @@ impl Parent {
         }
     }
 
+    /// Settings only: `app`'s own settings pane in `persona` of the
+    /// person ("personal" or a named one), into `window` (curia.md §15).
+    pub fn request_app_settings(&mut self, window: WindowToken, app: &str, persona: &str) -> Result<EmbedId, Error> {
+        let req = proto::AppSettings { window, z: 0, app: app.into(), persona: persona.into() };
+        match self.0.call(op::REQUEST_APP_SETTINGS, &req)? {
+            Reply::Embed { embed } => Ok(embed),
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+        }
+    }
+
     /// Start a read-only picker nested in Arca's bound provisioning sheet.
     /// The file is returned on this connection, owned by Arca.
     pub fn request_smime_picker(&mut self, sheet: EmbedId, window: WindowToken) -> Result<EmbedId, Error> {

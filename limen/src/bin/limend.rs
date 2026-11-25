@@ -102,6 +102,8 @@ fn main() -> std::io::Result<()> {
     shared.set_system_uid(limen::catalogue::SHARE, share_uid);
     let targets = installed.clone();
     shared.set_target_check(Box::new(move |person: &str, app: &str| targets.may_target(person, app)));
+    let panes = installed.clone();
+    shared.set_pane_check(Box::new(move |person: &str, app: &str| panes.may_provide(person, app, "app-settings")));
     // So is prelum-sheet, the print sheet (`_prelum-sheet`, printing.md §5).
     let prelum_uid: u32 = std::env::var("LIMEN_PRELUM_UID").ok().and_then(|v| v.parse().ok()).unwrap_or(65046);
     shared.set_system_uid(limen::catalogue::PRELUM, prelum_uid);
