@@ -81,21 +81,35 @@ fn main() {
 
     // Each ask goes the way Navigator's does: a Show message from the
     // parent, which Files spends through limend.
+    let mut asked = 0u32;
     let mut show = |press: [u8; 16]| -> Result<(), Error> {
-        let m = ToChild::Show { folder: Folder::Downloads, name: "report.csv".into(), press };
+        // Each ask names its own file, so it spends its own message and
+        // never one left over from the ask before.
+        asked += 1;
+        let name = format!("report-{asked}.csv");
+        let m = ToChild::Show { folder: Folder::Downloads, name: name.clone(), press };
         app.send(e, m.encode())?;
-        let got = files.poll(Duration::from_secs(2))?;
-        let Some(ChildEvent::Message { embed, bytes }) = got else { return Err(Error::Refused(u8::MAX)) };
-        match ToChild::decode(&bytes) {
-            Some(ToChild::Show { press: p, .. }) if embed == e => files.spend_show_press(e, p),
-            _ => Err(Error::Refused(u8::MAX)),
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            match files.poll(Duration::from_millis(200))? {
+                Some(ChildEvent::Message { embed, bytes }) if embed == e => match ToChild::decode(&bytes) {
+                    Some(ToChild::Show { name: n, press: p, .. }) if n == name => return files.spend_show_press(e, p),
+                    other => println!("     (skipped an earlier message: {other:?})"),
+                },
+                Some(other) => println!("     (skipped {other:?})"),
+                None => {}
+            }
         }
+        println!("     (no message for {name} in 5 s)");
+        Err(Error::Refused(u8::MAX))
     };
-    let no_press = |r: Result<(), Error>| matches!(r, Err(Error::Refused(refusal::NO_PRESS)));
-    check(no_press(show([0; 16])), "no press: refused");
+    let no_press = |r: &Result<(), Error>| matches!(r, Err(Error::Refused(refusal::NO_PRESS)));
+    let r = show([0; 16]);
+    check(no_press(&r), &format!("no press: refused ({r:?})"));
     let mut made_up = [0u8; 16];
     std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut made_up)).expect("urandom");
-    check(no_press(show(made_up)), "a made-up press: refused");
+    let r = show(made_up);
+    check(no_press(&r), &format!("a made-up press: refused ({r:?})"));
 
     println!("PRESS {} {}", AT.0 + SIZE.0 as i32 / 2, AT.1 + SIZE.1 as i32 / 2);
     let mut press = None;
@@ -109,7 +123,8 @@ fn main() {
     if let Some(p) = press {
         let first = show(p);
         check(first.is_ok(), &format!("the live press is spent for Show ({first:?})"));
-        check(no_press(show(p)), "the same press again (stale): refused");
+        let again = show(p);
+        check(no_press(&again), &format!("the same press again (stale): refused ({again:?})"));
     }
 
     const DECLARED: u32 = 6;
