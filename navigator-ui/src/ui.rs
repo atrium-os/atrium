@@ -381,8 +381,8 @@ impl View for ShellView {
         // frescod (the page's window is above this one), else drawn here.
         if let (Some(r), Some(p)) = (g.popover, page.clone()) {
             let (st, st2) = (self.state.clone(), self.state.clone());
-            let (action, refused) = (shell::popover_actions(&s), s.live_refusals());
-            floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p, action, refused.as_deref(), &st2));
+            let (action, refused, facts) = (shell::popover_actions(&s), s.live_refusals(), s.live_facts());
+            floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p, action, refused.as_deref(), facts, &st2));
         }
         if let (Some(r), Some(p)) = (g.presence_menu, &page) {
             let (st, st2) = (self.state.clone(), self.state.clone());
@@ -741,6 +741,10 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
             if !times.is_empty() {
                 text(ctx, x + title_w + em(6.0), y + em(13.0), &times, type_size::XXS, Weight::Medium, t.text_tertiary());
             }
+        }
+        if s.opened_beside((tr.id, pi)) {
+            // Opened beside by the live page, on a press (I6.8).
+            icon(ctx, em(200.0) - if *indent > 0.0 { em(22.0) } else { 0.0 }, y + em(6.0), ph::APP_WINDOW, 14.0, t.text_tertiary());
         }
         if current {
             rect(ctx, em(220.0), y + em(10.0), em(6.0), em(6.0), t.accent_mark(), em(3.0));
@@ -1183,7 +1187,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
 
 /// The tier chip's popover (§6.5): Connection, What runs, the reasons,
 /// and the line that says what green does not mean.
-fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, actions: Vec<shell::PopoverAction>, refused: Option<&str>, st: &Mutable<Shell>) {
+fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, actions: Vec<shell::PopoverAction>, refused: Option<&str>, facts: Vec<String>, st: &Mutable<Shell>) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let f = &*p.display_facts();
@@ -1192,7 +1196,9 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, actions: Vec<shell::PopoverA
     let w = r.w() - em(32.0);
     let mut y = r.y() + em(14.0);
     icon(ctx, x, y, light_glyph(f.light), 16.0, light_color(ctx, f.light));
+    let live_head = (f.tier == Tier::Live && !facts.is_empty()).then(|| format!("{site} runs live"));
     let head = match f.light {
+        _ if live_head.is_some() => live_head.as_deref().unwrap_or_default(),
         Light::Green => "Nothing to worry about that we can see",
         Light::Amber => "Something is weaker than usual",
         Light::Red => "This page is unsafe",
@@ -1212,6 +1218,15 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, actions: Vec<shell::PopoverA
     }
     for reason in &f.reasons {
         y = wrapped(ctx, x, y, w, reason, if f.light == Light::Red { t.danger_fg() } else { t.warning_fg() });
+    }
+    // While it runs (§15.1): what the running page holds and has done.
+    if !facts.is_empty() {
+        y += em(6.0);
+        text(ctx, x, y + em(6.0), "WHILE IT RUNS", type_size::XXS, Weight::Semibold, t.text_tertiary());
+        y += em(16.0);
+        for l in &facts {
+            y = wrapped(ctx, x, y, w, l, t.text_secondary());
+        }
     }
     // What the live page was refused (I6.4): nothing is refused silently.
     if let Some(r) = refused {
@@ -1704,7 +1719,16 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),
             ("over http: anyone on the network can read it".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
-        Prompt::RunLive | Prompt::RunPageLive { .. } | Prompt::Widget { .. } | Prompt::WidgetUnload { .. } | Prompt::WidgetFailed { .. } => (ph::LIGHTNING, vec![(crate::ax::prompt_text(p), body(t.text_primary(), Weight::Regular))]),
+        Prompt::RunPageLive { site, .. } => (ph::LIGHTNING, vec![
+            ("Run this page live?".into(), body(t.text_primary(), Weight::Semibold)),
+            (format!("Its scripts run in a jail of their own and can send what you type here to {site}'s sites."), body(t.text_secondary(), Weight::Regular)),
+        ]),
+        Prompt::Widget { origin, runnable: true, .. } => (ph::LIGHTNING, vec![
+            ("Start the live widget from".into(), body(t.text_secondary(), Weight::Regular)),
+            (shell::plain(origin), body(t.text_primary(), Weight::Semibold)),
+            ("? It runs in a jail of its own.".into(), body(t.text_secondary(), Weight::Regular)),
+        ]),
+        Prompt::RunLive | Prompt::Widget { .. } | Prompt::WidgetUnload { .. } | Prompt::WidgetFailed { .. } => (ph::LIGHTNING, vec![(crate::ax::prompt_text(p), body(t.text_primary(), Weight::Regular))]),
         Prompt::PasteTooLong => (ph::CLIPBOARD, vec![(crate::ax::prompt_text(p), body(t.text_secondary(), Weight::Regular))]),
         Prompt::FetchAgain => (ph::ARROW_CLOCKWISE, vec![("This page could not be restored and will be fetched again".into(), body(t.text_secondary(), Weight::Regular))]),
         Prompt::Stored { at_s } => (ph::CLOCK, vec![
@@ -1722,12 +1746,15 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
     let bs = sans(type_size::SM, Weight::Semibold, t.text_primary());
     // The words stop short of the answers: cut with an ellipsis, never
     // under a button (the whole text is the accessibility tree's).
-    let buttons: f32 = answers.iter().map(|a| width(a, &bs) + em(24.0) + em(8.0)).sum();
+    // The primary answer that starts code carries a play glyph.
+    let plays = |a: &str| matches!(a, "Run live" | "Start");
+    let buttons: f32 = answers.iter().map(|a| width(a, &bs) + em(24.0) + em(8.0) + if plays(a) { em(20.0) } else { 0.0 }).sum();
     let room = r.w() - em(46.0) - em(16.0) - buttons - em(8.0);
     inline(ctx, r.x() + em(46.0), r.y() + em(22.0), em(6.0), &fit_runs(&runs, em(6.0), room));
     let mut x = r.x() + r.w() - em(16.0);
     for (i, a) in answers.iter().enumerate().rev() {
-        let w = width(a, &bs) + em(24.0);
+        let glyph = plays(a);
+        let w = width(a, &bs) + em(24.0) + if glyph { em(20.0) } else { 0.0 };
         x -= w;
         let primary = i == answers.len() - 1;
         let ghost = i == 0 && answers.len() > 2;
@@ -1745,7 +1772,10 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
                 eprintln!("navigator-ui: a press within 500 ms of the prompt appearing doesn't count");
             }
         }));
-        text(ctx, x + em(12.0), r.y() + em(22.0), a, type_size::SM, Weight::Semibold, fg);
+        if glyph {
+            icon(ctx, x + em(12.0), r.y() + em(14.0), ph::PLAY, 16.0, fg);
+        }
+        text(ctx, x + em(12.0) + if glyph { em(20.0) } else { 0.0 }, r.y() + em(22.0), a, type_size::SM, Weight::Semibold, fg);
         ctx.pop();
         x -= em(8.0);
     }
