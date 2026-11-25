@@ -59,7 +59,11 @@ async function items() {
 }
 async function show() {
     const list = document.getElementById("items");
-    list.replaceChildren(...(await items()).map(t => Object.assign(document.createElement("li"), { textContent: t })));
+    // A filled store holds 30 MiB byte arrays: name their size, never put
+    // them in the page as text (one text node of that size takes GBs).
+    const label = t => typeof t === "string" ? t.slice(0, 200)
+        : (t && t.byteLength !== undefined) ? t.byteLength + " bytes" : String(t).slice(0, 200);
+    list.replaceChildren(...(await items()).map(t => Object.assign(document.createElement("li"), { textContent: label(t) })));
 }
 await step("indexeddb", async () => { await show(); return (await items()).length + " stored"; });
 document.getElementById("add").addEventListener("submit", async e => {
