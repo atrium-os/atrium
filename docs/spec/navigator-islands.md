@@ -2976,8 +2976,10 @@ the answer reached the engine with only its content type.
 - **`Origin`.** Arca's courier takes a new client header, `Origin`
   (`Header::Origin` = 8 in `arca-courier/src/schema.rs`), only in the shape
   `https://host[:port]` (`origin_value`); anything else refuses the whole
-  request. The client states it as it already states the ticket's
-  initiator, which Arca's same-site rule trusts. `navigator_cookies::Fetch`
+  request. It and the ticket's initiator are one claim: arcad's `COOKIES`
+  takes the request's origin and allows it only from a ticket whose
+  initiator is on its site (DENIED, the ticket unspent, otherwise), and the
+  courier then refuses the request unsent. `navigator_cookies::Fetch`
   carries it (`from_origin`), only from a live view, on the first hop only.
   navigatord's `LiveJar` sends the page's origin with a request to another
   host of the site, with every script POST and with a form.
@@ -3040,8 +3042,12 @@ engine change:
   to a receiver at the target's origin (`*` any, `/` the sender's own),
   stamped with the sender's real origin, at most 32 waiting per engine.
   Each side reads `LIVE_MESSAGES` every 250 ms while it has a frame or is
-  one, and dispatches a `message` event. Messages and reports don't count
-  toward a page's 4,096 network requests.
+  one, and dispatches a `message` event. A message waiting for a frame is
+  checked again when it is taken, so a frame that has moved to another
+  origin doesn't get it. Messages and reports don't count toward a page's
+  4,096 network requests; navigatord's own addresses are held to 20
+  requests a second instead, past which they are refused and the page
+  runs on.
 - **Not yet.** `window.top` in a frame is the frame itself
   (`[LegacyUnforgeable]`, the script can't replace it); messages carry
   JSON, not transferables or ports; a frame's own frames are not run; a
