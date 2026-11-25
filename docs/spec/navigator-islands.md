@@ -2601,6 +2601,34 @@ Same flag as I6.1.
 7. Press **Open another site**: the page reports `window-open` refused and the
    trail is unchanged.
 
+#### I6.2 second part: gate results on arm64 Tessera, 2026-11-25
+
+Main `067dced7e` with J2: the `I6_PAGE` engine (`62dafe26…18c6`, audit
+passed; its sources unchanged since `2ef0a53f7`), navigatord and
+navigator-ui from main, and main's portcullisd, atrium-jaild, portcullis
+and opifex. Under J2 jaild refused every app launch (`path.class_root`:
+"/var/lib/atrium/jails/org.atrium.navigator is not a app jail's root for
+mailgate") until the guest's `jaild.policy.toml` took the repository's
+`[apps]` section (`class_roots`, `class_rw_subtrees`, `class_ro_subtrees`,
+`sockets_dir`, `sockets`); `navigator-signin-base` predates it.
+
+5. Run `app.html` live, press **Route (pushState)**: the trail gained
+   `https://app.example/route/1` (two entries), the same engine process
+   kept running (pid 4245 before and after), and no request for
+   `/route/1` reached the fixture server. Passed.
+6. Back: `app.html` ran live again with no prompt, in a new engine (pid
+   4538). Forward: `/route/1` opened and ran live (pid 5195). The fixture
+   server answers `/route/1` with the app's page (200), not 404 as the step
+   expected. Passed.
+7. **Open another site**: the page reported `window-open: refused`, the
+   trail stayed at two entries and the engine kept running. Passed.
+
+The cross-site link sequence of the first part's step 3 (live link, Back,
+Run live, Another site) drew `elsewhere.example` in all three repeats.
+jaild logged 34 warnings while removing jails, all `rctl -r` "No such
+process" but one devfs unmount `EBUSY`; launches were not affected.
+Evidence is in `~/atrium-vm/evidence/navigator-i6-2b-20261125/`.
+
 #### I6.2 first part: gate results on arm64 Tessera, 2026-11-25
 
 Main `87785725f`, set up as for the I6.1 gate: the `I6_PAGE` engine
