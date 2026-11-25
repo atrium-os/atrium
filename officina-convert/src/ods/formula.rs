@@ -111,7 +111,7 @@ pub fn from_of(f: &str) -> Option<String> {
                     j += 1;
                 }
                 let word: String = ch[i..j].iter().collect();
-                let w = word.strip_prefix("COM.MICROSOFT.").or_else(|| word.strip_prefix("_xlfn.")).unwrap_or(&word);
+                let w = word.strip_prefix("COM.MICROSOFT.").or_else(|| word.strip_prefix("_xlfn.")).or_else(|| word.strip_prefix("LEGACY.")).unwrap_or(&word);
                 if ch.get(j) == Some(&'(') && w.eq_ignore_ascii_case("FORMULA") {
                     out.push_str("FORMULATEXT");
                 } else {
@@ -221,7 +221,12 @@ fn looks_like_cell(s: &str) -> bool {
 /// LibreOffice writes them).
 /// Excel functions OpenFormula has under another meaning, or not at all:
 /// LibreOffice writes them in Microsoft's namespace too.
-const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET", "CEILING", "FLOOR", "CEILING.MATH", "FLOOR.MATH", "MAXIFS", "MINIFS", "RANK.EQ", "RANK.AVG", "PERCENTILE.INC", "PERCENTILE.EXC", "QUARTILE.INC", "QUARTILE.EXC", "MODE.SNGL", "COVARIANCE.P", "COVARIANCE.S", "MODE.MULT", "FORECAST.LINEAR"];
+const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET", "CEILING", "FLOOR", "CEILING.MATH", "FLOOR.MATH", "MAXIFS", "MINIFS", "RANK.EQ", "RANK.AVG", "PERCENTILE.INC", "PERCENTILE.EXC", "QUARTILE.INC", "QUARTILE.EXC", "MODE.SNGL", "COVARIANCE.P", "COVARIANCE.S", "MODE.MULT", "FORECAST.LINEAR",
+    "NORM.DIST", "NORM.INV", "NORM.S.DIST", "NORM.S.INV", "LOGNORM.DIST", "LOGNORM.INV", "T.DIST", "T.DIST.2T", "T.DIST.RT", "T.INV", "T.INV.2T", "CHISQ.DIST", "CHISQ.DIST.RT", "CHISQ.INV", "CHISQ.INV.RT", "F.DIST", "F.DIST.RT", "F.INV", "F.INV.RT", "BINOM.DIST", "BINOM.DIST.RANGE", "BINOM.INV", "NEGBINOM.DIST", "POISSON.DIST", "HYPGEOM.DIST", "EXPON.DIST", "GAMMA.DIST", "GAMMA.INV", "GAMMALN.PRECISE", "BETA.DIST", "BETA.INV", "WEIBULL.DIST", "ERF.PRECISE", "ERFC.PRECISE", "CONFIDENCE.NORM", "CONFIDENCE.T", "T.TEST", "Z.TEST", "CHISQ.TEST", "F.TEST"];
+
+/// Excel names OpenFormula keeps under `LEGACY.` (its own CHIDIST and so on
+/// take other arguments).
+const LEGACY: &[&str] = &["CHIDIST", "CHIINV", "CHITEST", "FDIST", "FINV", "NORMSDIST", "NORMSINV", "TDIST"];
 
 pub fn to_of(a1: &str) -> String {
     let body = a1.strip_prefix('=').unwrap_or(a1);
@@ -316,6 +321,8 @@ pub fn to_of(a1: &str) -> String {
                 } else if ch.get(j) == Some(&'(') {
                     if MICROSOFT.iter().any(|f| f.eq_ignore_ascii_case(&word)) {
                         out.push_str("COM.MICROSOFT.");
+                    } else if LEGACY.iter().any(|f| f.eq_ignore_ascii_case(&word)) {
+                        out.push_str("LEGACY.");
                     }
                     out.push_str(if word.eq_ignore_ascii_case("FORMULATEXT") { "FORMULA" } else { &word });
                     i = j;
@@ -439,6 +446,7 @@ mod tests {
             ("=CEILING.MATH(A1,2)+FLOOR(A1,2)", "of:=COM.MICROSOFT.CEILING.MATH([.A1];2)+COM.MICROSOFT.FLOOR([.A1];2)"),
             ("=NETWORKDAYS(A1,B1)+SWITCH(A1,1,2)", "of:=NETWORKDAYS([.A1];[.B1])+SWITCH([.A1];1;2)"),
             ("=MAXIFS(A1:A3,B1:B3,1)+PMT(0.1,2,3)", "of:=COM.MICROSOFT.MAXIFS([.A1:.A3];[.B1:.B3];1)+PMT(0.1;2;3)"),
+            ("=NORM.DIST(1,0,1,TRUE)+CHIDIST(1,2)", "of:=COM.MICROSOFT.NORM.DIST(1;0;1;TRUE())+LEGACY.CHIDIST(1;2)"),
         ] {
             assert_eq!(to_of(a1), of, "{a1}");
             assert_eq!(from_of(of).as_deref(), Some(a1), "back {of}");
