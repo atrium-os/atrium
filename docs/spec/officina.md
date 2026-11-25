@@ -4953,6 +4953,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - Excel also moves the active cell *inside* a selection with Enter and Tab. The grid's active cell is always a corner of its one selection range, so that is not done. Ctrl+. (§16.116) visits the corners instead.
 - Tests: `enter_after_tabs_goes_to_the_next_row_where_they_began` and `f8_extends_the_selection_until_pressed_again_or_escape` (pergola), and `the_status_bar_shows_extend_selection_while_f8_is_on` (Sheets). All 153 Sheets and 242 pergola lib tests pass. `doc::tests::a_slow_edit_hands_the_window_back_and_greys_what_is_not_done` failed once while two builds ran at the same time. It is timing-based and passed on the rerun.
 
+### 16.124 Selection summary in the status bar (2026-11-25)
+
+- With two or more cells selected, the status bar shows **Average**, **Count** and **Sum** at its right, as Excel does, for example "Average: 2   Count: 3   Sum: 6". Count is the cells holding anything. Average and Sum cover the numbers only. With no numbers only the count shows, and nothing shows for one cell or an empty selection.
+- `data::selection_stats` reads the selection with `Workbook::each`, which skips empty stretches unseen, so a whole column costs only its filled cells. The result is kept until the document's revision, the sheet or the selection changes, so it is computed once per change, not once per frame.
+- Numbers use the General format (up to 15 significant digits). Excel uses the first cell's format and also leaves out rows a filter hides; Sheets does neither yet.
+- Test: `the_status_bar_sums_up_the_selection`. All 154 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
