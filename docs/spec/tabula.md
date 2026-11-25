@@ -166,6 +166,28 @@ Not yet built:
 - the system users `_tabula`, `_share`, `_praeco` and `_forum`;
 - Portcullis mounting the socket's directory into those jails.
 
+### 2.6 A press in an island, spent by its parent (2026-11-25)
+
+A live page in Navigator is an island: a slot in the Navigator window that the engine's own
+window fills (navigator-islands.md §7, I6.4). Keys and clicks on it go to the engine, so the
+token is minted for the engine's uid, and the engine has no Tabula access. The Navigator UI,
+which owns the window the island is a slot of, writes and reads the clipboard for it.
+
+- When frescod mints a token for a press in an island slot, it also records the parent window
+  and that window's owner's uid (`island_parent` in `socket_server.rs`, `Entry.parent_window`
+  and `parent_uid` in `activation.rs`).
+- `CONSUME` with `presenter_uid` equal to that parent uid is taken for `COPY` and `PASTE`
+  only. Every other purpose still needs the island's own uid. The chord rule (§2.2) is
+  unchanged: Ctrl-C for a copy, Ctrl-V for a paste.
+- The focus check passes when the island or its parent window is focused.
+- Tabula is unchanged: it still passes its caller's uid as `presenter_uid`.
+- The engine forwards each Ctrl-C (with the selected text, at most 16 KiB) and each Ctrl-V
+  with its token to navigatord, which hands them to the UI. The UI spends the token through
+  Pergola's `copy_text_with` and `paste_text_with`, and only for the live page on screen.
+
+Test: `an_islands_parent_spends_a_press_in_the_island_only_on_a_copy_or_a_paste` in
+`activation.rs`.
+
 ## 3. Tabula's wire (`CLASS_CLIPBOARD` = 2, `/atrium/sockets/clipboard/clipboard.sock`)
 
 Reachable by apps whose manifest says `clipboard = true` (portcullis.md). Payloads are CAS blobs

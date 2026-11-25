@@ -897,6 +897,12 @@ impl Shell {
         self.outbox.len() > before
     }
 
+    /// Whether the live page at `from` is running and on screen: only it
+    /// may copy or paste (I6.4).
+    pub fn live_on_screen(&self, from: &str) -> bool {
+        self.history.is_none() && self.live_run.as_ref().is_some_and(|r| r.url == from && r.origin.is_some() && Some(r.key) == self.shown_key())
+    }
+
     /// The popover's line for what the live page on screen was refused.
     pub fn live_refusals(&self) -> Option<String> {
         let run = self.live_run.as_ref().filter(|r| Some(r.key) == self.shown_key() && !r.refused.is_empty())?;
@@ -2788,6 +2794,7 @@ mod tests {
         assert_eq!(s.outbox.pop(), Some(Out::Save { id: 1 << 31, press: [3; 16] }));
         // window.print(): the entry's rendering prints, once at a time; not
         // for a page that isn't the one running.
+        assert!(s.live_on_screen(url) && !s.live_on_screen("https://app.example/other.html"));
         assert!(!s.live_print("https://app.example/other.html"));
         assert!(s.live_print(url));
         assert_eq!(s.outbox.pop(), Some(Out::Print));

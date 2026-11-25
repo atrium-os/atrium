@@ -95,6 +95,12 @@ mod caps;
 #[path = "../lock.rs"]
 #[allow(dead_code)]
 mod lock;
+#[path = "../pack.rs"]
+#[allow(dead_code)]
+mod pack;
+#[path = "../chrome.rs"]
+#[allow(dead_code)]
+mod chrome;
 #[path = "../socket_server.rs"]
 mod socket_server;
 

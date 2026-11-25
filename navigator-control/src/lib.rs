@@ -233,6 +233,9 @@ pub enum Request {
     /// without a press. navigatord refuses unless the person ran this
     /// origin live in this window and has not stopped it.
     ContinueLive { url: String, rect: [u32; 4], jar: Jar },
+    /// The text Tabula gave for a live page's paste (`Event::LivePaste`,
+    /// I6.4), for the live page at `url`.
+    LivePasted { url: String, text: String },
 }
 
 /// The longest WebAuthn options a `Credential` carries (the page's own
@@ -440,6 +443,13 @@ pub enum Event {
     /// The live page at `from` asked to be printed (I6.4): the UI prints
     /// its trail entry's document-lane rendering, as Ctrl-P does.
     LivePrint { from: String },
+    /// The person copied in the live page at `from` (I6.4): `text`, and
+    /// the press's token, which the UI spends on Tabula (frescod lets an
+    /// island's parent spend it on a copy).
+    LiveCopy { from: String, text: String, token: Press },
+    /// The person pressed Ctrl-V in the live page at `from` (I6.4): the UI
+    /// spends `token` on a paste and answers `Request::LivePasted`.
+    LivePaste { from: String, token: Press },
 }
 
 /// The longest refusal a [`Event::LiveRefused`] names.

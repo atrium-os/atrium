@@ -162,7 +162,8 @@ pub fn spawn_event_fanout(
                  * WM gets the event without it. */
                 let bare = activation::has_token(&ev).then(|| {
                     let uid = window_uid(&ev, &comp);
-                    activation::mint_for(&mut ev, uid);
+                    let island = island_parent(&ev, &comp);
+                    activation::mint_for(&mut ev, uid, island);
                     activation::without_token(&ev)
                 });
                 /* Drags follow the input (tabula.md §4; frescod only). */
@@ -503,6 +504,21 @@ fn window_uid(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Option<u32> {
     use DisplayEvent as E;
     let (E::InputKey { window_id, .. } | E::InputPointerButton { window_id, .. }) = *ev else { return None };
     window_owner_uid(window_id, comp)
+}
+
+/// For a press in an island slot: the window it is a slot of and that
+/// window's owner's uid (tabula.md §2.6).
+fn island_parent(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Option<(u32, u32)> {
+    use DisplayEvent as E;
+    let (E::InputKey { window_id, .. } | E::InputPointerButton { window_id, .. }) = *ev else { return None };
+    let parent = {
+        let c = comp.lock().unwrap();
+        let id = u16::try_from(window_id).ok()?;
+        if !c.is_island(id) { return None; }
+        c.windows.get(&id)?.slot?.parent
+    };
+    let uid = window_owner_uid(u32::from(parent), comp)?;
+    Some((u32::from(parent), uid))
 }
 
 /// The uid of the app that owns `window_id`.
