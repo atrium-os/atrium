@@ -2712,6 +2712,45 @@ and navigator-cookies:
 4. Run the same page live in an Unrecorded trail: not signed in.
 5. Add an item: `/api/items` (a script POST with JSON) answers its count.
 
+#### I6.3 as built (2026-11-25, second part: storage)
+
+navigatord side host-tested; the engine's Rust side type-checks; the
+LibWeb glue that makes `localStorage` use it is the Mac step.
+
+- **Where.** `live_storage::Stores` keeps one store per (jar, site): for
+  the persona's own jar a file `<NAVIGATORD_STORE>/live-storage/<site>.store`
+  (0600, written whole to a fresh file and renamed), for an Unrecorded
+  trail's jar memory only, dropped when the trail's jar is forgotten.
+  Forgetting a site (`Forget`) removes its store with its cookies.
+- **Bounds.** 5 MiB of keys and values (LibWeb's quota) and 65,536 items a
+  site; a change batch is at most 32 KiB (Nuntius's POST bound), and a
+  batch that is out of shape or would break a bound changes nothing. A
+  damaged file starts the site empty, logged.
+- **On the channel.** After its page is delivered, the engine GETs
+  `limen::web_island::LIVE_STORAGE` (`https://live-page.atrium.invalid/local-storage`)
+  for its site's store and POSTs batches of set, append, remove and clear
+  there (`serve` answers 204, or refuses). A value too long for one batch
+  goes as a set and appends; if one is refused the value is left partial.
+  The site is the delivered page's, so a page reaches no other store.
+- **Engine.** `fixture_fetch.rs` has `navigator_live_storage_load` (each
+  item to a callback), `navigator_live_storage_set`, `_remove` and
+  `_clear`. Still to do on the Mac, with the pinned LibWeb source: for
+  `ATRIUM_I6_PAGE`, fill the page's local storage from
+  `navigator_live_storage_load` before its scripts run, and forward
+  `setItem`, `removeItem` and `clear` to the three calls, failing a
+  `setItem` navigatord refuses as LibWeb does over its quota.
+- **IndexedDB** stays per run: LibWeb keeps it in memory, and persisting it
+  is its own step.
+
+**Gate (Mac),** after the LibWeb glue, with `NAVIGATORD_STORE` set:
+
+1. Run `app.html` live: `local-storage` reads 1 visit.
+2. Stop, run live again: 2 visits. Restart navigatord, run live: 3.
+3. The same page in an Unrecorded trail: 1 visit; close that trail and
+   open another: 1 again.
+4. `live-storage/app.example.store` exists, mode 0600, owned by the
+   persona's Navigator user, and no file appears for the Unrecorded runs.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
@@ -3567,7 +3606,7 @@ alongside I0.
 | **D7** ✓ | How a warmed engine gets its own jail (I5 warm start) | fork zygote in a per-persona parent jail · fork zygote on the host · warm pool of ordinary one-shot workers | **Decided (Shankar, 2026-11-24): warm pool, one standby per persona with a live Navigator.** No new privileged process or jail creator, its own ASLR per island, and today's I5 checks apply unchanged; the cost is one idle engine's memory per persona |
 | **D8** ✓ | Is "run this page live" remembered (I6) | ask on every visit · remember per (persona, origin) until revoked · remember for the session only | **Remember per (persona, origin), revocable in Curia and from the chip.** A fat client used daily should not need a press every visit, and a choice that is per persona and visible in the chip keeps it the person's. Never automatic for an origin not chosen |
 | **D9** ✓ | Whose jar a live page uses (I6) | a jar per (persona, origin) kept by Nuntius through Arca couriers · a throwaway jar per run | **Kept per (persona, origin) through Arca's couriers**, as sign-in windows do (D6). Apps people run live are the ones they sign in to; a throwaway jar would sign them out at every Stop. The engine still never holds a cookie |
-| **D10** ✓ | Where a live page's storage lives (I6) | a per-(persona, origin) directory on the persona's encrypted volume, mounted into the engine jail · in memory for the run only | **On the persona's encrypted volume, one directory per origin**, mounted read-write into that origin's engine jail only. Offline-capable apps (Notion, WhatsApp) need it; persona removal destroys it with the rest (Tessera E5) |
+| **D10** ✓ | Where a live page's storage lives (I6) | a per-(persona, origin) directory on the persona's encrypted volume, mounted into the engine jail · in memory for the run only · kept by navigatord and served over the engine's channel | **Kept by navigatord, one store per (jar, site), on the persona's encrypted volume** (Shankar 2026-11-25, replacing the mounted directory accepted 2026-11-24). As Ladybird keeps storage in its browser process, the engine never holds a file and no mount authority is added; the engine loads its site's store and sends each change ([I6.3 second part](#i63-as-built-2026-11-25-second-part-storage)). Persona removal destroys it with the rest (Tessera E5) |
 | **D11** ✓ | Cross-origin frames inside a live page (I6) | each its own engine jail, started with the page · a box the person presses, as in the document lane · not shown | **Its own engine jail, started with the page**, composed by Limen as a nested island. Payment and sign-in frames must work inside an app, and asking per frame would break it; the origin stays the isolation unit (legacy-web §7.6). Third-party frames refused by D12 are not started |
 | **D12** ✓ | What a live page's scripts may reach (I6) | its own origin only (legacy-web §5.4.1c) · its registrable domain · its registrable domain plus origins it names in a declared list | **Its registrable domain**, measured in I6.0 before it is fixed. Fat clients keep their APIs and static assets on sibling hosts; third-party requests are refused and listed in the popover. The chip's words change to "send it to atlas.example's sites" |
 | **D13** ✓ | GPU for live pages (I6) | none in I6 · a jailed GPU process later | **None in I6.** The threat model keeps GPU descriptors out of engines (§2). A jailed GPU broker for WebGL is its own spec, opened only if I6.0 shows that apps the person needs cannot run without it |

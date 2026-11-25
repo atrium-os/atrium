@@ -103,7 +103,7 @@ fn snapshot_state(reg: &Reg) -> PersistState {
     let map = reg.lock().unwrap();
     let mut sessions = Vec::new();
     for (name, s) in map.iter() {
-        if s.dead.load(Ordering::SeqCst) || name.starts_with(CONSOLE_PREFIX) {
+        if s.dead.load(Ordering::SeqCst) || !persisted(name) {
             continue;
         }
         let inner = s.inner.lock().unwrap();
@@ -161,10 +161,13 @@ fn persist(reg: &Reg) {
     if let Err(e) = st.save_atomic(dir) {
         eprintln!("stoad: persist meta to {dir:?} failed: {e}");
     }
-    // Scrollback: dump each live window's history+screen as text.
+    // Scrollback: dump each live window's history+screen as text. A console
+    // (`console.<person>:<app>:<n>`, an app's or workspace's shell) is never
+    // persisted (§10a): its output belongs to the person's key group, not to
+    // stoad's own state.
     let map = reg.lock().unwrap();
     for (name, s) in map.iter() {
-        if s.dead.load(Ordering::SeqCst) {
+        if s.dead.load(Ordering::SeqCst) || !persisted(name) {
             continue;
         }
         let inner = s.inner.lock().unwrap();
@@ -203,7 +206,7 @@ fn restore_sessions(reg: &Reg, path: &Path) {
         }
         // An app's console isn't kept: its shells came from portcullisd,
         // and only a press there makes new ones.
-        if ps.name.starts_with(CONSOLE_PREFIX) {
+        if !persisted(&ps.name) {
             continue;
         }
         let udp = match UdpSocket::bind("0.0.0.0:0") {
@@ -656,6 +659,12 @@ struct SessionState {
 /// `console.<person>.<app id>.<n>`. Only root (portcullisd) makes, lists,
 /// attaches or ends them; their target is `console:<app id>`.
 const CONSOLE_PREFIX: &str = "console.";
+
+/// Whether a session's layout and scrollback are written to the state
+/// directory: never a console's (§10a).
+fn persisted(name: &str) -> bool {
+    !name.starts_with(CONSOLE_PREFIX)
+}
 
 type Reg = Arc<Mutex<HashMap<String, Arc<SessionState>>>>;
 
@@ -1776,5 +1785,18 @@ fn write_all_fd(fd: i32, mut data: &[u8]) {
             return;
         }
         data = &data[n as usize..];
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::persisted;
+
+    #[test]
+    fn consoles_are_never_written() {
+        assert!(!persisted("console.alice:org.test.stay:1"));
+        assert!(!persisted("console.alice:ws_scratch:2"));
+        assert!(persisted("main"));
+        assert!(persisted("alice-work"));
     }
 }

@@ -470,7 +470,7 @@ as **making the account usable first, then filling in what's worth having, polit
   March 2021 (12,400 of 48,000)", with *Pause*. No spinner blocks anything.
 - Opening an old message or attachment that isn't local fetches just that one, at once.
 
-### 6.4a Mail at rest: PROPOSED 2026-11-25
+### 6.4a Mail at rest: ACCEPTED 2026-11-25 (Shankar accepted D-at-rest-1 to 3 as recommended)
 
 Shankar asked whether downloaded mail is encrypted on the device, and whether that is
 secure enough. The review thread's adversarial assessment (project files
@@ -608,7 +608,7 @@ work, not Mail's.
 3. A3.
 4. A5 last, because it needs all of the above.
 
-Decisions for Shankar:
+Decisions (all accepted as recommended, 2026-11-25):
 - D-at-rest-1: fail closed for Personal too, not only named personas, with the one-login
   migration allowance in A1. Recommended yes.
 - D-at-rest-2: GELI one-time swap. Recommended yes.

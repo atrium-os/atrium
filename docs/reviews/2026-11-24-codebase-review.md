@@ -545,6 +545,13 @@ Proposal:
    while arcad, frescod and limend could not start (fixed d6d0346aa; the
    link-following mkdir beside it, 483276d7).
 
+5. **Rule added to AGENTS.md's review checklist** (accepted by Shankar 2026-11-25,
+   from `reviews/stores-at-rest-assessment.md`):
+   > A person's or persona's data at rest lives in that persona's key group (its app
+   > overlay, or a directory portcullisd makes there for a service, as for Fasti), never in
+   > a system service's own state, `/var/db`, or `/tmp`. A service that can't get the
+   > directory keeps that data in memory only.
+
 The AGENTS.md section:
 
 ```markdown

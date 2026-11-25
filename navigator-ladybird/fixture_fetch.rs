@@ -343,3 +343,129 @@ pub unsafe extern "C" fn navigator_live_post(
     }
     n as isize
 }
+
+/// A whole live page's `localStorage` (I6.3): navigatord keeps it for the
+/// page's site; the engine loads it once and sends each change. The batch
+/// format is navigatord's `live_storage`: per op a byte (1 set, 2 remove,
+/// 3 clear, 4 append), then each string as a little-endian u32 length and
+/// its UTF-8 bytes. A value too long for one batch goes as a set and appends.
+mod live_storage {
+    pub const SET: u8 = 1;
+    pub const REMOVE: u8 = 2;
+    pub const CLEAR: u8 = 3;
+    pub const APPEND: u8 = 4;
+    /// Room for one batch's strings under Nuntius's POST bound.
+    pub const ROOM: usize = nuntius::BODY_MAX - 64;
+
+    pub fn put(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend((s.len() as u32).to_le_bytes());
+        out.extend(s);
+    }
+
+    /// Cut `s` into pieces of at most `room` bytes, each whole UTF-8.
+    pub fn pieces(s: &str, room: usize) -> Vec<&str> {
+        let mut out = vec![];
+        let mut rest = s;
+        while !rest.is_empty() {
+            let mut at = rest.len().min(room);
+            while !rest.is_char_boundary(at) { at -= 1; }
+            let (a, b) = rest.split_at(at);
+            out.push(a);
+            rest = b;
+        }
+        if out.is_empty() { out.push(""); }
+        out
+    }
+}
+
+fn live_storage_send(batch: Vec<u8>) -> bool {
+    let mut answer = [0u8; 16];
+    let post = Some(("application/octet-stream", batch.as_slice()));
+    matches!(live_exchange_with(limen::web_island::LIVE_STORAGE, post, &mut answer, Duration::from_secs(10)), Some((204, _, _, 0)))
+}
+
+/// Load the page's store: `on_item(ctx, key, key_len, value, value_len)`
+/// for each item. False when navigatord gave none or it is out of shape.
+/// # Safety
+/// `on_item` is a valid function for this call; the strings it is given
+/// live only for that call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_storage_load(
+    ctx: *mut std::ffi::c_void, on_item: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize, *const u8, usize),
+) -> bool {
+    // navigatord's bound: a 5 MiB quota and 8 bytes for each of at most
+    // 65,536 items.
+    let mut store = vec![0u8; 5 * 1024 * 1024 + 8 * 65_536];
+    let Some((200, _, _, n)) = live_exchange(limen::web_island::LIVE_STORAGE, &mut store, Duration::from_secs(10)) else { return false };
+    let mut rest = &store[..n];
+    let mut items = vec![];
+    let take = |rest: &mut &[u8]| -> Option<String> {
+        let (len, more) = rest.split_first_chunk::<4>()?;
+        let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
+        if len > more.len() { return None; }
+        let (s, more) = more.split_at(len);
+        *rest = more;
+        String::from_utf8(s.to_vec()).ok()
+    };
+    while !rest.is_empty() {
+        let (Some(k), Some(v)) = (take(&mut rest), take(&mut rest)) else { return false };
+        items.push((k, v));
+    }
+    for (k, v) in &items {
+        // SAFETY: the caller's function, with strings alive for this call.
+        unsafe { on_item(ctx, k.as_ptr(), k.len(), v.as_ptr(), v.len()) };
+    }
+    true
+}
+
+/// `localStorage.setItem(key, value)`: sent to navigatord, which keeps it
+/// or refuses (over the site's quota). False: not kept.
+/// # Safety
+/// Both UTF-8 buffers are readable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_storage_set(key: *const u8, key_len: usize, value: *const u8, value_len: usize) -> bool {
+    use live_storage::*;
+    if key.is_null() || (value.is_null() && value_len > 0) || key_len > ROOM / 2 { return false; }
+    // SAFETY: the caller passes readable buffers of these lengths.
+    let (k, v) = unsafe { (std::slice::from_raw_parts(key, key_len), if value_len == 0 { &[][..] } else { std::slice::from_raw_parts(value, value_len) }) };
+    let (Ok(k), Ok(v)) = (std::str::from_utf8(k), std::str::from_utf8(v)) else { return false };
+    for (i, piece) in pieces(v, ROOM - k.len()).into_iter().enumerate() {
+        let mut batch = vec![if i == 0 { SET } else { APPEND }];
+        put(&mut batch, k.as_bytes());
+        put(&mut batch, piece.as_bytes());
+        if !live_storage_send(batch) { return false; }
+    }
+    true
+}
+
+/// `localStorage.removeItem(key)`.
+/// # Safety
+/// The UTF-8 buffer is readable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_storage_remove(key: *const u8, key_len: usize) -> bool {
+    use live_storage::*;
+    if key.is_null() || key_len > ROOM { return false; }
+    // SAFETY: the caller passes a readable buffer of `key_len` bytes.
+    let k = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let mut batch = vec![REMOVE];
+    put(&mut batch, k);
+    live_storage_send(batch)
+}
+
+/// `localStorage.clear()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_live_storage_clear() -> bool {
+    live_storage_send(vec![live_storage::CLEAR])
+}
+
+#[cfg(test)]
+mod live_storage_tests {
+    #[test]
+    fn a_long_value_is_cut_on_character_boundaries() {
+        let v = "é".repeat(10);
+        let p = super::live_storage::pieces(&v, 5);
+        assert!(p.iter().all(|s| s.len() <= 5));
+        assert_eq!(p.concat(), v);
+        assert_eq!(super::live_storage::pieces("", 5), vec![""]);
+    }
+}

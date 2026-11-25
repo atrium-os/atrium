@@ -55,6 +55,7 @@ mod mail_sheet;
 mod credential_get;
 mod inbox_fixture;
 mod live_page;
+mod live_storage;
 mod press;
 mod settings;
 mod worker;
@@ -485,6 +486,13 @@ fn jar_id(jar: Jar) -> Option<u64> {
         Jar::Personal => None,
         Jar::Unrecorded(j) => Some(j),
     }
+}
+
+/// Every live page's `localStorage` in this navigatord (I6.3).
+static LIVE_STORES: std::sync::OnceLock<Arc<Mutex<live_storage::Stores>>> = std::sync::OnceLock::new();
+
+fn live_stores() -> Arc<Mutex<live_storage::Stores>> {
+    LIVE_STORES.get_or_init(|| Arc::new(Mutex::new(live_storage::Stores::new(None)))).clone()
 }
 
 static VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1341,6 +1349,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     continue;
                 }
                 state.lock().unwrap().forget(jar, site.as_deref());
+                // A live page's storage goes with the site, or with the jar.
+                match (&url, jar) {
+                    (Some(u), _) => if let Some(k) = live_storage::Key::of(jar_id(jar), u) { live_stores().lock().unwrap().forget(&k) },
+                    (None, Jar::Unrecorded(j)) => live_stores().lock().unwrap().forget_jar(j),
+                    (None, Jar::Personal) => {}
+                }
                 let Some(c) = &cookies else { continue };
                 // The jar's partition for that site, or the whole jar's prefix.
                 let (part, prefix) = match (jar, &url) {
@@ -2396,6 +2410,9 @@ fn main() {
         }
     }
     let state = Arc::new(Mutex::new(state));
+    // Live pages' storage (I6.3): beside the page store, on the persona's
+    // volume; in memory only without one.
+    let _ = LIVE_STORES.set(Arc::new(Mutex::new(live_storage::Stores::new(cfg.store.as_ref().map(|d| d.join("live-storage"))))));
     // Arca, for sites that know you. An Unrecorded jar a crash left behind
     // is forgotten now: none outlives the navigatord that made it.
     let cookies: Option<Cookies> = cfg.arca.as_ref().filter(|_| cfg.portal.is_none()).map(|(a, c)| {
@@ -2891,10 +2908,11 @@ mod island_metadata_tests {
 /// one (I6.3, D9), else the plain fetcher.
 fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4],
               cookies: Option<Cookies>, jar: Jar) -> Result<live_page::Live, String> {
+    let storage = live_page::JarStores { stores: live_stores(), jar: jar_id(jar) };
     let jar = cookies.map(|c| live_page::LiveJar::open(c, &page, jar_id(jar))).transpose()?;
     let (on_start, on_nav, on_route, on_end) = (w.clone(), w.clone(), w.clone(), w.clone());
     let (start_url, nav_url, route_url, end_url) = (page.clone(), page.clone(), page.clone(), page.clone());
-    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar,
+    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar, Some(storage),
         move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
         move |url| send(&on_nav, &Event::LiveNavigate { from: nav_url.clone(), url }),
         move |url| send(&on_route, &Event::LiveUrlChanged { from: route_url.clone(), url }),
