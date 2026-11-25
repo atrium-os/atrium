@@ -266,6 +266,7 @@ V "rm -rf $B/ui-app"
 if want inspect; then
     V "mkdir -p $B/ui-app" && scp -q $K -P 2222 "$UI/target/$TARGET/debug/ui" "$UI/src/main.rs" "$UI/atrium.toml" root@localhost:$B/ui-app/ \
         || echo "  (the inspector's dev app didn't copy)"
+    rm -rf "$UI"   # a build output in the tree: never left to be committed
 fi
 # The make rules from this tree: a base older than 2a7b458a7 builds with no
 # -g (sys.mk's CFLAGS won over a ?=), and Debug then finds no lines.
