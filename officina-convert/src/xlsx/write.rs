@@ -275,8 +275,19 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
     }
     let (fr, fc) = sh.freeze;
     let zoom = sh.zoom.clamp(officina_grid::book::ZOOM_MIN, officina_grid::book::ZOOM_MAX);
-    if (fr, fc) == (0, 0) && zoom != 100 {
-        let _ = write!(o, r#"<sheetViews><sheetView zoomScale="{zoom}" workbookViewId="0"/></sheetViews>"#);
+    // The view's own settings, as `<sheetView>` attributes.
+    let mut view = String::new();
+    if !sh.show_grid {
+        view.push_str(r#" showGridLines="0""#);
+    }
+    if !sh.show_headings {
+        view.push_str(r#" showRowColHeaders="0""#);
+    }
+    if zoom != 100 {
+        view.push_str(&format!(r#" zoomScale="{zoom}""#));
+    }
+    if (fr, fc) == (0, 0) && !view.is_empty() {
+        let _ = write!(o, r#"<sheetViews><sheetView{view} workbookViewId="0"/></sheetViews>"#);
     }
     if (fr, fc) != (0, 0) {
         let fr = fr.min(XLSX_ROWS - 1);
@@ -290,9 +301,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         // count the frozen ones from there.
         let (tr, tc) = (sh.freeze_from.0.min(fr.saturating_sub(1)), sh.freeze_from.1.min(fc.saturating_sub(1)));
         o.extend_from_slice(br#"<sheetViews><sheetView"#);
-        if zoom != 100 {
-            let _ = write!(o, r#" zoomScale="{zoom}""#);
-        }
+        o.extend_from_slice(view.as_bytes());
         o.extend_from_slice(br#" workbookViewId="0""#);
         if (tr, tc) != (0, 0) {
             let _ = write!(o, r#" topLeftCell="{}""#, a1(tr, tc));

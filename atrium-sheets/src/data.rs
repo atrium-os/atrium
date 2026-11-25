@@ -48,6 +48,10 @@ pub enum DataCmd {
     ZoomOut,
     Zoom100,
     ZoomSelection,
+    /// The sheet's gridlines, and its row and column headings, on or off
+    /// (kept with the sheet in files).
+    Gridlines,
+    Headings,
     /// The cells last copied here with rows turned into columns.
     PasteTransposed,
     /// The copied cells' comments only.
@@ -411,6 +415,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Zoom Out").shortcut("Ctrl+Alt+-"), Some(DataCmd::ZoomOut)),
         (MenuItem::new("Zoom to 100%"), Some(DataCmd::Zoom100)),
         (MenuItem::new("Zoom to Selection"), Some(DataCmd::ZoomSelection)),
+        (MenuItem::new("Gridlines").checked(wb.sheet(s).show_grid), Some(DataCmd::Gridlines)),
+        (MenuItem::new("Headings").checked(wb.sheet(s).show_headings), Some(DataCmd::Headings)),
         (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()).separated(), Some(DataCmd::FillCopy)),
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
@@ -1602,9 +1608,21 @@ fn columns_named(d: &Doc, t: &Target, rect: Rect, spec: &str) -> Result<Vec<u32>
     let mut cols = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let lower = part.to_lowercase();
-        let by_header = (rect.c0..=rect.c1).find(|&c| header(c).is_some_and(|h| !h.is_empty() && h == lower));
+        let named = |c: u32| header(c).is_some_and(|h| !h.is_empty() && h == lower);
+        let mut by_header = (rect.c0..=rect.c1).filter(|&c| named(c));
+        let (first, second) = (by_header.next(), by_header.next());
         let by_letter = officina_grid::addr::parse_col(&part.to_uppercase()).filter(|c| (rect.c0..=rect.c1).contains(c));
-        let Some(col) = by_header.or(by_letter) else {
+        let name = officina_grid::addr::col_name;
+        // A name that could mean two columns is refused before any cell changes.
+        if let (Some(a), Some(b)) = (first, second) {
+            return Err(format!("{part:?} heads columns {} and {}: type their letters instead.", name(a), name(b)));
+        }
+        if let (Some(h), Some(l)) = (first, by_letter) {
+            if h != l {
+                return Err(format!("{part:?} is column {}'s header and column {}'s letter: type {} for column {}, or column {}'s header.", name(h), name(l), name(h), name(h), name(l)));
+            }
+        }
+        let Some(col) = first.or(by_letter) else {
             return Err(format!("{part:?} isn't a column of the data: use a letter from {} to {} or a header.", officina_grid::addr::col_name(rect.c0), officina_grid::addr::col_name(rect.c1)));
         };
         if !cols.contains(&col) {
@@ -2086,11 +2104,53 @@ pub fn keep_values(d: &mut Doc, row: u32, col: u32, keep: Vec<String>, every: bo
 }
 
 /// The conditions a filter column offers besides picking values (index 0).
-pub const FILTER_CONDS: [&str; 19] = [
+pub const FILTER_CONDS: [&str; 21] = [
     "Values", "Equals", "Does not equal", "Greater than", "Greater than or equal to", "Less than", "Less than or equal to", "Between",
     "Top", "Bottom", "Top %", "Bottom %", "Begins with", "Ends with", "Contains", "Does not contain",
-    "Above average", "Below average", "Date is",
+    "Above average", "Below average", "Date is", "Fill colour is", "Text colour is",
 ];
+
+/// The [`FILTER_CONDS`] indexes of "Fill colour is" and "Text colour is":
+/// a choice of [`column_colors`], held as [`color_text`].
+pub const FILL_COND: usize = 19;
+pub const FONT_COND: usize = 20;
+/// The most colours the choice offers, and the most rows read for them.
+pub const MAX_COLORS: usize = 16;
+const COLOR_ROWS: u32 = 100_000;
+
+/// A colour choice as the panel holds it: `RRGGBB`, or `none` (no fill,
+/// automatic text).
+pub fn color_text(c: Option<u32>) -> String {
+    c.map_or("none".into(), |c| format!("{:06X}", c & 0xFF_FFFF))
+}
+
+/// A colour's name in the choice: a named one, or its hex.
+pub fn color_label(c: Option<u32>, fill: bool) -> String {
+    match c {
+        None => if fill { "No fill" } else { "Automatic" }.into(),
+        Some(c) => crate::format::LIGHT_COLORS.iter().map(|&(v, n)| (v, n)).chain(crate::tabs::COLORS.iter().map(|&(v, n)| (v, n))).find(|x| x.0 == c).map_or(format!("#{:06X}", c & 0xFF_FFFF), |x| x.1.to_string()),
+    }
+}
+
+/// The fill (or text) colours shown in the filter column at (`row`,
+/// `col`), in the order met: at most [`MAX_COLORS`], from its first
+/// 100,000 rows. Patterned fills match no colour and are left out.
+pub fn column_colors(d: &Doc, row: u32, col: u32, fill: bool) -> Vec<Option<u32>> {
+    let Some(scope) = filter_scope(d, row, col) else { return Vec::new() };
+    let (rect, first) = (scope.rect(), scope.first());
+    let mut out = Vec::new();
+    for r in first..=rect.r1.min(first.saturating_add(COLOR_ROWS - 1)) {
+        if let Some(c) = officina_grid::filter::shown_color(&d.wb, CellAddr::new(d.sheet, r, col), fill) {
+            if !out.contains(&c) {
+                out.push(c);
+                if out.len() == MAX_COLORS {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
 
 /// The [`FILTER_CONDS`] index of "Date is": a choice of [`DATE_RULES`].
 pub const DATE_COND: usize = 18;
@@ -2112,7 +2172,7 @@ pub const DATE_RULES: [(&str, &str); 32] = [
 /// Whether condition `kind` of [`FILTER_CONDS`] takes a typed value
 /// (Date is takes a choice instead).
 pub fn filter_cond_typed(kind: usize) -> bool {
-    !matches!(kind, 0 | 16 | 17 | DATE_COND)
+    !matches!(kind, 0 | 16 | 17 | DATE_COND | FILL_COND | FONT_COND)
 }
 
 /// Condition `kind` of [`FILTER_CONDS`] with what was typed for it (`b` only for
@@ -2125,6 +2185,14 @@ pub fn filter_cond(kind: usize, a: &str, b: &str) -> Result<Cond, String> {
     }
     if kind == DATE_COND {
         return DATE_RULES.iter().find(|(_, n)| *n == a).and_then(|(_, n)| officina_grid::filter::DynamicDate::parse(n, None)).map(Cond::DynamicDate).ok_or_else(|| "Choose a date.".into());
+    }
+    if matches!(kind, FILL_COND | FONT_COND) {
+        let rgb = match a {
+            "none" => None,
+            hex if hex.len() == 6 => Some(u32::from_str_radix(hex, 16).map_err(|_| "Choose a colour.")?),
+            _ => return Err("Choose a colour.".into()),
+        };
+        return Ok(Cond::Appearance(officina_grid::filter::AppearanceFilter::Color(officina_grid::filter::ColorFilter { cell: kind == FILL_COND, rgb })));
     }
     if a.is_empty() || (kind == 7 && b.is_empty()) {
         return Err("Type a value for the condition.".into());
@@ -2172,6 +2240,7 @@ pub fn cond_fields(c: &Cond) -> Option<(usize, String, String)> {
         Cond::Rank(r) => Some((8 + 2 * usize::from(r.percent) + usize::from(r.bottom), r.limit().to_string(), String::new())),
         Cond::Average { below } => Some((16 + usize::from(*below), String::new(), String::new())),
         Cond::DynamicDate(r) => Some((DATE_COND, r.name().to_string(), String::new())),
+        Cond::Appearance(officina_grid::filter::AppearanceFilter::Color(c)) => Some((if c.cell { FILL_COND } else { FONT_COND }, color_text(c.rgb), String::new())),
         Cond::Custom(t, _) if t.len() == 1 => match &t[0] {
             Test::Text(t) if !t.case_sensitive => {
                 let k = match t.op {
@@ -2773,6 +2842,20 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if cmd == DataCmd::CalculateNow { "Calculated every sheet.".into() } else { "Calculated this sheet.".into() })
         }
         DataCmd::InsertFunction | DataCmd::PasteName | DataCmd::Precedents | DataCmd::Dependents => Ok(String::new()),
+        DataCmd::Gridlines | DataCmd::Headings => {
+            let sheet = d.sheet;
+            let sh = d.wb.sheet_mut(sheet);
+            let (on, what) = if cmd == DataCmd::Gridlines {
+                sh.show_grid = !sh.show_grid;
+                (sh.show_grid, "Gridlines")
+            } else {
+                sh.show_headings = !sh.show_headings;
+                (sh.show_headings, "Headings")
+            };
+            // A view setting: not an undo step, but the file keeps it.
+            d.dirty = true;
+            Ok(format!("{what} {}.", if on { "shown" } else { "hidden" }))
+        }
         DataCmd::ShowFormulas => {
             d.show_formulas = !d.show_formulas;
             Ok(if d.show_formulas { "Formulas are shown in their cells.".into() } else { "Values are shown in their cells.".into() })

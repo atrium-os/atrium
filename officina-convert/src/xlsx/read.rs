@@ -418,6 +418,9 @@ struct Seg {
     view_top: (u32, u32),
     /// The `<sheetView zoomScale>`, when in Excel's 10–400.
     zoom: Option<u16>,
+    /// `<sheetView showGridLines="0">` and `showRowColHeaders="0"`.
+    no_grid: bool,
+    no_headings: bool,
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
@@ -729,6 +732,9 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
             b"sheetView" => {
                 seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0));
                 seg.zoom = attr(&e, b"zoomScale")?.and_then(|v| v.parse::<u16>().ok()).filter(|z| (officina_grid::book::ZOOM_MIN..=officina_grid::book::ZOOM_MAX).contains(z));
+                let off = |v: Option<String>| v.is_some_and(|v| v == "0" || v == "false");
+                seg.no_grid = off(attr(&e, b"showGridLines")?);
+                seg.no_headings = off(attr(&e, b"showRowColHeaders")?);
             }
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from
@@ -885,6 +891,12 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 }
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
+                }
+                if seg.no_grid {
+                    wb.sheet_mut(s).show_grid = false;
+                }
+                if seg.no_headings {
+                    wb.sheet_mut(s).show_headings = false;
                 }
                 if let Some(z) = seg.zoom {
                     wb.sheet_mut(s).zoom = z;

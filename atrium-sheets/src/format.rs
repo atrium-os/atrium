@@ -44,6 +44,8 @@ pub enum FormatCmd {
     /// The text's face: monospace (`true`, as Courier New in files) or the
     /// workbook's own sans.
     Mono(bool),
+    /// One of [`CELL_STYLES`]: its font, fill and borders on the selection.
+    CellStyle(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,65 @@ pub const LIGHT_COLORS: [(u32, &str); 6] = [
     (0xE4DFEC, "Light purple"),
     (0xEDEDED, "Light grey"),
 ];
+
+/// A cell style's look: what it sets, as Excel's built-in styles do. The
+/// cells keep their number format and alignment.
+#[derive(Debug, Clone, Copy)]
+pub struct Look {
+    pub fill: Option<u32>,
+    pub color: Option<u32>,
+    pub bold: bool,
+    pub italic: bool,
+    /// Points; None: the default size.
+    pub size: Option<u16>,
+    /// Left, right, top, bottom: a line and its colour.
+    pub borders: [Option<(Line, u32)>; 4],
+}
+
+const PLAIN: Look = Look { fill: None, color: None, bold: false, italic: false, size: None, borders: [None; 4] };
+const fn boxed(line: Line, c: u32) -> [Option<(Line, u32)>; 4] {
+    [Some((line, c)); 4]
+}
+const fn under(line: Line, c: u32) -> [Option<(Line, u32)>; 4] {
+    [None, None, None, Some((line, c))]
+}
+const HEAD: u32 = 0x44546A;
+const ACCENT: u32 = 0x4472C4;
+
+/// Excel's built-in cell styles (the Office theme's colours), by name.
+pub const CELL_STYLES: [(&str, Look); 16] = [
+    ("Normal", PLAIN),
+    ("Good", Look { fill: Some(0xC6EFCE), color: Some(0x006100), ..PLAIN }),
+    ("Bad", Look { fill: Some(0xFFC7CE), color: Some(0x9C0006), ..PLAIN }),
+    ("Neutral", Look { fill: Some(0xFFEB9C), color: Some(0x9C5700), ..PLAIN }),
+    ("Title", Look { color: Some(HEAD), size: Some(18), ..PLAIN }),
+    ("Heading 1", Look { color: Some(HEAD), bold: true, size: Some(15), borders: under(Line::Thick, ACCENT), ..PLAIN }),
+    ("Heading 2", Look { color: Some(HEAD), bold: true, size: Some(13), borders: under(Line::Thick, 0xA2B8E1), ..PLAIN }),
+    ("Heading 3", Look { color: Some(HEAD), bold: true, borders: under(Line::Medium, 0x8EA9DB), ..PLAIN }),
+    ("Heading 4", Look { color: Some(HEAD), bold: true, ..PLAIN }),
+    ("Total", Look { bold: true, borders: [None, None, Some((Line::Thin, ACCENT)), Some((Line::Double, ACCENT))], ..PLAIN }),
+    ("Input", Look { fill: Some(0xFFCC99), color: Some(0x3F3F76), borders: boxed(Line::Thin, 0x7F7F7F), ..PLAIN }),
+    ("Output", Look { fill: Some(0xF2F2F2), color: Some(0x3F3F3F), bold: true, borders: boxed(Line::Thin, 0x3F3F3F), ..PLAIN }),
+    ("Calculation", Look { fill: Some(0xF2F2F2), color: Some(0xFA7D00), bold: true, borders: boxed(Line::Thin, 0x7F7F7F), ..PLAIN }),
+    ("Check Cell", Look { fill: Some(0xA5A5A5), color: Some(0xFFFFFF), bold: true, borders: boxed(Line::Double, 0x3F3F3F), ..PLAIN }),
+    ("Note", Look { fill: Some(0xFFFFCC), borders: boxed(Line::Thin, 0xB2B2B2), ..PLAIN }),
+    ("Warning Text", Look { color: Some(0xFF0000), ..PLAIN }),
+];
+
+/// `st` in cell style `look`: its font, fill and borders replaced; the
+/// number format, alignment, wrapping, indent, rotation and protection kept.
+pub fn styled(st: &Style, look: &Look) -> Style {
+    let edge = |e: Option<(Line, u32)>| e.map_or(Edge::default(), |(line, c)| Edge { line, color: Some(c) });
+    Style {
+        font: officina_grid::style::Font { color: look.color, bold: look.bold, italic: look.italic, size: look.size.filter(|&p| p != 11).map(|p| p * 20), ..Default::default() },
+        fill: look.fill,
+        pattern: None,
+        gradient: None,
+        borders: look.borders.map(edge),
+        diagonals: [Edge::default(); 2],
+        ..st.clone()
+    }
+}
 
 /// Font sizes Larger and Smaller step through, points.
 /// The font name Font: Mono gives cells, as files keep it.
@@ -154,6 +215,10 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         v.push((item, Some(FormatCmd::Rotate(*deg))));
     }
     v.push((MenuItem::new("Rotation Angle…").radio(!ROTATIONS.iter().any(|r| r.1 == st.rotation)), Some(FormatCmd::Angle)));
+    for (i, (name, look)) in CELL_STYLES.iter().enumerate() {
+        let item = MenuItem::new(format!("Cell Style: {name}")).radio(styled(st, look) == *st);
+        v.push((if i == 0 { item.separated() } else { item }, Some(FormatCmd::CellStyle(i))));
+    }
     v
 }
 
@@ -280,6 +345,11 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
         FormatCmd::Mono(mono) => {
             one(d, "Font", &|st| { let mut st = st.clone(); st.font.name = mono.then(|| MONO_FONT.into()); st });
             Ok(if mono { format!("Text is in a monospace font ({MONO_FONT}).") } else { "Text is in the workbook's own font.".into() })
+        }
+        FormatCmd::CellStyle(i) => {
+            let (name, look) = *CELL_STYLES.get(i).ok_or("Unknown cell style.")?;
+            one(d, "Cell Style", &|st| styled(st, &look));
+            Ok(format!("Cell style {name}."))
         }
         // The window opens the bar.
         FormatCmd::Colors(_) => Ok(String::new()),

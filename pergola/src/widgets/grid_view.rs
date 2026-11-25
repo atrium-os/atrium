@@ -360,6 +360,15 @@ pub trait GridSource {
     fn zoom(&self) -> f32 {
         1.0
     }
+    /// Whether the cells show gridlines (Excel's View > Gridlines).
+    fn show_grid(&self) -> bool {
+        true
+    }
+    /// Whether the row and column headings show (View > Headings). Without
+    /// them the cells start at the view's top left.
+    fn show_headings(&self) -> bool {
+        true
+    }
     /// Today's date (or, `time`, the time now) as typed into a cell, for
     /// Ctrl+; and Ctrl+Shift+;. None: the keys do nothing.
     fn now_text(&self, _time: bool) -> Option<String> {
@@ -994,6 +1003,13 @@ impl GridView {
         ((digits * TEXT_SIZE * 0.62 + 2.0 * PAD + 6.0) * header_scale(zoom)).ceil()
     }
 
+    /// The row headings' width and the column headings' height for `src`
+    /// with rows up to `last`: scaled with its zoom, or none when it hides
+    /// its headings.
+    pub fn headings_size(src: &dyn GridSource, last: u32) -> (f32, f32) {
+        if src.show_headings() { (Self::header_width_at(last, src.zoom()), header_height(src.zoom())) } else { (0.0, 0.0) }
+    }
+
     /// The tiles to send for a view at (`x`, `y`) of `w` × `h` px: those
     /// it touches plus one each side, as (first tile row, last), (first
     /// tile column, last).
@@ -1025,8 +1041,8 @@ impl GridView {
         let (tiles_r, _) = Self::tiles(&*src, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
         // Headers scale with the zoom, within half to twice their size.
         let hs = header_scale(src.zoom());
-        let header_w = Self::header_width_at((tiles_r.1 + 1) * TILE_ROWS, src.zoom());
-        let header_h = header_height(src.zoom());
+        let headings = src.show_headings();
+        let (header_w, header_h) = Self::headings_size(&*src, (tiles_r.1 + 1) * TILE_ROWS);
         let body = Rect::new(r.x() + header_w, r.y() + header_h, (r.w() - header_w).max(0.0), (r.h() - header_h).max(0.0));
         let frozen = src.frozen();
         let frozen = (frozen.0.min(rows), frozen.1.min(cols));
@@ -1459,7 +1475,7 @@ impl GridView {
         ctx.key(self.key + 1);
         let ch_rect = Rect::new(body.x(), r.y(), body.w(), header_h);
         let colh = ctx.push(Node::Scroll { rect: ch_rect, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: (x - bx) as f32, content_w: 0.0 });
-        {
+        if headings {
             ctx.key(1);
             let page = ctx.push(Node::vstack(Rect::new(ch_rect.x(), ch_rect.y(), ((ext[0] - bx).clamp(0.0, 3.0 * REBASE)) as f32, header_h), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
@@ -1599,7 +1615,7 @@ impl GridView {
         ctx.key(self.key + 2);
         let rh_rect = Rect::new(r.x(), body.y(), header_w, body.h());
         let rowh = ctx.push(Node::Scroll { rect: rh_rect, offset: (y - by) as f32, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
-        {
+        if headings {
             ctx.key(1);
             let page = ctx.push(Node::vstack(Rect::new(rh_rect.x(), rh_rect.y(), header_w, ((ext[1] - by).clamp(0.0, 3.0 * REBASE)) as f32), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
@@ -1739,7 +1755,7 @@ impl GridView {
         }
 
         // ---- the frozen columns' and rows' labels, kept in view ----
-        if fz[0] > 0.0 && frozen.1 > 0 {
+        if headings && fz[0] > 0.0 && frozen.1 > 0 {
             ctx.key(self.key + 6);
             let fr = Rect::new(body.x(), r.y(), fz[0] as f32, header_h);
             let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
@@ -1762,7 +1778,7 @@ impl GridView {
             let d = col_drag.clone();
             ctx.on_drag(id, move |ph, p| d(ph, p));
         }
-        if fz[1] > 0.0 && frozen.0 > 0 {
+        if headings && fz[1] > 0.0 && frozen.0 > 0 {
             ctx.key(self.key + 7);
             let fr = Rect::new(r.x(), body.y(), header_w, fz[1] as f32);
             let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
@@ -1957,6 +1973,7 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
 /// meeting them, placed by `at`, in groups keyed by tile as the body's.
 fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, rr: (u32, u32), cr: (u32, u32), at: &dyn Fn(f64, f64) -> (f32, f32)) {
     let line = t.border_default();
+    let grid = src.show_grid();
     let mut spills: Vec<(u32, u32, (u32, u32), CellView)> = Vec::new();
     for tr in rr.0 / TILE_ROWS..=rr.1 / TILE_ROWS {
         for tc in cr.0 / TILE_COLS..=cr.1 / TILE_COLS {
@@ -1971,7 +1988,9 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
             ctx.set_flex(tile, FlexStyle { free: true, ..FlexStyle::default() });
             for row in r0..=r1 {
                 let (_, yb) = at(left, src.row_top(row + 1));
-                ctx.add(Node::Rect { rect: Rect::new(tx, yb - 1.0, tw, 1.0), fill: line, radius: 0.0 });
+                if grid {
+                    ctx.add(Node::Rect { rect: Rect::new(tx, yb - 1.0, tw, 1.0), fill: line, radius: 0.0 });
+                }
             }
             let mut columns = Vec::with_capacity((c1 - c0 + 1) as usize);
             let mut xl = left;
@@ -1979,8 +1998,10 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
                 let xr = src.col_left(col + 1);
                 if xr > xl {
                     columns.push((col, xl, xr));
-                    let (x, _) = at(xr, top);
-                    ctx.add(Node::Rect { rect: Rect::new(x - 1.0, ty, 1.0, th), fill: line, radius: 0.0 });
+                    if grid {
+                        let (x, _) = at(xr, top);
+                        ctx.add(Node::Rect { rect: Rect::new(x - 1.0, ty, 1.0, th), fill: line, radius: 0.0 });
+                    }
                 }
                 xl = xr;
             }
@@ -3310,11 +3331,13 @@ mod tests {
         /// Pressable floats: key and where.
         buttons: RefCell<Vec<(u64, [f64; 4])>>,
         fills: std::cell::Cell<bool>,
+        /// Gridlines and headings shown.
+        view: std::cell::Cell<(bool, bool)>,
     }
 
     impl Sheet {
         fn new(rows: u32, cols: u32) -> Self {
-            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), from: Default::default(), buttons: Default::default(), fills: Default::default() }
+            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), from: Default::default(), buttons: Default::default(), fills: Default::default(), view: std::cell::Cell::new((true, true)) }
         }
         fn w(&self, c: u32) -> f64 {
             *self.widths.borrow().get(&c).unwrap_or(&64.0)
@@ -3387,6 +3410,12 @@ mod tests {
         }
         fn fills(&self) -> bool {
             self.fills.get()
+        }
+        fn show_grid(&self) -> bool {
+            self.view.get().0
+        }
+        fn show_headings(&self) -> bool {
+            self.view.get().1
         }
         fn floats(&self, _view: [f64; 4], _theme: &crate::theme::Semantic) -> Vec<GridFloat> {
             self.buttons.borrow().iter().map(|&(key, at)| GridFloat { key, at, nodes: Rc::new(vec![Node::Rect { rect: Rect::new(0.0, 0.0, at[2] as f32, at[3] as f32), fill: Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 0.0 }]), movable: false, pressable: true }).collect()
@@ -4091,6 +4120,31 @@ mod tests {
         let zooms: Vec<f32> = log.borrow().iter().filter_map(|a| if let GridAction::Zoom(f) = a { Some(*f) } else { None }).collect();
         assert_eq!(zooms.len(), 2, "{:?}", log.borrow());
         assert!(zooms[0] > 1.0 && zooms[1] < 1.0, "{zooms:?}");
+    }
+
+    #[test]
+    fn gridlines_and_headings_can_be_turned_off() {
+        let (mut app, grid, scroll, state, _) = host(100, 20);
+        app.tick();
+        let thin = |app: &App<Host>| app.tree().iter().filter(|(_, n)| matches!(n, Node::Rect { rect, .. } if rect.w() == 1.0 || rect.h() == 1.0)).count();
+        let label = |app: &App<Host>, l: &str| app.tree().iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content.as_str() == l));
+        let lines = thin(&app);
+        assert!(label(&app, "B"), "column B's heading shows");
+        grid.view.set((false, true));
+        scroll.set(scroll.get());
+        app.tick();
+        assert!(thin(&app) * 4 < lines, "gridlines gone: {} of {lines}", thin(&app));
+        assert!(label(&app, "B"));
+        grid.view.set((false, false));
+        scroll.set(scroll.get());
+        app.tick();
+        assert!(!label(&app, "B"), "no headings");
+        // The cells start at the view's top left: B2 is at (64, 20).
+        let p = Point::new(64.0 + 10.0, 20.0 + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        app.tick();
+        assert_eq!(state.get_cloned().cursor, (1, 1));
     }
 
     #[test]
