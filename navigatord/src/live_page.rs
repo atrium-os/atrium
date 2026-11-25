@@ -690,13 +690,11 @@ pub fn address_change(page: Option<&str>, to: &str) -> Option<String> {
     (page.and_then(crate::origin).is_some() && page.and_then(crate::origin) == crate::origin(&to)).then_some(to)
 }
 
-/// How a page may open windows beside it: at most one a second and
-/// [`Beside::MAX`] in a run. The engine's word that the person pressed is
-/// all navigatord has, so these bound what a hostile page can add to the
-/// trail.
+/// How a page may open windows beside it (I6.8): each on a press of the
+/// person's in the page that frescod routed and Limen spends, so one press
+/// opens at most one, and at most [`Beside::MAX`] in a run besides.
 #[derive(Default)]
 pub struct Beside {
-    last: Option<std::time::Instant>,
     opened: usize,
     /// The refusals the UI was told of: each once a run (its popover
     /// merges repeats anyway), the rest only logged.
@@ -704,12 +702,12 @@ pub struct Beside {
 }
 
 impl Beside {
-    pub const GAP: std::time::Duration = std::time::Duration::from_secs(1);
-    pub const MAX: usize = 16;
-    pub fn allow(&mut self, now: std::time::Instant) -> Result<(), &'static str> {
-        if self.opened >= Self::MAX { return Err("a new window past the run's 16"); }
-        if self.last.is_some_and(|last| now.saturating_duration_since(last) < Self::GAP) { return Err("a new window, too soon after the last"); }
-        self.last = Some(now);
+    pub const MAX: usize = 64;
+    /// `spend_press` asks Limen to spend the person's press in the page;
+    /// it is asked last, so a window refused anyway spends none.
+    pub fn allow(&mut self, spend_press: impl FnOnce() -> bool) -> Result<(), &'static str> {
+        if self.opened >= Self::MAX { return Err("a new window past the run's 64"); }
+        if !spend_press() { return Err("a new window with no press in the page"); }
         self.opened += 1;
         Ok(())
     }
@@ -1163,11 +1161,14 @@ impl Live {
                         // (`ContinueLive`), in the document lane if not. Within
                         // the origin it is looked at through the jar first, off
                         // this thread: a file is offered, not run (I6.4).
-                        // A new window (I6.2): beside the page in the trail, at
-                        // most one a second, since the engine's word that the
-                        // person pressed is all there is.
+                        // A new window (I6.2): beside the page in the trail, on
+                        // a real press in the page, spent (I6.8): the engine's
+                        // word that the person pressed is not proof.
                         Some(Report::OpenBeside(to)) => match navigation(page.as_deref(), to) {
-                            Some(to) => match beside.allow(std::time::Instant::now()) {
+                            Some(to) => match beside.allow(|| match connection.spend_press(embed) {
+                                Ok(()) => true,
+                                Err(e) => { eprintln!("navigatord: no press to spend for a new window: {e:?}"); false }
+                            }) {
                                 Ok(()) => tell.open_beside(to),
                                 Err(why) => {
                                     eprintln!("navigatord: a live page's new window refused: {why} ({})", crate::refused_target(&to));
@@ -1708,19 +1709,17 @@ mod tests {
     }
 
     #[test]
-    fn a_page_opens_at_most_one_window_beside_it_a_second() {
+    fn a_page_opens_a_window_beside_it_only_on_a_spent_press() {
         let mut b = Beside::default();
-        let t = std::time::Instant::now();
-        assert!(b.allow(t).is_ok());
-        assert!(b.allow(t + std::time::Duration::from_millis(500)).is_err());
-        assert!(b.allow(t + Beside::GAP).is_ok());
-        assert!(b.allow(t).is_err(), "a clock that went back counts as no time at all");
-        // At most 16 in a run, however slowly.
+        assert_eq!(b.allow(|| false), Err("a new window with no press in the page"));
+        assert!(b.allow(|| true).is_ok());
+        assert!(b.allow(|| true).is_ok(), "two presses, two windows, however close");
+        // At most MAX in a run, and past it no press is spent.
         let mut b = Beside::default();
-        for i in 0..Beside::MAX as u32 { assert!(b.allow(t + Beside::GAP * i).is_ok()); }
-        assert_eq!(b.allow(t + Beside::GAP * 100), Err("a new window past the run's 16"));
-        assert!(b.first("a new window past the run's 16"));
-        assert!(!b.first("a new window past the run's 16"), "the UI is told once a run");
+        for _ in 0..Beside::MAX { assert!(b.allow(|| true).is_ok()); }
+        assert_eq!(b.allow(|| panic!("spent a press on a refused window")), Err("a new window past the run's 64"));
+        assert!(b.first("a new window past the run's 64"));
+        assert!(!b.first("a new window past the run's 64"), "the UI is told once a run");
     }
 
     /// A run's `Tell` that keeps what it was told was refused.

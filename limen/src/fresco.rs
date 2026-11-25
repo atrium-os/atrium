@@ -105,6 +105,22 @@ impl Compositor for Frescod {
         }
     }
 
+    fn spend_press(&mut self, window: WindowToken, ms: u32) -> bool {
+        let q = PressedQuery { window, within_ms: ms.min(slot::PRESSED_MAX_MS) };
+        match self.call::<_, PressedResult>(slot::op::SPEND_PRESS, &q) {
+            Ok(PressedResult::Ok { pressed }) => pressed,
+            Ok(PressedResult::Refused { reason }) => {
+                eprintln!("limend: frescod refused the press spend ({reason})");
+                false
+            }
+            Err(e) => {
+                eprintln!("limend: frescod press spend: {e}");
+                self.conn = None;
+                false
+            }
+        }
+    }
+
     /// Unbind but keep shown (`keep_shown`), for Forum's `pip` layer.
     fn release(&mut self, parent: WindowToken, child: WindowToken) -> Result<(), u8> {
         // The kind and z don't matter for an unbind.

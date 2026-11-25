@@ -2550,6 +2550,13 @@ pub mod slot {
         /// A byte of value 1 means the compositor's Stop control was pressed.
         /// Unbinding or destroying the window closes the stream.
         pub const WATCH_ISLAND_STOP: u16 = 0x0913;
+        /// `PressedQuery` → `PressedResult`; slot allowlist only: as
+        /// `PRESSED`, and a press that answers yes is spent, so the next
+        /// ask is yes only after another real press reaches the window.
+        /// limend's proof for an island's parent that the person pressed
+        /// in the island (navigator-islands.md I6.8: a live page's new
+        /// window), one action per press.
+        pub const SPEND_PRESS: u16 = 0x0914;
     }
 
     /// The longest look back `PressedQuery` takes.

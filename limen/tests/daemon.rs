@@ -56,6 +56,13 @@ impl Compositor for Fresco {
         assert_eq!(ms, catalogue::PIP_GESTURE_MS);
         self.1.lock().unwrap().pressed.contains(&w)
     }
+    fn spend_press(&mut self, w: WindowToken, ms: u32) -> bool {
+        assert_eq!(ms, catalogue::ISLAND_PRESS_MS);
+        let mut g = self.1.lock().unwrap();
+        let before = g.pressed.len();
+        g.pressed.retain(|&p| p != w);
+        g.pressed.len() != before
+    }
     fn release(&mut self, _p: WindowToken, c: WindowToken) -> Result<(), u8> {
         self.1.lock().unwrap().released.push(c);
         Ok(())
@@ -859,6 +866,51 @@ fn only_settings_opens_an_apps_own_pane_and_the_launcher_decides_the_persona() {
 }
 
 #[test]
+fn a_plugin_is_any_app_the_parent_names_that_is_one_for_its_person() {
+    let w = World::new();
+    w.shared.set_plugin_check(Box::new(|person: &str, app: &str| person == "ana" && ["org.example.notes", "org.example.map"].contains(&app)));
+    let mut app = w.parent(APP);
+    // Never from a plain request, and only apps that are plugins, by names
+    // limend can check.
+    assert_eq!(refused(app.request("editor-extension", W_APP)), refusal::NO_PROVIDER);
+    assert_eq!(refused(app.request_plugin(W_APP, "org.example.player")), refusal::NO_PLUGIN);
+    assert_eq!(refused(app.request_plugin(W_APP, "../org.example.notes")), refusal::NO_PLUGIN);
+    assert_eq!(refused(app.request_plugin(W_APP, "")), refusal::NO_PLUGIN);
+
+    // Two plugins side by side, each started as itself.
+    let a = app.request_plugin(W_APP, "org.example.notes").unwrap();
+    let (spawned, mut notes) = w.spawned();
+    assert_eq!(a, spawned);
+    assert_eq!(next_c(&mut notes), ChildEvent::Attach { embed: a, role: "editor-extension".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    let b = app.request_plugin(W_APP, "org.example.map").unwrap();
+    let (spawned, _map) = w.spawned();
+    assert_eq!(b, spawned);
+    assert_ne!(a, b);
+    // But one of each per window.
+    assert_eq!(refused(app.request_plugin(W_APP, "org.example.notes")), refusal::TOO_MANY);
+
+    // LSP travels without a panel; a panel is the plugin's window, bound
+    // in a plain slot.
+    let init = limen::editor_ext::ToChild::Init(limen::editor_ext::Init { languages: vec!["rust".into()], workspace: "hello".into(), read: false });
+    app.send(a, init.encode()).unwrap();
+    assert_eq!(next_c(&mut notes), ChildEvent::Message { embed: a, bytes: init.encode() });
+    for part in limen::editor_ext::split(br#"{"jsonrpc":"2.0","id":1,"result":null}"#, false).unwrap() {
+        notes.emit(a, part.clone()).unwrap();
+        assert_eq!(next_p(&mut app), ParentEvent::Message { embed: a, bytes: part });
+    }
+    notes.ready(a, W_NOTES).unwrap();
+    app.place(a, RECT).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: a });
+    assert!(w.fresco.binds().iter().any(|x| x.0 == W_APP && x.1 == W_NOTES && x.2 == SlotKind::Plain));
+
+    // Once it is gone the same plugin can start again (Restart).
+    app.detach(a).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: a });
+    let c = app.request_plugin(W_APP, "org.example.notes").unwrap();
+    assert_eq!(w.spawned().0, c);
+}
+
+#[test]
 fn a_choice_in_another_persona_goes_to_the_launcher_which_decides() {
     let w = World::new();
     w.shared.set_target_check(Box::new(|person: &str, app: &str| person == "ana" && app == "org.example.notes"));
@@ -1026,6 +1078,33 @@ fn delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine() {
     ui.detach(doc).unwrap();
     let broker = w.parent(4101).request_island(W_APP, 1).unwrap();
     assert_ne!(doc, broker);
+}
+
+#[test]
+fn an_islands_parent_spends_a_press_in_the_island_once() {
+    let w = World::new();
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    w.fresco.0.lock().unwrap().0.insert(W_APP, 4101);
+    let mut app = w.parent(4101);
+    let id = app.request_island(W_APP, 1).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::IslandFetch { embed: id });
+    let _fetch = app.take_island_fetch(id).unwrap();
+    let (_, mut child) = w.spawned();
+    let _ = next_c(&mut child);
+    w.fresco.1.lock().unwrap().pressed.push(W_VIEWER);
+    assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS, "not bound yet");
+    app.place(id, Some([0., 0., 640., 360.])).unwrap();
+    child.ready(id, W_VIEWER).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: id });
+    assert_eq!(refused(w.parent(OTHER).spend_press(id)), refusal::NOT_YOURS);
+    assert_eq!(refused(app.spend_press(id + 1)), refusal::NOT_YOURS);
+    app.spend_press(id).unwrap();
+    assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS, "spent");
+    // A press on the parent's own window is not the island's.
+    w.fresco.1.lock().unwrap().pressed.push(W_APP);
+    assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS);
+    w.fresco.1.lock().unwrap().pressed.push(W_VIEWER);
+    app.spend_press(id).unwrap();
 }
 
 #[test]

@@ -47,6 +47,12 @@ pub trait Compositor: Send {
         false
     }
 
+    /// As [`Self::pressed_within`], spending the press: the next ask is
+    /// no until another press. No frescod support: never.
+    fn spend_press(&mut self, _window: WindowToken, _ms: u32) -> bool {
+        false
+    }
+
     /// Take `child` out of `parent`'s slot but keep it shown, for Forum to
     /// place in the `pip` layer. A later `bind` puts it back.
     fn release(&mut self, _parent: WindowToken, _child: WindowToken) -> Result<(), u8> {
@@ -161,6 +167,8 @@ struct Embed {
     legacy_selection_sent: bool,
     smime_scope: Option<Option<String>>,
     smime_picker: Option<SmimePicker>,
+    /// `REQUEST_PLUGIN`: the plugin's app id.
+    plugin: Option<String>,
     to_child: Rate,
     to_parent: Rate,
 }
@@ -290,6 +298,8 @@ pub struct Shared {
     target_check: Mutex<Option<TargetCheck>>,
     /// Without one (tests), any app has a settings pane.
     pane_check: Mutex<Option<PaneCheck>>,
+    /// Without one (tests), any app is a plugin.
+    plugin_check: Mutex<Option<PaneCheck>>,
 }
 
 impl Shared {
@@ -313,6 +323,7 @@ impl Shared {
             embed_check: Mutex::new(None),
             target_check: Mutex::new(None),
             pane_check: Mutex::new(None),
+            plugin_check: Mutex::new(None),
         })
     }
 
@@ -370,6 +381,12 @@ impl Shared {
     /// manifests' `[roles] implements` ([`crate::manifests::Installed::may_provide`]).
     pub fn set_pane_check(&self, c: PaneCheck) {
         *self.pane_check.lock().unwrap() = Some(c);
+    }
+
+    /// Which apps are plugins (`editor-extension`) for a person: limend's
+    /// is the installed manifests' `[roles] implements`.
+    pub fn set_plugin_check(&self, c: PaneCheck) {
+        *self.plugin_check.lock().unwrap() = Some(c);
     }
 
     /// Live embeds (tests and logs).
@@ -458,6 +475,11 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 request(shared, conn, uid, proto::Request { role: "app-settings".into(), window: a.window, z: a.z },
                         Via::Pane { app: a.app, persona: a.persona })
             }
+            op::REQUEST_PLUGIN => {
+                let p: proto::Plugin = de(payload)?;
+                request(shared, conn, uid, proto::Request { role: "editor-extension".into(), window: p.window, z: p.z },
+                        Via::Plugin { app: p.app })
+            }
             op::REQUEST_SMIME_PICKER => {
                 let (sheet, window) = de(payload)?;
                 request_smime_picker(shared, conn, uid, sheet, window)
@@ -515,6 +537,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 emit(shared, conn, m, Some(fd))
             }
             op::PIP => pip(shared, conn, de(payload)?),
+            op::SPEND_PRESS => spend_press(shared, conn, de(payload)?),
             op::CHOOSE => choose(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
@@ -553,10 +576,13 @@ enum Via {
     Island(Island),
     /// `REQUEST_APP_SETTINGS`: the app and persona Curia named.
     Pane { app: String, persona: String },
+    /// `REQUEST_PLUGIN`: the plugin the parent named.
+    Plugin { app: String },
 }
 
 fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, via: Via) -> Result<Reply, Reply> {
     let island = match via { Via::Island(i) => Some(i), _ => None };
+    let plugin = match &via { Via::Plugin { app } => Some(app.clone()), _ => None };
     let pane = match via { Via::Pane { app, persona } => Some((app, persona)), _ => None };
     let with_fetch = island.is_some();
     let refuse = |reason| Err(Reply::Refused { reason });
@@ -580,7 +606,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
     };
     // A chosen role needs no `embeds` of its own: the choice can only come
     // from a share sheet the parent opened, which did need it.
-    if let (Provider::System(_) | Provider::Worker(_) | Provider::User | Provider::Named, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
+    if let (Provider::System(_) | Provider::Worker(_) | Provider::User | Provider::Named | Provider::Plugin, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
         if !print_pin && !check(&app, role.name) {
             eprintln!("limend: {app} (uid {uid}) may not embed {}: not in its manifest's embeds", role.name);
             return refuse(refusal::NOT_EMBEDDABLE);
@@ -588,8 +614,17 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
     }
     // A pane: only Settings asks, only through its own op, and only for an
     // app that has one for this person; the launcher decides the persona.
-    if (role.provider == Provider::Named) != pane.is_some() {
+    if (role.provider == Provider::Named) != pane.is_some() || (role.provider == Provider::Plugin) != plugin.is_some() {
         return refuse(refusal::NO_PROVIDER);
+    }
+    // A plugin: any the parent names, if it is one for the parent's person.
+    if let Some(named) = &plugin {
+        let ok = crate::manifests::plausible_id(named)
+            && shared.plugin_check.lock().unwrap().as_ref().is_none_or(|check| check(&user, named));
+        if !ok {
+            eprintln!("limend: {app} (uid {uid}) asked for plugin {named:?}: not one");
+            return refuse(refusal::NO_PLUGIN);
+        }
     }
     if let Some((named, persona)) = &pane {
         let ok = app == catalogue::CURIA && crate::manifests::plausible_id(named) && plausible_persona(persona)
@@ -624,6 +659,12 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
     if pane.is_some() && st.embeds.values().any(|e| e.role.name == "app-settings" && e.parent_window == req.window) {
         return refuse(refusal::TOO_MANY);
     }
+    // One of each plugin per Artifex window.
+    if let Some(named) = &plugin {
+        if st.embeds.values().any(|e| e.parent == conn && e.parent_window == req.window && e.plugin.as_deref() == Some(named.as_str())) {
+            return refuse(refusal::TOO_MANY);
+        }
+    }
     if role.name == "print" {
         // One print sheet per window, and a window that keeps opening it
         // is slowed (printing.md §5.2).
@@ -657,10 +698,11 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
             Some(&(c, u)) => (c, u, false),
             None => return refuse(refusal::NO_PROVIDER),
         },
-        Provider::Worker(_) | Provider::User | Provider::Chosen | Provider::Named => {
+        Provider::Worker(_) | Provider::User | Provider::Chosen | Provider::Named | Provider::Plugin => {
             let provider = match role.provider {
                 Provider::Worker(app) => Some((app.to_string(), None)),
                 Provider::Named => pane.clone().map(|(a, p)| (a, Some(p))),
+                Provider::Plugin => plugin.clone().map(|a| (a, None)),
                 Provider::Chosen => match st.choices.remove(&conn) {
                     Some((app, persona, at)) if at.elapsed() <= Duration::from_millis(catalogue::CHOICE_MS) => Some((app, persona)),
                     _ => None,
@@ -742,7 +784,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, vi
     let e = Embed {
         role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket: None,
         child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, island: with_fetch.then(Default::default), media_ready: false, attached: false, pip: false,
-        legacy_selection_sent: false, smime_scope, smime_picker: None,
+        legacy_selection_sent: false, smime_scope, smime_picker: None, plugin: plugin.clone(),
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
@@ -890,7 +932,7 @@ fn request_smime_picker(shared: &Arc<Shared>, conn: ConnId, uid: u32, sheet: Emb
         spawned: false, audio_ticket: None, child_window: None, rect: None, visible: true,
         bound: false, binding_generation: 0, island: None, media_ready: false, attached: false, pip: false,
         legacy_selection_sent: false, smime_scope: None,
-        smime_picker: Some(SmimePicker { sheet, opened: false, delivered: false, finished: false }),
+        smime_picker: Some(SmimePicker { sheet, opened: false, delivered: false, finished: false }), plugin: None,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: "picker".into(), parent_app: catalogue::ARCA.into(), parent_uid: uid });
@@ -1179,6 +1221,26 @@ fn regular_file_size(fd: &OwnedFd) -> Option<u64> {
         return None;
     }
     u64::try_from(stat.st_size).ok()
+}
+
+/// A web island's parent spends the person's press in the island
+/// (navigator-islands.md I6.8).
+fn spend_press(shared: &Arc<Shared>, conn: ConnId, p: proto::SpendPress) -> Result<Reply, Reply> {
+    let st = shared.state.lock().unwrap();
+    let Some(e) = st.embeds.get(&p.embed).filter(|e| e.parent == conn) else {
+        return Err(Reply::Refused { reason: refusal::NOT_YOURS });
+    };
+    let child_w = match e.child_window {
+        Some(w) if e.island.is_some() && e.bound => w,
+        _ => return Err(Reply::Refused { reason: refusal::NO_PRESS }),
+    };
+    // Only a press in the island itself: one on the parent's own chrome
+    // is not the page's.
+    if shared.compositor.lock().unwrap().spend_press(child_w, catalogue::ISLAND_PRESS_MS) {
+        Ok(Reply::Ok)
+    } else {
+        Err(Reply::Refused { reason: refusal::NO_PRESS })
+    }
 }
 
 /// The child's PiP request (atrium-player-pip-keys.md §3).

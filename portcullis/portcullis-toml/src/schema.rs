@@ -103,6 +103,28 @@ pub struct RolesSection {
     /// (curia.md §15).
     #[serde(rename = "app-settings")]
     pub app_settings: Option<AppSettingsSection>,
+    /// `[roles.editor-extension]`: an Artifex plugin (dev-tools.md §3.8).
+    #[serde(rename = "editor-extension")]
+    pub editor_extension: Option<EditorExtensionSection>,
+}
+
+/// `[roles.editor-extension]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorExtensionSection {
+    /// Artifex's language names it is started for (`rust`, `c`,
+    /// `markdown`), or `*` for every file.
+    pub languages: Vec<String>,
+    /// Its commands' ids, shown in the Plugins view before it is switched
+    /// on; the palette shows only these.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// Its panel's title, if it draws one.
+    pub panel: Option<String>,
+    /// Asks for the workspace read-only at `/work` (D28), granted per
+    /// workspace when the person switches it on.
+    #[serde(default, rename = "workspace-read")]
+    pub workspace_read: bool,
 }
 
 /// A settings pane's `data`: a relative folder of 1 to 8 plain names

@@ -264,6 +264,9 @@ enum Pending {
 pub struct Client {
     local_root: PathBuf,
     remote_root: String,
+    /// `file://` for a workspace server; `artifex://` for a plugin, which
+    /// names files by their path in `work` (dev-tools.md §3.8).
+    scheme: &'static str,
     next_id: i64,
     pending: HashMap<i64, Pending>,
     ready: bool,
@@ -290,9 +293,19 @@ impl Client {
     /// A session for the workspace whose `work` Artifex sees at
     /// `local_root` and the server at `remote_root`; queues `initialize`.
     pub fn new(local_root: &Path, remote_root: &str) -> Client {
+        Self::with_scheme(local_root, remote_root, "file://")
+    }
+
+    /// A session with a plugin: files are `artifex:///<path in work>`.
+    pub fn plugin(local_root: &Path) -> Client {
+        Self::with_scheme(local_root, "", "artifex://")
+    }
+
+    fn with_scheme(local_root: &Path, remote_root: &str, scheme: &'static str) -> Client {
         let mut c = Client {
             local_root: local_root.to_path_buf(),
             remote_root: remote_root.trim_end_matches('/').to_string(),
+            scheme,
             next_id: 1,
             pending: HashMap::new(),
             ready: false,
@@ -370,8 +383,12 @@ impl Client {
     }
 
     fn remote_uri_of_rel(&self, rel: &str) -> String {
-        let p = if rel.is_empty() { self.remote_root.clone() } else { format!("{}/{rel}", self.remote_root) };
-        format!("file://{}", encode(&p))
+        let p = match rel {
+            "" if self.remote_root.is_empty() => "/".to_string(),
+            "" => self.remote_root.clone(),
+            _ => format!("{}/{rel}", self.remote_root),
+        };
+        format!("{}{}", self.scheme, encode(&p))
     }
 
     /// The server's URI for a file Artifex has open, if it's in `work`.
@@ -382,8 +399,8 @@ impl Client {
 
     /// Artifex's path for a server URI, if it's in `work`.
     pub fn local(&self, uri: &str) -> Option<PathBuf> {
-        let p = decode(uri.strip_prefix("file://")?)?;
-        let rel = if p == self.remote_root { "" } else { p.strip_prefix(&format!("{}/", self.remote_root))? };
+        let p = decode(uri.strip_prefix(self.scheme)?)?;
+        let rel = if p == self.remote_root || p == "/" && self.remote_root.is_empty() { "" } else { p.strip_prefix(&format!("{}/", self.remote_root))? };
         if rel.split('/').any(|c| c == ".." || c == ".") {
             return None;
         }

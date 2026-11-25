@@ -126,6 +126,33 @@ pub fn validate(m: &Manifest) -> Report {
                 r.errors.push(format!("[roles.share-target].mime {t:?}: a media type (`text/plain`), a family (`image/*`) or `*/*`"));
             }
         }
+        let plugin = roles.implements.iter().any(|n| n == "editor-extension");
+        match &roles.editor_extension {
+            None if plugin => r.errors.push("\"editor-extension\" in [roles].implements without [roles.editor-extension]".into()),
+            None => {}
+            Some(_) if !plugin => r.errors.push("[roles.editor-extension] without \"editor-extension\" in [roles].implements".into()),
+            Some(x) => {
+                let id = |s: &str| !s.is_empty() && s.len() <= 64
+                    && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
+                if x.languages.is_empty() || x.languages.len() > 16 {
+                    r.errors.push(format!("[roles.editor-extension].languages: {} names, 1 to 16", x.languages.len()));
+                }
+                for l in x.languages.iter().filter(|l| *l != "*" && !id(l)) {
+                    r.errors.push(format!("[roles.editor-extension].languages {l:?}: a language name, `a-z 0-9 . - _`, or `*`"));
+                }
+                if x.commands.len() > 64 {
+                    r.errors.push(format!("[roles.editor-extension].commands: {}, at most 64", x.commands.len()));
+                }
+                for c in x.commands.iter().filter(|c| !id(c)) {
+                    r.errors.push(format!("[roles.editor-extension].commands {c:?}: `a-z 0-9 . - _`, at most 64 bytes"));
+                }
+                if let Some(t) = &x.panel {
+                    if t.trim().is_empty() || t.len() > 80 || t.chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+                        r.errors.push(format!("[roles.editor-extension].panel {t:?}: a title of 1 to 80 bytes, one line"));
+                    }
+                }
+            }
+        }
         let pane = roles.implements.iter().any(|n| n == "app-settings");
         match &roles.app_settings {
             None if pane => r.errors.push("\"app-settings\" in [roles].implements without [roles.app-settings]".into()),
@@ -582,6 +609,24 @@ implements = ["share-target"]
 provides = ["com.example.photos.library/1"]
 uses     = ["org.atrium.notify/1"]
 "#;
+
+    #[test]
+    fn editor_extension_section() {
+        let with = |sec: &str| PHOTOS.replace("implements = [\"share-target\"]", &format!("implements = [\"editor-extension\"]\n\n[roles.editor-extension]\n{sec}"));
+        let m = Manifest::from_str(&with("languages = [\"rust\", \"c\"]\ncommands = [\"todo-lens.list\"]\npanel = \"TODOs\"\nworkspace-read = true")).unwrap();
+        assert!(crate::validate(&m).is_ok(), "{:?}", crate::validate(&m));
+        let x = m.roles.as_ref().unwrap().editor_extension.as_ref().unwrap();
+        assert!(x.workspace_read);
+        assert_eq!(x.panel.as_deref(), Some("TODOs"));
+        assert!(crate::validate(&Manifest::from_str(&with("languages = [\"*\"]")).unwrap()).is_ok());
+        for bad in ["languages = []", "languages = [\"Rust\"]", "languages = [\"c\"]\ncommands = [\"a/b\"]", "languages = [\"c\"]\npanel = \"\"", "languages = [\"c\"]\npanel = \"two\\nlines\""] {
+            let m = Manifest::from_str(&with(bad)).unwrap();
+            assert!(!crate::validate(&m).is_ok(), "{bad}");
+        }
+        let bare = PHOTOS.replace("implements = [\"share-target\"]", "implements = [\"editor-extension\"]");
+        assert!(!crate::validate(&Manifest::from_str(&bare).unwrap()).is_ok(), "the role without the section");
+        assert!(Manifest::from_str(&with("languages = [\"c\"]\nnetwork = []")).is_err(), "an unknown key");
+    }
 
     #[test]
     fn share_target_types() {

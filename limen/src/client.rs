@@ -163,6 +163,17 @@ impl Parent {
         }
     }
 
+    /// One of the parent's plugins: `app`, which must implement
+    /// `editor-extension` for the parent's person (dev-tools.md §3.8).
+    pub fn request_plugin(&mut self, window: WindowToken, app: &str) -> Result<EmbedId, Error> {
+        let req = proto::Plugin { window, z: 0, app: app.into() };
+        match self.0.call(op::REQUEST_PLUGIN, &req)? {
+            Reply::Embed { embed } => Ok(embed),
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+        }
+    }
+
     /// Start a read-only picker nested in Arca's bound provisioning sheet.
     /// The file is returned on this connection, owned by Arca.
     pub fn request_smime_picker(&mut self, sheet: EmbedId, window: WindowToken) -> Result<EmbedId, Error> {
@@ -180,6 +191,14 @@ impl Parent {
 
     pub fn set_visible(&mut self, embed: EmbedId, visible: bool) -> Result<(), Error> {
         self.0.ok(op::SET_VISIBLE, &proto::SetVisible { embed, visible })
+    }
+
+    /// Spend the person's press in a web island of ours: `Ok` when frescod
+    /// routed one to the island's window within
+    /// [`ISLAND_PRESS_MS`](crate::catalogue::ISLAND_PRESS_MS) that wasn't
+    /// spent yet; refused with `NO_PRESS` otherwise.
+    pub fn spend_press(&mut self, embed: EmbedId) -> Result<(), Error> {
+        self.0.ok(op::SPEND_PRESS, &proto::SpendPress { embed })
     }
 
     /// A role message, already encoded with the role's types.
