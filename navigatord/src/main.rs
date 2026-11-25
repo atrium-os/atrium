@@ -56,6 +56,7 @@ mod credential_get;
 mod inbox_fixture;
 mod live_page;
 mod live_frames;
+mod live_idb;
 mod live_storage;
 mod live_remembered;
 mod press;
@@ -495,6 +496,13 @@ static LIVE_STORES: std::sync::OnceLock<Arc<Mutex<live_storage::Stores>>> = std:
 
 fn live_stores() -> Arc<Mutex<live_storage::Stores>> {
     LIVE_STORES.get_or_init(|| Arc::new(Mutex::new(live_storage::Stores::new(None)))).clone()
+}
+
+/// Every live page's IndexedDB in this navigatord (I6.7).
+static LIVE_IDB: std::sync::OnceLock<Arc<Mutex<live_idb::Stores>>> = std::sync::OnceLock::new();
+
+fn live_idb() -> Arc<Mutex<live_idb::Stores>> {
+    LIVE_IDB.get_or_init(|| Arc::new(Mutex::new(live_idb::Stores::new(None)))).clone()
 }
 
 static LIVE_REMEMBERED: std::sync::OnceLock<Arc<Mutex<live_remembered::Remembered>>> = std::sync::OnceLock::new();
@@ -1388,8 +1396,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 state.lock().unwrap().forget(jar, site.as_deref());
                 // A live page's storage goes with the site, or with the jar.
                 match (&url, jar) {
-                    (Some(u), _) => if let Some(k) = live_storage::Key::of(jar_id(jar), u) { live_stores().lock().unwrap().forget(&k) },
-                    (None, Jar::Unrecorded(j)) => live_stores().lock().unwrap().forget_jar(j),
+                    (Some(u), _) => if let Some(k) = live_storage::Key::of(jar_id(jar), u) {
+                        live_stores().lock().unwrap().forget(&k);
+                        live_idb().lock().unwrap().forget(&k);
+                    },
+                    (None, Jar::Unrecorded(j)) => {
+                        live_stores().lock().unwrap().forget_jar(j);
+                        live_idb().lock().unwrap().forget_jar(j);
+                    }
                     (None, Jar::Personal) => {}
                 }
                 let Some(c) = &cookies else { continue };
@@ -2474,6 +2488,7 @@ fn main() {
     // Live pages' storage (I6.3): beside the page store, on the persona's
     // volume; in memory only without one.
     let _ = LIVE_STORES.set(Arc::new(Mutex::new(live_storage::Stores::new(cfg.store.as_ref().map(|d| d.join("live-storage"))))));
+    let _ = LIVE_IDB.set(Arc::new(Mutex::new(live_idb::Stores::new(cfg.store.as_ref().map(|d| d.join("live-idb"))))));
     // The origins run live every time (D8): the same volume.
     let _ = LIVE_REMEMBERED.set(Arc::new(Mutex::new(live_remembered::Remembered::new(cfg.store.as_ref().map(|d| d.join("live-origins"))))));
     // Arca, for sites that know you. An Unrecorded jar a crash left behind
@@ -2971,7 +2986,7 @@ mod island_metadata_tests {
 /// one (I6.3, D9), else the plain fetcher.
 fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4],
               cookies: Option<Cookies>, jar: Jar, waiting: &Arc<Mutex<files::Waiting>>) -> Result<live_page::Live, String> {
-    let storage = live_page::JarStores { stores: live_stores(), jar: jar_id(jar) };
+    let storage = live_page::JarStores { stores: live_stores(), idb: live_idb(), jar: jar_id(jar) };
     let jar = cookies.map(|c| live_page::LiveJar::open(c, &page, jar_id(jar))).transpose()?;
     let tell = Arc::new(LiveTell { w: w.clone(), from: page.clone(), waiting: waiting.clone() });
     live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar, Some(storage), tell)

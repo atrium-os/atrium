@@ -228,6 +228,16 @@ fn live_exchange(url: &str, out: &mut [u8], wait: Duration) -> Option<(u16, Stri
 
 /// As [`live_exchange`], or a script's POST of `post` (content type, body; I6.3).
 fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wait: Duration) -> Option<(u16, String, Option<String>, usize)> {
+    let mut body = vec![];
+    let (status, final_url, kind, n) = live_exchange_into(url, post, out.len(), &mut body, wait)?;
+    out[..n].copy_from_slice(&body);
+    Some((status, final_url, kind, n))
+}
+
+/// As [`live_exchange_with`], the body (at most `max` bytes) into `out`,
+/// which grows to the length the answer declares.
+fn live_exchange_into(url: &str, post: Option<(&str, &[u8])>, max: usize, out: &mut Vec<u8>, wait: Duration) -> Option<(u16, String, Option<String>, usize)> {
+    out.clear();
     let mut state = CLIENT.get()?.lock().ok()?;
     let (client, _, _) = state.as_mut()?;
     let id = {
@@ -240,7 +250,7 @@ fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wa
         Some((kind, body)) => Open::post(id, url, kind, body.to_vec()),
         None => Open::get(id, url),
     };
-    open.limits.max_bytes = out.len() as u64;
+    open.limits.max_bytes = max as u64;
     open.retry.max_attempts = 0;
     LIVE_CORS.with(|c| c.borrow_mut().take());
     client.open(open).ok()?;
@@ -250,8 +260,9 @@ fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wa
     while Instant::now() < until {
         match client.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(Some(Event::Head { id: got, status, final_url, content_type, length: Some(n), .. }))
-                if got == id && head.is_none() && n <= out.len() as u64 =>
+                if got == id && head.is_none() && n <= max as u64 =>
             {
+                out.try_reserve_exact(n as usize).ok()?;
                 head = Some((status, final_url, content_type, n as usize));
             }
             // Once, after the head and before the body.
@@ -265,7 +276,7 @@ fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wa
             Ok(Some(Event::Data { id: got, offset, bytes }))
                 if got == id && offset == used as u64 && head.as_ref().is_some_and(|h| bytes.len() <= h.3 - used) =>
             {
-                out[used..used + bytes.len()].copy_from_slice(&bytes);
+                out.extend_from_slice(&bytes);
                 used += bytes.len();
             }
             Ok(Some(Event::Done { id: got, bytes })) if got == id => {
@@ -493,6 +504,97 @@ pub unsafe extern "C" fn navigator_live_storage_remove(key: *const u8, key_len: 
 #[unsafe(no_mangle)]
 pub extern "C" fn navigator_live_storage_clear() -> bool {
     live_storage_send(vec![live_storage::CLEAR])
+}
+
+/// A live page's IndexedDB (navigator-islands.md I6.7, D15): navigatord
+/// keeps the site's databases. The engine loads them once, before the
+/// page's scripts run, and at each transaction's commit sends what the
+/// transaction changed, in the format of `limen::web_island::idb`; the
+/// commit completes only if navigatord kept all of it.
+mod live_idb {
+    use limen::web_island::idb::Op;
+    use std::cell::RefCell;
+    thread_local! {
+        /// The changes of the transaction being committed, and whether one
+        /// of them was out of shape (then the commit fails).
+        pub static RUN: RefCell<(Vec<Op>, bool)> = const { RefCell::new((Vec::new(), false)) };
+    }
+    pub static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+}
+
+/// Each change of the site's IndexedDB, in order, from empty: `on_op(ctx,
+/// tag, a, a_len, b, b_len, n)` with the fields of
+/// `limen::web_island::idb::Op::fields`. False when navigatord gave none or
+/// it is out of shape, and then no change was given.
+/// # Safety
+/// `on_op` is a valid function for this call; the bytes it is given live
+/// only for that call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_idb_load(
+    ctx: *mut std::ffi::c_void,
+    on_op: unsafe extern "C" fn(*mut std::ffi::c_void, u8, *const u8, usize, *const u8, usize, u64),
+) -> bool {
+    use limen::web_island::idb::{decode_ops, LOAD_MAX};
+    let mut store = vec![];
+    let Some((200, _, _, _)) = live_exchange_into(limen::web_island::LIVE_IDB, None, LOAD_MAX, &mut store, Duration::from_secs(60)) else { return false };
+    let Some(ops) = decode_ops(&store, LOAD_MAX) else { return false };
+    drop(store);
+    for op in &ops {
+        let (t, a, b, n) = op.fields();
+        // SAFETY: the caller's function, with bytes alive for this call.
+        unsafe { on_op(ctx, t, a.as_ptr(), a.len(), b.as_ptr(), b.len(), n) };
+    }
+    true
+}
+
+/// A transaction starts committing: its changes follow.
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_live_idb_begin() {
+    live_idb::RUN.with(|r| *r.borrow_mut() = (Vec::new(), false));
+}
+
+/// One change of the committing transaction, as
+/// `limen::web_island::idb::Op::fields` gives them.
+/// # Safety
+/// `a` and `b` are readable for their lengths (or null with length 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_idb_op(t: u8, a: *const u8, a_len: usize, b: *const u8, b_len: usize, n: u64) {
+    let bytes = |p: *const u8, len: usize| -> Option<&[u8]> {
+        if len == 0 { return Some(&[]); }
+        // SAFETY: the caller passes a readable buffer of `len` bytes.
+        (!p.is_null()).then(|| unsafe { std::slice::from_raw_parts(p, len) })
+    };
+    let op = bytes(a, a_len).zip(bytes(b, b_len)).and_then(|(a, b)| limen::web_island::idb::Op::from_fields(t, a, b, n));
+    live_idb::RUN.with(|r| {
+        let mut r = r.borrow_mut();
+        match op {
+            Some(op) => r.0.push(op),
+            None => r.1 = true,
+        }
+    });
+}
+
+/// Send the committing transaction's changes. True only when navigatord
+/// kept every one; false aborts the transaction (`QuotaExceededError`).
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_live_idb_commit() -> bool {
+    let (ops, bad) = live_idb::RUN.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    if bad {
+        eprintln!("island: an IndexedDB change was out of shape; the commit fails");
+        return false;
+    }
+    let run = live_idb::NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let parts = limen::web_island::idb::parts(run, &ops);
+    drop(ops);
+    let mut answer = vec![];
+    for part in parts {
+        let post = Some(("application/octet-stream", part.as_slice()));
+        if !matches!(live_exchange_into(limen::web_island::LIVE_IDB, post, 0, &mut answer, Duration::from_secs(30)), Some((204, _, _, 0))) {
+            eprintln!("island: navigatord didn't keep an IndexedDB commit");
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
