@@ -41,6 +41,9 @@ pub enum FormatCmd {
     PenLine(usize),
     /// Their colour: one of the tab colours, or automatic.
     PenColor(Option<u32>),
+    /// The text's face: monospace (`true`, as Courier New in files) or the
+    /// workbook's own sans.
+    Mono(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,12 +88,16 @@ pub const LIGHT_COLORS: [(u32, &str); 6] = [
 ];
 
 /// Font sizes Larger and Smaller step through, points.
+/// The font name Font: Mono gives cells, as files keep it.
+pub const MONO_FONT: &str = "Courier New";
+
 pub const SIZES: [u16; 14] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
 /// The menu, read from the selection's first cell.
 pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
     let st = d.wb.style(CellAddr::new(d.sheet, sel.r0, sel.c0));
     let pt = st.font.size.unwrap_or(220) / 20;
+    let mono = st.font.name.as_deref().is_some_and(crate::source::is_mono_font);
     let mut v = vec![
         (MenuItem::new("Bold").checked(st.font.bold).shortcut("Ctrl+B"), Some(FormatCmd::Bold)),
         (MenuItem::new("Italic").checked(st.font.italic).shortcut("Ctrl+I"), Some(FormatCmd::Italic)),
@@ -98,6 +105,8 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Strikethrough").checked(st.font.strike).shortcut("Ctrl+5"), Some(FormatCmd::Strike)),
         (MenuItem::new(format!("Larger Text ({pt} pt)")).separated(), Some(FormatCmd::Larger)),
         (MenuItem::new("Smaller Text"), Some(FormatCmd::Smaller)),
+        (MenuItem::new("Font: Sans").radio(!mono), Some(FormatCmd::Mono(false))),
+        (MenuItem::new("Font: Mono").radio(mono), Some(FormatCmd::Mono(true))),
         (MenuItem::new("Text Colour…"), Some(FormatCmd::Colors(false))),
         (MenuItem::new("Fill Colour…"), Some(FormatCmd::Colors(true))),
         (MenuItem::new("Align Left").checked(st.h_align == HAlign::Left).separated(), Some(FormatCmd::Align(HAlign::Left))),
@@ -267,6 +276,10 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
             let next = *next.ok_or(if cmd == FormatCmd::Larger { "That is the largest size." } else { "That is the smallest size." })?;
             one(d, "Font Size", &|st| { let mut st = st.clone(); st.font.size = (next != 11).then_some(next * 20); st });
             Ok(format!("Text is {next} pt."))
+        }
+        FormatCmd::Mono(mono) => {
+            one(d, "Font", &|st| { let mut st = st.clone(); st.font.name = mono.then(|| MONO_FONT.into()); st });
+            Ok(if mono { format!("Text is in a monospace font ({MONO_FONT}).") } else { "Text is in the workbook's own font.".into() })
         }
         // The window opens the bar.
         FormatCmd::Colors(_) => Ok(String::new()),

@@ -106,6 +106,8 @@ pub enum Cmd {
     FilterCond2(usize),
     /// The filter panel's two conditions joined by or (`true`) or and.
     FilterJoin(bool),
+    /// The filter panel's Date is choice: an index of [`crate::data::DATE_RULES`].
+    FilterDate(usize),
     /// A Format menu command on the selection.
     Format(crate::format::FormatCmd),
     /// The text or fill colour bar closed.
@@ -1230,7 +1232,7 @@ impl Sheets {
         let rect = Self::grid_rect(w, h);
         let old = self.source.zoom_factor();
         let (sw, sh) = ((self.source.col_left(sel.c1 + 1) - self.source.col_left(sel.c0)) / old, (self.source.row_top(sel.r1 + 1) - self.source.row_top(sel.r0)) / old);
-        let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::grid_view::HEADER_H - 16.0).max(40.0));
+        let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::grid_view::header_height(self.source.zoom() as f32) - 16.0).max(40.0));
         let fit = (bw / sw.max(1.0)).min(bh / sh.max(1.0)) * 100.0;
         self.set_zoom(fit.clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)).floor() as u16);
         let scroll = self.authoring.active_scroll(self);
@@ -2421,15 +2423,16 @@ impl Sheets {
             return;
         };
         // Content px to window px, as the grid places its body.
-        use pergola::widgets::grid_view::{HEADER_H, TILE_ROWS};
+        use pergola::widgets::grid_view::{header_height, TILE_ROWS};
+        use pergola::widgets::GridSource;
         let rect = Self::grid_rect(w, h);
         let active = self.authoring.active(rect);
         let Some((_, r, scroll)) = self.authoring.panes(self, rect).nth(active) else { return };
         let st = scroll.get();
         let (tiles_r, _) = GridView::tiles(&*self.source, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
-        let hw = GridView::header_width((tiles_r.1 + 1) * TILE_ROWS);
+        let hw = GridView::header_width_at((tiles_r.1 + 1) * TILE_ROWS, self.source.zoom());
         let x = r.x() + hw + (at[0] - st.physics_x.y) as f32;
-        let y = r.y() + HEADER_H + (at[1] + at[3] - st.physics.y) as f32;
+        let y = r.y() + header_height(self.source.zoom()) + (at[1] + at[3] - st.physics.y) as f32;
         let cmds = self.cmds.clone();
         let picks = [DataCmd::FillCopy, DataCmd::FillSeries, DataCmd::FillFormats, DataCmd::FillNoFormats];
         use pergola::widgets::{Menu, MenuItem};
@@ -3104,7 +3107,14 @@ impl View for Sheets {
                 let now = if fp.cond == 0 { "Pick values" } else { crate::data::FILTER_CONDS[fp.cond] };
                 MenuButton::new(now.to_string(), self.filter_cond_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterCond(i))).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).render(ctx);
             }
-            if !crate::data::filter_cond_typed(fp.cond) && fp.cond > 0 {
+            if fp.cond == crate::data::DATE_COND {
+                let a = self.filter_a.get_cloned().text().to_string();
+                let now = crate::data::DATE_RULES.iter().position(|(_, n)| *n == a);
+                let items: Vec<pergola::widgets::MenuItem> = crate::data::DATE_RULES.iter().enumerate().map(|(i, (l, _))| pergola::widgets::MenuItem::new(*l).radio(now == Some(i))).collect();
+                let cmds = self.cmds.clone();
+                MenuButton::new(now.map_or("Choose a date", |i| crate::data::DATE_RULES[i].0).to_string(), self.filter_cond2_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterDate(i))).at(x0 + 12.0, y0 + 78.0).width(FILTER_W - 24.0).render(ctx);
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 120.0, FILTER_W - 24.0, 18.0), content: "Dates only; today, weeks and months follow the day it is applied.".into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            } else if !crate::data::filter_cond_typed(fp.cond) && fp.cond > 0 {
                 let note = if fp.cond == 16 { "Rows with numbers above the column's average." } else { "Rows with numbers below the column's average." };
                 ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 84.0, FILTER_W - 24.0, 18.0), content: note.into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
             } else if fp.cond > 0 {
@@ -4170,6 +4180,13 @@ impl Sheets {
                     if k == 0 || crate::data::filter_cond_joins(k) {
                         p.cond2 = k;
                         self.filter.set(p);
+                    }
+                    self.changed();
+                    false
+                }
+                Cmd::FilterDate(i) => {
+                    if let Some((_, n)) = crate::data::DATE_RULES.get(i) {
+                        self.filter_a.set(TextEdit::new(n));
                     }
                     self.changed();
                     false
@@ -6087,6 +6104,33 @@ mod tests {
         assert!(crate::data::filter_cond2(&crate::data::PanelCond { kind: 8, a: "2".into(), kind2: 3, c: "1".into(), ..Default::default() }).is_err());
         s.cmds.lock().unwrap().push(Cmd::FilterCancel);
         s.take_cmds();
+        // Date is: a choice of dates, not typed.
+        let d = sheets_of(b"When,Qty\nx,1\nx,2\nx,3\nx,4\n");
+        for (r, t) in ["2026-03-04", "2026-07-01", "2025-03-30", "soon"].iter().enumerate() {
+            assert!(d.doc.borrow_mut().type_into(r as u32 + 1, 0, t));
+        }
+        d.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Filter));
+        d.take_cmds();
+        d.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 0));
+        d.cmds.lock().unwrap().push(Cmd::FilterCond(crate::data::DATE_COND));
+        d.take_cmds();
+        let (tree, _) = pergola::view::render(&d, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Choose a date")));
+        d.cmds.lock().unwrap().push(Cmd::FilterApply);
+        d.take_cmds();
+        assert!(d.filter.get_cloned().open && d.doc.borrow().status.contains("Choose a date"));
+        let march = crate::data::DATE_RULES.iter().position(|(l, _)| *l == "March").unwrap();
+        d.cmds.lock().unwrap().push(Cmd::FilterDate(march));
+        d.cmds.lock().unwrap().push(Cmd::FilterApply);
+        d.take_cmds();
+        assert_eq!(hidden(&d), [2, 4], "{}", d.doc.borrow().status);
+        d.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 0));
+        d.take_cmds();
+        assert_eq!((d.filter.get_cloned().cond, d.filter_a.get_cloned().text().to_string()), (crate::data::DATE_COND, "M3".into()));
+        // This year follows the day it is applied.
+        let year = officina_grid::Workbook::new().date_system().ymd(officina_grid::Workbook::new().date_system().now()).map(|y| y.0);
+        assert!(crate::data::filter_cond(crate::data::DATE_COND, "thisYear", "").is_ok() && year.is_some());
+        assert!(crate::data::filter_cond(crate::data::DATE_COND, "someday", "").is_err());
         // Above and below the average (5.25) take nothing typed.
         s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowAll));
         s.take_cmds();
@@ -6099,7 +6143,7 @@ mod tests {
         let (back, _) = officina_convert::xlsx::read(&x).unwrap();
         assert_eq!(back.sheet(0).filter.as_ref().map(|f| f.conds.clone()), Some(vec![(1, officina_grid::filter::Cond::Average { below: true })]));
         // Each condition the panel makes reads back as itself.
-        for (k, a, b) in [(1, "4", ""), (2, "pear", ""), (4, "2.5", ""), (6, "x", ""), (7, "1", "9"), (8, "3", ""), (11, "10", ""), (12, "a", ""), (13, "b", ""), (14, "c", ""), (15, "d", ""), (16, "", ""), (17, "", "")] {
+        for (k, a, b) in [(1, "4", ""), (2, "pear", ""), (4, "2.5", ""), (6, "x", ""), (7, "1", "9"), (8, "3", ""), (11, "10", ""), (12, "a", ""), (13, "b", ""), (14, "c", ""), (15, "d", ""), (16, "", ""), (17, "", ""), (crate::data::DATE_COND, "lastWeek", ""), (crate::data::DATE_COND, "Q2", "")] {
             assert_eq!(cond_fields(&filter_cond(k, a, b).unwrap()), Some((k, a.to_string(), b.to_string())), "{k}");
         }
     }
@@ -7253,6 +7297,15 @@ mod tests {
         s.take_cmds();
         assert!(s.splitting.get().is_none(), "{}", s.doc.borrow().status);
         assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2), shown(&s, 1, 0), shown(&s, 1, 1), shown(&s, 2, 0)], ["ab", "cd", "ef", "a", "b; c", "plain"]);
+        // Pieces that read as dates become dates, in a date format.
+        let s = sheets_of(b"x\n");
+        assert!(s.doc.borrow_mut().type_into(0, 0, "a;2026-03-04;7"));
+        crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), CellRange { r0: 0, c0: 0, r1: 0, c1: 0 }, (0, 0), ";").unwrap();
+        assert!(matches!(s.doc.borrow().wb.value(0, 0, 1), officina_grid::Value::Num(_)));
+        assert!(s.doc.borrow().wb.styles.format(s.doc.borrow().wb.style_id(officina_grid::CellAddr::new(0, 0, 1))).is_date());
+        assert_eq!(shown(&s, 0, 2), "7");
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(shown(&s, 0, 0), "a;2026-03-04;7");
         // Runs of the delimiter as one with +, and fixed widths.
         let s = sheets_of(b"x\n");
         assert!(s.doc.borrow_mut().type_into(0, 0, "a--b-c"));
@@ -8589,6 +8642,30 @@ mod tests {
         let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
         let has = |t: &str| tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == t));
         assert!(has(&format!("{z}%")) && has("Format Painter"));
+    }
+
+    #[test]
+    fn font_mono_draws_in_the_monospace_face_and_files_keep_the_name() {
+        use crate::format::FormatCmd;
+        use pergola::widgets::GridSource;
+        let s = sheets_of(b"abc,def\n");
+        select(&s, (0, 0), (0, 0));
+        assert_eq!(fmt(&s, FormatCmd::Mono(true)), "Text is in a monospace font (Courier New).");
+        assert_eq!(s.doc.borrow().wb.style(officina_grid::CellAddr::new(0, 0, 0)).font.name.as_deref(), Some("Courier New"));
+        assert!(s.source.cell(0, 0).unwrap().mono && !s.source.cell(0, 1).unwrap().mono);
+        let menu = crate::format::menu(&s.doc.borrow(), s.grid.get_cloned().selection());
+        assert!(menu.iter().any(|(m, c)| *c == Some(FormatCmd::Mono(true)) && m.mark == pergola::widgets::Mark::Radio(true)));
+        // A file's monospace fonts draw mono; others sans.
+        for (name, mono) in [("Consolas", true), ("Menlo", true), ("JetBrains Mono", true), ("Source Code Pro", true), ("Arial", false), ("Calibri", false)] {
+            assert_eq!(crate::source::is_mono_font(name), mono, "{name}");
+        }
+        fmt(&s, FormatCmd::Mono(false));
+        assert!(s.doc.borrow().wb.style(officina_grid::CellAddr::new(0, 0, 0)).font.name.is_none());
+        assert!(!s.source.cell(0, 0).unwrap().mono);
+        assert!(s.doc.borrow_mut().undo());
+        let x = officina_convert::xlsx::write(&s.doc.borrow().wb, Vec::new()).unwrap();
+        let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+        assert_eq!(back.style(officina_grid::CellAddr::new(0, 0, 0)).font.name.as_deref(), Some("Courier New"));
     }
 
     #[test]

@@ -1780,8 +1780,21 @@ fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32), how: Split) 
     if busy {
         return Err(format!("Columns {}–{} have data where the pieces would go; insert columns first.", officina_grid::addr::col_name(right.c0), officina_grid::addr::col_name(right.c1)));
     }
+    // Pieces that read as dates become dates in a date format, as typing them would.
+    let mut dated: Vec<(CellAddr, String)> = Vec::new();
     let rows: Vec<Vec<Input>> = pieces.into_iter().zip(r0..=r1).map(|(p, r)| match p {
-        Some(p) => p.into_iter().map(|t| if t.starts_with('=') { Input::Value(Value::str(&t)) } else { Input::typed(&t) }).collect(),
+        Some(p) => p.into_iter().enumerate().map(|(k, t)| {
+            if t.starts_with('=') {
+                return Input::Value(Value::str(&t));
+            }
+            match d.typed_date(&t) {
+                Some((serial, fmt)) => {
+                    dated.push((CellAddr::new(s, r, col + k as u32), fmt));
+                    Input::Value(Value::Num(serial))
+                }
+                None => Input::typed(&t),
+            }
+        }).collect(),
         None => vec![d.wb.input(CellAddr::new(s, r, col))],
     }).collect();
     let n = rows.iter().filter(|r| r.len() > 1).count();
@@ -1790,7 +1803,21 @@ fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32), how: Split) 
     if let Some(first) = rows.first_mut() {
         first.resize(wide.max(first.len()), Input::Empty);
     }
-    d.run("Text to Columns", vec![GridOp::block(s, r0, col, rows)]);
+    let mut ops = vec![GridOp::block(s, r0, col, rows)];
+    // One restyle per run of dates down a column in one format.
+    dated.retain(|(a, _)| &*d.wb.style(*a).num_fmt == "General");
+    dated.sort_by(|x, y| (x.0.col, x.0.row).cmp(&(y.0.col, y.0.row)));
+    let mut runs: Vec<(Rect, String)> = Vec::new();
+    for (a, fmt) in dated {
+        match runs.last_mut() {
+            Some((r, f)) if r.c0 == a.col && r.r1 + 1 == a.row && *f == fmt => r.r1 = a.row,
+            _ => runs.push((Rect::cell(a), fmt)),
+        }
+    }
+    for (r, fmt) in runs {
+        ops.push(GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { num_fmt: fmt.as_str().into(), ..st.clone() }));
+    }
+    d.run("Text to Columns", ops);
     Ok(format!("Split {n} {} at {name} into {wide} columns.", if n == 1 { "cell" } else { "cells" }))
 }
 
@@ -2059,15 +2086,33 @@ pub fn keep_values(d: &mut Doc, row: u32, col: u32, keep: Vec<String>, every: bo
 }
 
 /// The conditions a filter column offers besides picking values (index 0).
-pub const FILTER_CONDS: [&str; 18] = [
+pub const FILTER_CONDS: [&str; 19] = [
     "Values", "Equals", "Does not equal", "Greater than", "Greater than or equal to", "Less than", "Less than or equal to", "Between",
     "Top", "Bottom", "Top %", "Bottom %", "Begins with", "Ends with", "Contains", "Does not contain",
-    "Above average", "Below average",
+    "Above average", "Below average", "Date is",
 ];
 
-/// Whether condition `kind` of [`FILTER_CONDS`] takes a typed value.
+/// The [`FILTER_CONDS`] index of "Date is": a choice of [`DATE_RULES`].
+pub const DATE_COND: usize = 18;
+
+/// The dates "Date is" offers, as Excel's Date Filters: label, and the
+/// rule's name in files (`DynamicDate::parse`). Relative ones follow the
+/// day the filter is applied.
+pub const DATE_RULES: [(&str, &str); 32] = [
+    ("Today", "today"), ("Yesterday", "yesterday"), ("Tomorrow", "tomorrow"),
+    ("This week", "thisWeek"), ("Last week", "lastWeek"), ("Next week", "nextWeek"),
+    ("This month", "thisMonth"), ("Last month", "lastMonth"), ("Next month", "nextMonth"),
+    ("This quarter", "thisQuarter"), ("Last quarter", "lastQuarter"), ("Next quarter", "nextQuarter"),
+    ("This year", "thisYear"), ("Last year", "lastYear"), ("Next year", "nextYear"), ("Year to date", "yearToDate"),
+    ("Quarter 1", "Q1"), ("Quarter 2", "Q2"), ("Quarter 3", "Q3"), ("Quarter 4", "Q4"),
+    ("January", "M1"), ("February", "M2"), ("March", "M3"), ("April", "M4"), ("May", "M5"), ("June", "M6"),
+    ("July", "M7"), ("August", "M8"), ("September", "M9"), ("October", "M10"), ("November", "M11"), ("December", "M12"),
+];
+
+/// Whether condition `kind` of [`FILTER_CONDS`] takes a typed value
+/// (Date is takes a choice instead).
 pub fn filter_cond_typed(kind: usize) -> bool {
-    !matches!(kind, 0 | 16 | 17)
+    !matches!(kind, 0 | 16 | 17 | DATE_COND)
 }
 
 /// Condition `kind` of [`FILTER_CONDS`] with what was typed for it (`b` only for
@@ -2075,8 +2120,11 @@ pub fn filter_cond_typed(kind: usize) -> bool {
 pub fn filter_cond(kind: usize, a: &str, b: &str) -> Result<Cond, String> {
     use officina_grid::filter::{Rank, Test, TextOp, TextTest};
     let (a, b) = (a.trim(), b.trim());
-    if !filter_cond_typed(kind) && kind != 0 {
+    if matches!(kind, 16 | 17) {
         return Ok(Cond::Average { below: kind == 17 });
+    }
+    if kind == DATE_COND {
+        return DATE_RULES.iter().find(|(_, n)| *n == a).and_then(|(_, n)| officina_grid::filter::DynamicDate::parse(n, None)).map(Cond::DynamicDate).ok_or_else(|| "Choose a date.".into());
     }
     if a.is_empty() || (kind == 7 && b.is_empty()) {
         return Err("Type a value for the condition.".into());
@@ -2123,6 +2171,7 @@ pub fn cond_fields(c: &Cond) -> Option<(usize, String, String)> {
         }
         Cond::Rank(r) => Some((8 + 2 * usize::from(r.percent) + usize::from(r.bottom), r.limit().to_string(), String::new())),
         Cond::Average { below } => Some((16 + usize::from(*below), String::new(), String::new())),
+        Cond::DynamicDate(r) => Some((DATE_COND, r.name().to_string(), String::new())),
         Cond::Custom(t, _) if t.len() == 1 => match &t[0] {
             Test::Text(t) if !t.case_sensitive => {
                 let k = match t.op {
