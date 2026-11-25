@@ -347,6 +347,9 @@ pub enum LinkAction {
     Consented { url: String },
 }
 
+/// How often navigatord asks how much memory a live page's engine uses.
+pub const LIVE_MEMORY_EVERY_MS: u64 = 5000;
+
 /// navigatord → UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
@@ -386,7 +389,9 @@ pub enum Event {
     /// from, `kind` what its bytes look like ("PDF", "ZIP archive", …).
     File { id: u32, url: String, name: String, size: u64, origin: String, kind: String },
     /// Written: `path` is where.
-    Saved { id: u32, path: String },
+    /// `name`: its own name in the persona's Downloads, when portcullisd
+    /// saved it there (what "Show in Files" asks Files to show).
+    Saved { id: u32, path: String, name: Option<String> },
     NotSaved { id: u32, why: String },
     /// frescod didn't count the press that came with `Save` or `Hand`
     /// (something was over the prompt row, or it had just moved): nothing
@@ -461,6 +466,11 @@ pub enum Event {
     /// What the live page at `from` keeps in its site's stores, of what
     /// it may, in bytes (navigator-ui.md §15.1), after each load or change.
     LiveUsage { from: String, stored: u64, max: u64 },
+    /// How much memory the live page at `from`'s engine jail uses, and the
+    /// cap it is held to, in bytes (navigator-ui.md §15.3): told about
+    /// every [`LIVE_MEMORY_EVERY_MS`] while it runs, when it moved by a
+    /// mebibyte or more.
+    LiveMemory { from: String, used: u64, cap: Option<u64> },
     /// The live page at `from` asked to be printed (I6.4): the UI prints
     /// its trail entry's document-lane rendering, as Ctrl-P does.
     LivePrint { from: String },

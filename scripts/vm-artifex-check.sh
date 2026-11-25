@@ -20,11 +20,12 @@
 # library closure, loader), and the VM unarchives and installs it through
 # opifex's trust gate (needs cargo-atrium and opifex built for the host:
 # sdk/target/release and portcullis/target/release).
-# With limend up (as _limen), the two sample plugins (artifex/plugins,
+# With limend up (as _limen), the three sample plugins (artifex/plugins,
 # dev-tools.md §3.8) are installed like any app: the palette shows the
 # Plugins view, Switch on starts them in jails of their own held to the
 # plugin limits (rctl), md-links marks notes.md's dead anchor and its quick
-# fix mends it, and todo-lens' command and panel come from the palette.
+# fix mends it, todo-lens' command and panel come from the palette, and
+# words (in C, atrium_plugin.h) counts notes.md from its command.
 # Ends "artifex: N failed".
 #
 #   sh scripts/vm-artifex-check.sh [out-dir]
@@ -58,6 +59,15 @@ xb portcullis "-p portcullisd -p portcullis-cli -p opifex -p jaild -p atrium-vol
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex -p md-links -p todo-lens --bin artifex --bin md-links --bin todo-lens"
+# The C sample plugin (artifex/plugins/words, atrium_plugin.h) against this
+# tree's libatrium, linked in statically: its jail has the base's libc but
+# not libatrium unless install-c-sdk.sh ran.
+LA=$ROOT/libatrium/target/$TARGET/release
+(cd "$ROOT/libatrium" && RUSTFLAGS="$(echo "$CROSS_RUSTFLAGS" | sed 's# -C link-arg=[^ ]*/Scrt1.o##')" \
+    cargo rustc -q --release --target "$TARGET" --lib --crate-type staticlib) || { echo "build of libatrium failed"; echo "artifex: 1 failed"; exit 1; }
+clang --target="$TARGET" --sysroot="$S" -fuse-ld=lld -O2 -Wall -Werror -I "$ROOT/libatrium/include" -o "$LA/words" \
+    "$ROOT/artifex/plugins/words/words.c" "$LA/libatrium.a" -lexecinfo -lkvm -lmemstat -lprocstat -ldevstat -lutil -lrt -lpthread -lgcc_s -lm -lc \
+    || { echo "build of words failed"; echo "artifex: 1 failed"; exit 1; }
 xb limen "--bin limend"
 xb atrium-image-decode ""
 [ -z "${FORUM:-}" ] || xb forum-wm "--bin forum-wm"
@@ -79,7 +89,7 @@ fi
 
 echo "=== install"
 B=/var/tmp/artifexchk
-V "pkill -x portcullisd; pkill -x frescod; pkill -x forum-wm; pkill -x stoad; pkill -f atrium-term-socket; pkill -x artifex; pkill -x limend; pkill -x md-links; pkill -x todo-lens; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+V "pkill -x portcullisd; pkill -x frescod; pkill -x forum-wm; pkill -x stoad; pkill -f atrium-term-socket; pkill -x artifex; pkill -x limend; pkill -x md-links; pkill -x todo-lens; pkill -x words; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 V "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     V "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -q $K -P 2222 "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
@@ -89,12 +99,12 @@ for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/releas
          portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/atrium-jaild portcullis/target/$TARGET/release/atrium-volumes \
          atrium-term-socket/target/$TARGET/release/atrium-term-socket \
          stoa/target/$TARGET/release/stoad artifex/target/$TARGET/release/artifex \
-         artifex/target/$TARGET/release/md-links artifex/target/$TARGET/release/todo-lens limen/target/$TARGET/release/limend; do
+         artifex/target/$TARGET/release/md-links artifex/target/$TARGET/release/todo-lens libatrium/target/$TARGET/release/words limen/target/$TARGET/release/limend; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "artifex: 1 failed"; exit 1; }
 done
 scp -q $K -P 2222 "$ROOT/artifex/app/atrium.toml" root@localhost:$B/artifex.toml
-# The two sample plugins (dev-tools.md §3.8), with their checked-in manifests.
-for x in md-links todo-lens; do scp -q $K -P 2222 "$ROOT/artifex/plugins/$x/atrium.toml" root@localhost:$B/$x.toml; done
+# The three sample plugins (dev-tools.md §3.8), with their checked-in manifests.
+for x in md-links todo-lens words; do scp -q $K -P 2222 "$ROOT/artifex/plugins/$x/atrium.toml" root@localhost:$B/$x.toml; done
 # The system's image decoder, for the Assets view's previews.
 for f in atrium-image-decode/target/$TARGET/release/atrium-image-decode scripts/image-decode-bundle.sh etc/jaild.policy.toml; do
     scp -q $K -P 2222 "$ROOT/$f" root@localhost:$B/ || { echo "copy $f failed"; echo "artifex: 1 failed"; exit 1; }
@@ -118,7 +128,7 @@ fi
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 TERM_ID=org.atrium.terminal; ART=org.atrium.artifex
-MDL=org.atrium.sample.md-links; TODO=org.atrium.sample.todo-lens
+MDL=org.atrium.sample.md-links; TODO=org.atrium.sample.todo-lens; WRD=org.atrium.sample.words
 V 'sh -s' <<EOS
 set -e
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
@@ -165,9 +175,9 @@ fi
 # and no other plugin (vm-embeds-check.sh's dev build would be a third row).
 for m in /var/lib/atrium/apps/*/atrium.toml; do
   id=\$(basename \$(dirname \$m))
-  case \$id in $MDL|$TODO) ;; *) grep -q '^implements.*"editor-extension"' \$m && { opifex uninstall \$id >/dev/null 2>&1 || rm -rf /var/lib/atrium/apps/\$id; } ;; esac
+  case \$id in $MDL|$TODO|$WRD) ;; *) grep -q '^implements.*"editor-extension"' \$m && { opifex uninstall \$id >/dev/null 2>&1 || rm -rf /var/lib/atrium/apps/\$id; } ;; esac
 done
-for x in md-links:$MDL todo-lens:$TODO; do
+for x in md-links:$MDL todo-lens:$TODO words:$WRD; do
   n=\${x%%:*}; id=\${x#*:}
   O=$B/b-\$id; mkdir -p \$O/bin; cp $B/\$n \$O/bin/; cp $B/\$n.toml \$O/atrium.toml
   sign \$O; opifex install \$O >/dev/null
@@ -520,7 +530,7 @@ if want plugins; then
         inj "KEY 0x28 1" "KEY 0x28 0"; sleep 3
     }
     pal "plugins" "Show the plugins" && waitstate 'view=Plugins' 20 && ok "the palette shows the Plugins view" || bad "plugins view: $(state)"
-    waitstate "plugins=\[$MDL:off:|$TODO:off:\]" 60 && ok "limend lists both sample plugins, both off" \
+    waitstate "plugins=\[$MDL:off:|$TODO:off:|$WRD:off:\]" 60 && ok "limend lists the three sample plugins, all off" \
         || bad "listed: [$(plugins)] $(V "grep 'plugins' $B/artifex.log | tail -2; tail -3 $LLOG")"
     shot artifex-plugins-1-view
     # Switch on (views.rs: right of each row, 760 wide; md-links' row is
@@ -612,6 +622,29 @@ if want plugins; then
     check "Take back: no /work in its new jail" "" "$(V "mount -p | awk '\$2 ~ /todo-lens[^ ]*\\/work\$/'")"
     waitstate "plugins=\[[^]]*$TODO:on:Running" 60 && [ -n "$(V "pgrep -x todo-lens")" ] && ok "and it runs again" || bad "todo-lens: [$(plugins)]"
     shot artifex-plugins-6-taken-back
+    # The C sample (atrium_plugin.h): Word count, the third row. notes.md
+    # is open, so it starts at once.
+    WY=$(state | sed 's/.* ptops=\[\([^]]*\)\].*/\1/' | cut -d, -f3)
+    press 757 $((74 + ${WY:-0} + 22))
+    waitstate "plugins=\[[^]]*$WRD:on:Running" 120 && ok "Switch on starts Word count, the plugin written in C" \
+        || bad "words: [$(plugins)] ptops [$WY] $(V "grep -i 'words\|plugin' $LLOG $LOG | tail -4")"
+    J=$(V "ps -axo jid,uid,comm | awk '\$3 == \"words\" {print \$1\" \"\$2; exit}'")
+    WJ=${J%% *}; WU=${J#* }
+    if [ -n "$WJ" ] && [ "$WJ" != 0 ] && [ -n "$WU" ] && [ "$WU" != "$AU" ]; then ok "it runs jailed (jid $WJ) as uid $WU"; else bad "words process: [$J] artifex uid [$AU]"; fi
+    press 64 100
+    waitstate 'view=Code' 20 || bad "files: $(state)"
+    ROW=$(rows | grep -n '^notes.md$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1))); sleep 2
+    # Its command counts notes.md's text, as Artifex sent it (didOpen):
+    # 9 words over 7 lines once md-links' fix is in.
+    pal "count the words" "Count the words in this file" \
+        && waitstate 'lsp=Some("[^"]*Word count: 9 words, 7 lines in notes.md' 60 && ok "the palette runs its command: $(state | grep -o 'Word count: [^"]*')" \
+        || bad "word count: $(state | grep -o 'lsp=Some("[^"]*")') $(V "tail -3 $LLOG")"
+    pal "plugins" "Show the plugins" && waitstate 'view=Plugins' 20 || bad "plugins view: $(state)"
+    press 757 $((74 + ${WY:-0} + 22))
+    waitstate "plugins=\[[^]]*$WRD:off:" 30 && ok "Switch off" || bad "words off: [$(plugins)]"
+    i=0; while [ $i -lt 30 ] && [ -n "$(V "pgrep -x words")" ]; do sleep 1; i=$((i+1)); done
+    check "and it exits" "" "$(V "pgrep -x words")"
     press 64 100
     waitstate 'view=Code' 20 || bad "files: $(state)"
     # Back to the Output panel for Run's question.

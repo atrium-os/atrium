@@ -142,6 +142,35 @@ impl Launcher for Portcullis {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
     }
+
+    fn usage(&mut self, embed: EmbedId) -> Option<Box<dyn crate::daemon::UsageProbe>> {
+        let s = self.jails.get(&embed)?.try_clone().ok()?;
+        Some(Box::new(JailUsage(s)))
+    }
+}
+
+/// portcullisd answers `InstanceUsage` on the connection that holds an
+/// instance: holding it is what lets limend ask.
+struct JailUsage(UnixStream);
+
+impl crate::daemon::UsageProbe for JailUsage {
+    fn ask(&mut self) -> Option<(u64, Option<u64>)> {
+        use portcullis_ipc::{read_response_unbuffered, write_request, Request, Response};
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // portcullisd answers one a second; two seconds is a missed answer.
+        self.0.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
+        write_request(&mut self.0, &Request::InstanceUsage { seq }).ok()?;
+        // An answer to an earlier ask that timed out may come first: skip it.
+        for _ in 0..4 {
+            match read_response_unbuffered(&mut self.0).ok()? {
+                Response::InstanceUsage { seq: s, memory, memory_cap } if s == seq => return memory.map(|m| (m, memory_cap)),
+                Response::InstanceUsage { .. } => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
 }
 
 /// Which of portcullisd's launches.
@@ -227,6 +256,32 @@ impl Portcullis {
         let uid = uid.ok_or_else(|| format!("portcullisd didn't say whom {app} runs as"))?;
         self.jails.insert(embed, s);
         Ok(uid)
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use crate::daemon::UsageProbe;
+    use portcullis_ipc::{read_request, write_response, Request, Response};
+
+    /// The answer to this ask, past a late one to an earlier ask; and
+    /// nothing from a connection whose instance has ended.
+    #[test]
+    fn a_late_answer_is_skipped_and_an_exit_is_no_answer() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(theirs.try_clone().unwrap());
+            let mut w = theirs;
+            let Request::InstanceUsage { seq } = read_request(&mut r).unwrap() else { panic!() };
+            write_response(&mut w, &Response::InstanceUsage { seq: seq.wrapping_sub(1), memory: Some(1), memory_cap: None }).unwrap();
+            write_response(&mut w, &Response::InstanceUsage { seq, memory: Some(73_400_320), memory_cap: Some(1 << 30) }).unwrap();
+            let Request::InstanceUsage { .. } = read_request(&mut r).unwrap() else { panic!() };
+            write_response(&mut w, &Response::LaunchExit { code: Some(0) }).unwrap();
+        });
+        let mut p = super::JailUsage(ours);
+        assert_eq!(p.ask(), Some((73_400_320, Some(1 << 30))));
+        assert_eq!(p.ask(), None);
+        t.join().unwrap();
     }
 }
 

@@ -92,6 +92,10 @@ done
 
 echo "=== narrow windows"
 WIDE=$SIZE
+# forum-wm maximizes a document window, so a narrow one would be painted
+# at the screen's width whatever it asked for: these run without it (the
+# strip then covers the window's top rows), and it comes back after.
+[ "$SPLIT" = 1 ] && g "pkill -x forum-wm; sleep 2; true"
 for sz in $NARROW; do
     for th in light dark; do
         SIZE=$sz
@@ -113,6 +117,10 @@ for sz in $NARROW; do
     fi
 done
 SIZE=$WIDE
+if [ "$SPLIT" = 1 ]; then
+    g "cd $S && env FRESCO_SOCKET=$S/fresco.sock FRESCO_WM_SOCKET=$S/wm.sock FORUM_CTL_SOCKET=$S/ctl.sock FORUM_STATE=$S/forum-state daemon -f -o $S/wm.log $D/forum-wm </dev/null"
+    sleep 8
+fi
 
 if [ "${DRIVE:-1}" = 1 ]; then
     echo "=== drive: clicks and keys through the injector"

@@ -5,6 +5,7 @@
 use super::criteria::{Criterion, Key};
 use super::ifcache;
 use super::arrays::*;
+use super::more::*;
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -172,6 +173,51 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("BYCOL", 2, 2, bycol),
     f!("MAKEARRAY", 3, 3, makearray),
     f!("ISOMITTED", 1, 1, isomitted),
+    // the second batch (more.rs), after the first so function ids stay put
+    f!("CEILING", 2, 2, ceiling),
+    f!("FLOOR", 2, 2, floor),
+    f!("CEILING.MATH", 1, 3, ceiling_math),
+    f!("FLOOR.MATH", 1, 3, floor_math),
+    f!("MROUND", 2, 2, mround),
+    f!("QUOTIENT", 2, 2, quotient),
+    f!("EVEN", 1, 1, even),
+    f!("ODD", 1, 1, odd),
+    f!("FACT", 1, 1, fact),
+    f!("COMBIN", 2, 2, combin),
+    f!("GCD", 1, N, gcd),
+    f!("LCM", 1, N, lcm),
+    f!("SUMSQ", 1, N, sumsq),
+    f!("RADIANS", 1, 1, radians),
+    f!("DEGREES", 1, 1, degrees),
+    f!("SIN", 1, 1, sin),
+    f!("COS", 1, 1, cos),
+    f!("TAN", 1, 1, tan),
+    f!("ASIN", 1, 1, asin),
+    f!("ACOS", 1, 1, acos),
+    f!("ATAN", 1, 1, atan),
+    f!("ATAN2", 2, 2, atan2),
+    f!("TIME", 3, 3, time),
+    f!("HOUR", 1, 1, hour),
+    f!("MINUTE", 1, 1, minute),
+    f!("SECOND", 1, 1, second),
+    f!("EDATE", 2, 2, edate),
+    f!("DAYS", 2, 2, days),
+    f!("DATEDIF", 3, 3, datedif),
+    f!("NETWORKDAYS", 2, 3, networkdays),
+    f!("WORKDAY", 2, 3, workday),
+    f!("WEEKNUM", 1, 2, weeknum),
+    f!("ISOWEEKNUM", 1, 1, isoweeknum),
+    f!("PROPER", 1, 1, proper),
+    f!("CHAR", 1, 1, char_fn),
+    f!("CODE", 1, 1, code),
+    f!("UNICHAR", 1, 1, unichar),
+    f!("UNICODE", 1, 1, unicode),
+    f!("CLEAN", 1, 1, clean),
+    f!("SWITCH", 3, N, switch),
+    f!("ISEVEN", 1, 1, iseven),
+    f!("ISODD", 1, 1, isodd),
+    f!("N", 1, 1, n_fn),
+    f!("T", 1, 1, t_fn),
 ];
 
 /// The id of a function by its upper-case name.
@@ -223,7 +269,7 @@ fn opt_num(c: &Ctx, args: &[Expr], i: usize, default: f64) -> Result<f64, ErrorK
 /// Visits the numbers in `args` as SUM does: in ranges and arrays only numbers count
 /// (text and booleans are skipped); direct arguments are coerced (`SUM("3", TRUE)` is 4).
 /// The first error stops it.
-fn each_num(c: &Ctx, args: &[Expr], f: &mut dyn FnMut(f64)) -> Result<(), ErrorKind> {
+pub(super) fn each_num(c: &Ctx, args: &[Expr], f: &mut dyn FnMut(f64)) -> Result<(), ErrorKind> {
     each_num_slices(c, args, &mut |xs| xs.iter().for_each(|&x| f(x)))
 }
 

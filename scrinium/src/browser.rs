@@ -570,6 +570,30 @@ impl Browser {
         self.reload();
     }
 
+    /// The place an app's "Show in Files" means: `folder` of the person's
+    /// (Personal) or of the named persona's.
+    pub fn shown_place(persona: &str, folder: limen::picker::Folder) -> String {
+        let f = folder.label().to_ascii_lowercase();
+        if persona == "personal" { format!("home:{f}") } else { format!("persona:{persona}:{f}") }
+    }
+
+    /// "Show in Files" (§4.5): open the place `place_id` and select the file
+    /// `name` at its top, or say it isn't there. `false` when the place isn't
+    /// (yet) one of ours.
+    pub fn show(&mut self, place_id: &str, name: &str) -> bool {
+        let Some(i) = self.places.iter().position(|p| p.id == place_id) else { return false };
+        self.go(i, Vec::new(), true);
+        let label = self.places[i].label.clone();
+        match self.entries.iter().position(|e| e.name == name) {
+            Some(j) => {
+                self.select_only(j);
+                self.notice = None;
+            }
+            None => self.say(format!("“{name}” is not in {label} any more"), true),
+        }
+        true
+    }
+
     pub fn open_place(&mut self, i: usize) {
         if i < self.places.len() {
             self.go(i, Vec::new(), true);
@@ -1623,6 +1647,33 @@ mod tests {
         b.persona = "work".into();
         b.set_places(all);
         assert_eq!(ids(&b), ["persona:work:documents", "persona:work:downloads", "da1s1", "da2s1"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn show_in_files_opens_the_personas_folder_on_the_file() {
+        use limen::picker::Folder;
+        let d = std::env::temp_dir().join(format!("scrinium-show-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["home/Downloads", "personas/work/Downloads"] {
+            std::fs::create_dir_all(d.join(f)).unwrap();
+        }
+        std::fs::write(d.join("home/Downloads/a.pdf"), "a").unwrap();
+        std::fs::write(d.join("home/Downloads/report.pdf"), "r").unwrap();
+        std::fs::write(d.join("personas/work/Downloads/report.pdf"), "w").unwrap();
+        let mut all = crate::places::home_in(&d.join("home"));
+        all.extend(crate::places::personas_in(&d.join("personas")));
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(all);
+        assert_eq!(Browser::shown_place("personal", Folder::Downloads), "home:downloads");
+        assert!(b.show(&Browser::shown_place("work", Folder::Downloads), "report.pdf"));
+        assert_eq!(b.dir().unwrap(), d.join("personas/work/Downloads"), "Work's own Downloads");
+        assert_eq!(b.selected_names(), ["report.pdf"]);
+        assert!(b.show("home:downloads", "report.pdf"));
+        assert_eq!((b.dir().unwrap(), b.selected_names()), (d.join("home/Downloads"), vec!["report.pdf".to_string()]));
+        assert!(b.show("home:downloads", "gone.pdf"));
+        assert!(b.selected.is_empty() && b.notice.as_ref().is_some_and(|n| n.text.contains("not in Downloads")));
+        assert!(!b.show("persona:school:downloads", "x"), "not a place of ours");
         let _ = std::fs::remove_dir_all(&d);
     }
 

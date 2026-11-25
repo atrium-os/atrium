@@ -704,8 +704,16 @@ pub enum Response {
     JailExecStarted { pid: i32, uid: u32 },
 
     /// [`Request::JailInfo`]: `jid` is `None` when the jail is recorded but
-    /// not running.
-    JailInfo { jid: Option<i32>, path: String, persist: bool },
+    /// not running. `memory` is its resident memory in bytes (rctl
+    /// `memoryuse`) and `memory_cap` the smallest `memoryuse` cap on it,
+    /// both `None` where racct can't say (not running, no RACCT).
+    JailInfo {
+        jid: Option<i32>, path: String, persist: bool,
+        #[serde(default)]
+        memory: Option<u64>,
+        #[serde(default)]
+        memory_cap: Option<u64>,
+    },
 
     /// Request was structurally valid but rejected by jaild's
     /// policy (mount source not allowed, name pattern bad, …).

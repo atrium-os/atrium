@@ -703,7 +703,21 @@ manifest asks for no `graphics`: its panel is on the
 embed-only frescod connection limend hands it, and limend refuses a
 provider that would also get frescod's app socket. `vm-embeds-check.sh`
 covers the refusals: a plain `editor-extension` request gets no provider,
-an app that isn't a plugin gets NO_PLUGIN. **Not done yet:** the C header.
+an app that isn't a plugin gets NO_PLUGIN.
+C (2026-11-25): `libatrium` carries the session behind
+`include/atrium_plugin.h` (`atrium_plugin_start`, `_next` with
+`atrium_plugin_event_t`, `_send`/`_reply`/`_notify` taking JSON text that
+is parsed before it goes out, `_register_command`, `_status`,
+`_open_panel` (a window on limend's frescod connection, drawn with
+atrium.h's frame calls), `_workspace_dir`, `_path_of`, and
+`atrium_plugin_json_get` to read a message's fields by path). Strings it
+hands out live until the next `_next`. The sample `artifex/plugins/words`
+(`org.atrium.sample.words`, "Word count") is C: it counts the active
+Markdown file's words and lines from didOpen/didChange and answers its
+palette command in the status bar. `libatrium/tests/plugin_c_abi.rs`
+covers the calls, refusals and a panel against a stub frescod;
+`vm-artifex-check.sh` builds `words` against this tree's `libatrium.a`
+and switches it on, checks its jail, its count and its exit.
 
 **Decisions.**
 

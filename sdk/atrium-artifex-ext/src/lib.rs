@@ -104,6 +104,20 @@ impl Channel for Child {
     }
 }
 
+/// A boxed channel, so one plugin type serves limend's channel and a
+/// test's (the C interface keeps one handle type for both).
+impl Channel for Box<dyn Channel> {
+    fn poll(&mut self, wait: Duration) -> Result<Option<ChildEvent>, Error> {
+        (**self).poll(wait)
+    }
+    fn emit(&mut self, embed: EmbedId, bytes: Vec<u8>) -> Result<(), Error> {
+        (**self).emit(embed, bytes)
+    }
+    fn ready(&mut self, embed: EmbedId, window: WindowToken) -> Result<(), Error> {
+        (**self).ready(embed, window)
+    }
+}
+
 /// One plugin instance: what Artifex opened it for, and its channel.
 pub struct Plugin<C: Channel = Child> {
     ch: C,

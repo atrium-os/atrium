@@ -115,6 +115,8 @@ pub fn words(cap: &str) -> (String, bool) {
         "window-management" | "window_management" => ("manage other apps' windows", true),
         "arca" => ("keep secrets in your keychain (Arca)", false),
         "embeds" => ("show parts of other apps inside its window", false),
+        // An Artifex plugin's ask; the person allows it per workspace there.
+        "workspace-read" => ("read a workspace's files in Artifex, where you allow it", true),
         _ => {
             if let Some(role) = cap.strip_prefix("embeds:") {
                 return (embed_words(role), false);
@@ -168,6 +170,7 @@ mod tests {
         assert_eq!(words("tessera-cas-read"), ("tessera cas read".into(), true), "unknown ones are marked");
         assert_eq!(words("embeds:picker"), ("show the file picker inside its window".into(), false));
         assert_eq!(words("embeds:new-role").0, "show new role inside its window");
+        assert_eq!(words("workspace-read"), ("read a workspace's files in Artifex, where you allow it".into(), true));
         assert_eq!(size(512), "512 bytes");
         assert_eq!(size(3_400_000), "3.4 MB");
     }

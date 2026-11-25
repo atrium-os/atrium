@@ -350,7 +350,12 @@ pub fn tree(s: &Shell) -> Node {
                 crate::shell::DownloadState::Opened(a) => format!("opened in {a}"),
                 crate::shell::DownloadState::Failed(w) => format!("not kept: {w}"),
             };
-            Node::new(id::DOWNLOADS_MENU | (i as u64 + 1) << 8, "list-item", d.file.clone()).value(st)
+            let row = Node::new(id::DOWNLOADS_MENU | (i as u64 + 1) << 8, "list-item", d.file.clone()).value(st);
+            match (&d.state, &d.in_downloads) {
+                (crate::shell::DownloadState::Saved(_), Some(_)) =>
+                    row.kids(vec![Node::new(id::DOWNLOADS_MENU | (i as u64 + 1) << 8 | 1 << 40, "button", "Show in Files".to_string())]),
+                _ => row,
+            }
         }).collect();
         top.push(Node::new(id::DOWNLOADS_MENU, "list", "Downloads").kids(kids));
     }

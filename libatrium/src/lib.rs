@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 
 pub mod inspect;
+pub mod plugin;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
@@ -1129,6 +1130,14 @@ fn fresco_ensure_open() -> bool {
     } else {
         false
     }
+}
+
+/// Make `conn` the window connection (an Artifex plugin's panel uses the
+/// frescod connection limend handed it, not a socket path) and run `body`
+/// on it.
+pub(crate) fn with_adopted_fresco<T>(conn: fresco_client::Connection, body: impl FnOnce(&mut fresco_client::Connection) -> T) -> T {
+    let mut g = FRESCO_CONN.lock().unwrap_or_else(|e| e.into_inner());
+    body(g.insert(conn))
 }
 
 fn fresco_drop() {

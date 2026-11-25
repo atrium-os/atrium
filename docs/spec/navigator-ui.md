@@ -1725,18 +1725,37 @@ its own checks (trace lines plus a screenshot at each width the step touches).
   quotas, 5 MB plus 50 MB. The popover says "Storage: 12 MB of 58 MB, kept on this
   computer, in your Personal persona". The UI drops a count for another page, or one
   over its max.
-- **Memory** stays in words ("capped by its jail"). Its use is the engine jail's
-  `memoryuse`, which only rctl reads (as memfed does), and navigatord, unprivileged and
-  jailed, can't. A number would need limend or portcullisd to report it to the island's
-  parent.
+- **Memory in numbers** (2026-11-25): the engine jail's `memoryuse`, which only root's
+  rctl reads, comes up a chain where each link checks the one below:
+  - jaild's `JailInfo` answer carries `memory` (from `rctl -u jail:<name>`) and
+    `memory_cap` (the smallest `memoryuse` rule on it), for a jail jaild made.
+  - portcullisd answers `InstanceUsage { seq }` only on the connection that holds an
+    `ExecInstance`, while the jail runs: holding that connection is the authority, and
+    only the launcher (here limend) has it. The hang-up watcher reads it (lines of at most
+    128 bytes, one answer a second, sent without blocking under a lock it shares with the
+    launch's last answer); anything else written there gets an `Error`.
+  - limend's parent op `USAGE` (`Reply::Usage { memory, cap }`) answers only an embed's
+    own parent, and only for an embed it spawned; `NO_USAGE` otherwise.
+  - navigatord asks every 5 s while the page runs and sends `Event::LiveMemory { from,
+    used, cap }` when it moved by a mebibyte or the cap changed.
+  The popover says "Memory: 70 MB of 1 GB. Past that, the page stops." Until a number
+  comes it keeps the words.
 - **Opened beside**: a page a live page opened beside on a press (I6.8) is marked with an
   app-window glyph in the rail's path while the run lasts. At most 64 are tracked, which
   is navigatord's own cap.
-- **Downloads** got its popover in step 1. "Show in Files" is not built: no app can yet
-  ask Files to show a file. That is a generic primitive for Files (Scrinium), not a
-  Navigator feature, and it waits on that design.
-- Host test:
-  `the_live_popover_says_what_the_running_page_holds_and_the_rail_marks_its_windows`.
+- **Show in Files** (2026-11-25): a saved download's row in the Downloads list has a
+  "Show in Files" button when portcullisd saved it into the persona's Downloads
+  (`Event::Saved` carries its own `name`). The press asks Files through the generic
+  primitive in [scrinium.md](scrinium.md) §4.5 (`pergola::files::show`, Downloads, that
+  name); Files opens its own window on the file. Navigator learns only whether Files took
+  the ask.
+- Host tests:
+  `the_live_popover_says_what_the_running_page_holds_and_the_rail_marks_its_windows`,
+  `downloads_list_what_was_answered_and_how_it_ended` (Show in Files), navigatord's
+  `memory_is_told_first_then_on_a_mebibyte_or_a_new_cap`, limend's
+  `only_an_embeds_parent_learns_its_memory_use` and
+  `a_late_answer_is_skipped_and_an_exit_is_no_answer`, jaild's
+  `memory_use_and_cap_from_rctl_output`.
 
 *Step 5, 2026-11-25*:
 - **Dark** needs no new code: every colour in the chrome is a Pergola token. The only fixed

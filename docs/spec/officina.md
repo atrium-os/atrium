@@ -5025,6 +5025,21 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - Tests: `gridlines_and_headings_turn_off_per_sheet_and_files_keep_them`, `cell_styles_set_font_fill_and_borders_and_keep_the_number_format`, `a_filter_column_keeps_rows_by_fill_or_text_colour` and `remove_duplicates_keeps_the_first_of_each_row_and_undoes` (ambiguous names) in Sheets; pergola `gridlines_and_headings_can_be_turned_off`; officina-grid `iso_dates_read_as_dates_and_write_back_as_written`; officina-convert `gridlines_and_headings_off_round_trip_through_xlsx_ods_and_the_native_file`. All 161 Sheets (`--test-threads=2`), 247 pergola and 124 officina-grid lib tests pass.
 - Not yet: headings off in LibreOffice is view-wide, so a file with some sheets' headings off shows them all there; cell style names (`cellStyleXfs`) aren't kept, only their look.
 
+### 16.132 Forty-four more functions (2026-11-25)
+
+Sheets had 128 functions; Excel's everyday ones it lacked now work, in `eval/more.rs`, appended after the first batch so function ids stay put:
+
+- **Rounding to a multiple and integers:** CEILING, FLOOR, CEILING.MATH, FLOOR.MATH, MROUND, QUOTIENT, EVEN, ODD, FACT, COMBIN, GCD, LCM, SUMSQ. Quotients within 1e-12 of a whole number count as whole, so CEILING(1.5, 0.1) is 1.5 as in Excel. GCD and LCM take ranges, refuse negatives and numbers past 2^53, and LCM refuses a result past 2^64 (#NUM!).
+- **Trigonometry:** SIN, COS, TAN (refusing angles of 2^27 or more, as Excel), ASIN, ACOS, ATAN, ATAN2 (x first, as Excel), RADIANS, DEGREES.
+- **Times and dates:** TIME (wrapping past a day, #NUM! below zero), HOUR, MINUTE and SECOND (to the nearest second), EDATE (the month's last day when the day is past it), DAYS, DATEDIF (Y, M, D, YM, YD and MD, whose odd results for a day past the month's end are Excel's), NETWORKDAYS and WORKDAY (Monday to Friday, with up to 100,000 holidays; whole weeks at once when there are none), WEEKNUM (return types 1, 2, 11 to 17 and 21) and ISOWEEKNUM. All use the workbook's date system.
+- **Text:** PROPER (a letter after a non-letter is capital, so 76BudGet is 76Budget), CHAR and CODE (Windows-1252, as Excel on Windows; CODE gives 63 for a character it lacks), UNICHAR, UNICODE, CLEAN.
+- **Logic and information:** SWITCH (with a default; #N/A without a match), ISEVEN, ISODD (#VALUE! for a logical), N, T.
+- One-value arguments lift over arrays as the first batch's do (`EVEN(A1:A3)` is three values). NETWORKDAYS' and WORKDAY's holidays are a set, and SWITCH lifts only its expression.
+- Files: `.xlsx` writes UNICHAR and UNICODE with `_xlfn.`, as it already did CEILING.MATH, FLOOR.MATH, DAYS, ISOWEEKNUM and SWITCH. `.ods` writes CEILING, FLOOR and their .MATH forms in Microsoft's namespace, as LibreOffice does, since OpenFormula's CEILING and FLOOR differ for negative numbers.
+- Sheets shows argument tips for all of them (`fnhelp::ARGS`), and AutoComplete offers them.
+- Tests: 106 new conformance cases with the results on Microsoft's function pages (`tests/conformance.rs`, 326 in all, each printed and parsed back); the `.xlsx` and `.ods` name tests; Sheets' `every_function_has_its_arguments_and_they_match_its_counts`. `tests/budget.rs`' `sliced_recalc_stops_in_time_and_ends_where_one_call_does` fails here the same way before this change (a 64 ms slice in a debug build on a busy cloud box).
+- Not yet: MAXIFS and MINIFS, XMATCH, TEXTBEFORE and TEXTSPLIT, OFFSET and INDIRECT, LOOKUP, ADDRESS, RANK, PERCENTILE, QUARTILE, MODE, the financial functions (PMT, FV, PV, NPV, IRR, RATE, NPER), YEARFRAC and the rest of the long tail.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

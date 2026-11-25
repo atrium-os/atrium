@@ -359,6 +359,73 @@ struct Embed {
     requested: bool,
 }
 
+/// The most "Show in Files" windows open at once, across apps.
+const SHOWN_MAX: usize = 4;
+
+/// Show `ask` (a place id, a file name) for the app running as `uid`: in
+/// its window if it has one open, else in a new one.
+fn show_in_files(shown: &mut HashMap<u32, Sender<(String, String)>>, uid: u32, persona: String, ask: (String, String),
+                 fresco: &str, places: &SharedPlaces) -> Result<(), String> {
+    let ask = match shown.get(&uid) {
+        Some(w) => match w.send(ask) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::SendError(ask)) => {
+                shown.remove(&uid);
+                ask
+            }
+        },
+        None => ask,
+    };
+    // A window whose person closed it has dropped its end.
+    shown.retain(|_, w| w.send((String::new(), String::new())).is_ok());
+    if shown.len() >= SHOWN_MAX {
+        return Err("Too many Files windows are open".into());
+    }
+    let (wtx, wrx) = mpsc::channel();
+    let _ = wtx.send(ask);
+    let (f, pl) = (fresco.to_string(), places.clone());
+    std::thread::spawn(move || shown_window(f, pl, persona, wrx));
+    shown.insert(uid, wtx);
+    Ok(())
+}
+
+/// A Files window opened by "Show in Files": the file manager, on the asked
+/// place with the file selected; a later ask moves it.
+fn shown_window(fresco: String, places: SharedPlaces, persona: String, rx: Receiver<(String, String)>) {
+    let (w, h) = size_of(&env("SCRINIUM_SIZE", ""), (960, 600));
+    let win = match fresco_client::Connection::connect(&fresco).and_then(|c| Window::open_on(c, &WindowDesc::new("Files", SizeSpec::Fixed(w, h)))) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("scrinium: a Files window to show a file: {e}");
+            return;
+        }
+    };
+    let mut pane = Pane::new(win, Mode::Manager);
+    with(&pane.state, |b| b.persona = persona);
+    let mut want: Option<(String, String)> = None;
+    loop {
+        if !pane.step(Duration::from_millis(100), &places, "shown") {
+            break;
+        }
+        while let Ok(ask) = rx.try_recv() {
+            // An empty ask only checks that the window is still open.
+            if !ask.0.is_empty() { want = Some(ask); }
+        }
+        if let Some((id, name)) = want.clone() {
+            let mut done = false;
+            with(&pane.state, |b| done = b.show(&id, &name));
+            if done { want = None; }
+        }
+        // Ejecting is the Files window's own; here it says so.
+        if pane.state.get_cloned().want_eject.is_some() {
+            with(&pane.state, |b| {
+                b.want_eject = None;
+                b.notice = Some(scrinium::browser::Notice { text: "Eject from the Files app's own window".into(), error: true });
+            });
+        }
+    }
+}
+
 /// Hand the pick over: files as descriptors, a folder as a grant into the
 /// app's jail (dispensatord finds the jail from the app's uid).
 fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_sock: &std::path::Path) -> Result<(), String> {
@@ -484,6 +551,9 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
         eprintln!("scrinium: providing picker");
         let (tx, rx) = mpsc::channel::<FromPane>();
         let mut embeds: HashMap<EmbedId, Embed> = HashMap::new();
+        // "Show in Files" windows, one per asking app (by uid), which a
+        // later ask of that app's moves.
+        let mut shown: HashMap<u32, Sender<(String, String)>> = HashMap::new();
         loop {
             let ev = match child.poll(Duration::from_millis(20)) {
                 Ok(ev) => ev,
@@ -535,6 +605,26 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                     }
                 }
                 Some(ChildEvent::Message { embed, bytes }) => {
+                    if let Some(ToChild::Show { folder, name }) = ToChild::decode(&bytes) {
+                        let Some(e) = embeds.get_mut(&embed) else { continue };
+                        if e.requested { continue; }
+                        e.requested = true;
+                        // Not a sheet: the picker's own window never comes up.
+                        let _ = e.to_pane.send(ToPane::Close);
+                        let reply = match e.persona.clone() {
+                            None => ToParent::Failed { why: "Cannot tell whose files to show".into() },
+                            Some(persona) => {
+                                let ask = (Browser::shown_place(&persona, folder), name);
+                                eprintln!("scrinium: showing a file in {} for uid {}", ask.0, e.parent_uid);
+                                match show_in_files(&mut shown, e.parent_uid, persona, ask, &fresco, &places) {
+                                    Ok(()) => ToParent::Done { files: 0 },
+                                    Err(why) => ToParent::Failed { why },
+                                }
+                            }
+                        };
+                        let _ = child.emit(embed, reply.encode());
+                        continue;
+                    }
                     let message = match ToChild::decode(&bytes) {
                         Some(ToChild::OpenInPersona { filter, persona }) => {
                             let Some(e) = embeds.get_mut(&embed) else { continue };

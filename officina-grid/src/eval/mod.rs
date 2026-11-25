@@ -12,6 +12,7 @@ pub mod criteria;
 pub mod dates;
 pub mod funcs;
 pub mod ifcache;
+mod more;
 mod textafter;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};

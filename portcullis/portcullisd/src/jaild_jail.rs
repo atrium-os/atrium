@@ -159,6 +159,16 @@ pub fn jid(name: &str) -> Option<i32> {
     }
 }
 
+/// A jail jaild made: its resident memory and smallest memory cap, in
+/// bytes, each `None` where jaild or racct can't say.
+pub fn memory(name: &str) -> (Option<u64>, Option<u64>) {
+    let Ok(mut client) = connect() else { return (None, None) };
+    match client.send(&Request::JailInfo { name: name.into() }) {
+        Ok((Response::JailInfo { memory, memory_cap, .. }, _)) => (memory, memory_cap),
+        _ => (None, None),
+    }
+}
+
 /// Run a process in a jail jaild made, as `req` says: on a pty (the master
 /// comes back) or on `stdio`.
 pub fn exec_in(req: ExecInJailRequest, stdio: Option<[OwnedFd; 3]>) -> Result<(Running, Option<OwnedFd>), String> {

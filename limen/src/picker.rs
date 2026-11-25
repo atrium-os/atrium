@@ -130,6 +130,41 @@ pub enum ToChild {
     /// Open one read-only file only if the broker delivered this parent persona.
     /// An older picker cannot interpret the request or expose its default place.
     OpenInPersona { filter: Filter, persona: String },
+    /// Show the person the file `name` in their `folder`, in the asking
+    /// app's persona, in a Files window of its own (navigator-ui.md §15.3,
+    /// scrinium.md §4.5): "Show in Files". Nothing comes back but `Done {
+    /// files: 0 }` once the window is asked for, or `Failed`: the app
+    /// learns neither the folder's contents nor whether the file is there.
+    Show { folder: Folder, name: String },
+}
+
+/// One of the person's own folders, by name: the app never names a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Folder {
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Videos,
+}
+
+impl Folder {
+    /// Its name as the person sees it, which is also its folder's.
+    pub fn label(self) -> &'static str {
+        match self {
+            Folder::Documents => "Documents",
+            Folder::Downloads => "Downloads",
+            Folder::Pictures => "Pictures",
+            Folder::Music => "Music",
+            Folder::Videos => "Videos",
+        }
+    }
+}
+
+/// A file's own name as [`ToChild::Show`] takes it: no folder, nothing a
+/// path walk could use, no control characters, at most [`MAX_NAME`] bytes.
+pub fn plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && clean(name, MAX_NAME)
 }
 
 impl ToChild {
@@ -144,6 +179,7 @@ impl ToChild {
             Self::Open(f) if !f.sane() => None,
             Self::OpenInPersona { filter, persona } if !filter.sane() || filter.kind != Kind::File
                 || filter.write || filter.multiple || (persona != "personal" && !portcullis_peer::valid_person_persona(persona)) => None,
+            Self::Show { name, .. } if !plain_name(name) => None,
             _ => Some(m),
         }
     }
@@ -249,6 +285,22 @@ mod tests {
         ] {
             assert_eq!(ToParent::decode(&bad.encode()), None, "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod show_tests {
+    use super::*;
+
+    #[test]
+    fn show_takes_a_plain_name_in_one_of_the_persons_folders() {
+        let m = ToChild::Show { folder: Folder::Downloads, name: "report (2).pdf".into() };
+        assert_eq!(ToChild::decode(&m.encode()), Some(m));
+        for bad in ["", ".", "..", "../etc/passwd", "a/b", "a\u{0}b", "a\nb", &"x".repeat(MAX_NAME + 1)] {
+            let m = ToChild::Show { folder: Folder::Downloads, name: bad.into() };
+            assert_eq!(ToChild::decode(&m.encode()), None, "{bad:?}");
+        }
+        assert_eq!(Folder::Downloads.label(), "Downloads");
     }
 }
 

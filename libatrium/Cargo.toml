@@ -24,6 +24,10 @@ fresco-client   = { path = "../fresco-client" }
 postcard        = { version = "1", features = ["use-std"] }
 atrium-inspect  = { path = "../atrium-inspect" }
 libc            = "0.2"
+# Artifex plugins in C (atrium_plugin.h, dev-tools.md §3.8).
+atrium-artifex-ext = { path = "../sdk/atrium-artifex-ext" }
+limen           = { path = "../limen" }
+serde_json      = "1"
 
 [dev-dependencies]
 tempfile = "3"

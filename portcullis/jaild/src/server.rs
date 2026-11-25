@@ -1937,7 +1937,9 @@ fn handle_jail_info(name: &str, state: &PersistentState) -> (Response, Vec<i32>)
             detail: format!("no jail named {name:?} in jaild state"),
         }, Vec::new());
     };
-    (Response::JailInfo { jid: ffi::jail_id_by_name(name), path: r.path.clone(), persist: r.persistent }, Vec::new())
+    let jid = ffi::jail_id_by_name(name);
+    let (memory, memory_cap) = if jid.is_some() { (ffi::jail_memory_use(name), ffi::jail_memory_cap(name)) } else { (None, None) };
+    (Response::JailInfo { jid, path: r.path.clone(), persist: r.persistent, memory, memory_cap }, Vec::new())
 }
 
 /// A TCP socket listening on 127.0.0.1:`port` (0: any) in the network stack

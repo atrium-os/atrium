@@ -47,6 +47,18 @@ pub struct Pending {
 /// `false` and `network = "none"` grant nothing.
 pub fn caps(manifest: &str) -> Vec<String> {
     let v: toml::Value = manifest.parse().unwrap_or(toml::Value::Table(Default::default()));
+    let mut out = granted(&v);
+    // An Artifex plugin that asks to read workspaces (dev-tools.md §3.8,
+    // D28): the person still allows it per workspace in Artifex, but the
+    // sheet names it and an update that starts asking is asked about.
+    let ext = v.get("roles").and_then(|r| r.get("editor-extension"));
+    if ext.and_then(|e| e.get("workspace-read")).and_then(|w| w.as_bool()) == Some(true) {
+        out.push("workspace-read".into());
+    }
+    out
+}
+
+fn granted(v: &toml::Value) -> Vec<String> {
     v.get("capabilities").and_then(|c| c.as_table()).map(|t| {
         t.iter().filter(|(k, v)| k.as_str() != "graphics" && v.as_bool() != Some(false) && v.as_str() != Some("none"))
             .flat_map(|(k, v)| match (k.as_str(), v) {
@@ -79,6 +91,16 @@ pub fn class(manifest: &str) -> String {
 /// What to do with `new` over `installed`, for a person who chose `pref`.
 #[cfg(test)]
 mod embeds_tests {
+    #[test]
+    fn a_plugin_that_reads_workspaces_says_so_and_an_update_that_starts_asking_asks() {
+        let m = |read: &str| format!("[app]\nid = \"org.a.b\"\nname = \"B\"\nversion = \"1\"\nentry = \"x\"\n[capabilities]\nnetwork = \"none\"\n[roles]\nimplements = [\"editor-extension\"]\n[roles.editor-extension]\nlanguages = [\"c\"]\n{read}");
+        assert_eq!(super::caps(&m("workspace-read = true\n")), ["workspace-read"]);
+        assert!(super::caps(&m("workspace-read = false\n")).is_empty());
+        assert!(super::caps(&m("")).is_empty());
+        let (_, added) = super::decide(&m(""), &m("workspace-read = true\n"), true, None);
+        assert_eq!(added, ["workspace-read"]);
+    }
+
     #[test]
     fn each_embedded_role_is_its_own_line_and_an_added_one_is_asked() {
         let m = |e: &str| format!("[app]\nid = \"org.a.b\"\nname = \"B\"\nversion = \"1\"\nentry = \"x\"\n[capabilities]\nembeds = [{e}]\n");

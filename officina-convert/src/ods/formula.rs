@@ -219,7 +219,9 @@ fn looks_like_cell(s: &str) -> bool {
 /// `=SUM(A1:A3)` → `of:=SUM([.A1:.A3])`.
 /// Functions Excel added that OpenFormula names in Microsoft's namespace (as
 /// LibreOffice writes them).
-const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET"];
+/// Excel functions OpenFormula has under another meaning, or not at all:
+/// LibreOffice writes them in Microsoft's namespace too.
+const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET", "CEILING", "FLOOR", "CEILING.MATH", "FLOOR.MATH"];
 
 pub fn to_of(a1: &str) -> String {
     let body = a1.strip_prefix('=').unwrap_or(a1);
@@ -434,6 +436,8 @@ mod tests {
             ("=IF(FALSE,1)", "of:=IF(FALSE();1)"),
             ("=1E+30", "of:=1E+30"),
             ("=ISERROR(#REF!)+ISNA(#N/A)", "of:=ISERROR(#REF!)+ISNA(#N/A)"),
+            ("=CEILING.MATH(A1,2)+FLOOR(A1,2)", "of:=COM.MICROSOFT.CEILING.MATH([.A1];2)+COM.MICROSOFT.FLOOR([.A1];2)"),
+            ("=NETWORKDAYS(A1,B1)+SWITCH(A1,1,2)", "of:=NETWORKDAYS([.A1];[.B1])+SWITCH([.A1];1;2)"),
         ] {
             assert_eq!(to_of(a1), of, "{a1}");
             assert_eq!(from_of(of).as_deref(), Some(a1), "back {of}");

@@ -5,7 +5,7 @@
 # Installs, in the base (so every workspace sees them, read-only):
 #   /usr/lib/libfresco.so.0 (+ .so link, .a)   built natively in the VM
 #   /usr/lib/libatrium.so.0 (+ .so link, .a)   cross-built here
-#   /usr/include/atrium/{fresco.h,atrium.h}
+#   /usr/include/atrium/{fresco.h,atrium.h,atrium_plugin.h}
 #   /usr/libdata/pkgconfig/{fresco,atrium}.pc
 #   /usr/share/mk/atrium.app.mk
 # The image builders call the same steps for an image.
@@ -32,7 +32,7 @@ tar -C "$ROOT/libfresco" -cf - Makefile src include | V "tar -C $S/libfresco -xf
 # Its kernel interface headers, at ../fresco-kmod as the tree has them.
 V "mkdir -p $S/fresco-kmod"
 (cd "$ROOT/fresco-kmod" && tar -cf - *.h) | V "tar -C $S/fresco-kmod -xf -"
-for f in "$LA/libatrium.so" "$LA/libatrium.a" "$ROOT/libatrium/include/atrium.h" \
+for f in "$LA/libatrium.so" "$LA/libatrium.a" "$ROOT/libatrium/include/atrium.h" "$ROOT/libatrium/include/atrium_plugin.h" \
          "$ROOT/etc/pkgconfig/fresco.pc" "$ROOT/etc/pkgconfig/atrium.pc" "$ROOT/etc/mk/atrium.app.mk"; do
     scp -q $K -P 2222 "$f" root@localhost:$S/
 done
@@ -50,7 +50,7 @@ install -m 0444 $S/libatrium.so /usr/lib/libatrium.so.0
 ln -sf libatrium.so.0 /usr/lib/libatrium.so
 install -m 0444 $S/libatrium.a /usr/lib/libatrium.a
 mkdir -p /usr/include/atrium /usr/libdata/pkgconfig /usr/share/mk
-install -m 0444 include/fresco.h $S/atrium.h /usr/include/atrium/
+install -m 0444 include/fresco.h $S/atrium.h $S/atrium_plugin.h /usr/include/atrium/
 install -m 0444 $S/fresco.pc $S/atrium.pc /usr/libdata/pkgconfig/
 install -m 0444 $S/atrium.app.mk /usr/share/mk/atrium.app.mk
 EOS

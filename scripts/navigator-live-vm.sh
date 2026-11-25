@@ -337,7 +337,7 @@ key 0x29                    # Esc: the rail lets go
 T=$(tool aa); press ${T% *} $((TOP + ${T#* }))
 sleep "$GAP"
 shot live-11-aa
-press 1158 152              # Text size + (the pop-up hangs from Aa, 32 pt left of where it was)
+press 1190 152              # Text size + (the pop-up is held inside the window's right edge)
 g "grep -q 'reading changed: text 72 ' $S/ui9.log" && ok "Aa: a larger text size went to the page" || bad "aa text: $(g "grep -v trace $S/ui9.log | tail -3")"
 g "grep -q 'laid out again: text 112%' $S/limend.log" && ok "…which laid the page out again, without fetching it" || bad "relayout: $(g "grep 'laid out again' $S/limend.log | tail -2")"
 press 1172 270              # Comfortable

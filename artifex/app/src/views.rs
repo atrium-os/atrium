@@ -683,12 +683,11 @@ pub fn plugins(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
              w - em(48.0), type_size::SM, Weight::Regular, t.text_tertiary(), 3);
         return;
     }
-    let mut y = y0 + em(80.0);
-    for (i, r) in s.plugin_rows.iter().enumerate() {
+    for ((i, r), (top, rh)) in s.plugin_rows.iter().enumerate().zip(plugin_row_tops(&s.plugin_rows)) {
+        let y = y0 + top;
         if y > area.y() + area.h() - em(90.0) {
             break;
         }
-        let rh = em(30.0) + r.asks.len() as f32 * em(18.0) + if r.state.is_empty() { 0.0 } else { em(20.0) } + em(12.0);
         ctx.add(Node::Rect { rect: Rect::new(x0 + em(16.0), y, w - em(32.0), rh), fill: t.bg_surface(), radius: radius::MD });
         icon(ctx, x0 + em(32.0), y + em(20.0), phosphor::PUZZLE_PIECE, type_size::MD, t.text_secondary());
         text(ctx, x0 + em(56.0), y + em(20.0), &r.name, type_size::MD, Weight::Medium, t.text_primary());
@@ -718,8 +717,19 @@ pub fn plugins(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
                 Button::ghost("Restart").at(x0 + w - em(150.0), ly - em(12.0)).width(em(118.0)).on_click(plain(q, Act::PluginRestart(r.app.clone()))).render(ctx);
             }
         }
-        y += rh + em(10.0);
     }
+}
+
+/// Each Plugins row's top, below the view's top, and its height (points).
+/// Switch on/off is 22 below the top, Allow reading/Take back 60.
+pub fn plugin_row_tops(rows: &[crate::ui::PluginRow]) -> Vec<(f32, f32)> {
+    let mut y = em(80.0);
+    rows.iter().map(|r| {
+        let rh = em(30.0) + r.asks.len() as f32 * em(18.0) + if r.state.is_empty() { 0.0 } else { em(20.0) } + em(12.0);
+        let at = (y, rh);
+        y += rh + em(10.0);
+        at
+    }).collect()
 }
 
 pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {

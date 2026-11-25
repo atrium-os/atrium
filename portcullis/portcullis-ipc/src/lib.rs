@@ -145,6 +145,13 @@ pub enum Request {
     Hello { version: u32 },
     /// Cheap liveness probe.
     Ping,
+    /// On the connection that holds an `ExecInstance` (and only there,
+    /// after `ReadyForFds`): how much memory that instance's jail uses now.
+    /// Holding the connection is the authority, since only the launcher
+    /// has it. Answered with [`Response::InstanceUsage`] echoing `seq`, at
+    /// most one every [`INSTANCE_USAGE_GAP_MS`]; anything else written
+    /// there gets an `Error`.
+    InstanceUsage { seq: u32 },
     /// "Can app `app_id` (with this manifest hash and these caps)
     /// launch right now?" Daemon returns `Authorized` if the policy
     /// already covers everything, `NeedsApproval` with the delta
@@ -1026,6 +1033,9 @@ pub enum Response {
     /// Handshake reply; daemon advertises its proto version.
     Hello { version: u32 },
     Pong,
+    /// [`Request::InstanceUsage`]: the jail's resident memory and its
+    /// smallest memory cap, in bytes; `None` where racct can't say.
+    InstanceUsage { seq: u32, memory: Option<u64>, memory_cap: Option<u64> },
     /// Authorize → all requested caps already granted.
     Authorized,
     /// Authorize → needs user approval. `delta` is human-readable
@@ -1208,6 +1218,14 @@ pub fn write_response<W: Write>(w: &mut W, resp: &Response) -> io::Result<()> {
     w.write_all(&line)?;
     w.flush()
 }
+
+/// The least time between two [`Request::InstanceUsage`] answers on one
+/// connection: each is a jaild round trip and two rctl runs.
+pub const INSTANCE_USAGE_GAP_MS: u64 = 1000;
+
+/// The longest [`Request::InstanceUsage`] line portcullisd reads on an
+/// instance's connection; longer is answered with an `Error` and dropped.
+pub const MAX_USAGE_LINE: usize = 128;
 
 /// The longest request line portcullisd reads. No request carries bulk
 /// data; the largest (argv lists, workspace layouts) are a few KiB.
