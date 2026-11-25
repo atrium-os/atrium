@@ -1037,22 +1037,35 @@ it, which also loads the key after a login. A part with an overlay still
 mounted (a system upgraded without a reboot) waits, plain, and moves in at
 the first ask after it is unmounted, at the latest after the next logout.
 Every other outcome refuses the launch (mail.md §6.4a A1, accepted
-2026-11-25): no atrium-volumes, an error or unexpected answer, or
-`encrypted: false`. After atrium-volumes answers, portcullisd asks the
-kernel (`TESSERA_IOC_GROUP_INFO`, opened `O_DIRECTORY | O_NOFOLLOW`) about
-each app data folder, and the launch goes on sealed only if every one is
-in a key group that is open and not bad. Plain is allowed in two cases
-only: `plain_app_data = true` in `/etc/atrium/volumes.policy.toml` on a
-machine where the kernel reports no key group on any of the person's app
-data folders (dev VMs; ignored, and logged, otherwise), and Personal's one
-login while atrium-volumes reports folders `waiting` (spent at logout,
-recorded in `/var/db/atrium/plain-app-data/<person>`). A named persona
-never runs plain under the migration allowance. portcullisd tells the app
-which it was (`ATRIUM_APP_DATA`, portcullis.md "App data fails closed").
-The folder is checked by descriptor and mounted by path. The checked
-folders are root-owned and outside the app's jail, so the app can't swap
-one between the two; the person's own uid could, which is not the threat
-this check is for. A removed persona's `persona-apps/<persona>` goes with its
+2026-11-25), and the visible folders (Documents, Downloads, …) at login
+follow the same rule: no atrium-volumes, an error or unexpected answer,
+or `encrypted: false`. Sealed needs both answers: atrium-volumes'
+`FoldersReady { encrypted: true }` (it alone knows each folder's expected
+group, so a folder moved offline into another open group is
+`FoldersRefused`), and the kernel's (`TESSERA_IOC_GROUP_INFO`, opened
+`O_DIRECTORY | O_NOFOLLOW`): every folder in a key group that is open and
+not bad. Plain is allowed in two cases only:
+- `plain_app_data = true` in `/etc/atrium/volumes.policy.toml`, on a
+  machine whose volume has no key groups. The kernel says so: GROUP_INFO
+  sets `TESSERA_GROUP_INFO_VOLUME_GROUPS` once any group was made on the
+  volume, and a folder in a group counts too. Any error but "not Tessera"
+  (ENOTTY, EOPNOTSUPP) or a folder not there yet counts as having groups.
+  Otherwise the opt-out is ignored and logged.
+- Personal's one login while atrium-volumes reports folders `waiting`.
+  `/var/db/atrium/plain-app-data/<person>` records it at first use, with
+  this boot's `kern.boottime`; it holds for that boot (portcullisd may
+  restart), and is spent at logout or by any later boot, so a power-off
+  that never sent SessionEnded spends it too. An unreadable record is
+  spent. Left open: a logout portcullisd never hears, followed by another
+  login in the same boot, gets it again.
+A named persona never runs plain under the migration allowance.
+portcullisd tells the app which it was (`ATRIUM_APP_DATA`, portcullis.md
+"App data fails closed"). The folder is checked by descriptor and
+mounted by path; the app data folders are root-owned all the way down
+and the visible ones the person's, so no app can swap one between the
+two.
+
+A removed persona's `persona-apps/<persona>` goes with its
 group (E5).
 
 Not covered: the machine-wide overlays of apps launched with no person

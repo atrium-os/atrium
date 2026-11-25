@@ -2823,9 +2823,9 @@ cross checks; no VM run yet). `home::ensure_app_data` returns
 `AppData::Sealed` or `AppData::Plain`, or refuses the launch; every
 caller (launch, dev launch, workspaces, consoles) fails closed. What
 counts as sealed is the kernel's answer, not atrium-volumes' reply
-(tessera-encryption.md §13.2). The visible home folders (`encrypt_folders`)
-keep the older rule: atrium-volumes unreachable is logged and the login
-goes on.
+(tessera-encryption.md §13.2), together with atrium-volumes' `encrypted`.
+The visible home folders (`encrypt_folders`) follow the same rule
+(`sealed_or_allowed`), so an unreachable atrium-volumes refuses them too.
 
 The launch passes `ATRIUM_APP_DATA=sealed|plain` to the app (`clean_env`).
 The SDK reads it with `atrium_storage::app_data()`, which is `Unknown` when

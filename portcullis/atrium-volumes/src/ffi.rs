@@ -182,6 +182,9 @@ impl GroupInfo {
     pub const LOCKED: u32 = 0x4;
     pub const BAD: u32 = 0x8;
     pub const NO_RECORD: u32 = 0x10;
+    /// The volume has key groups (`TESSERA_INCOMPAT_KEY_GROUPS`): any
+    /// group, anyone's. A kernel from before this flag never sets it.
+    pub const VOLUME_GROUPS: u32 = 0x20;
     pub fn has(&self, f: u32) -> bool { self.flags & f != 0 }
 }
 

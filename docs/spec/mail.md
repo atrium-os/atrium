@@ -620,6 +620,11 @@ question in tessera-encryption.md §13.2; Mail's side is here:
   persona, with the reason), and Add (and Microsoft re-sign-in) stays off until
   `keeps_here()` allows it. The main window shows the line at the foot of the sidebar
   and tells the refusal once as a note.
+- After the review thread's pass: the migration allowance is recorded at first use
+  with the boot it is in (spent by logout or any later boot); the override asks the
+  volume (`TESSERA_GROUP_INFO_VOLUME_GROUPS`) and fails toward "has groups"; the
+  visible folders follow the same rule; and sealed needs atrium-volumes' `encrypted`
+  as well as the kernel's answer (tessera-encryption.md §13.2).
 - Differences from the text above: the SDK crate is `atrium-storage`
   (`atrium_storage::app_data()`, `ATRIUM_APP_DATA=sealed|plain`); the launch error is
   portcullisd's ("… app data is not encrypted, so the app does not start: …"), not a
