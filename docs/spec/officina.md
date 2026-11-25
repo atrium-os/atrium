@@ -4897,6 +4897,14 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Shift+F11** adds a sheet and shows it. **Shift+F2** opens the comment bar for the cursor's cell, where Excel opens its note editor. Plain F2 still edits the cell.
 - pergola's grid sends `GridAction::Sheet(-1 | 0 | 1)` and `GridAction::Comment`. Tests: `ctrl_page_keys_step_through_shown_sheets_only` (Sheets) and the grid's region and key test (pergola). Sheets 143 and pergola 237 lib tests pass. pergola's lib tests now build only in debug, since the UI inspector's `Link` is `debug_assertions`-only.
 
+### 16.116 Active-cell, screen and Paste Special keys (2026-11-25)
+
+- **Ctrl+.** moves the active cell to the selection's next corner, clockwise, and keeps the selection. **Shift+Backspace** leaves only the active cell selected. Neither clears anything.
+- **Ctrl+Backspace** scrolls back to the active cell. Plain Backspace and Delete still clear the selection.
+- **Alt+PageDown** and **Alt+PageUp** move one screen right or left. The step is as many columns as fit at the active column's width, so the two keys undo each other. Hidden columns are stepped over, and Shift is not needed to keep Ctrl+PageUp/PageDown for sheets.
+- **Ctrl+Alt+V** opens the Paste Special bar (pergola's grid sends `GridAction::PasteSpecial`). The menu item shows the key.
+- Tests: `excel_keys_for_the_active_cell_corners_and_screens` (pergola) and the Paste Special test (Sheets). Sheets 143 and pergola 239 lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

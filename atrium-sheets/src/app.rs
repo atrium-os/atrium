@@ -2189,6 +2189,8 @@ impl Sheets {
                         cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Go(s)));
                     }
                 }
+                // Ctrl+Alt+V: the Paste Special bar.
+                GridAction::PasteSpecial => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::PasteSpecial)),
                 // Shift+F2: the cursor cell's comment.
                 GridAction::Comment => cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Commenting)),
                 // Ctrl+`: formulas shown in their cells, or values again.
@@ -2247,7 +2249,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::PasteSpecial | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -5774,6 +5776,11 @@ mod tests {
         let mut g = grid.get_cloned();
         g.select(0, 1);
         grid.set(g);
+        // The menu names Excel's key (Ctrl+Alt+V, sent by the grid as PasteSpecial).
+        let items = crate::data::menu(&s.doc.borrow(), grid.get_cloned().selection(), (0, 1));
+        let it = items.iter().find(|(_, c)| *c == Some(crate::data::DataCmd::PasteSpecial)).map(|(m, _)| m.clone());
+        assert_eq!(it.as_ref().and_then(|m| m.shortcut.as_deref()), Some("Ctrl+Alt+V"));
+        assert!(it.is_some_and(|m| m.enabled));
         run(Cmd::Data(crate::data::DataCmd::PasteSpecial));
         assert_eq!(s.paste_bar.get().map(|p| p.what), Some(officina_grid::clip::What::All));
         for c in [TabCmd::PasteWhat(1), TabCmd::PasteOp(1), TabCmd::PasteTurn] {

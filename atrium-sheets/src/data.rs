@@ -397,7 +397,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste and Subtract").enabled(special), Some(DataCmd::PasteSubtract)),
         (MenuItem::new("Paste and Multiply").enabled(special), Some(DataCmd::PasteMultiply)),
         (MenuItem::new("Paste and Divide").enabled(special), Some(DataCmd::PasteDivide)),
-        (MenuItem::new("Paste Special…").enabled(special), Some(DataCmd::PasteSpecial)),
+        (MenuItem::new("Paste Special…").shortcut("Ctrl+Alt+V").enabled(special), Some(DataCmd::PasteSpecial)),
         (MenuItem::new("Paste Link").enabled(special), Some(DataCmd::PasteLink)),
         (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::InsertRows)),
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
