@@ -3174,6 +3174,58 @@ worked. jaild logged no WARNs.
     which fails with the lock taken out).
   - navigator-ui: `a_site_chosen_always_runs_live_unasked_until_the_chip_asks_again`.
 
+#### I6.6 as built (2026-11-25, second part: recycling)
+
+What already recycles a whole live page, from I2:
+
+- **Idle.** frescod retires an island 30 minutes after the last input it
+  routed there (`FRESCOD_ISLAND_IDLE_S`). Limen ends the engine, and
+  navigatord answers `LiveEnded`.
+- **Memory.** The engine's jail has an RCTL `memoryuse` SIGKILL rule,
+  which portcullisd sets from the engine manifest and limend requires.
+- **Either way,** the trail shows the document lane again at the address
+  the live page was on. A remembered origin (D8) runs live again on its
+  next open; any other origin needs the chip's "Run this page live"
+  again. Unsaved page state is lost, as with a widget.
+
+What this part adds (Shankar was asked for the limit; built as
+recommended, 1 GiB for pages):
+
+- **The limit by role.** A whole page asks Limen with
+  `REQUEST_PAGE_ISLAND` (`Parent::request_page_island`) and gets the
+  engine manifest's own limit.
+  - `REQUEST_ISLAND`, used for widgets and a live page's frames, now
+    passes `limen::web_island::PART_MEMORY_MB` (256) to portcullisd.
+    portcullisd can only tighten the manifest's limit with it.
+  - A standby engine (D7) is launched with the part's limit. A whole page
+    therefore never takes the standby and always starts cold, which
+    leaves the standby for the next widget.
+  - The engine manifest says `memory = "1G"`
+    (`navigator-ladybird/counter/atrium.toml`; the installed engine
+    bundle on the Mac needs the same line).
+- **One pool.** The manifest declares `[resources.pool]` (weight 1, floor
+  256 MiB), so `memfed --pools-from` budgets every engine as one share.
+  Frames and windows divide that share rather than add to it. Shipped
+  memfed doesn't run `--pools-from` yet: its jail needs the apps directory
+  mounted. Until then the pool is only declared.
+- **What the person is told.** An engine that exits by itself (Limen's
+  `ChildLost`, most often the RCTL kill; Limen can't tell which) ends with
+  "the page's engine stopped; it may have used more memory than a live
+  page may", in the UI's note.
+- **Tests.** In limen,
+  `island_fetch_channels_are_private_to_the_signed_navigator_request`
+  checks that two parts ask for 256 MiB and a page for the manifest's
+  limit. `a_navigators_next_island_takes_its_warmed_standby_engine` checks
+  that a page leaves the standby waiting. The delegated UI is refused the
+  new request too.
+- **Left for later.**
+  - The engine's own cooperative trim when memoryd sends SIGINFO (drop
+    caches before it is killed). That is engine-side, a Mac build.
+  - memfed `--pools-from` in the shipped service.
+  - A Mac check: a fixture page that grows past 256 MiB keeps running up
+    to 1 GiB and then falls back to the document lane, and a widget is
+    still killed at 256 MiB.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

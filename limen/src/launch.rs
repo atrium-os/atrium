@@ -87,32 +87,32 @@ fn uid_of(name: &str) -> Option<u32> {
 
 impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
-        self.start(app, embed, channel, None, None, None)
+        self.start(app, embed, channel, None, None, None, None)
     }
 
     /// The child serves `parent_uid`: under a `per_instance` worker rule it
     /// runs as a uid of the parent's instance (its person and persona), and
     /// portcullisd says which.
     fn launch_for(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), None, None)
+        self.start(app, embed, channel, Some(parent_uid), None, None, None)
     }
 
     /// The child in another of the parent's person's personas: portcullisd
     /// starts it only while that person's `share` crossing switch from the
     /// parent's persona to `persona` is on (share-sheet.md §7).
     fn launch_in(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), Some(persona), None)
+        self.start(app, embed, channel, Some(parent_uid), Some(persona), None, None)
     }
 
-    fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32, fetch: UnixStream) -> Result<u32, String> {
-        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, Some(fetch))
+    fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32, fetch: UnixStream, memory_mb: Option<u64>) -> Result<u32, String> {
+        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, Some(fetch), memory_mb)
     }
 
     fn launch_island_standby(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
         if !self.standby { return Err("standby engines are off (LIMEN_ISLAND_STANDBY)".into()); }
         // No fetch socket: stdout is /dev/null, which is how the engine
         // knows to warm up and then wait for one on its channel.
-        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, None)
+        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, None, Some(crate::web_island::PART_MEMORY_MB))
     }
 
     fn end(&mut self, embed: EmbedId) {
@@ -123,7 +123,7 @@ impl Launcher for Portcullis {
 }
 
 impl Portcullis {
-    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>) -> Result<u32, String> {
+    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>, memory_mb: Option<u64>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         // A provider from its manifest's [roles] implements has no system
         // rule: portcullisd runs it as a uid of the parent's instance (as a
@@ -149,9 +149,10 @@ impl Portcullis {
                 app_id: app.to_string(),
                 instance: Some(format!("limen-{embed:016x}")),
                 tmpfs_mb: 64,
-                // The provider's [resources] set the caps; a machine without
+                // The provider's [resources] set the caps, and `memory_mb`
+                // only tightens them (a part of a page); a machine without
                 // racct refuses rather than runs it uncapped.
-                memory_mb: None,
+                memory_mb,
                 cpu_pct: None,
                 require_memory_limit: true,
                 serves,

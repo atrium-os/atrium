@@ -135,7 +135,17 @@ impl Parent {
     /// Request the fixed Navigator engine. IslandFetch supplies the broker
     /// endpoint of this embed's transport before any child messages.
     pub fn request_island(&mut self, window: WindowToken, z: u8) -> Result<EmbedId, Error> {
-        match self.0.call(op::REQUEST_ISLAND, &(window, z))? {
+        self.island(op::REQUEST_ISLAND, window, z)
+    }
+
+    /// [`Parent::request_island`] for a whole live page, which gets the
+    /// engine manifest's memory limit rather than a part's.
+    pub fn request_page_island(&mut self, window: WindowToken, z: u8) -> Result<EmbedId, Error> {
+        self.island(op::REQUEST_PAGE_ISLAND, window, z)
+    }
+
+    fn island(&mut self, opc: u16, window: WindowToken, z: u8) -> Result<EmbedId, Error> {
+        match self.0.call(opc, &(window, z))? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
             Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),

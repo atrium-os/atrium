@@ -72,9 +72,11 @@ impl Launcher for Launch {
         self.0.send((embed, ch)).unwrap();
         Ok(match app { "org.example.player" => PLAYER_UID, "org.example.notes" => NOTES_UID, _ => VIEWER_UID })
     }
-    fn launch_island(&mut self, embed: EmbedId, ch: UnixStream, _: u32, mut fetch: UnixStream) -> Result<u32, String> {
+    fn launch_island(&mut self, embed: EmbedId, ch: UnixStream, _: u32, mut fetch: UnixStream, memory_mb: Option<u64>) -> Result<u32, String> {
         use std::io::Write;
+        // The marker the test reads: the embed, then the limit asked (0: the manifest's).
         fetch.write_all(&embed.to_le_bytes()).unwrap();
+        fetch.write_all(&memory_mb.unwrap_or(0).to_le_bytes()).unwrap();
         self.launch(catalogue::NAVIGATOR_ENGINE, embed, ch)
     }
     fn launch_island_standby(&mut self, embed: EmbedId, ch: UnixStream, _: u32) -> Result<u32, String> {
@@ -926,18 +928,22 @@ fn island_fetch_channels_are_private_to_the_signed_navigator_request() {
     assert_eq!(refused(w.parent(OTHER).request_island(W_APP, 1)), refusal::NOT_PROVIDER);
     assert_eq!(refused(w.parent(4102).request_island(W_APP, 1)), refusal::NOT_PROVIDER);
 
+    assert_eq!(refused(w.parent(OTHER).request_page_island(W_APP, 1)), refusal::NOT_PROVIDER);
     let first = navigator.request_island(W_APP, 1).unwrap();
     let second = navigator.request_island(W_APP, 1).unwrap();
-    for id in [first, second] {
+    // A whole page: the engine manifest's limit, not a part's.
+    let page = navigator.request_page_island(W_APP, 1).unwrap();
+    for (id, limit) in [(first, limen::web_island::PART_MEMORY_MB), (second, limen::web_island::PART_MEMORY_MB), (page, 0)] {
         assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: id });
         assert!(navigator.take_fd().is_none());
         assert!(navigator.take_island_fetch(id + 9).is_none());
         let mut stream = navigator.take_island_fetch(id).unwrap();
         // The fake worker wrote its marker before launch returned.
         stream.set_nonblocking(true).unwrap();
-        let mut message = [0; 8];
+        let mut message = [0; 16];
         stream.read_exact(&mut message).unwrap();
-        assert_eq!(u64::from_le_bytes(message), id);
+        assert_eq!(u64::from_le_bytes(message[..8].try_into().unwrap()), id);
+        assert_eq!(u64::from_le_bytes(message[8..].try_into().unwrap()), limit, "embed {id}");
         assert!(navigator.take_island_fetch(id).is_none());
         navigator.detach(id).unwrap();
     }
@@ -960,6 +966,7 @@ fn delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine() {
     std::fs::remove_file(path).unwrap();
     let mut ui = Parent::wrap(aqueduct::Connection::wrap(socket).unwrap());
     assert_eq!(refused(ui.request_island(W_APP, 1)), refusal::NOT_PROVIDER);
+    assert_eq!(refused(ui.request_page_island(W_APP, 1)), refusal::NOT_PROVIDER);
     assert_eq!(refused(ui.request("web-island", W_APP)), refusal::NOT_PROVIDER);
     assert_eq!(refused(ui.request("navigator-inbox-page", W_APP)), refusal::NOT_PROVIDER);
     assert_eq!(w.shared.embeds(), 0);
@@ -1163,6 +1170,17 @@ fn a_navigators_next_island_takes_its_warmed_standby_engine() {
     assert!(matches!((&standby_channel).read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     standby_channel.set_nonblocking(false).unwrap();
 
+    // A whole page never takes it: the standby has a part's memory limit.
+    let page = navigator.request_page_island(W_APP, 1).unwrap();
+    assert!(![first, standby].contains(&page));
+    let (instance, _page_child) = w.spawned();
+    assert_eq!(instance, page);
+    assert!(w.shared.standby_ready(4101), "the standby still waits");
+    assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: first });
+    assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: page });
+    navigator.detach(page).unwrap();
+    assert_eq!(next_p(&mut navigator), ParentEvent::Detached { embed: page });
+
     // The second island is the standby: same embed id, no new launch.
     let second = navigator.request_island(W_APP, 1).unwrap();
     assert_eq!(second, standby);
@@ -1172,9 +1190,7 @@ fn a_navigators_next_island_takes_its_warmed_standby_engine() {
     let (mut warm, _fresco) = Child::embedded_on(standby_channel).unwrap();
     assert!(matches!(next_c(&mut warm), ChildEvent::Attach { embed, role, .. } if embed == second && role == "web-island"));
     // The fetch socket reaches the navigator as this island's.
-    for id in [first, second] {
-        assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: id });
-    }
+    assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: second });
     let mut broker = navigator.take_island_fetch(second).unwrap();
     fetch.write_all(b"warm").unwrap();
     let mut got = [0u8; 4];

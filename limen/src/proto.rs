@@ -27,6 +27,10 @@ pub mod op {
     pub const DELEGATE_NAVIGATOR_UI: u16 = 0x08;
     /// Trusted Arca UI only: `(provisioning sheet, its window token)`.
     pub const REQUEST_SMIME_PICKER: u16 = 0x09;
+    /// Signed Navigator requests its engine for a whole live page: as
+    /// [`REQUEST_ISLAND`], with the engine manifest's memory limit rather
+    /// than a part's (navigator-islands.md I6.6).
+    pub const REQUEST_PAGE_ISLAND: u16 = 0x0a;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;

@@ -143,6 +143,12 @@ pub enum Api {
 /// fetch channel, Nuntius's body bound).
 pub const DOWNLOAD_MAX: usize = 32 * 1024;
 
+/// The memory limit, in MiB, of an engine that runs a part of a page (a
+/// widget, or a live page's frame), and of a standby engine: limend asks
+/// portcullisd for it, which can only tighten the engine manifest's. A
+/// whole live page gets the manifest's own (navigator-islands.md I6.6).
+pub const PART_MEMORY_MB: u64 = 256;
+
 const APIS: &[(Api, &str, &str)] = &[
     (Api::Notifications, "notifications", "notifications"),
     (Api::Geolocation, "geolocation", "your location"),
