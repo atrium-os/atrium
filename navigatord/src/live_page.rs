@@ -687,6 +687,9 @@ pub fn address_change(page: Option<&str>, to: &str) -> Option<String> {
 pub struct Beside {
     last: Option<std::time::Instant>,
     opened: usize,
+    /// The refusals the UI was told of: each once a run (its popover
+    /// merges repeats anyway), the rest only logged.
+    told: Vec<&'static str>,
 }
 
 impl Beside {
@@ -698,6 +701,13 @@ impl Beside {
         self.last = Some(now);
         self.opened += 1;
         Ok(())
+    }
+
+    /// Whether to tell the UI of the refusal `why`: the first time only.
+    pub fn first(&mut self, why: &'static str) -> bool {
+        if self.told.contains(&why) { return false; }
+        self.told.push(why);
+        true
     }
 }
 
@@ -1150,7 +1160,7 @@ impl Live {
                                 Ok(()) => tell.open_beside(to),
                                 Err(why) => {
                                     eprintln!("navigatord: a live page's new window refused: {why} ({})", crate::refused_target(&to));
-                                    tell.refused(why.into());
+                                    if beside.first(why) { tell.refused(why.into()); }
                                 }
                             },
                             None => {
@@ -1676,6 +1686,8 @@ mod tests {
         let mut b = Beside::default();
         for i in 0..Beside::MAX as u32 { assert!(b.allow(t + Beside::GAP * i).is_ok()); }
         assert_eq!(b.allow(t + Beside::GAP * 100), Err("a new window past the run's 16"));
+        assert!(b.first("a new window past the run's 16"));
+        assert!(!b.first("a new window past the run's 16"), "the UI is told once a run");
     }
 
     /// A run's `Tell` that keeps what it was told was refused.
