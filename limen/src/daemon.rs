@@ -478,7 +478,7 @@ fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Ar
                 } else {
                     Reply::Refused { reason: refusal::MALFORMED }
                 }
-            } else if navigator_ui && !navigator_ui_operation(m.op, &m.payload) {
+            } else if navigator_ui && !navigator_ui_operation(&shared, m.op, &m.payload) {
                 Reply::Refused { reason: refusal::NOT_PROVIDER }
             } else {
                 handle(&shared, id, uid, m.op, &m.payload, fd)
@@ -494,11 +494,18 @@ fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Ar
 
 // The UI receives a broker-opened stream. Keep the restriction on the
 // server end so it applies to every duplicate of the delegated descriptor.
-fn navigator_ui_operation(opc: u16, payload: &[u8]) -> bool {
+// A picker it may ask for only to send it one thing, "Show in Files"
+// (scrinium.md §4.5): never an Open, so no file comes back to the UI.
+fn navigator_ui_operation(shared: &Arc<Shared>, opc: u16, payload: &[u8]) -> bool {
+    let to_picker = |embed: EmbedId| shared.state.lock().unwrap().embeds.get(&embed).is_some_and(|e| e.role.name == "picker");
     match opc {
         op::REQUEST => postcard::from_bytes::<proto::Request>(payload)
-            .is_ok_and(|req| matches!(req.role.as_str(), "doc-viewer" | "vpn-sign-in-page" | "credential" | "print")),
-        op::PLACE | op::SEND | op::SEND_FD | op::DETACH | op::SET_VISIBLE => true,
+            .is_ok_and(|req| matches!(req.role.as_str(), "doc-viewer" | "vpn-sign-in-page" | "credential" | "print" | "picker")),
+        op::SEND => postcard::from_bytes::<proto::Send>(payload).is_ok_and(|m| {
+            !to_picker(m.embed) || matches!(crate::picker::ToChild::decode(&m.bytes), Some(crate::picker::ToChild::Show { .. }))
+        }),
+        op::SEND_FD => postcard::from_bytes::<proto::Send>(payload).is_ok_and(|m| !to_picker(m.embed)),
+        op::PLACE | op::DETACH | op::SET_VISIBLE => true,
         _ => false,
     }
 }

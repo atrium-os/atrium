@@ -1784,3 +1784,14 @@ Scrinium, navigatord and navigator-ui from main at 690b26a72 or later):
    `ToChild::Show` with a stale token): limend logs frescod's refusal, Scrinium answers
    `Failed` ("needs your press"), and no Files window opens.
 The trace line's `show=` field gives each "Show in Files" button's centre, by download id.
+
+Mac results, 2026-11-25 (690b26a72, f74f059d2): check 1 passed. The popover read "Memory: 99
+MB of 1 GB", and `rctl -u` read 98.6 MiB under `memoryuse:sigkill=1073741824`. navigatord
+now also logs `navigatord: LiveMemory used=… cap=…` when it tells the UI. Check 3 failed:
+limend refused the delegated navigator-ui connection's `picker` request (`NOT_PROVIDER`).
+That connection may now ask for a picker, but may send it only `ToChild::Show`: an `Open`,
+or any `SEND_FD` to it, is refused, so no file can come back to the UI. Host test:
+`delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine`. Checks 2 and 4
+need a test client that holds an engine's connection or sends a stale press; until one
+exists, host tests cover them (portcullisd's watcher cannot run on a Linux host;
+`files_spends_the_parents_press_for_show_in_files_once` covers 4).

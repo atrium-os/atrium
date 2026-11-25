@@ -1184,6 +1184,7 @@ impl Live {
                     if let Ok(now) = connection.usage(embed) {
                         if memory_moved(memory_told, now) {
                             memory_told = Some(now);
+                            eprintln!("navigatord: LiveMemory used={} cap={}", now.0, now.1.map_or("-".into(), |c| c.to_string()));
                             tell.memory(now.0, now.1);
                         }
                     }

@@ -986,6 +986,8 @@ fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>, buttons: V
         let (g, c, line) = match &d.state {
             shell::DownloadState::Saving => (ph::DOWNLOAD, t.accent_fg(), format!("{} · saving · {}", d.size, d.origin)),
             shell::DownloadState::Opening => (ph::DOWNLOAD, t.accent_fg(), format!("{} · opening · {}", d.size, d.origin)),
+            // navigatord's words: "“name” in Downloads", or a folder.
+            shell::DownloadState::Saved(path) if d.in_downloads.is_some() => (ph::CHECK_CIRCLE, t.success_fg(), format!("Saved as {path}")),
             shell::DownloadState::Saved(path) => (ph::CHECK_CIRCLE, t.success_fg(), format!("Saved in {path}")),
             shell::DownloadState::Opened(app) => (ph::CHECK_CIRCLE, t.success_fg(), format!("Opened in {app}")),
             shell::DownloadState::Failed(why) => (ph::PROHIBIT, t.danger_fg(), format!("Not kept · {why}")),
