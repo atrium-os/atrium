@@ -577,6 +577,18 @@ and should never dump it.
 
 As built (2026-11-25): portcullis.md "No core dumps from jails".
 
+**A3 as built (2026-11-25, not run on a VM yet).** Atrium images have no swap of their
+own today (the devroot's fstab has none). The swap that exists is zram's backing store
+(atrium-zram-v2.md §4.5), which holds written-back pages in the clear. So:
+- The atrium-zram rc.d script hands zram the backing partition only under GELI
+  one-time (`geli onetime -d -e AES-XTS -l 256 -s 4096`, a fresh random key each boot),
+  as `<backing>.eli`. If GELI fails, zram runs with no backing store; it never gets the
+  plain partition. A plain or `.eli` swap on that partition is turned off first.
+- Every start reports any other swap device that is neither zram0 nor `.eli` as plain
+  swap. Swap listed in fstab must be `/dev/<part>.eli` (swapon(8) makes it one-time).
+  A swap file (`md` over a file) would take the same `.eli` shape; nothing makes one.
+- The devroot sets `dumpdev="NO"` until `dumpon -k` is set up.
+
 **A5. A gate that proves it (scripts/mail-at-rest-vm-check.sh, on Tessera).** It syncs a
 synthetic account (the JMAP fixture) whose message carries a unique marker in four
 places: the subject, the body, an attachment and a search term. The gate then:
@@ -627,6 +639,11 @@ question in tessera-encryption.md §13.2; Mail's side is here:
   volume (`TESSERA_GROUP_INFO_VOLUME_GROUPS`) and fails toward "has groups"; the
   visible folders follow the same rule; and sealed needs atrium-volumes' `encrypted`
   as well as the kernel's answer (tessera-encryption.md §13.2).
+- **Not closed until the kmod is deployed:** `TESSERA_GROUP_INFO_VOLUME_GROUPS` is in
+  tessera_fs.c (5a7cd289b) but not built or run. Until a kernel with it runs, the
+  override is the per-person test (a group on one of the person's folders), so a person
+  whose group isn't made yet on a volume that has other groups can still get plain
+  under a stale `plain_app_data`.
 - Differences from the text above: the SDK crate is `atrium-storage`
   (`atrium_storage::app_data()`, `ATRIUM_APP_DATA=sealed|plain`); the launch error is
   portcullisd's ("… app data is not encrypted, so the app does not start: …"), not a

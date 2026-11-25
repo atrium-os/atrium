@@ -124,6 +124,10 @@ sendmail_submit_enable="NO"
 sendmail_outbound_enable="NO"
 sendmail_msp_queue_enable="NO"
 update_motd="NO"
+# No kernel crash dumps: a dump is the whole of RAM, decrypted mail and
+# keys included, written to swap (mail.md §6.4a A3). Off until encrypted
+# dumps (dumpon -k) are set up.
+dumpdev="NO"
 EOF
 rm -f $T/etc/rc.conf.d/* 2>/dev/null || true
 # passwordless root for the console; key auth (authorized_keys) covers ssh

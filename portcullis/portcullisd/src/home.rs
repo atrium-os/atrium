@@ -302,6 +302,9 @@ fn kernel_has_groups(at: &Path, checked: &[PathBuf]) -> bool {
     }
     dirs.iter().any(|d| match atrium_volumes::ffi::tessera_group_info(d) {
         Ok(g) => g.group_id != 0 || g.has(GroupInfo::VOLUME_GROUPS),
+        // ENOENT: a folder not made yet. Every caller has atrium-volumes
+        // (or ensure_*) make the folders first, so a missing one is not a
+        // removed one; if that changes, ENOENT must count as yes.
         Err(e) => !matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOENT)),
     })
 }

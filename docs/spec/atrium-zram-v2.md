@@ -433,6 +433,9 @@ longer put fresh pages on disk.
 
 **As built (increment 5, 2026-11-04).**
 
+- The rc.d script gives zram the partition only under GELI one-time, as
+  `<partition>.eli`, never plain (mail.md §6.4a A3, 2026-11-25): written-back
+  pages are plaintext. If GELI fails, zram runs with no backing store.
 - `kern.zram.backing_dev` names a GEOM provider (`gpt/swapfs`, `/dev/ada0p3`).
   It is set once, by sysctl or as a loader tunable, and opened exclusively
   (r1w1e1) through a small GEOM class of zram's own. The rc.d script should

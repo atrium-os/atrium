@@ -2848,6 +2848,6 @@ fails the child exits 105 and nothing runs. Its children inherit it and
 cannot raise it back. The only exception is a debug class (an app launched
 under the debugger, a workspace), which already exposes its memory, and
 never a filtered jail (jail-sysfil.md §2). `server::cores_allowed` is the
-rule. The jail record doesn't keep whether a jail is filtered, so an
-ExecInJail into a filtered debug jail may dump; nothing makes one today.
+rule. ExecInJail reads both from jaild's jail record (`class`, `filtered`,
+kept at create); a record from before `filtered` reads as unfiltered.
 

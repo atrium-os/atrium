@@ -320,9 +320,9 @@ fn dispatch(
 
         Request::CreateJail(spec) => {
             match handle_create(&spec, stdio, control, listen, policy, dry_run, state, state_path) {
-                Ok(CreateOutcome { resp, procdesc_fd }) => {
+                Ok(CreateOutcome { resp, procdesc_fd, filtered }) => {
                     if !dry_run {
-                        state.set_class(&spec.name, spec.class.clone(), spec.exec.is_none());
+                        state.set_class(&spec.name, spec.class.clone(), spec.exec.is_none(), filtered);
                         if let Err(e) = state.save(state_path) { warn!("jaild: state save after class: {e}"); }
                     }
                     (Response::JailCreated(resp), procdesc_fd.into_iter().collect())
@@ -700,6 +700,8 @@ fn handle_detach_mount(
 struct CreateOutcome {
     resp:        CreateJailResponse,
     procdesc_fd: Option<i32>,
+    /// The jail got a system call filter: none of its processes dump.
+    filtered:    bool,
 }
 
 /// Handle a RemoveJail request. Cleans up any associated lo0
@@ -943,6 +945,7 @@ fn handle_create(
                 jid: 99, pid: 0, procdesc_attached: false,
             },
             procdesc_fd: None,
+            filtered: false,
         });
     }
 
@@ -1173,6 +1176,7 @@ fn handle_create(
         return Ok(CreateOutcome {
             resp: CreateJailResponse { jid, pid: 0, procdesc_attached: false },
             procdesc_fd: None,
+            filtered: sysfil.is_some(),
         });
     }
 
@@ -1222,6 +1226,7 @@ fn handle_create(
             jid: created.jid, pid: 0, procdesc_attached: false,
         },
         procdesc_fd: None,
+        filtered: sysfil.is_some(),
     })
 }
 
@@ -1903,6 +1908,7 @@ fn handle_create_with_exec(
             procdesc_attached: true,
         },
         procdesc_fd: Some(pdf.procdesc_fd),
+        filtered: sysfil.is_some(),
     })
 }
 
@@ -2114,9 +2120,7 @@ fn handle_exec_in_jail(
             eprintln!("jaild-child: stdio: {e}");
             ffi::child_exit(101);
         }
-        // The jail's record doesn't keep whether it is filtered: a debug
-        // class is the only one whose processes may dump.
-        if !cores_allowed(jail.class.as_ref(), false) {
+        if !cores_allowed(jail.class.as_ref(), jail.filtered) {
             child_no_cores();
         }
         if let Err(e) = ffi::jail_attach(jid) {
