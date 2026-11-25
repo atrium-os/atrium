@@ -204,6 +204,9 @@ fn zephyr_controller_without_public_address_uses_its_static_one() {
     // LE only: no BR/EDR command is sent; its LE buffers carry everything.
     assert!(!sent.iter().any(|c| matches!(c.op_code, OpCode::ReadBufferSize | OpCode::WriteSimplePairingMode)));
     assert!(h.info().le_buffers > 0);
+    // Nor any inquiry when a user scans.
+    h.inquiry(true, 0);
+    assert!(h.poll_frame().is_none(), "no Classic inquiry on an LE-only controller");
     // Scans then say "random" for our own address.
     h.le_scan(true, 0);
     let f = h.poll_frame().unwrap();

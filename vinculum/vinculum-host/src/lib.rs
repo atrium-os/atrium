@@ -106,6 +106,12 @@ pub struct ControllerInfo {
 }
 
 impl ControllerInfo {
+    /// LMP feature bit 37, "BR/EDR not supported" (Core Vol 2 Part C §3.3):
+    /// such a controller refuses every BR/EDR command.
+    pub fn le_only(&self) -> bool {
+        self.lmp_features & (1 << 37) != 0
+    }
+
     /// Whether the controller lists a command (Core Vol 4 Part E §6.27).
     pub fn supports(&self, octet: usize, bit: u8) -> bool {
         self.supported_commands.get(octet).is_some_and(|o| o & (1 << bit) != 0)
@@ -387,7 +393,11 @@ impl Host {
     /// pairing mode), for about 10 s, or stop looking. Results arrive as
     /// `InquiryResult`, the end as `InquiryDone`. We stay undiscoverable
     /// ourselves: this only asks.
+    /// An LE-only controller has no inquiry: nothing is sent.
     pub fn inquiry(&mut self, on: bool, now_ms: u64) {
+        if self.le_only() {
+            return;
+        }
         if on {
             // Extended results carry the name and the signal.
             self.issue(to_cmd(hci::WriteInquiryMode { inquiry_mode: hci::InquiryMode::RssiOrExtended }), Tag::Policy);
@@ -951,10 +961,8 @@ impl Host {
         }
     }
 
-    /// LMP feature bit 37, "BR/EDR not supported" (Core Vol 2 Part C §3.3):
-    /// such a controller refuses every BR/EDR command.
     fn le_only(&self) -> bool {
-        self.info.lmp_features & (1 << 37) != 0
+        self.info.le_only()
     }
 
     /// The first buffer-size read: the BR/EDR ACL buffers, or straight to

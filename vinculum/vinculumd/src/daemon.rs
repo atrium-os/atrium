@@ -246,7 +246,7 @@ impl Daemon {
             Request::Status => Event::Status {
                 ready: self.host.is_ready(),
                 powered: !self.off,
-                address: self.host.info().address.map(|a| Addr { bytes: a, random: false }),
+                address: self.host.info().address.map(|a| Addr { bytes: a, random: self.host.info().address_random }),
                 scanning: self.user_scan,
                 pairable: self.pairable.is_open(now),
                 agents: self.agents() as u32,
@@ -381,7 +381,8 @@ impl Daemon {
     /// Names come first: a device found without one is asked (Remote Name
     /// Request) with the inquiry paused, then the inquiry goes on.
     fn update_inquiry(&mut self) {
-        let free = self.host.is_ready() && !self.off && self.user_scan && self.pending_pair.is_none() && self.naming.is_none();
+        // An LE-only controller has no inquiry; its users' scans are LE alone.
+        let free = self.host.is_ready() && !self.host.info().le_only() && !self.off && self.user_scan && self.pending_pair.is_none() && self.naming.is_none();
         let want = free && self.names_wanted.is_empty();
         if want != self.inquiring {
             let now = self.now();
