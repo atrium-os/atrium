@@ -22,7 +22,11 @@
 #
 #   sh scripts/deploy-portcullis.sh              # deploy + enable + start
 #   START=0 sh scripts/deploy-portcullis.sh      # install only
+#   EGRESS_IF=vtnet0 sh scripts/deploy-portcullis.sh   # NAT interface, when
+#                     the guest has no default route and several interfaces
 set -u
+EGRESS_IF="${EGRESS_IF:-}"
+case "$EGRESS_IF" in *[!a-z0-9]*) echo "EGRESS_IF must be an interface name" >&2; exit 2;; esac
 BSD="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-aarch64-unknown-freebsd}"
 T="$BSD/portcullis/target/$TARGET/release"
@@ -132,8 +136,12 @@ echo "=== pf isolation -> /usr/local/etc/atrium/pf.conf ==="
 # rules are loaded (network.md §0) — without them an app reached the host.
 scp $SSHOPT -P 2222 "$BSD/etc/atrium.pf" root@localhost:/root/atrium.pf >/dev/null 2>&1 \
   && g 'mkdir -p /usr/local/etc/atrium
-E=$(route -n get default 2>/dev/null | awk '"'"'/interface:/{print $2}'"'"')
-[ -n "$E" ] || { echo "no default route: cannot pick the NAT interface"; exit 1; }
+E='"$EGRESS_IF"'
+[ -n "$E" ] || E=$(route -n get default 2>/dev/null | awk '"'"'/interface:/{print $2}'"'"')
+# No default route (a restricted QEMU net): the one interface with an IPv4
+# address that is neither loopback nor a jail bridge is the egress.
+[ -n "$E" ] || E=$(ifconfig -l inet | tr " " "\n" | grep -Ev "^(lo|atrium|bridge|epair)" | awk '"'"'{n++; i=$0} END{if (n == 1) print i}'"'"')
+[ -n "$E" ] || { echo "no default route and not exactly one candidate interface: set EGRESS_IF"; exit 1; }
 cur=$(sysrc -n pf_rules 2>/dev/null)
 case "$cur" in ""|/etc/pf.conf|/usr/local/etc/atrium/pf.conf) ;;
   *) echo "pf_rules is $cur — an operator ruleset; add the atrium rules to it by hand"; exit 1;;
