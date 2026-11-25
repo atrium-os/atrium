@@ -84,6 +84,9 @@ mk $STAY Stay home_probe stay_probe ''
 mk $SYS Sys home_probe stay_probe 'status-item = true'
 mk $LAUNCHER Launcher console_probe console_probe 'graphics = "fresco"\napp-launch = true' '$STAY\n$SYS\n$STAY\n' targets
 mk $TERM_ID Terminal atrium-term-socket atrium-term-socket 'graphics = "fresco"\nconsoles = true' 'on\n' .trace
+# A guest without Tessera: app data is plain, which portcullisd allows only
+# when the policy says so (mail.md §6.4a A1).
+grep -q '^plain_app_data' /etc/atrium/volumes.policy.toml || { awk '!d && /^\[/ { print "plain_app_data = true\n"; d = 1 } { print }' /etc/atrium/volumes.policy.toml > /etc/atrium/volumes.policy.toml.new && mv /etc/atrium/volumes.policy.toml.new /etc/atrium/volumes.policy.toml; }
 mkdir -p /atrium/sockets/portcullis /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
 : > $LOG
 mkdir -m 700 $B/stoa-state

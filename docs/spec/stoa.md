@@ -510,7 +510,7 @@ to a blob is dropped — Stoa does not need to know about it.
    run with the state directory pointed at a plain path must find the marker, to prove the
    grep works.
 
-**As built (2026-11-25, not VM-run yet):**
+**As built (2026-11-25; `vm-console-check.sh` 0 failed on the cloud VM, `stoa-at-rest-vm.sh` not run yet):**
 - portcullisd `stoa_state.rs`, request `SessionStateDir { uid, persona }` (capability
   `session_state`, or root): `<persona apps dir>/.stoa/` (root, 0700) and `sessions/` in it
   (stoad's uid, 0700), never a link, opened `O_DIRECTORY|O_NOFOLLOW`, owner and mode checked
