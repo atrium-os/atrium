@@ -2517,6 +2517,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-live-origins"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
 name = "navigator-media"
 version = "0.1.0"
 dependencies = [
@@ -2603,6 +2610,7 @@ dependencies = [
  "navigator-backend",
  "navigator-control",
  "navigator-cookies",
+ "navigator-live-origins",
  "navigator-media",
  "navigator-prerender",
  "nuntius",
