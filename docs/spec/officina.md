@@ -4932,6 +4932,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - `data::precedents` reads the formula group's footprints at the cursor's row, so names and tables are included. `data::dependents` checks every group's footprints for the row that reads the cell, so a filled-down `=A1*2` gives only the row reading it. At most `MAX_DEPENDENTS` (1,000) are listed. The menu has **Go to Precedents** and **Go to Dependents**.
 - Test: `ctrl_brackets_go_to_precedents_and_dependents`. All 147 Sheets and 240 pergola lib tests pass.
 
+### 16.121 Function argument tips (2026-11-25)
+
+- While a formula is being typed, a tip under the formula bar shows the arguments of the function the caret is in. For example, `ROUND(number, num_digits)` appears with the current argument in bold. Optional arguments are in brackets, and `...` marks a list that can go on. The `...` becomes current once the caret is past the listed arguments.
+- `fnhelp::call_at` finds the innermost function call before the caret. It skips commas inside nested calls, plain parentheses, array constants, strings and quoted sheet names. Inside a string there is no tip. At most `MAX_TIP_SCAN` (8 KiB) of the formula is read.
+- `fnhelp::ARGS` holds Excel's argument names for each of Sheets' 128 functions. A test checks that every function has an entry and that its required and total arguments match the evaluator's `min` and `max`, so a new function without names fails the build's tests.
+- Tests: `every_function_has_its_arguments_and_they_match_its_counts`, `the_caret_s_function_and_argument_are_found`, `the_tip_marks_the_current_argument` and `a_formula_being_typed_shows_its_function_s_arguments`. All 151 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -2646,6 +2646,25 @@ impl View for Sheets {
         for (pane, bounds, scroll) in self.authoring.panes(self, rect) {
             self.emit_grid(ctx, bounds, scroll, pane, pane == active);
         }
+        // While a formula is typed: the arguments of the function at the caret.
+        if let Some(parts) = g.edit.as_ref().and_then(|e| crate::fnhelp::tip(e.text(), e.caret())) {
+            let style = |on: bool| TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if on { Weight::Semibold } else { Weight::Regular }, color: t.text_primary() };
+            let widths: Vec<f32> = parts.iter().map(|(s, on)| pergola::text::measure(s, &style(*on)).w).collect();
+            let total: f32 = widths.iter().sum();
+            let (x0, y0) = (124.0, TOOLBAR_H + FORMULA_H + 2.0);
+            let bw = (total + 16.0).min((w - x0 - 8.0).max(0.0));
+            let tip = ctx.add(Node::Rect { rect: Rect::new(x0, y0, bw, 24.0), fill: t.bg_surface(), radius: 4.0 });
+            ctx.on_click(tip, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0 + 23.0, bw, 1.0), fill: t.border_default(), radius: 0.0 });
+            let mut x = x0 + 8.0;
+            for ((s, on), pw) in parts.into_iter().zip(widths) {
+                if x + pw > x0 + bw {
+                    break;
+                }
+                ctx.add(Node::Text { rect: Rect::new(x, y0 + 4.0, pw + 1.0, 16.0), content: s, style: style(on) });
+                x += pw;
+            }
+        }
 
         self.render_tabs(ctx, w, h - STATUS_H - crate::tabs::TABS_H);
 
@@ -7786,6 +7805,40 @@ mod tests {
         run(Cmd::Data(DataCmd::Dependents));
         assert_eq!(status(), "No formula reads this cell.");
         assert_eq!(at(0).1, cr(2, 1, 2, 1));
+    }
+
+    #[test]
+    fn a_formula_being_typed_shows_its_function_s_arguments() {
+        let s = sheets_of(b"1,2\n");
+        let parts = |s: &Sheets| -> Vec<(String, Weight)> {
+            let tree = pergola::view::render(s, pergola::theme::Semantic::LIGHT).0;
+            let y = TOOLBAR_H + FORMULA_H + 6.0;
+            let mut v: Vec<(f32, String, Weight)> = tree.iter().filter_map(|(_, n)| match n {
+                Node::Text { content, rect, style } if (rect.y() - y).abs() < 0.5 => Some((rect.x(), content.clone(), style.weight)),
+                _ => None,
+            }).collect();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            v.into_iter().map(|(_, t, w)| (t, w)).collect()
+        };
+        let mut g = s.grid.get_cloned();
+        g.select(3, 3);
+        let mut ed = TextEdit::new("");
+        ed.insert("=ROUND(A1, ");
+        g.edit = Some(ed);
+        s.grid.set(g);
+        let p = parts(&s);
+        let line: String = p.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(line, "ROUND(number, num_digits)");
+        assert_eq!(p.iter().filter(|(_, w)| *w == Weight::Semibold).map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["num_digits"]);
+        // Not a function call, or not editing: no tip.
+        let mut g = s.grid.get_cloned();
+        g.edit.as_mut().unwrap().set_text("=1+2");
+        s.grid.set(g);
+        assert!(parts(&s).is_empty());
+        let mut g = s.grid.get_cloned();
+        g.edit = None;
+        s.grid.set(g);
+        assert!(parts(&s).is_empty());
     }
 
     #[test]
