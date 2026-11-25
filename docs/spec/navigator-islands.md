@@ -3104,10 +3104,13 @@ the Mac check.
 **Mac check, 2026-11-25 (arm64 Tessera, ac5ba59b9).** The fixture's
 `same-site-api` line passed ("api.app.example answered") and its `frame`
 line passed ("pay.example running; parent DOM unreachable"), with the
-frame in a second engine. **Open bug:** once the frame runs, the main page
-takes no clicks or keys. Clicks on its links and fields do nothing, and
-keys go only to the frame, while the main engine sits idle in `sbwait`.
-The same page with the iframe removed takes input normally.
+frame in a second engine. Once the frame ran, the main page took no clicks
+or keys: frescod's covered-island rule held the page island under the
+frame island. 534c8262c lets a sibling island wholly inside it pass. Its
+recheck on a fresh arm64 Tessera guest passed. With the frame running,
+typing in the main page, then the frame, then the main page again landed
+each time in the field clicked, and Ctrl-C/Ctrl-V in the main page still
+worked. jaild logged no WARNs.
 
 #### Costs
 
@@ -4057,4 +4060,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4](#i64-gate-results-on-arm64-tessera-2026-11-25) (downloads and refusals, file input through Scrinium, printing, keys and the clipboard) passed its gates on arm64 Tessera after four fixes. I6.5 is built; its fixture lines pass on the Mac, but a page with a running cross-origin frame takes no input ([open bug](#i65-as-built-2026-11-25-second-part-cross-origin-frames)).
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4](#i64-gate-results-on-arm64-tessera-2026-11-25) (downloads and refusals, file input through Scrinium, printing, keys and the clipboard) passed its gates on arm64 Tessera after four fixes. I6.5 is built and [its Mac check passed](#i65-as-built-2026-11-25-second-part-cross-origin-frames), with the frame-input fix (534c8262c).
