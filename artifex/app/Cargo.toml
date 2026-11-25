@@ -25,3 +25,7 @@ atrium-worker = { path = "../../sdk/atrium-worker" }
 serde_json = "1"
 toml = "0.8"
 libc = "0.2"
+
+[dev-dependencies]
+# The dock's own check, to prove what the icon editor writes is drawn.
+atrium-icon = { path = "../../sdk/atrium-icon" }

@@ -125,13 +125,15 @@ pub struct Assets {
     pub importing: Option<Importing>,
     /// The planned import's icon, decoded at [`ICON_SIZES`].
     pub import_preview: Option<Vec<Result<Image, String>>>,
+    /// The icon editor, open on one of the icons (or a new one).
+    pub editing: Option<crate::iconedit::Editor>,
 }
 
 impl std::fmt::Debug for Assets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Assets").field("project", &self.project).field("files", &self.files.len())
             .field("selected", &self.selected).field("preview", &self.preview).field("check", &self.check)
-            .field("importing", &self.importing).field("import_preview", &self.import_preview.as_ref().map(Vec::len)).finish()
+            .field("importing", &self.importing).field("import_preview", &self.import_preview.as_ref().map(Vec::len)).field("editing", &self.editing.as_ref().map(|e| (&e.rel, e.shapes.len()))).finish()
     }
 }
 
@@ -139,7 +141,7 @@ impl PartialEq for Assets {
     fn eq(&self, o: &Assets) -> bool {
         self.project == o.project && self.files == o.files && self.truncated == o.truncated && self.error == o.error
             && self.selected == o.selected && self.preview == o.preview && self.check == o.check
-            && self.importing == o.importing && self.import_preview.as_ref().map(Vec::len) == o.import_preview.as_ref().map(Vec::len)
+            && self.importing == o.importing && self.editing == o.editing && self.import_preview.as_ref().map(Vec::len) == o.import_preview.as_ref().map(Vec::len)
     }
 }
 

@@ -557,6 +557,41 @@ PY
         waitstate 'note=Some("Imported art/Logo.svg as assets/icons/logo.svg")' 120 && ok "Import writes assets/icons/logo.svg" || bad "import: $(state)"
         waitstate 'assets=Some((3, "assets/icons/logo.svg", 4' 120 && ok "and shows it, decoded" || bad "imported: $(state)"
         shot artifex-19-imported
+        # The icon editor (step 5): New icon, shapes on the 24 grid, a
+        # gradient and a stroke, the pen, reordering, Save; the saved icon
+        # then goes through the system's decoder and the dock's check like
+        # any other. In the 1100x660 window the canvas is 288 pt at window
+        # (372, 142): a unit is 12 pt, so unit (u, v) is screen
+        # (412 + 12u, 172 + 12v); the fill and stroke start at window x 684,
+        # the shape list at 916 (views.rs icon_editor; screen = window +
+        # (40, 30)).
+        u() { echo $((412 + 12 * $1)) $((172 + 12 * $2)); }
+        drag() { inj "MOVE $1 $2" "BTN 1 1" "MOVE $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))" "MOVE $3 $4" "BTN 1 0"; sleep ${GAP:-4}; }
+        IC='icon=Some(("assets/icons/icon.svg"'
+        press 1058 110           # New icon (the right pane's top right)
+        waitstate "$IC, Select, 0," 20 && ok "New icon opens the editor on assets/icons/icon.svg" || bad "new icon: $(state)"
+        press 535 145            # Rectangle
+        drag $(u 2 2) $(u 22 22)
+        press 908 202            # Fill: Radial
+        waitstate "$IC, Rect, 1, \"r\", \"r\"" 20 && ok "a rectangle drawn on the grid, filled with a radial gradient" || bad "rect: $(state)"
+        press 619 145            # Ellipse, then (it is selected) Fill: Linear
+        drag $(u 7 7) $(u 17 17)
+        press 855 202
+        press 703 145            # Line, then a stroke 2 wide
+        drag $(u 5 19) $(u 19 5)
+        press 869 420
+        press 787 145            # Pen: three points, then the first again
+        for pt in "4 4" "9 4" "4 9" "4 4"; do press $(u $pt); done
+        waitstate "$IC, Pen, 4, \"relp\", \"rlll\", 0, true" 30 && ok "an ellipse, a stroked line and a closed pen shape" || bad "shapes: $(state)"
+        shot artifex-20-icon-editor
+        press 1041 448           # Back: the pen shape behind the line
+        waitstate "$IC, Pen, 4, \"repl\"" 20 && ok "the shape list reorders" || bad "reorder: $(state)"
+        press 772 630            # Save
+        waitstate 'note=Some("Saved assets/icons/icon.svg")' 30 && ok "Save writes it" || bad "save: $(state)"
+        check "the file is the editor's" "1" "$(V "grep -c 'artifex-icon v1' $W/proj/work/$P/assets/icons/icon.svg")"
+        waitstate 'assets=Some((4, "assets/icons/icon.svg", 4, Some(0), Some(true)' 300 \
+            && ok "the saved icon is decoded at four sizes and the dock's check passes" || bad "saved icon: $(state)"
+        shot artifex-21-icon-saved
     else
         echo "  (no cargo-atrium with icon in the Rust layer: the check and Import SVG skipped)"
     fi
