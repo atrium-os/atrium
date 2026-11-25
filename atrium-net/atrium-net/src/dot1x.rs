@@ -46,8 +46,9 @@ pub enum Do {
     /// EAPOL-Logoff to port k's switch (when its link is up),
     /// `wired-stop`, and close the connection.
     Stop(usize),
-    /// DHCP again on port k: an authorized port is often moved to
-    /// another VLAN.
+    /// DHCP again on port k: the switch moves a port to another VLAN when
+    /// it authorizes it, and back (or shuts it) when that ends, so the
+    /// old lease is wrong either way.
     RestartLease(usize),
     /// Report the port's state (`dot1x` event).
     Report(usize),
@@ -63,11 +64,14 @@ pub struct Dot1x {
     pub hold_until: Option<u64>,
     /// A wired profile is set up (kept in atrium-net's settings).
     pub configured: bool,
+    /// The switch opened the port and the lease since is on its VLAN:
+    /// set by `authorized`, ended by a failure, a forget or the link.
+    pub open: bool,
 }
 
 impl Dot1x {
     pub fn new(configured: bool) -> Dot1x {
-        Dot1x { port: None, state: State::Idle, fails: 0, hold_until: None, configured }
+        Dot1x { port: None, state: State::Idle, fails: 0, hold_until: None, configured, open: false }
     }
 
     fn held(&self, now: u64) -> bool {
@@ -125,6 +129,7 @@ impl Dot1x {
         match (verb, why) {
             ("authorized", _) => {
                 self.state = State::Authorized;
+                self.open = true;
                 self.fails = 0;
                 self.hold_until = None;
                 vec![Do::RestartLease(k), Do::Report(k)]
@@ -141,6 +146,9 @@ impl Dot1x {
                 let forever = why == "eap-trust" || self.fails >= MAX_FAILS;
                 self.hold_until = Some(if forever { u64::MAX } else { now + HOLD_MS });
                 self.state = State::Failed(why);
+                if std::mem::take(&mut self.open) {
+                    return vec![Do::RestartLease(k), Do::Report(k)];
+                }
                 vec![Do::Report(k)]
             }
             _ => Vec::new(),
@@ -166,9 +174,13 @@ impl Dot1x {
         self.fails = 0;
         self.hold_until = None;
         if !on {
-            let k = self.port;
+            let (k, was) = (self.port, self.open);
             *self = Dot1x::new(false);
-            return k.map(|k| vec![Do::Stop(k), Do::Report(k)]).unwrap_or_default();
+            return match k {
+                Some(k) if was => vec![Do::Stop(k), Do::RestartLease(k), Do::Report(k)],
+                Some(k) => vec![Do::Stop(k), Do::Report(k)],
+                None => Vec::new(),
+            };
         }
         match self.port.or(up) {
             Some(k) => {
@@ -182,8 +194,10 @@ impl Dot1x {
 
     /// aura-keys went away: the next frame or link change starts over.
     pub fn keys_lost(&mut self) -> Vec<Do> {
-        let k = self.port;
+        let (k, open) = (self.port, self.open);
         *self = Dot1x::new(self.configured);
+        // The switch still has the port open.
+        self.open = open;
         k.map(|k| vec![Do::Report(k)]).unwrap_or_default()
     }
 }
@@ -219,7 +233,7 @@ mod tests {
         assert_eq!(d.frame(1, 0), (true, vec![]));
         assert_eq!(d.keys_line("authorized", None, 5), vec![Do::RestartLease(1), Do::Report(1)]);
         assert_eq!(d.state, State::Authorized);
-        assert_eq!(d.link(1, false, 9), vec![Do::Stop(1), Do::Report(1)]);
+        assert_eq!(d.link(1, false, 9), vec![Do::Stop(1), Do::Report(1)], "the lease follows the link itself");
         assert_eq!((d.port, &d.state), (None, &State::Idle));
     }
 
@@ -253,6 +267,28 @@ mod tests {
         assert_eq!(d.configure(true, None), vec![Do::Start(0), Do::Report(0)]);
         assert_eq!(d.configure(false, None), vec![Do::Stop(0), Do::Report(0)]);
         assert!(!d.configured && d.port.is_none());
+    }
+
+    #[test]
+    fn the_lease_starts_over_when_authorization_ends() {
+        let mut d = Dot1x::new(true);
+        d.link(0, true, 0);
+        d.keys_line("authorized", None, 1);
+        // The switch asks again and the sign-in fails: the port is shut.
+        assert_eq!(d.keys_line("failed", Some("eap-rejected"), 2), vec![Do::RestartLease(0), Do::Report(0)]);
+        assert_eq!(d.keys_line("failed", Some("eap-rejected"), 3), vec![Do::Report(0)], "only once");
+        d.tick(70_000, |_| true);
+        d.keys_line("authorized", None, 70_001);
+        assert_eq!(d.configure(false, Some(0)), vec![Do::Stop(0), Do::RestartLease(0), Do::Report(0)], "forgotten");
+        // A new profile on an open port that then fails: the switch shuts it.
+        let mut d = Dot1x::new(true);
+        d.link(0, true, 0);
+        d.keys_line("authorized", None, 1);
+        assert_eq!(d.configure(true, Some(0)), vec![Do::Start(0), Do::Report(0)]);
+        assert_eq!(d.keys_line("failed", Some("eap-rejected"), 2), vec![Do::RestartLease(0), Do::Report(0)]);
+        let mut d = Dot1x::new(true);
+        d.link(0, true, 0);
+        assert_eq!(d.configure(false, Some(0)), vec![Do::Stop(0), Do::Report(0)], "never authorized: the lease stands");
     }
 
     #[test]

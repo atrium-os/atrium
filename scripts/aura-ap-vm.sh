@@ -142,20 +142,20 @@ ap() {
 # Wired 802.1X (wifi.md §7.5): the NIC on the cable to the FreeBSD VM
 # (QEMU socket netdev, MAC 02:4e:00:00:02:01) becomes a switch port that
 # asks for a sign-in: hostapd with driver=wired, and DHCP only while
-# authorized (wired-port.sh). Run after `ap`, which stops every hostapd.
+# authorized (hostapd's output piped through wired-port.sh). Run after `ap`, which stops every hostapd.
 wired() {
     for f in hostapd-wired.conf udhcpd-wired.conf wired-port.sh; do
         scp -q -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
             -P "$SSH_PORT" "$ROOT/aura/sim-ap/$f" ubuntu@localhost:/tmp/
     done
     gssh "set -e; n=\$(grep -l 02:4e:00:00:02:01 /sys/class/net/*/address | cut -d/ -f5); [ -n \"\$n\" ] || { echo 'no cable NIC: aura-ap-vm.sh up boots with it'; exit 1; }
-        pkill -f '[h]ostapd /tmp/hostapd-wired' || true; pkill -f '[h]ostapd_cli -i' || true; pkill -f '[u]dhcpd -f /tmp/udhcpd-wired.conf' || true; sleep 1
+        pkill -f '[h]ostapd /tmp/hostapd-wired' || true; pkill -f '[w]ired-port.sh' || true; pkill -f '[u]dhcpd -f /tmp/udhcpd-wired.conf' || true; sleep 1
         ip addr flush dev \$n; ip addr add 10.79.0.1/24 dev \$n; ip link set \$n up
         sed -i \"s/cable0/\$n/\" /tmp/hostapd-wired.conf /tmp/udhcpd-wired.conf; chmod 755 /tmp/wired-port.sh
         rm -f /run/udhcpd-wired.leases /tmp/wired-port.log /tmp/udhcpd-wired.log; touch /run/udhcpd-wired.leases
-        (nohup hostapd ${HOSTAPD_ARGS:-} /tmp/hostapd-wired.conf >/tmp/hostapd-wired.log 2>&1 &)
+        : > /tmp/hostapd-wired.log
+        (nohup sh -c 'stdbuf -oL hostapd ${HOSTAPD_ARGS:-} /tmp/hostapd-wired.conf 2>&1 | tee -a /tmp/hostapd-wired.log | grep --line-buffered authorizing.port | /tmp/wired-port.sh' >/dev/null 2>&1 &)
         i=0; until [ -S /run/hostapd-wired/\$n ]; do i=\$((i+1)); [ \$i -lt 30 ] || { cat /tmp/hostapd-wired.log; exit 1; }; sleep 1; done
-        hostapd_cli -B -p /run/hostapd-wired -i \$n -a /tmp/wired-port.sh
         echo \"aura-ap-vm: wired 802.1X port on \$n\""
 }
 

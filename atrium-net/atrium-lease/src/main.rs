@@ -131,6 +131,7 @@ fn main() {
                         c6 = Some(Client6::new(mac, Box::new(rand)));
                     }
                     ("up", Some(cl)) => outs.extend(cl.start(now())),
+                    ("restart", Some(cl)) => outs.extend(cl.restart(now())),
                     ("down", Some(cl)) => {
                         cl.stop();
                         rdnss.clear();

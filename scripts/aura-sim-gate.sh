@@ -1127,6 +1127,9 @@ w8() {
     r=$("$V" "$H; echo wrong | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/eap-ca.der) --secret-stdin" 2>&1) || fail "remember 3: $r"
     wait_st 'dot1x=failed' 180 && ok "a wrong password: refused ($(st | grep -o 'dot1x_why=[a-z-]*'))" || fail "wrong password: $(st)"
     plog | tail -n 1 | grep -q closed && ok "the switch closed the port" || fail "port: $(plog | tail -n 2)"
+    # The old lease went with the open port: DHCP starts over (and gets nothing).
+    n=0; while st | grep -q 'addr=10\.79\.' && [ $n -lt 30 ]; do sleep 2; n=$((n + 1)); done
+    st | grep -q 'addr=10\.79\.' && fail "the closed port kept its address: $(st)" || ok "the closed port's address dropped ($(st | grep -o 'state=[a-z]*'))"
     r=$("$V" "$H; echo s3cret | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/evil-ca.der) --secret-stdin" 2>&1) || fail "remember 4: $r"
     # The switch's quiet period after the wrong password (60 s) first.
     wait_st 'dot1x_why=eap-' 240 && sleep 20 && st | grep -q 'dot1x=failed' && ok "a server outside the network's CA: refused before the password ($(st | grep -o 'dot1x_why=[a-z-]*'))" || fail "evil CA: $(st)"
