@@ -9,7 +9,9 @@
 # lyra-vm-check.sh does, and have lyra-play play a tone through Lyra for
 # TONE_SECS (5) at LYRA_PLAY_VOLUME (0.25), as a RATE (48000) stream: the
 # device follows a stream that starts alone (lyra-hires.md §3), and lyrad
-# logs whether the period went out bit-perfect. A person listens; the script
+# logs whether the period went out bit-perfect. SIGNAL=counter plays a
+# counter instead and checks it arrived exactly: in lyrad's dump, and, with
+# WAV=<host wav>, in what a qemu audiodev recorded (qemu-xhci-audio-check.sh). A person listens; the script
 # checks what it can see:
 #   - the card is uaudio's, and lyrad opened it (sndstat shows lyrad's channel)
 #   - the samples lyrad sent held the tone for ~TONE_SECS (LYRA_DUMP)
@@ -35,6 +37,7 @@ bad() { printf '  FAIL %s\n' "$*"; FAILS=$((FAILS + 1)); }
 v() { "$VSSH" "$@"; }
 
 v true >/dev/null 2>&1 || die "cannot reach the VM (sudo USB=vid:pid sh scripts/usb-host-vm.sh)"
+SYSTEM_LYRAD=0; v "jls name" 2>/dev/null | grep -qx atrium-lyrad && SYSTEM_LYRAD=1
 
 if [ -n "${LYRA_PREBUILT:-}" ]; then
     say "prebuilt binaries from $LYRA_PREBUILT"; SRC="$LYRA_PREBUILT"
@@ -50,7 +53,7 @@ else
 fi
 
 say "stage"
-v "pkill -f 'daemon.*lyra-dac' ; pkill lyrad ; pkill choragusd ; pkill lyra-play ; true" >/dev/null 2>&1
+v "pkill -f 'daemon.*lyra-dac' ; pkill -x lyrad ; pkill -x choragusd ; pkill lyra-play ; true" >/dev/null 2>&1
 for b in lyra/lyrad lyra/lyra-play choragus/choragusd; do
     name="${b#*/}"
     if [ -n "$SRC" ]; then src="$SRC/$name"; else src="$ROOT/${b%/*}/target/$TARGET/release/$name"; fi
@@ -85,7 +88,7 @@ for u in $UNITS; do
     desc=$(v "sysctl -n dev.pcm.$u.%desc; sysctl -n dev.pcm.$u.%parent" | tr '\n' ' ')
     say "pcm$u: $desc"
     v "set -e
-        pkill -f 'daemon.*lyra-dac' || true; pkill lyrad || true; pkill choragusd || true
+        pkill -f 'daemon.*lyra-dac' || true; pkill -x lyrad || true; pkill -x choragusd || true
         sleep 1
         sysctl -q hw.snd.default_unit=$u >/dev/null
         sysctl -q dev.pcm.$u.bitperfect=${BITPERFECT:-1} >/dev/null 2>&1 || true
@@ -96,7 +99,19 @@ for u in $UNITS; do
         printf '50001 alice org.test.a\n' > $T/registry; printf 'org.test.a audio\n' > $T/grants
         chmod 644 $T/registry $T/grants
         rm -f $DUMP; install -o _lyra -m 0644 /dev/null $DUMP
-        daemon -r -R 1 -u _lyra -o $T/lyrad.log -t lyra-dac-lyrad env LYRA_DUMP=$DUMP $BIN/lyrad --serve </dev/null >/dev/null 2>&1
+        if [ $SYSTEM_LYRAD = 1 ]; then
+            # The installed, jailed lyrad (jaild restarts it): restart it so
+            # it opens the new default card. It keeps no dump. Its socket is
+            # bound by the supervisor and handed in (fast-boot.md §5): never
+            # remove it, or nothing binds it again until the next boot.
+            old=\$(pgrep -x atrium-lyrad || true); jail -r atrium-lyrad >/dev/null 2>&1 || true
+            for i in \$(seq 1 30); do n=\$(pgrep -x atrium-lyrad || true); [ -n \"\$n\" ] && [ \"\$n\" != \"\$old\" ] && break; sleep 1; done
+            [ -S /atrium/sockets/lyrad/lyrad.sock ] || { echo 'no lyrad socket'; exit 1; }
+            sleep 2   # the new lyrad opening the card
+            echo 'the system lyrad (jailed, from /usr/local/bin/atrium-lyrad)' > $T/lyrad.log
+        else
+            daemon -r -R 1 -u _lyra -o $T/lyrad.log -t lyra-dac-lyrad env LYRA_DUMP=$DUMP $BIN/lyrad --serve </dev/null >/dev/null 2>&1
+        fi
         daemon -r -R 1 -u _choragus -o $T/choragusd.log -t lyra-dac-choragusd \
             $BIN/choragusd --daemon $T/audio.sock /atrium/sockets/lyrad/lyrad.sock \
             --grants $T/grants --app-registry $T/registry --control $T/control.sock --state /var/db/choragus </dev/null >/dev/null 2>&1
@@ -106,14 +121,20 @@ for u in $UNITS; do
     v "cat $T/lyrad.log"
     xr() { v "cat /dev/sndstat" | sed -n "/^pcm$u:/,/^pcm[0-9]*:/p" | grep -oE '(underruns|xruns) [0-9]+' | head -1; }
     pre=$(xr)
+    # SIGNAL=counter (qemu-xhci-isoch.md §4 A): lyra-play's counter at unity
+    # gain; with WAV= (the host file a qemu audiodev writes) the recording is
+    # judged from where it stood before the run.
+    sig=""; [ "${SIGNAL:-}" = counter ] && { sig="LYRA_PLAY_SIGNAL=counter"; VOL=1; }
+    wav_at=0; [ -n "${WAV:-}" ] && wav_at=$(( $(stat -f %z "$WAV" 2>/dev/null || stat -c %s "$WAV") / 4 * 4 ))
     printf '\n  >>> LISTEN on pcm%s: a 440 Hz tone for %s s at volume %s\n' "$u" "$TONE_SECS" "$VOL"
     # Bounded: a stream with no device behind it never drains.
-    v "timeout $((TONE_SECS + 20)) su -m appa -c 'env LYRA_PLAY_FREQ=440 LYRA_PLAY_RATE=${RATE:-48000} LYRA_PLAY_VOLUME=$VOL $BIN/lyra-play $T/audio.sock media $TONE_SECS'" \
+    v "timeout $((TONE_SECS + 20)) su -m appa -c 'env LYRA_PLAY_FREQ=440 LYRA_PLAY_RATE=${RATE:-48000} LYRA_PLAY_VOLUME=$VOL $sig $BIN/lyra-play $T/audio.sock media $TONE_SECS'" \
         && ok "lyra-play finished" || bad "lyra-play failed"
     v "cat /dev/sndstat" | sed -n "/pcm$u:/,/^pcm/p" | head -20
     post=$(xr)
     echo "  device xruns: before '${pre:-?}', after '${post:-?}'"
     # The dump is what lyrad sent the device: S16 stereo at the device rate.
+    if [ $SYSTEM_LYRAD = 0 ]; then
     stats=$(v "od -An -v -td2 $DUMP | awk '{for (i = 1; i <= NF; i++) {s = \$i; if (s < 0) s = -s; if (s > 200) {n++; q += \$i * \$i}}} END {if (n) printf \"%d %.1f\", n / 2, 20 * log(sqrt(q / n) / 32768) / log(10); else print \"0 -inf\"}'")
     frames=${stats% *}; dbfs=${stats#* }
     echo "  dump: $frames loud frames, RMS $dbfs dBFS"
@@ -122,9 +143,27 @@ for u in $UNITS; do
     else
         bad "pcm$u: dump does not hold the tone ($frames loud frames, $dbfs dBFS)"
     fi
+    else
+        echo "  (the system lyrad keeps no dump: only the device's side is judged)"
+    fi
+    if [ -n "$sig" ] && [ $SYSTEM_LYRAD = 0 ]; then
+        # What lyrad sent (its dump) must hold the counter exactly: then any
+        # fault in the recording is the transport's, not Lyra's.
+        # shellcheck disable=SC2086
+        scp $SCP_OPTS "root@localhost:$DUMP" "${WAV:-/tmp}.lyra-dump.raw" >/dev/null 2>&1
+        python3 -I "$ROOT/scripts/lib/audio-counter-check.py" --raw "${WAV:-/tmp}.lyra-dump.raw" \
+            && ok "pcm$u: lyrad sent the counter exactly" || bad "pcm$u: lyrad's own output is not the counter"
+    fi
+    if [ -n "$sig" ]; then
+        if [ -n "${WAV:-}" ]; then
+            sleep 1
+            python3 -I "$ROOT/scripts/lib/audio-counter-check.py" --offset "$wav_at" "$WAV" \
+                && ok "pcm$u: the device received the counter exactly" || bad "pcm$u: the device's recording is not the counter"
+        fi
+    fi
     v "tail -8 $T/lyrad.log; tail -5 $T/choragusd.log"
 done
 
-v "pkill -f 'daemon.*lyra-dac' ; pkill lyrad ; pkill choragusd ; true" >/dev/null 2>&1
+v "pkill -f 'daemon.*lyra-dac' ; pkill -x lyrad ; pkill -x choragusd ; true" >/dev/null 2>&1
 say "result"
 [ $FAILS = 0 ] && echo "PASS (the machine side; the ears are yours)" || { echo "$FAILS failure(s)"; exit 1; }
