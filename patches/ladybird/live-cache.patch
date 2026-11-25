@@ -1,0 +1,558 @@
+--- a/Libraries/LibWeb/ServiceWorker/Cache.cpp
++++ b/Libraries/LibWeb/ServiceWorker/Cache.cpp
+@@ -25,6 +25,231 @@
+ #include <LibWeb/Streams/ReadableStream.h>
+ #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
+ 
++#ifdef ATRIUM_I6_PAGE
++#    include <AK/HashMap.h>
++#    include <LibURL/Parser.h>
++#    include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
++#    include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
++#    include <LibWeb/ServiceWorker/LiveCache.h>
++#    include <LibWeb/WebIDL/QuotaExceededError.h>
++
++extern "C" void navigator_live_cache_begin();
++extern "C" void navigator_live_cache_op(u8, u8 const*, size_t, u8 const*, size_t, u64);
++extern "C" bool navigator_live_cache_commit();
++
++// Atrium's live pages (navigator-islands.md I6.7, second part): the page's own Cache API, kept by navigatord. Each
++// cache is a database named for it holding one store, "entries", whose records are the cache's items keyed by
++// their place (a big-endian u64), the item encoded below. Only caches of the live CacheStorage are named in
++// live_cache_names(); any other cache is the run's.
++namespace Web::ServiceWorker::LiveCache {
++
++HashMap<RequestResponseList const*, ByteString>& names()
++{
++    static HashMap<RequestResponseList const*, ByteString> map;
++    return map;
++}
++
++HashMap<RequestResponse const*, u64>& keys()
++{
++    static HashMap<RequestResponse const*, u64> map;
++    return map;
++}
++
++u64& next_key()
++{
++    static u64 next = 1;
++    return next;
++}
++
++void send(u8 tag, ReadonlyBytes a, ReadonlyBytes b, u64 n)
++{
++    navigator_live_cache_op(tag, a.data(), a.size(), b.data(), b.size(), n);
++}
++
++void begin() { navigator_live_cache_begin(); }
++bool commit() { return navigator_live_cache_commit(); }
++
++static void put_u32(ByteBuffer& out, u32 n)
++{
++    for (int i = 0; i < 4; ++i)
++        out.append(static_cast<u8>(n >> (8 * i)));
++}
++
++static void put_bytes(ByteBuffer& out, ReadonlyBytes bytes)
++{
++    put_u32(out, static_cast<u32>(bytes.size()));
++    out.append(bytes);
++}
++
++static void put_headers(ByteBuffer& out, HTTP::HeaderList const& headers)
++{
++    put_u32(out, static_cast<u32>(headers.headers().size()));
++    for (auto const& header : headers.headers()) {
++        put_bytes(out, header.name.bytes());
++        put_bytes(out, header.value.bytes());
++    }
++}
++
++ByteBuffer key_bytes(u64 key)
++{
++    ByteBuffer out;
++    for (int i = 7; i >= 0; --i)
++        out.append(static_cast<u8>(key >> (8 * i)));
++    return out;
++}
++
++// Request URL, method and headers; response type, status, status text, URL list, headers and body bytes. None when
++// the body is not bytes (a stream not yet read): that item is the run's.
++Optional<ByteBuffer> encode_item(RequestResponse const& item)
++{
++    ByteBuffer out;
++    auto const& request = *item.request;
++    put_bytes(out, request.url().serialize().bytes());
++    put_bytes(out, request.method().bytes());
++    put_headers(out, request.header_list());
++    auto const& response = *item.response;
++    out.append(static_cast<u8>(response.type()));
++    put_u32(out, static_cast<u32>(response.status()));
++    put_bytes(out, response.status_message().bytes());
++    put_u32(out, static_cast<u32>(response.url_list().size()));
++    for (auto const& url : response.url_list())
++        put_bytes(out, url.serialize().bytes());
++    put_headers(out, response.header_list());
++    if (!response.body()) {
++        out.append(0);
++        return out;
++    }
++    auto source = response.body_source();
++    if (!source.has_value())
++        return {};
++    out.append(1);
++    put_bytes(out, source->bytes());
++    return out;
++}
++
++struct Reader {
++    ReadonlyBytes rest;
++    Optional<u8> byte()
++    {
++        if (rest.is_empty())
++            return {};
++        auto b = rest[0];
++        rest = rest.slice(1);
++        return b;
++    }
++    Optional<u32> u32_()
++    {
++        if (rest.size() < 4)
++            return {};
++        u32 n = rest[0] | (rest[1] << 8) | (rest[2] << 16) | (static_cast<u32>(rest[3]) << 24);
++        rest = rest.slice(4);
++        return n;
++    }
++    Optional<ReadonlyBytes> bytes()
++    {
++        auto len = u32_();
++        if (!len.has_value() || *len > rest.size())
++            return {};
++        auto b = rest.trim(*len);
++        rest = rest.slice(*len);
++        return b;
++    }
++    Optional<NonnullRefPtr<HTTP::HeaderList>> headers()
++    {
++        auto count = u32_();
++        // Each header takes at least eight bytes.
++        if (!count.has_value() || *count > rest.size() / 8)
++            return {};
++        Vector<HTTP::Header> list;
++        for (u32 i = 0; i < *count; ++i) {
++            auto name = bytes();
++            auto value = bytes();
++            if (!name.has_value() || !value.has_value())
++                return {};
++            list.append({ ByteString(*name), ByteString(*value) });
++        }
++        return HTTP::HeaderList::create(move(list));
++    }
++};
++
++// The item encode_item made, rebuilt; null when it is out of shape (navigatord kept bytes the engine sent).
++GC::Ptr<RequestResponse> decode_item(JS::Realm& realm, ReadonlyBytes bytes)
++{
++    using namespace Fetch::Infrastructure;
++    Reader r { bytes };
++    auto url_bytes = r.bytes();
++    auto method = r.bytes();
++    if (!url_bytes.has_value() || !method.has_value())
++        return {};
++    auto url = URL::Parser::basic_parse(StringView { *url_bytes });
++    auto request_headers = r.headers();
++    if (!url.has_value() || !request_headers.has_value())
++        return {};
++    auto request = Request::create();
++    request->set_url(*url);
++    request->set_method(ByteString(*method));
++    request->set_header_list(*request_headers);
++
++    auto type = r.byte();
++    auto status = r.u32_();
++    auto status_message = r.bytes();
++    auto url_count = r.u32_();
++    if (!type.has_value() || *type > static_cast<u8>(Response::Type::OpaqueRedirect) || !status.has_value() || *status > 999
++        || !status_message.has_value() || !url_count.has_value() || *url_count > r.rest.size() / 4)
++        return {};
++    Vector<URL::URL> url_list;
++    for (u32 i = 0; i < *url_count; ++i) {
++        auto bytes = r.bytes();
++        if (!bytes.has_value())
++            return {};
++        auto parsed = URL::Parser::basic_parse(StringView { *bytes });
++        if (!parsed.has_value())
++            return {};
++        url_list.append(parsed.release_value());
++    }
++    auto response_headers = r.headers();
++    auto has_body = r.byte();
++    if (!response_headers.has_value() || !has_body.has_value() || *has_body > 1)
++        return {};
++    auto internal = Response::create();
++    internal->set_status(static_cast<Status>(*status));
++    internal->set_status_message(ByteString(*status_message));
++    internal->set_url_list(move(url_list));
++    internal->set_header_list(*response_headers);
++    if (*has_body == 1) {
++        auto body = r.bytes();
++        if (!body.has_value())
++            return {};
++        internal->set_body(byte_sequence_as_response_body(*body));
++    }
++    if (!r.rest.is_empty())
++        return {};
++    NonnullRefPtr<Response> record = internal;
++    switch (static_cast<Response::Type>(*type)) {
++    case Response::Type::Basic:
++        record = BasicFilteredResponse::create(internal);
++        break;
++    case Response::Type::CORS:
++        record = CORSFilteredResponse::create(internal);
++        break;
++    case Response::Type::Opaque:
++        record = OpaqueFilteredResponse::create(internal);
++        break;
++    case Response::Type::OpaqueRedirect:
++        record = OpaqueRedirectFilteredResponse::create(internal);
++        break;
++    case Response::Type::Default:
++        break;
++    case Response::Type::Error:
++        return {};
++    }
++    auto view = ResponseView::create(realm, record);
++    return GC::Heap::the().allocate<RequestResponse>(request, view);
++}
++
++}
++#endif
++
+ namespace Web::ServiceWorker {
+ 
+ GC_DEFINE_ALLOCATOR(Cache);
+@@ -939,6 +1164,55 @@
+         // 3. Return resultList.
+         return removed_any_items;
+     }();
++
++#ifdef ATRIUM_I6_PAGE
++    // Atrium's live pages: step 9 for the page's own caches, which navigatord keeps. The items taken out and put in
++    // are what the list holds now against backupCache.
++    if (!result.is_error()) {
++        if (auto name = LiveCache::names().get(cache.ptr()); name.has_value()) {
++            auto& keys = LiveCache::keys();
++            Vector<GC::Ref<RequestResponse>> added;
++            LiveCache::begin();
++            LiveCache::send(LiveCache::Tag::Database, name->bytes(), {}, 0);
++            LiveCache::send(LiveCache::Tag::Store, "entries"sv.bytes(), {}, 0);
++            for (auto item : backup_cache->elements()) {
++                if (cache->elements().contains_slow(item))
++                    continue;
++                if (auto key = keys.get(item.ptr()); key.has_value())
++                    {
++                    auto key_bytes = LiveCache::key_bytes(*key);
++                    LiveCache::send(LiveCache::Tag::Delete, key_bytes.bytes(), {}, 0);
++                }
++            }
++            for (auto item : cache->elements()) {
++                if (backup_cache->elements().contains_slow(item))
++                    continue;
++                auto encoded = LiveCache::encode_item(*item);
++                if (!encoded.has_value()) {
++                    dbgln("live page: a cached response's body is not bytes yet; it is kept for this run only");
++                    continue;
++                }
++                auto key = LiveCache::next_key()++;
++                keys.set(item.ptr(), key);
++                added.append(item);
++                auto key_bytes = LiveCache::key_bytes(key);
++                LiveCache::send(LiveCache::Tag::Put, key_bytes.bytes(), encoded->bytes(), 0);
++            }
++            if (!LiveCache::commit()) {
++                for (auto item : added)
++                    keys.remove(item.ptr());
++                cache->elements().clear();
++                cache->elements().extend(backup_cache->elements());
++                return WebIDL::QuotaExceededError::create("The page's cached data could not be kept"_utf16);
++            } else {
++                for (auto item : backup_cache->elements()) {
++                    if (!cache->elements().contains_slow(item))
++                        keys.remove(item.ptr());
++                }
++            }
++        }
++    }
++#endif
+ 
+     // 5. And then, if an exception was thrown, then:
+     if (result.is_error()) {
+--- a/Libraries/LibWeb/ServiceWorker/CacheStorage.cpp
++++ b/Libraries/LibWeb/ServiceWorker/CacheStorage.cpp
+@@ -16,8 +16,129 @@
+ #include <LibWeb/ServiceWorker/CacheStorage.h>
+ #include <LibWeb/WebIDL/Promise.h>
+ 
++#ifdef ATRIUM_I6_PAGE
++#    include <AK/QuickSort.h>
++#    include <LibWeb/ServiceWorker/LiveCache.h>
++
++extern "C" bool navigator_live_cache_load(void*, void (*)(void*, u8, u8 const*, size_t, u8 const*, size_t, u64));
++
+ namespace Web::ServiceWorker {
+ 
++// Atrium's live pages (I6.7, second part): the first CacheStorage asked for its map loads the page's caches from
++// navigatord and is the one whose caches are kept; any other (a frame's engine gets no store) is the run's.
++static CacheStorage const* s_live_owner = nullptr;
++static bool s_tried = false;
++static bool s_loading = false;
++
++struct LoadedOp {
++    u8 tag;
++    ByteBuffer a;
++    ByteBuffer b;
++    u64 n;
++};
++
++static void on_cache_op(void* ctx, u8 tag, u8 const* a, size_t a_len, u8 const* b, size_t b_len, u64 n)
++{
++    auto& ops = *static_cast<Vector<LoadedOp>*>(ctx);
++    ops.append({ tag, MUST(ByteBuffer::copy(ReadonlyBytes { a, a_len })), MUST(ByteBuffer::copy(ReadonlyBytes { b, b_len })), n });
++}
++
++static void load_if_first(CacheStorage& self, JS::Realm& realm)
++{
++    if (s_tried)
++        return;
++    s_tried = true;
++    Vector<LoadedOp> ops;
++    if (!navigator_live_cache_load(&ops, on_cache_op))
++        return; // navigatord keeps no caches for this engine: they are the run's.
++
++    struct Item {
++        u64 key;
++        ByteBuffer value;
++    };
++    Vector<ByteString> order;
++    HashMap<ByteString, Vector<Item>> items;
++    Optional<ByteString> current;
++    bool bad = false;
++    for (auto& op : ops) {
++        switch (op.tag) {
++        case LiveCache::Tag::Version:
++        case LiveCache::Tag::Database:
++            current = ByteString(op.a.bytes());
++            if (!items.contains(*current)) {
++                order.append(*current);
++                items.set(*current, {});
++            }
++            break;
++        case LiveCache::Tag::CreateStore:
++        case LiveCache::Tag::Store:
++            break;
++        case LiveCache::Tag::Put: {
++            if (!current.has_value() || op.a.size() != 8) {
++                bad = true;
++                break;
++            }
++            u64 key = 0;
++            for (auto byte : op.a.bytes())
++                key = (key << 8) | byte;
++            items.get(*current)->append({ key, move(op.b) });
++            break;
++        }
++        case LiveCache::Tag::Append: {
++            if (!current.has_value()) {
++                bad = true;
++                break;
++            }
++            auto& list = *items.get(*current);
++            auto last_key = list.is_empty() ? ByteBuffer {} : LiveCache::key_bytes(list.last().key);
++            if (list.is_empty() || last_key.bytes() != op.a.bytes()) {
++                bad = true;
++                break;
++            }
++            list.last().value.append(op.b.bytes());
++            break;
++        }
++        default:
++            bad = true;
++        }
++        if (bad)
++            break;
++    }
++    if (bad) {
++        dbgln("live page: the caches navigatord gave are out of shape; this run keeps its caches for itself");
++        return;
++    }
++
++    s_live_owner = &self;
++    s_loading = true;
++    u64 highest = 0;
++    for (auto const& name : order) {
++        auto list = self.get_or_create_cache(Utf16String::from_utf8_with_replacement_character(name));
++        auto& entries = *items.get(name);
++        quick_sort(entries, [](auto const& a, auto const& b) { return a.key < b.key; });
++        for (auto& entry : entries) {
++            auto item = LiveCache::decode_item(realm, entry.value.bytes());
++            if (!item) {
++                dbgln("live page: a cached item navigatord gave is out of shape; it is left out");
++                continue;
++            }
++            list->elements().append(*item);
++            LiveCache::keys().set(item.ptr(), entry.key);
++            highest = max(highest, entry.key);
++        }
++    }
++    s_loading = false;
++    LiveCache::next_key() = max(LiveCache::next_key(), highest + 1);
++}
++
++}
++#    define ATRIUM_LOAD_CACHES(realm) load_if_first(*this, realm)
++#else
++#    define ATRIUM_LOAD_CACHES(realm)
++#endif
++
++namespace Web::ServiceWorker {
++
+ GC_DEFINE_ALLOCATOR(CacheStorage);
+ 
+ CacheStorage::CacheStorage()
+@@ -33,6 +154,7 @@
+ // https://w3c.github.io/ServiceWorker/#cache-storage-match
+ void CacheStorage::match(JS::Realm& realm, Fetch::RequestInfo request, MultiCacheQueryOptions options, GC::Ref<WebIDL::Promise> promise)
+ {
++    ATRIUM_LOAD_CACHES(realm);
+     // 1. If options["cacheName"] exists, then:
+     if (options.cache_name.has_value()) {
+         // 1. Return a new promise promise and run the following substeps in parallel:
+@@ -99,6 +221,7 @@
+ // https://w3c.github.io/ServiceWorker/#cache-storage-has
+ void CacheStorage::has(JS::Realm& realm, Utf16String const& cache_name, GC::Ref<WebIDL::Promise> promise)
+ {
++    ATRIUM_LOAD_CACHES(realm);
+     // 2. Run the following substeps in parallel:
+     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this, realm, promise, cache_name), [](auto& self, auto& realm, auto& promise, auto& cache_name) {
+         HTML::TemporaryExecutionContext context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+@@ -113,6 +236,7 @@
+ // https://w3c.github.io/ServiceWorker/#cache-storage-open
+ void CacheStorage::open(JS::Realm& realm, Utf16String const& cache_name, GC::Ref<WebIDL::Promise> promise)
+ {
++    ATRIUM_LOAD_CACHES(realm);
+     // 2. Run the following substeps in parallel:
+     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this, realm, promise, cache_name), [](auto& self, auto& realm, auto& promise, auto& cache_name) {
+         HTML::TemporaryExecutionContext context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+@@ -133,6 +257,7 @@
+ // https://w3c.github.io/ServiceWorker/#cache-storage-delete
+ void CacheStorage::delete_(JS::Realm& realm, Utf16String const& cache_name, GC::Ref<WebIDL::Promise> promise)
+ {
++    ATRIUM_LOAD_CACHES(realm);
+     // 2. Run the following substeps in parallel:
+     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this, realm, promise, cache_name), [](auto& self, auto& realm, auto& promise, auto& cache_name) {
+         HTML::TemporaryExecutionContext context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+@@ -150,6 +275,7 @@
+ // https://w3c.github.io/ServiceWorker/#cache-storage-keys
+ void CacheStorage::keys(JS::Realm& realm, GC::Ref<WebIDL::Promise> promise)
+ {
++    ATRIUM_LOAD_CACHES(realm);
+     // 2. Run the following substeps in parallel:
+     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this, realm, promise), [](auto& self, auto& realm, auto& promise) {
+         HTML::TemporaryExecutionContext context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+@@ -176,7 +302,19 @@
+ {
+     if (!contains_cache(cache_name))
+         return false;
+-
++#ifdef ATRIUM_I6_PAGE
++    if (auto list = relevant_name_to_cache_map().get(cache_name); list.has_value()) {
++        if (auto name = LiveCache::names().get(list->ptr()); name.has_value()) {
++            LiveCache::begin();
++            LiveCache::send(LiveCache::Tag::DeleteDatabase, name->bytes(), {}, 0);
++            if (!LiveCache::commit())
++                dbgln("live page: navigatord didn't keep a cache's deletion");
++            for (auto item : (*list)->elements())
++                LiveCache::keys().remove(item.ptr());
++            LiveCache::names().remove(list->ptr());
++        }
++    }
++#endif
+     relevant_name_to_cache_map().remove(cache_name);
+     return true;
+ }
+@@ -188,6 +326,22 @@
+ 
+     auto cache = GC::Heap::the().allocate<RequestResponseList>();
+     relevant_name_to_cache_map().set(cache_name, cache);
++#ifdef ATRIUM_I6_PAGE
++    if (this == s_live_owner) {
++        auto name = cache_name.to_byte_string();
++        if (s_loading) {
++            LiveCache::names().set(cache.ptr(), name);
++        } else {
++            LiveCache::begin();
++            LiveCache::send(LiveCache::Tag::Version, name.bytes(), {}, 0);
++            LiveCache::send(LiveCache::Tag::CreateStore, "entries"sv.bytes(), {}, 0);
++            if (LiveCache::commit())
++                LiveCache::names().set(cache.ptr(), name);
++            else
++                dbgln("live page: navigatord didn't keep a new cache; it is kept for this run only");
++        }
++    }
++#endif
+     return cache;
+ }
+ 
+--- a/Libraries/LibWeb/ServiceWorker/LiveCache.h
++++ b/Libraries/LibWeb/ServiceWorker/LiveCache.h
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (c) 2026-present, the Atrium developers.
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#pragma once
++
++// Atrium's live pages (navigator-islands.md I6.7, second part): the page's own Cache API kept by navigatord. Defined
++// in Cache.cpp; used there and by CacheStorage.cpp.
++
++#ifdef ATRIUM_I6_PAGE
++
++#    include <AK/ByteBuffer.h>
++#    include <AK/ByteString.h>
++#    include <AK/HashMap.h>
++#    include <LibWeb/ServiceWorker/NameToCacheMap.h>
++
++namespace Web::ServiceWorker::LiveCache {
++
++// limen::web_island::idb::tag.
++namespace Tag {
++constexpr u8 Database = 1;
++constexpr u8 Version = 2;
++constexpr u8 DeleteDatabase = 3;
++constexpr u8 Store = 4;
++constexpr u8 CreateStore = 5;
++constexpr u8 Put = 9;
++constexpr u8 Append = 10;
++constexpr u8 Delete = 11;
++}
++
++// The caches navigatord keeps, by their list, with their names (UTF-8).
++HashMap<RequestResponseList const*, ByteString>& names();
++// Each kept item's key, its place in its cache.
++HashMap<RequestResponse const*, u64>& keys();
++u64& next_key();
++
++void begin();
++void send(u8 tag, ReadonlyBytes a, ReadonlyBytes b, u64 n);
++bool commit();
++
++ByteBuffer key_bytes(u64);
++Optional<ByteBuffer> encode_item(RequestResponse const&);
++GC::Ptr<RequestResponse> decode_item(JS::Realm&, ReadonlyBytes);
++
++}
++
++#endif

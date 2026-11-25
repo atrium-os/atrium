@@ -3733,6 +3733,28 @@ navigatord never reads it.
    kept for the run only, logged; `put` reads the body before it batches,
    so this should not happen.
 
+**The patch as written (2026-11-25).** `patches/ladybird/live-cache.patch`
+changes `Cache.cpp` and `CacheStorage.cpp` and adds `LiveCache.h`, all
+under `ATRIUM_I6_PAGE`, with no header of the pin changed (the engine
+links the two files' objects in place of the prebuilt ones). It builds
+against the pinned Ladybird, and the engine passes the JIT audit.
+
+- A cache's name and each item's key are kept in side tables, keyed by the
+  list and by the item (`LiveCache::names`, `keys`), so no class layout
+  changes.
+- `batch_cache_operations` compares the list with `backupCache` after the
+  operations. It deletes the keys of the items that went and puts the
+  items that came, each with a fresh key. When navigatord refuses, it
+  restores the list and throws `QuotaExceededError`.
+- `match`, `has`, `open`, `delete` and `keys` load first. The first
+  `CacheStorage` to ask is the one whose caches are kept. A load out of
+  shape is dropped, loudly, and that run keeps its caches to itself.
+- An item is encoded as length-prefixed fields: the request's URL, method
+  and headers, then the response's type, status, status text, URL list,
+  headers and body. On load a filtered response is rebuilt with its
+  filter around the stored fields. A body that is not bytes is kept for
+  the run, and its absence is logged.
+
 **Gate (Mac),** after the I6.7 gate's setup:
 
 1. Run `app.html` live: `cache-api` reads 1 cached. Stop, run live: 2.
