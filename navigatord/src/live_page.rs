@@ -258,7 +258,14 @@ pub trait LocalStorage {
     /// (I6.7); both are `live_idb` stores.
     fn load_idb(&mut self, _page: &str, _cache: bool) -> Result<Vec<u8>, String> { Err("no IndexedDB here".into()) }
     fn apply_idb(&mut self, _page: &str, _part: &[u8], _cache: bool) -> Result<(), String> { Err("no IndexedDB here".into()) }
+    /// What the page's site keeps here, and what it may: `localStorage`
+    /// and the IndexedDB and Cache API stores together (§15.1 of
+    /// navigator-ui.md, the Live code popover).
+    fn used(&mut self, _page: &str) -> Option<(u64, u64)> { None }
 }
+
+/// What a site may keep in all its stores together.
+pub const STORED_MAX: u64 = (crate::live_storage::QUOTA + crate::live_idb::QUOTA) as u64;
 
 /// The stores of one jar.
 pub struct JarStores {
@@ -285,6 +292,12 @@ impl LocalStorage for JarStores {
         let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
         self.idb.lock().unwrap().apply_kind(&key, if cache { crate::live_idb::Kind::Cache } else { crate::live_idb::Kind::Idb }, part)
     }
+    fn used(&mut self, page: &str) -> Option<(u64, u64)> {
+        let ls = crate::live_storage::Key::of(self.jar, page)?;
+        let idb = crate::live_idb::Key::of(self.jar, page)?;
+        let n = self.stores.lock().unwrap().used(&ls) + self.idb.lock().unwrap().used(&idb);
+        Some((n as u64, STORED_MAX))
+    }
 }
 
 /// What the serve loop saw, for the log and the UI.
@@ -304,6 +317,8 @@ pub trait Hooks {
     fn started(&mut self, _page: &str) {}
     /// The page's `localStorage` (I6.3), if it has one here.
     fn storage(&mut self) -> Option<&mut dyn LocalStorage> { None }
+    /// The page's stores were loaded or changed.
+    fn stored(&mut self, _page: &str) {}
     /// The page's script made a file to save (I6.4), named `name`, of the
     /// content type `kind`.
     fn made(&mut self, _page: &str, _name: &str, _kind: &str, _bytes: Vec<u8>) -> Result<(), String> {
@@ -420,6 +435,9 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
                 (Some(l), None) => l.load(&delivered_url).map(|b| (200, b)),
                 (Some(l), Some(b)) => l.apply(&delivered_url, &b.bytes).map(|_| (204, vec![])),
             };
+            if answer.is_ok() {
+                hooks.stored(&delivered_url);
+            }
             match answer {
                 Ok((status, body)) if body.len() as u64 <= open.limits.max_bytes => {
                     let length = body.len() as u64;
@@ -764,6 +782,8 @@ pub trait Tell: Send + Sync + 'static {
     /// The run ended by itself (`None`: the engine closed) or failed;
     /// once, and never after [`Live::stop`].
     fn finished(&self, why: Option<String>);
+    /// What the page's site keeps in its stores, of what it may (bytes).
+    fn usage(&self, _stored: u64, _max: u64) {}
 }
 
 /// The host of a refused request's target, as `refused_target` spells it.
@@ -905,6 +925,11 @@ impl Hooks for RunHooks {
     }
     fn messages(&mut self) -> Vec<u8> { self.mail.lock().unwrap().take_for_page() }
     fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.storage.as_mut().map(|s| s as &mut dyn LocalStorage) }
+    fn stored(&mut self, page: &str) {
+        if let Some((n, max)) = self.storage.as_mut().and_then(|s| s.used(page)) {
+            self.tell.usage(n, max);
+        }
+    }
     fn made(&mut self, page: &str, name: &str, kind: &str, bytes: Vec<u8>) -> Result<(), String> {
         if bytes.is_empty() { return Err("an empty file".into()); }
         let (what, ext) = crate::files::kind(&bytes).unwrap_or(match kind {
