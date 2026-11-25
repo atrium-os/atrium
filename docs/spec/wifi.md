@@ -544,7 +544,7 @@ account names are `creds::Net`. The rig: `aura-sim-gate.sh vms` boots both VMs w
 cable (FreeBSD vtnet2, QEMU udp 7811/7812), `aura-ap-vm.sh wired` starts hostapd
 `driver=wired` with `aura/sim-ap/hostapd-wired.conf`, and `wired-port.sh` (fed
 hostapd's port lines) runs udhcpd only while the port is authorized, so an address proves the
-switch opened it. `aura-sim-gate.sh w8` 23/23: needed with no address; PEAP stopping at
+switch opened it. `aura-sim-gate.sh w8` 24/24: needed with no address; PEAP stopping at
 the certificate, then trusted, an address and a ping; TTLS-PAP with the CA; EAP-TLS with
 the key in Arca; cable out and in signs in again with no one asked; a wrong password
 and another CA refused (the switch closes the port and the address goes); forget. `aura-sim-gate.sh
@@ -555,8 +555,11 @@ client `restart`: the old lease is dropped and DHCP starts from DISCOVER (not
 INIT-REBOOT, which a closed port's old VLAN could still answer). The rig's switch
 (`wired-port.sh`) follows hostapd's own "authorizing port" / "unauthorizing port"
 lines, since a failed re-authentication shuts the port with no hostapd_cli event.
-Open: periodic re-authentication by the switch is untested (`eap_reauth_period=0`
-in the rig).
+Re-authentication the switch starts (its reauth timer; the gate triggers it with
+hostapd's `EAPOL_REAUTH`) signs in again over the open port and keeps the lease: an
+`authorized` while already authorized and open restarts nothing. A sign-in atrium-net
+starts (new profile, link up, after a hold) still restarts the lease, since the switch
+may put the port on another VLAN.
 
 ## 8. Threat model and what runs where
 

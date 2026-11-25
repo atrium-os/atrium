@@ -128,10 +128,18 @@ impl Dot1x {
         let Some(k) = self.port else { return Vec::new() };
         match (verb, why) {
             ("authorized", _) => {
+                // Still authorized: the switch asked again on its own
+                // (re-authentication) and kept the port open, so the lease
+                // stands. After a sign-in we started, the port may be on
+                // another VLAN.
+                let again = self.state == State::Authorized && self.open;
                 self.state = State::Authorized;
                 self.open = true;
                 self.fails = 0;
                 self.hold_until = None;
+                if again {
+                    return Vec::new();
+                }
                 vec![Do::RestartLease(k), Do::Report(k)]
             }
             ("failed", Some("no-credential")) => {
@@ -289,6 +297,20 @@ mod tests {
         let mut d = Dot1x::new(true);
         d.link(0, true, 0);
         assert_eq!(d.configure(false, Some(0)), vec![Do::Stop(0), Do::Report(0)], "never authorized: the lease stands");
+    }
+
+    #[test]
+    fn the_switch_asking_again_keeps_the_lease() {
+        let mut d = Dot1x::new(true);
+        d.link(0, true, 0);
+        d.keys_line("authorized", None, 1);
+        // Re-authentication by the switch: the port stays open, same VLAN.
+        assert_eq!(d.frame(0, 3_600_000), (true, vec![]));
+        assert_eq!(d.keys_line("authorized", None, 3_600_001), vec![], "no new lease, nothing to report");
+        assert_eq!(d.state, State::Authorized);
+        // A sign-in we start (a new profile) may land on another VLAN.
+        d.configure(true, Some(0));
+        assert_eq!(d.keys_line("authorized", None, 3_600_100), vec![Do::RestartLease(0), Do::Report(0)]);
     }
 
     #[test]

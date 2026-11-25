@@ -1117,6 +1117,19 @@ w8() {
     wait_st 'dot1x=authorized' 180 && ok "EAP-TLS with the key in Arca: authorized" || fail "EAP-TLS: $(st)"
     "$V" "grep -c 'EAP (tls) on vtnet2' $KLOG" | grep -q '[1-9]' && ok "that sign-in was EAP-TLS" || fail "no EAP-TLS run"
 
+    # The switch asks again on its own (re-authentication, what its
+    # reauth timer does; hostapd_cli triggers it now): signed in again over
+    # the open port, the address kept, no new lease.
+    wait_st 'state=bound addr=10\.79\.0\.' 150 || fail "no lease before re-authentication: $(st)"
+    a0=$(st | grep -o 'addr=[0-9./]*')
+    n0=$("$V" "grep -c 'DHCP again' /tmp/aura/net.log")
+    e0=$("$V" "grep -c 'EAP succeeded on vtnet2' $KLOG")
+    sh "$AP" ssh 'n=$(grep -l 02:4e:00:00:02:01 /sys/class/net/*/address | cut -d/ -f5); hostapd_cli -p /run/hostapd-wired -i $n raw EAPOL_REAUTH 02:4e:00:00:02:02' | grep -q OK || fail "hostapd_cli eapol_reauth"
+    i=0; until [ "$("$V" "grep -c 'EAP succeeded on vtnet2' $KLOG")" -gt "$e0" ]; do i=$((i + 3)); [ $i -lt 120 ] || fail "no second EAP run: $(st)"; sleep 3; done
+    sleep 5
+    st | grep -q "dot1x=authorized.*" && st | grep -q "$a0" && [ "$("$V" "grep -c 'DHCP again' /tmp/aura/net.log")" = "$n0" ] \
+        && ok "the switch asked again: signed in again, same address ($a0), no new lease" || fail "after re-authentication: $(st); DHCP again $n0 -> $("$V" "grep -c 'DHCP again' /tmp/aura/net.log")"
+
     # Cable out and in: the port signs in again by itself.
     cablex off
     wait_st 'link=down' 30 && ok "cable pulled: link down" || fail "link still up: $(st)"
