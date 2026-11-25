@@ -2230,6 +2230,12 @@ origin that saved it.
 7. **I6.6 Hardening.** The remembered choice (D8) in Curia with revoke,
    recycling under memory pressure, the worker audit and check on a
    whole-page engine, and the fuzzed channel's new navigation messages.
+8. **I6.7 IndexedDB kept** (D15, proposed). A live page's IndexedDB
+   outlives the run, kept by navigatord as `localStorage` is (D10). Gate:
+   the fixture's `indexeddb` line counts visits across Stop, a navigatord
+   restart and an engine killed at its memory limit; an Unrecorded trail
+   keeps nothing; a commit past the quota fails with `QuotaExceededError`
+   and leaves the store as it was.
 
 #### I6.0 qualification run
 
@@ -3388,6 +3394,63 @@ Follow-up (cloud, 2026-11-25). What became of the rough edges:
   island box: a document-lane `<iframe>` becomes a press-to-start box.
   Left as it is.
 
+#### I6.7 proposal: IndexedDB kept (D15, 2026-11-25)
+
+At the pin (`ead47ae6`) LibWeb's IndexedDB is Rust
+(`Libraries/LibWeb/Bindings/Rust/src/indexed_db/`) and lives in the
+engine's heap only: `internal/storage.rs` holds every database for the
+life of the process. A page that stores its data offline (mail, notes,
+maps) finds it empty on every run, and recycling (I6.6) makes "every run"
+mean every memory kill too.
+
+**Where it is kept.** As D10: navigatord keeps one IndexedDB store per
+(jar, site), for the persona's jar a file
+`<NAVIGATORD_STORE>/live-idb/<site>.idb` (0600, the Navigator's uid, in the
+persona's key group), for an Unrecorded trail memory only. Forgetting a
+site removes it with the cookies and `localStorage`. The engine never
+holds a file and gets no mount.
+
+**When it is written (recommended: at commit).** The spec's own commit
+steps leave a hook: `commit_a_transaction` step 3, "attempt to write any
+outstanding changes made by transaction to the database", and step 4,
+"if an error occurs ... abort a transaction with ... a
+QuotaExceededError", are FIXMEs at the pin. A patch
+(`patches/ladybird/live-idb.patch`) fills them for `ATRIUM_I6_PAGE`:
+
+- From the transaction's mutation logs (which LibWeb already keeps to
+  revert an abort), the engine encodes what the transaction changed:
+  object stores and indexes made, renamed or deleted, the database
+  version, key generators, and each record stored (key and its
+  `StorageSerializationRecord` bytes) or deleted, with index records.
+- It POSTs that batch to `limen::web_island::LIVE_IDB` on its channel, as
+  `localStorage` batches go. navigatord checks it against the bounds,
+  applies it to the site's store as one change (an append-only log
+  beside the image, compacted when the log outgrows it, every write
+  fsync'd), and answers 204 before `complete` fires. A refusal aborts the
+  transaction with `QuotaExceededError`, so the page sees the store as it
+  was, as the standard says.
+- At start, before the page's scripts run, the engine GETs the site's
+  store and rebuilds its databases, object stores, indexes, records and
+  key generators in `internal/storage.rs`, with no script involved.
+
+The other ways: a snapshot sent at Stop and every few seconds needs no
+LibWeb patch but loses everything since the last one when the engine is
+killed at its limit, and an abort can't tell the page; keeping IndexedDB
+per run (today) leaves offline apps empty on each start.
+
+**Bounds.** A site's store is at most 50 MiB (keys, values and index
+records together), a batch at most 32 KiB like `localStorage`'s; a
+transaction bigger than one batch is sent as a numbered run of batches and
+applied only when its last one arrives, so a partial run changes nothing.
+A damaged file starts the site empty, logged, as for `localStorage`.
+
+**Left to check on the Mac.** Whether a stored `Blob` or `File` is
+serialized with its bytes (then it is kept like any value) or by
+reference (then such a commit is refused with `DataCloneError`, loudly,
+rather than kept for the run only), and that `StorageSerializationRecord`
+bytes read back by the same pinned engine; a new pin rereads them or
+starts the site empty.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
@@ -4247,6 +4310,7 @@ alongside I0.
 | **D11** ✓ | Cross-origin frames inside a live page (I6) | each its own engine jail, started with the page · a box the person presses, as in the document lane · not shown | **Its own engine jail, started with the page**, composed by Limen as a nested island. Payment and sign-in frames must work inside an app, and asking per frame would break it; the origin stays the isolation unit (legacy-web §7.6). Third-party frames refused by D12 are not started |
 | **D12** ✓ | What a live page's scripts may reach (I6) | its own origin only (legacy-web §5.4.1c) · its registrable domain · its registrable domain plus origins it names in a declared list | **Its registrable domain**, measured in I6.0 before it is fixed. Fat clients keep their APIs and static assets on sibling hosts; third-party requests are refused and listed in the popover. The chip's words change to "send it to atlas.example's sites" |
 | **D13** ✓ | GPU for live pages (I6) | none in I6 · a jailed GPU process later | **None in I6.** The threat model keeps GPU descriptors out of engines (§2). A jailed GPU broker for WebGL is its own spec, opened only if I6.0 shows that apps the person needs cannot run without it |
+| **D15** | Is a live page's IndexedDB kept (I6.7) | written through at each commit by a small LibWeb patch at the standard's own write step · a snapshot at Stop and every few seconds, no patch · per run only (today) | **Proposed: at each commit**, by navigatord as D10, 50 MiB a site ([I6.7 proposal](#i67-proposal-indexeddb-kept-d15-2026-11-25)) |
 
 ### Local Mail callback and account storage
 
