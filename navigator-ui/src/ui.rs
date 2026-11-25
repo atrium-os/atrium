@@ -1560,9 +1560,9 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
     let body = |c: Color, w: Weight| sans(type_size::SM, w, c);
     let (g, runs): (char, Vec<(String, TextStyle)>) = match p {
         Prompt::Download { file, size, origin, kind, .. } => (ph::DOWNLOAD, vec![
-            (file.clone(), body(t.text_primary(), Weight::Semibold)),
+            (shell::plain(file), body(t.text_primary(), Weight::Semibold)),
             (format!("{size} {kind} from"), body(t.text_secondary(), Weight::Regular)),
-            (origin.clone(), body(t.text_primary(), Weight::Semibold)),
+            (shell::plain(origin), body(t.text_primary(), Weight::Semibold)),
         ]),
         Prompt::Handoff { url, scheme } => (ph::ARROW_RIGHT, vec![
             (format!("This link is for another program ({scheme}):"), body(t.text_secondary(), Weight::Regular)),

@@ -179,6 +179,14 @@ pub struct Shell {
     pub sharing: bool,
 }
 
+/// `s` without control characters and without the invisible marks that
+/// reorder or hide text (bidi embeddings, overrides and isolates, the
+/// direction marks, zero-width joiners): a name a site chose, as the
+/// chrome shows it or hands it on, reads as its characters do.
+pub fn plain(s: &str) -> String {
+    s.chars().filter(|&c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')).collect()
+}
+
 /// The most downloads the list keeps.
 pub const DOWNLOADS_KEPT: usize = 16;
 
@@ -1766,7 +1774,7 @@ impl Shell {
                 if self.downloads.len() >= DOWNLOADS_KEPT {
                     self.downloads.remove(0);
                 }
-                self.downloads.push(Download { id, file: file.into(), size: size.into(), origin: origin.into(), state });
+                self.downloads.push(Download { id, file: plain(file), size: plain(size), origin: plain(origin), state });
             }
         }
         self.downloads_new = !self.downloads_open;
@@ -2277,6 +2285,12 @@ impl Shell {
         }
         if self.persona_open && !inside(g.persona_menu) && !inside(Some(g.persona_chip)) {
             self.persona_open = false;
+        }
+        if self.more_open && !inside(g.more_menu) && !inside(Some(g.more)) {
+            self.more_open = false;
+        }
+        if self.downloads_open && !inside(g.downloads_menu) && !inside(Some(g.downloads)) {
+            self.downloads_open = false;
         }
     }
 }
@@ -3541,6 +3555,16 @@ mod tests {
         s.press_more(MoreRow::Share, Some([4; 16]), 0.0);
         assert!(!s.more_open && s.sharing);
         assert!(matches!(s.outbox.pop(), Some(Out::Share { press: [4, ..], .. })));
+    }
+
+    #[test]
+    fn a_sites_names_lose_the_marks_that_reorder_them() {
+        assert_eq!(plain("invoice\u{202e}fdp.exe"), "invoicefdp.exe");
+        assert_eq!(plain("a\u{2066}b\u{2069}\u{200f}c\u{feff}\n"), "abc");
+        assert_eq!(plain("Ünïcödé · 東京.pdf"), "Ünïcödé · 東京.pdf");
+        let mut s = shell();
+        s.note_download(1, "x\u{202e}gpj.exe", "1 B", "o", DownloadState::Saving);
+        assert_eq!(s.downloads[0].file, "xgpj.exe");
     }
 
     #[test]
