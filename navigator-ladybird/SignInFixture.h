@@ -112,6 +112,41 @@ extern "C" bool navigator_take_page_size(NavigatorScene*, u16*, u16*);
 extern "C" bool navigator_live_url_changed(NavigatorScene*, u8 const*, size_t);
 extern "C" int navigator_take_file_picked(NavigatorScene*, u8*, size_t, size_t*);
 extern "C" ssize_t navigator_live_get(u8 const*, size_t, u8*, size_t, u16*, u8*, size_t, size_t*);
+extern "C" bool navigator_take_key(NavigatorScene*, u8*, u32*, u8*, bool*, u8*);
+extern "C" bool navigator_live_copy(NavigatorScene*, u8 const*, size_t, u8 const*);
+extern "C" bool navigator_live_paste(NavigatorScene*, u8 const*);
+extern "C" size_t navigator_take_pasted(NavigatorScene*, u8*, size_t);
+
+// A live page's key without text (painter.rs `live_key`) as LibWeb's code.
+inline Web::UIEvents::KeyCode live_key_code(u8 special)
+{
+    using K = Web::UIEvents::KeyCode;
+    switch (special) {
+    case 1: return K::Key_Return;
+    case 2: return K::Key_Backspace;
+    case 3: return K::Key_Tab;
+    case 4: return K::Key_Escape;
+    case 5: return K::Key_Delete;
+    case 6: return K::Key_Left;
+    case 7: return K::Key_Right;
+    case 8: return K::Key_Up;
+    case 9: return K::Key_Down;
+    case 10: return K::Key_Home;
+    case 11: return K::Key_End;
+    default: return K::Key_Invalid;
+    }
+}
+
+// The HID modifier byte (either hand) as LibWeb's modifiers.
+inline unsigned live_modifiers(u8 hid)
+{
+    unsigned m = 0;
+    if (hid & 0x11) m |= Web::UIEvents::KeyModifier::Mod_Ctrl;
+    if (hid & 0x22) m |= Web::UIEvents::KeyModifier::Mod_Shift;
+    if (hid & 0x44) m |= Web::UIEvents::KeyModifier::Mod_Alt;
+    if (hid & 0x88) m |= Web::UIEvents::KeyModifier::Mod_Super;
+    return m;
+}
 #endif
 
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
@@ -204,6 +239,45 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
                     }
                 }
                 client.page().file_picker_closed(files.span());
+            }
+        }
+        // The keyboard (I6.4). Ctrl-C and Ctrl-V are the clipboard's: the
+        // selection, or the paste, goes with the press's token to
+        // navigatord, and the UI spends it on Tabula. Anything else is the
+        // page's.
+        if (action == 7) {
+            u8 special = 0, mods = 0;
+            u32 code_point = 0;
+            bool pressed = false;
+            u8 token[16] {};
+            if (navigator_take_key(scene, &special, &code_point, &mods, &pressed, token)) {
+                bool ctrl = (mods & 0x11) && !(mods & 0x44);
+                if (pressed && ctrl && (code_point == 'c' || code_point == 'C')) {
+                    auto text = client.page().focused_navigable().selected_text();
+                    auto utf8 = text.to_byte_string();
+                    if (!utf8.is_empty() && !navigator_live_copy(scene, reinterpret_cast<u8 const*>(utf8.characters()), utf8.length(), token))
+                        warnln("live page: the copy was not handed over");
+                } else if (pressed && ctrl && (code_point == 'v' || code_point == 'V')) {
+                    if (!navigator_live_paste(scene, token))
+                        warnln("live page: the paste was not asked for");
+                } else if (pressed) {
+                    client.page().handle_keydown(live_key_code(special), live_modifiers(mods), code_point, false, true);
+                } else {
+                    client.page().handle_keyup(live_key_code(special), live_modifiers(mods), code_point, false);
+                }
+            }
+        }
+        // The text Tabula gave for the paste: typed where the focus is.
+        if (action == 8) {
+            auto buffer = ByteBuffer::create_uninitialized(16 * 1024);
+            size_t length = buffer.is_error() ? 0 : navigator_take_pasted(scene, buffer.value().data(), buffer.value().size());
+            if (length > 0) {
+                auto text = StringView { buffer.value().data(), length };
+                for (u32 code_point : Utf8View { text }) {
+                    auto key = code_point == '\n' ? Web::UIEvents::KeyCode::Key_Return : Web::UIEvents::KeyCode::Key_Invalid;
+                    client.page().handle_keydown(key, 0, code_point, false, true);
+                    client.page().handle_keyup(key, 0, code_point, false);
+                }
             }
         }
         // navigatord placed the page in a page area of this size (I6.2).

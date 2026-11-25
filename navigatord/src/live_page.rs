@@ -557,6 +557,10 @@ pub trait Tell: Send + Sync + 'static {
     fn refused(&self, what: String);
     /// The page asked to be printed (I6.4).
     fn print(&self);
+    /// The person copied `text` in the page with the press `token` (I6.4).
+    fn copy(&self, text: String, token: [u8; 16]);
+    /// The person pressed Ctrl-V in the page, `token` (I6.4).
+    fn paste(&self, token: [u8; 16]);
     /// The run ended by itself (`None`: the engine closed) or failed;
     /// once, and never after [`Live::stop`].
     fn finished(&self, why: Option<String>);
@@ -862,6 +866,11 @@ impl Live {
                                 }
                             }
                         }
+                        // The clipboard (I6.4): the press's token goes to the
+                        // UI, which spends it on Tabula; the engine has no
+                        // clipboard of its own.
+                        Some(Report::Copy { text, token }) => tell.copy(text.to_string(), token),
+                        Some(Report::Paste { token }) => tell.paste(token),
                         Some(Report::Ended(EndReason::Closed)) => break None,
                         Some(Report::Ended(EndReason::Failed)) => break Some("the page's engine failed".into()),
                         // A live page has no unload question in I6.1: Stop is the person's.
@@ -915,6 +924,15 @@ impl Live {
         };
         if running { tell_size(p, self.embed, rect); }
         Ok(())
+    }
+
+    /// The text the person pasted (I6.4), for the engine to insert where
+    /// its focus is.
+    pub fn paste(&self, text: &str) -> Result<(), String> {
+        let bytes = limen::web_island::Pasted(text.to_string()).encode().ok_or("nothing to paste, or too much")?;
+        let mut parent = self.parent.lock().unwrap();
+        let p = parent.as_mut().ok_or("the live page has ended")?;
+        p.send(self.embed, bytes).map_err(|e| format!("paste: {e:?}"))
     }
 
     /// End it: the island goes, and `finished` is not called.

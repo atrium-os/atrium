@@ -43,6 +43,7 @@ extern "C" bool navigator_video_channel(int);
 #endif
 extern "C" bool navigator_counter_started(NavigatorScene*, u8 const*, size_t, u8 const*, size_t);
 extern "C" void navigator_counter_ended(NavigatorScene*, bool);
+extern "C" void navigator_live_keys(NavigatorScene*);
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" NavigatorScene* navigator_mail_scene_open(bool, u8 const**, size_t*, u8 const**, size_t*);
 extern "C" bool navigator_is_vpn_page(NavigatorScene*);
@@ -162,6 +163,8 @@ int main(int argc, char** argv)
     if (!navigator_counter_started(scene, origin.bytes().data(), origin.byte_count(), title.bytes().data(), title.byte_count()))
         return 4;
     client->island_scene = scene;
+    // A live page takes the keyboard (I6.4).
+    navigator_live_keys(scene);
     auto status = Navigator::drive_page(*client, scene, loop);
     navigator_counter_ended(scene, status != 0);
     return status;

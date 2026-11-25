@@ -931,6 +931,24 @@ impl Live {
                         send(&mut self.w, &Request::Discard { id });
                     }
                 }
+                Event::LiveCopy { from, text, token } => {
+                    if !s.live_on_screen(&from) {
+                        eprintln!("navigator-ui: a live page's copy not taken");
+                    } else if let Err(e) = pergola::clipboard::copy_text_with(token, &text) {
+                        eprintln!("navigator-ui: the live page's copy: {e:?}");
+                    }
+                }
+                Event::LivePaste { from, token } => {
+                    if s.live_on_screen(&from) {
+                        match pergola::clipboard::paste_text_with(token) {
+                            Ok(Some(text)) if !text.is_empty() && text.len() <= limen::web_island::COPY_MAX => {
+                                send(&mut self.w, &Request::LivePasted { url: from, text });
+                            }
+                            Ok(_) => eprintln!("navigator-ui: nothing to paste into the live page"),
+                            Err(e) => eprintln!("navigator-ui: the live page's paste: {e:?}"),
+                        }
+                    }
+                }
                 Event::LivePrint { from } => {
                     if !s.live_print(&from) {
                         eprintln!("navigator-ui: a live page's print not taken");

@@ -2941,17 +2941,29 @@ sheet over the window with the fixture's document-lane rendering; Cancel,
 then a script's `window.print()` twice at once opens one sheet and the
 popover names "a print asked for again at once".
 
-#### The clipboard (I6.4, still to build)
+#### I6.4 as built (fourth part: keys and the clipboard)
 
-Copy is the engine's to report (the page's text, bounded) and the UI's to
-write through Tabula; paste needs the person's Ctrl-V. Both spend
-frescod's activation token for the press (tabula.md §2), and today a token
-is minted for, and spent by, the window that got the press. A press on a
-live page goes to the island, the engine's window, so neither the UI nor
-navigatord holds a token Tabula will take. The change is Fresco's first:
-frescod lets the parent of an island spend a token minted for a press in
-that island (it knows the embed), and Tabula's check names the parent's
-uid. Then the engine forwards each copy and each Ctrl-V with its token.
+A live page got only clicks before this part; it now takes the keyboard. The engine's
+painter marks the scene with `navigator_live_keys`, and each key on the island goes to
+LibWeb's `handle_keydown` and `handle_keyup`, except Ctrl-C and Ctrl-V.
+
+- **Copy.** On Ctrl-C the engine reads the focused navigable's selected text and sends
+  `Report::Copy { text, token }` (limen `web_island.rs`; text at most `COPY_MAX`, 16 KiB,
+  token non-zero). navigatord turns it into `Event::LiveCopy`, and the UI writes it through
+  Tabula with `pergola::clipboard::copy_text_with`, but only when that live page is the one
+  on screen (`Shell::live_on_screen`).
+- **Paste.** On Ctrl-V the engine sends `Report::Paste { token }`. The UI reads Tabula with
+  `paste_text_with`, then sends `Request::LivePasted { url, text }` if the text is at most
+  `COPY_MAX`. navigatord passes it to the engine as `Pasted` ('V' plus the text), and the
+  engine types it into the page as key presses.
+- **The token.** It is minted for the press in the island. frescod lets the island's parent,
+  the Navigator UI, spend it on `COPY` or `PASTE` only (tabula.md §2.6). The page never reads
+  the clipboard on its own: the reporter still refuses `navigator.clipboard.read` and
+  `readText`.
+
+Not built: a page's own `copy` and `paste` events with clipboardData, and rich (HTML) copy.
+The Mac gate types into the fixture, then runs Ctrl-C and Ctrl-V with a frescod rebuilt
+for §2.6.
 
 #### Costs
 

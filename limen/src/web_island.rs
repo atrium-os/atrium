@@ -1,8 +1,11 @@
 //! Reports from a broker-fetched web island (navigator-islands.md §5).
 use serde::{Deserialize, Serialize};
 
-/// The longest report: a submitted form's address, its body and framing.
-pub const MAX_FRAME: usize = URL_MAX + FORM_MAX + 64;
+/// The longest report: a copy's text and framing (more than a submitted
+/// form's address and body).
+pub const MAX_FRAME: usize = COPY_MAX + 64;
+/// The most text a whole page copies or is pasted at once (I6.4).
+pub const COPY_MAX: usize = 16 * 1024;
 /// The longest address a whole page's engine reports (I6.2).
 pub const URL_MAX: usize = 2048;
 /// The longest form a whole page submits (I6.3): a sign-in, not an upload.
@@ -39,6 +42,21 @@ pub const LIVE_REPORTER: &str = "https://live-page.atrium.invalid/reporter.js";
 pub const LIVE_FILE: &str = "https://live-page.atrium.invalid/picked-file";
 /// The longest name a [`FilePicked`] carries.
 pub const PICKED_NAME_MAX: usize = 255;
+
+/// The text the person pasted into a whole page (I6.4), a control
+/// message: 'V' and UTF-8, at most [`COPY_MAX`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pasted(pub String);
+
+impl Pasted {
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        (!self.0.is_empty() && self.0.len() <= COPY_MAX).then(|| [b"V".as_slice(), self.0.as_bytes()].concat())
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(bytes.strip_prefix(b"V")?).ok()?;
+        (!text.is_empty() && text.len() <= COPY_MAX).then(|| Self(text.to_string()))
+    }
+}
 
 /// navigatord's answer to [`Report::PickFile`], a control message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +179,13 @@ pub enum Report<'a> {
     /// `application/x-www-form-urlencoded`. Never sent by the engine;
     /// navigatord sends it through the page's jar and opens the answer.
     Submit { url: &'a str, body: &'a [u8] },
+    /// The person copied in the page (Ctrl-C, I6.4): its selected text and
+    /// the press's activation token, which the page's parent spends on
+    /// Tabula (frescod lets an island's parent spend it on a copy).
+    Copy { text: &'a str, token: [u8; 16] },
+    /// The person pressed Ctrl-V in the page (I6.4): the parent spends the
+    /// token on a paste and answers with [`Pasted`].
+    Paste { token: [u8; 16] },
     /// The page asked for a file (`<input type=file>`, I6.4): one file,
     /// read-only. navigatord opens Scrinium's picker over the window and
     /// answers with [`FilePicked`]; the engine never sees a folder.
@@ -180,6 +205,8 @@ impl Report<'_> {
             Self::Title(text) => text.len() <= 256 && !text.chars().any(char::is_control),
             Self::Resize { width, height } => (1..=16384).contains(width) && (1..=16384).contains(height),
             Self::Ended(_) | Self::MediaReady | Self::PickFile => true,
+            Self::Copy { text, token } => !text.is_empty() && text.len() <= COPY_MAX && *token != [0; 16],
+            Self::Paste { token } => *token != [0; 16],
             Self::BeforeUnload { query } => *query != 0,
             Self::Navigate(url) | Self::UrlChanged(url) => reportable(url),
             Self::Submit { url, body } => reportable(url) && body.len() <= FORM_MAX && body.iter().all(u8::is_ascii_graphic),
@@ -272,7 +299,7 @@ impl Lifecycle {
     pub fn accepts_control(&mut self, bytes: &[u8], media_ready: bool) -> bool {
         if let Some(answer) = UnloadAnswer::decode(bytes) { return self.answer(answer); }
         let running = matches!(self, Self::Running { .. });
-        if PageSize::decode(bytes).is_some() || FilePicked::decode(bytes).is_some() { return running; }
+        if PageSize::decode(bytes).is_some() || FilePicked::decode(bytes).is_some() || Pasted::decode(bytes).is_some() { return running; }
         media_ready && running && ChapterSeek::decode(bytes).is_some()
     }
 
@@ -289,7 +316,7 @@ impl Lifecycle {
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
             (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
-            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. } | Report::PickFile) => running,
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. } | Report::PickFile | Report::Copy { .. } | Report::Paste { .. }) => running,
             (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
             (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,
@@ -398,6 +425,27 @@ mod tests {
         let ask = Report::PickFile.encode().unwrap();
         assert!(Lifecycle::default().receive(&ask).is_none());
         assert_eq!(Lifecycle::Running { last_query: 0 }.receive(&ask), Some(Report::PickFile));
+    }
+
+    #[test]
+    fn a_copy_and_a_paste_carry_a_press_and_bounded_text() {
+        let t = [7; 16];
+        let copy = Report::Copy { text: "hello", token: t }.encode().unwrap();
+        assert_eq!(Lifecycle::Running { last_query: 0 }.receive(&copy), Some(Report::Copy { text: "hello", token: t }));
+        assert!(Lifecycle::default().receive(&copy).is_none(), "not before the page runs");
+        let big = "x".repeat(COPY_MAX);
+        assert!(Lifecycle::Running { last_query: 0 }.receive(&Report::Copy { text: &big, token: t }.encode().unwrap()).is_some(), "at the bound");
+        for bad in [Report::Copy { text: "", token: t }, Report::Copy { text: "a", token: [0; 16] }, Report::Paste { token: [0; 16] }] {
+            assert!(bad.encode().is_none(), "{bad:?}");
+            assert!(Lifecycle::Running { last_query: 0 }.receive(&postcard::to_stdvec(&bad).unwrap()).is_none());
+        }
+        assert!(Report::Copy { text: &"x".repeat(COPY_MAX + 1), token: t }.encode().is_none());
+        let pasted = Pasted("ünïcode".into());
+        assert_eq!(Pasted::decode(&pasted.encode().unwrap()), Some(pasted.clone()));
+        assert!(Pasted(String::new()).encode().is_none() && Pasted("x".repeat(COPY_MAX + 1)).encode().is_none());
+        assert!(Pasted::decode(&[b'V', 0xff]).is_none());
+        assert!(Lifecycle::Running { last_query: 0 }.accepts_control(&pasted.encode().unwrap(), false));
+        assert!(!Lifecycle::default().accepts_control(&pasted.encode().unwrap(), false));
     }
 
     #[test]

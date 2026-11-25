@@ -1998,6 +1998,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
+            Request::LivePasted { url, text } => {
+                match live.as_ref().filter(|l| l.url == url) {
+                    Some(l) => if let Err(why) = l.paste(&text) { eprintln!("navigatord: live page paste: {why}"); },
+                    None => eprintln!("navigatord: a paste for a page not running live"),
+                }
+            }
             Request::PlaceLive { url, rect } => {
                 if rect.is_none() { live_origin = None; }
                 if let Some(active) = live.as_ref().filter(|l| l.url == url) {
@@ -2955,4 +2961,6 @@ impl live_page::Tell for LiveTell {
     }
     fn finished(&self, why: Option<String>) { send(&self.w, &Event::LiveEnded { url: self.from.clone(), why }); }
     fn print(&self) { send(&self.w, &Event::LivePrint { from: self.from.clone() }); }
+    fn copy(&self, text: String, token: [u8; 16]) { send(&self.w, &Event::LiveCopy { from: self.from.clone(), text, token }); }
+    fn paste(&self, token: [u8; 16]) { send(&self.w, &Event::LivePaste { from: self.from.clone(), token }); }
 }

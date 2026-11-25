@@ -89,6 +89,20 @@ pub fn paste_text() -> Result<Option<String>, Error> {
     Ok(paste_format(&["text/plain"])?.map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
+/// Copy `text` spending `token`, a press the caller was handed rather than
+/// one it is dispatching: an island's parent copying for the page in it
+/// (navigator-islands.md I6.4; frescod lets the parent spend it).
+pub fn copy_text_with(token: Token, text: &str) -> Result<(), Error> {
+    if token == fresco_protocol::activation::NONE { return Err(Error::NoGesture); }
+    with_backend(|b| b.set(token, &[("text/plain", text.as_bytes())], false))
+}
+
+/// Paste as text spending `token`, as [`copy_text_with`].
+pub fn paste_text_with(token: Token) -> Result<Option<String>, Error> {
+    if token == fresco_protocol::activation::NONE { return Err(Error::NoGesture); }
+    Ok(with_backend(|b| b.get(token, &["text/plain"]))?.map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 /// Inside a drop handler: the dropped content as text, if it offers
 /// `text/plain`. Invalid UTF-8 is replaced.
 pub fn drop_text() -> Result<Option<String>, Error> {

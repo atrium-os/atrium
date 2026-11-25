@@ -962,6 +962,11 @@ pub mod host {
         page_size: Option<(u16, u16)>,
         /// navigatord's answer to the page's file input (I6.4).
         file_picked: Option<limen::web_island::FilePicked>,
+        /// A whole live page takes the keyboard (I6.4): its keys, and the
+        /// text pasted into it.
+        live_keys: bool,
+        key: Option<(u8, u32, u8, bool, [u8; 16])>,
+        pasted: Option<String>,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -1569,6 +1574,10 @@ pub mod host {
                         state.file_picked = Some(picked);
                         return 6;
                     }
+                    if let Some(limen::web_island::Pasted(text)) = limen::web_island::Pasted::decode(&bytes) {
+                        state.pasted = Some(text);
+                        return 8;
+                    }
                 }
                 Err(_) => return -1,
                 _ => {}
@@ -1588,9 +1597,110 @@ pub mod host {
                 }
                 0
             }
+            // A whole live page's keys (I6.4): `navigator_take_key`.
+            Ok(Some(event @ fresco_client::Event::Key { .. })) if state.live_keys => {
+                let fresco_client::Event::Key { hid_usage, pressed, modifiers, activation, .. } = event else { return 0 };
+                let special = live_key(hid_usage);
+                let code_point = match pergola::input::translate(&event) {
+                    Some(pergola::Event::Key { chars, .. }) if pressed && special == 0 => chars.chars().next().map_or(0, u32::from),
+                    _ => 0,
+                };
+                if special == 0 && code_point == 0 && pressed { return 0; }
+                state.key = Some((special, code_point, modifiers, pressed, activation));
+                7
+            }
             Err(_) | Ok(Some(fresco_client::Event::CloseRequested {..})) => -1,
             _ => 0,
         }
+    }
+
+    /// A key a live page understands without text: 1 Enter, 2 Backspace,
+    /// 3 Tab, 4 Escape, 5 Delete, 6 Left, 7 Right, 8 Up, 9 Down, 10 Home,
+    /// 11 End; 0 for a key that types (or nothing).
+    fn live_key(hid: u16) -> u8 {
+        match hid {
+            0x28 | 0x58 => 1,
+            0x2a => 2,
+            0x2b => 3,
+            0x29 => 4,
+            0x4c => 5,
+            0x50 => 6,
+            0x4f => 7,
+            0x52 => 8,
+            0x51 => 9,
+            0x4a => 10,
+            0x4d => 11,
+            _ => 0,
+        }
+    }
+
+    /// A whole live page takes the keyboard from now on (I6.4).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_live_keys(state: &mut SceneState) {
+        state.live_keys = true;
+    }
+
+    /// The key `navigator_page_pointer` returned 7 for: `special` (see
+    /// `live_key`), the code point it types (0 for none), the HID modifier
+    /// byte (ctrl 0x11, shift 0x22, alt 0x44, meta 0x88), whether pressed,
+    /// and the press's activation token (zero on a release).
+    ///
+    /// # Safety
+    /// `token` is writable for 16 bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_take_key(state: &mut SceneState, special: &mut u8, code_point: &mut u32, modifiers: &mut u8, pressed: &mut bool, token: *mut u8) -> bool {
+        let Some((s, c, m, p, t)) = state.key.take() else { return false };
+        if token.is_null() { return false; }
+        (*special, *code_point, *modifiers, *pressed) = (s, c, m, p);
+        // SAFETY: the caller passes 16 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(t.as_ptr(), token, 16) };
+        true
+    }
+
+    /// The person copied in the page (Ctrl-C): `text` (UTF-8) with the
+    /// press's token goes to navigatord and on to Tabula through the UI.
+    ///
+    /// # Safety
+    /// `text` is readable for `len` bytes and `token` for 16.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_live_copy(state: &SceneState, text: *const u8, len: usize, token: *const u8) -> bool {
+        use limen::web_island::{Report, COPY_MAX};
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if text.is_null() || token.is_null() || len == 0 || len > COPY_MAX { return false; }
+        // SAFETY: the caller passes readable buffers of these lengths.
+        let (text, token) = unsafe { (std::slice::from_raw_parts(text, len), std::slice::from_raw_parts(token, 16)) };
+        let (Ok(text), Ok(token)) = (std::str::from_utf8(text), <[u8; 16]>::try_from(token)) else { return false };
+        let Some(bytes) = (Report::Copy { text, token }).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
+    /// The person pressed Ctrl-V in the page: the token goes to navigatord;
+    /// the text comes back as action 8 (`navigator_take_pasted`).
+    ///
+    /// # Safety
+    /// `token` is readable for 16 bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_live_paste(state: &SceneState, token: *const u8) -> bool {
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if token.is_null() { return false; }
+        // SAFETY: the caller passes 16 readable bytes.
+        let Ok(token) = <[u8; 16]>::try_from(unsafe { std::slice::from_raw_parts(token, 16) }) else { return false };
+        let Some(bytes) = (limen::web_island::Report::Paste { token }).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
+    /// The pasted text (action 8): its length, copied into `out` (at most
+    /// `cap` bytes, UTF-8); 0 for none or when it doesn't fit.
+    ///
+    /// # Safety
+    /// `out` is writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_take_pasted(state: &mut SceneState, out: *mut u8, cap: usize) -> usize {
+        let Some(text) = state.pasted.take() else { return 0 };
+        if out.is_null() || text.len() > cap { return 0; }
+        // SAFETY: `out` has room for `cap` bytes, and `text` is no longer.
+        unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
+        text.len()
     }
 
     /// The owner releases a state from navigator_scene_create exactly once.

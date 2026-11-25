@@ -68,6 +68,12 @@ pub struct Entry {
     pub drag_id: u64,
     /// For `GRANTED`: the one purpose it may be spent on.
     pub purpose: u8,
+    /// For a press in an island (a page's live engine, limen.md §5): the
+    /// window the island is a slot of, and its owner's uid, which may
+    /// spend the press on a copy or a paste for the page
+    /// (navigator-islands.md I6.4). Zero: not an island.
+    pub parent_window: u32,
+    pub parent_uid: u32,
 }
 
 #[derive(Default)]
@@ -159,8 +165,11 @@ impl Table {
             return refused(refusal::EXPIRED);
         }
         // A failed check does not spend it: a wrong presenter cannot burn
-        // the real app's token.
-        if e.uid != presenter_uid {
+        // the real app's token. An island's parent may spend a press in
+        // the island on a copy or a paste for it (the page's engine has no
+        // clipboard of its own, navigator-islands.md I6.4), nothing else.
+        let by_parent = e.uid != presenter_uid && e.parent_window != 0 && e.parent_uid == presenter_uid;
+        if e.uid != presenter_uid && !(by_parent && matches!(purpose, purpose::COPY | purpose::PASTE)) {
             return refused(refusal::WRONG_UID);
         }
         if !fits(&e, purpose) {
@@ -177,7 +186,8 @@ impl Table {
         }
         // A drop lands on whatever window is under the pointer, focused
         // or not; a granted token has no window.
-        if !matches!(e.kind, kind::GRANTED | kind::DROP) && !focused(e.window_id) {
+        // An island's press: the island or the window it is in has focus.
+        if !matches!(e.kind, kind::GRANTED | kind::DROP) && !focused(e.window_id) && !(e.parent_window != 0 && focused(e.parent_window)) {
             return refused(refusal::NOT_FOCUSED);
         }
         self.live.remove(token);
@@ -200,7 +210,7 @@ impl Table {
             return GrantResult::Refused { reason: refusal::WRONG_KIND };
         }
         self.live.remove(token);
-        let g = self.mint(Entry { window_id: 0, uid: for_uid, kind: kind::GRANTED, hid: 0, mods: 0, minted_ns: now, counter: 0, drag_id: 0, purpose });
+        let g = self.mint(Entry { window_id: 0, uid: for_uid, kind: kind::GRANTED, hid: 0, mods: 0, minted_ns: now, counter: 0, drag_id: 0, purpose, parent_window: 0, parent_uid: 0 });
         GrantResult::Ok { token: g }
     }
 
@@ -238,9 +248,11 @@ pub fn table() -> &'static Mutex<Table> {
 
 /// Replace a real device's [`MINT_HERE`] marker on a press with a token
 /// for the window's app (`uid`), or with zero when the app is not known.
+/// `island`: the window is an island slot of this window, whose owner
+/// has this uid.
 ///
 /// [`MINT_HERE`]: fresco_scene_server::window::MINT_HERE
-pub fn mint_for(ev: &mut fresco_scene_server::window::DisplayEvent, uid: Option<u32>) {
+pub fn mint_for(ev: &mut fresco_scene_server::window::DisplayEvent, uid: Option<u32>, island: Option<(u32, u32)>) {
     use fresco_scene_server::window::{DisplayEvent as E, MINT_HERE};
     let (window_id, slot, kind, hid, mods) = match ev {
         E::InputKey { window_id, hid_usage, modifiers, activation, .. } => (*window_id, activation, kind::KEY, *hid_usage, *modifiers),
@@ -255,7 +267,8 @@ pub fn mint_for(ev: &mut fresco_scene_server::window::DisplayEvent, uid: Option<
             let mut t = table().lock().unwrap();
             let now = now_ns();
             t.pressed_at(window_id, now);
-            t.mint(Entry { window_id, uid, kind, hid, mods, minted_ns: now, counter: 0, drag_id: 0, purpose: 0 })
+            let (parent_window, parent_uid) = island.unwrap_or((0, 0));
+            t.mint(Entry { window_id, uid, kind, hid, mods, minted_ns: now, counter: 0, drag_id: 0, purpose: 0, parent_window, parent_uid })
         }
         _ => [0; 16],
     };
@@ -287,7 +300,7 @@ impl Table {
 /// another app's window.
 /// A `DROP` token for `uid`'s window `window_id`, bound to `drag_id`.
 pub fn mint_drop(window_id: u32, uid: u32, drag_id: u64) -> Token {
-    table().lock().unwrap().mint(Entry { window_id, uid, kind: kind::DROP, hid: 0, mods: 0, minted_ns: now_ns(), counter: 0, drag_id, purpose: 0 })
+    table().lock().unwrap().mint(Entry { window_id, uid, kind: kind::DROP, hid: 0, mods: 0, minted_ns: now_ns(), counter: 0, drag_id, purpose: 0, parent_window: 0, parent_uid: 0 })
 }
 
 pub fn without_token(ev: &fresco_scene_server::window::DisplayEvent) -> fresco_scene_server::window::DisplayEvent {
@@ -835,13 +848,37 @@ mod tests {
     use super::*;
 
     fn key(hid: u16, mods: u8, at: u64) -> Entry {
-        Entry { window_id: 5, uid: 1001, kind: kind::KEY, hid, mods, minted_ns: at, counter: 0, drag_id: 0, purpose: 0 }
+        Entry { window_id: 5, uid: 1001, kind: kind::KEY, hid, mods, minted_ns: at, counter: 0, drag_id: 0, purpose: 0, parent_window: 0, parent_uid: 0 }
     }
     fn button(at: u64) -> Entry {
         Entry { kind: kind::BUTTON, hid: 0, mods: 0, ..key(0, 0, at) }
     }
     const YES: fn(u32) -> bool = |_| true;
     const NOVIS: fn(u32, u64) -> bool = |_, _| false;
+
+    #[test]
+    fn an_islands_parent_spends_a_press_in_the_island_only_on_a_copy_or_a_paste() {
+        // The engine's window 5 (uid 1001) is an island in window 9, owned
+        // by uid 2002 (the Navigator).
+        let island = |e: Entry| Entry { parent_window: 9, parent_uid: 2002, ..e };
+        let mut t = Table::default();
+        let paste = t.mint(island(key(HID_V, MOD_CTRL, 0)));
+        assert_eq!(t.consume(1, &paste, 3003, purpose::PASTE, YES, NOVIS), refused(refusal::WRONG_UID), "nobody else");
+        assert_eq!(t.consume(1, &paste, 2002, purpose::SHARE, YES, NOVIS), refused(refusal::WRONG_UID), "not another purpose");
+        assert!(matches!(t.consume(1, &paste, 2002, purpose::PASTE, YES, NOVIS), ConsumeResult::Ok { window_id: 5, .. }));
+        assert_eq!(t.consume(2, &paste, 2002, purpose::PASTE, YES, NOVIS), refused(refusal::UNKNOWN), "once");
+        // Typing in the page is still no paste.
+        let typed = t.mint(island(key(0x04, 0, 0)));
+        assert_eq!(t.consume(1, &typed, 2002, purpose::PASTE, YES, NOVIS), refused(refusal::WRONG_KIND));
+        // Focus on the island's window counts; on neither, it doesn't.
+        let copy = t.mint(island(key(HID_C, MOD_CTRL, 0)));
+        assert_eq!(t.consume(1, &copy, 2002, purpose::COPY, |w| w == 7, NOVIS), refused(refusal::NOT_FOCUSED));
+        assert!(matches!(t.consume(1, &copy, 2002, purpose::COPY, |w| w == 9, NOVIS), ConsumeResult::Ok { .. }));
+        // A press in a window that is no island: only its own app.
+        let plain = t.mint(key(HID_V, MOD_CTRL, 0));
+        assert_eq!(t.consume(1, &plain, 2002, purpose::PASTE, YES, NOVIS), refused(refusal::WRONG_UID));
+        assert!(matches!(t.consume(1, &plain, 1001, purpose::PASTE, YES, NOVIS), ConsumeResult::Ok { .. }));
+    }
 
     #[test]
     fn a_strip_note_is_owed_once_per_paste_press_and_worded_here() {
