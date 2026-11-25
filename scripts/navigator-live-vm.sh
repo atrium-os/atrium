@@ -117,6 +117,8 @@ press() { inj "MOVE $1 $2"; sleep 1; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"; slee
 key() { inj "KEY $1 1 ${2:-0}"; sleep 1; inj "KEY $1 0 ${2:-0}"; sleep "$GAP"; }
 last() { g "grep 'trace' $S/ui.log | tail -1"; }
 # Wait (up to WAIT s) for the last trace line to match.
+# Where the trace says a toolbar control is (navigator-ui.md §15.1).
+tool() { last | sed -n "s/.* tools=[^ ]*$1:\([0-9]*\),\([0-9]*\).*/\1 \2/p"; }
 until_trace() { i=0; while [ $i -lt "$WAIT" ]; do last | grep -q "$1" && return 0; sleep 3; i=$((i+3)); done; return 1; }
 
 echo "=== drive"
@@ -228,7 +230,7 @@ last() { g "grep 'trace' $S/ui7.log | tail -1"; }
 g "pkill -x navigator-ui; sleep 2; true"
 ui https://atlas.example/wiki/Atrium ui7
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "presence: first page: $(last)"
-press 1110 $((TOP + 20))     # the presence control: its menu (§6.2) hangs under it
+T=$(tool presence); press ${T% *} $((TOP + ${T#* }))     # the presence pill: its menu (§6.2) hangs under it
 sleep "$GAP"
 shot live-7-presence-menu
 press 1100 $((TOP + 34 + 58 + 16))   # "Let this site remember me"
@@ -332,19 +334,30 @@ g "grep -q 'a key from the page: NextRegion' $S/ui9.log" && [ "$(g "grep -c 'F6:
     && ok "…and F6 in the page went round to the rail" || bad "f6 from the page: $(g "grep -v trace $S/ui9.log | tail -3")"
 key 0x29                    # Esc: the rail lets go
 # Aa: the pop-up hangs under its button, above the page's window.
-press $((W - 90)) $((TOP + 20))
+T=$(tool aa); press ${T% *} $((TOP + ${T#* }))
 sleep "$GAP"
 shot live-11-aa
-press 1190 152              # Text size +
+press 1158 152              # Text size + (the pop-up hangs from Aa, 32 pt left of where it was)
 g "grep -q 'reading changed: text 72 ' $S/ui9.log" && ok "Aa: a larger text size went to the page" || bad "aa text: $(g "grep -v trace $S/ui9.log | tail -3")"
 g "grep -q 'laid out again: text 112%' $S/limend.log" && ok "…which laid the page out again, without fetching it" || bad "relayout: $(g "grep 'laid out again' $S/limend.log | tail -2")"
-press 1204 270              # Comfortable
+press 1172 270              # Comfortable
 g "grep -q 'reading changed: .* comfortable' $S/ui9.log" && ok "Aa: comfortable width" || bad "aa width: $(g "grep 'reading changed' $S/ui9.log | tail -2")"
 shot live-12-comfortable
 key 0x29                    # Esc: the pop-up goes
 sleep 3
 g "grep -q '\"site\": \"atlas.example\"' $S/trails.json" && g "grep -A2 '\"site\": \"atlas.example\"' $S/trails.json | grep -q '\"text\": 72'" \
     && ok "the choice is remembered for the site in the trail store" || bad "store: $(g "grep -A6 reading $S/trails.json")"
+# The toolbar's right end (navigator-ui.md §15.1): More and Downloads.
+T=$(tool more); press ${T% *} $((TOP + ${T#* }))
+g "grep -q 'ax  *menu \"More\"' $S/ui9.log" && g "grep -q 'ax  *menu-item \"Open with' $S/ui9.log" \
+    && ok "More opened its menu, with Open with… in it" || bad "more: $(g "grep 'ax' $S/ui9.log | tail -5")"
+shot live-12b-more
+key 0x29
+T=$(tool downloads); press ${T% *} $((TOP + ${T#* }))
+g "grep -q 'ax  *list \"Downloads\"' $S/ui9.log" && ok "Downloads opened its list" || bad "downloads: $(g "grep 'ax' $S/ui9.log | tail -5")"
+key 0x29
+last | grep -q 'tools=presence:[0-9]*,[0-9]*;keep:[0-9]*,[0-9]*;downloads:[0-9]*,[0-9]*;more:[0-9]*,[0-9]*;aa:[0-9]*,[0-9]*;share:' \
+    && ok "the toolbar has the pill, Keep, Downloads, More, Aa and Share" || bad "tools: $(last)"
 # Ctrl-plus in the page: its ScrollView zooms, and once it settles the
 # chrome remembers it.
 inpage

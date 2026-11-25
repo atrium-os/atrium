@@ -167,7 +167,106 @@ pub struct Shell {
     /// offers to ask again for them. navigatord's list is the one that
     /// counts; this only says which row to show.
     pub live_remembered: Vec<String>,
+    /// The files answered for this run (§15.1 Downloads), newest last, at
+    /// most [`DOWNLOADS_KEPT`]; whether one changed since the list was
+    /// last open (the button's dot); and whether the list is open.
+    pub downloads: Vec<Download>,
+    pub downloads_new: bool,
+    pub downloads_open: bool,
+    /// The More menu (§15.1).
+    pub more_open: bool,
+    /// The share sheet is up for the page (share-sheet.md §5), one at a time.
+    pub sharing: bool,
 }
+
+/// The most downloads the list keeps.
+pub const DOWNLOADS_KEPT: usize = 16;
+
+/// A file the person answered Save or Open for (§15.1 Downloads).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Download {
+    pub id: u32,
+    pub file: String,
+    pub size: String,
+    pub origin: String,
+    pub state: DownloadState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    Saving,
+    Opening,
+    /// Where navigatord saved it.
+    Saved(String),
+    /// The app it opened in.
+    Opened(String),
+    /// Why it was not saved or opened.
+    Failed(String),
+}
+
+/// What the presence pill says (§15.1): whether the site knows you, and
+/// as whom when Arca holds an account for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Presence {
+    NotKnown,
+    Remembers,
+    SignedIn(String),
+}
+
+/// A row of the More menu (§15.1). Reading and Share are there only when
+/// the window is too narrow for their buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoreRow {
+    Reading,
+    Share,
+    OpenWith,
+    Find,
+    Print,
+    History,
+    StatusBar,
+}
+
+impl MoreRow {
+    pub fn label(self) -> &'static str {
+        match self {
+            MoreRow::Reading => "Reading controls",
+            MoreRow::Share => "Share\u{2026}",
+            MoreRow::OpenWith => "Open with\u{2026}",
+            MoreRow::Find => "Find in page",
+            MoreRow::Print => "Print\u{2026}",
+            MoreRow::History => "History",
+            MoreRow::StatusBar => "Status bar",
+        }
+    }
+
+    pub fn keys(self) -> &'static str {
+        match self {
+            MoreRow::Find => "Ctrl F",
+            MoreRow::Print => "Ctrl P",
+            MoreRow::History => "Ctrl H",
+            MoreRow::StatusBar => "Ctrl /",
+            _ => "",
+        }
+    }
+}
+
+/// The toolbar (§15.1): the icon buttons at its right, each a 28 pt square
+/// on a 32 pt pitch, and the presence pill before them.
+pub const TOOL_PITCH: f32 = 32.0;
+pub const PRESENCE_PILL: f32 = 148.0;
+pub const PRESENCE_ICON: f32 = 32.0;
+/// Below these widths of the area right of the rail, the presence pill
+/// keeps only its icon, then Reading and Share move into More (§15.1).
+pub const BAR_PRESENCE_LABEL: f32 = 760.0;
+pub const BAR_TOOLS_FOLD: f32 = 620.0;
+/// The More menu and the Downloads list.
+pub const MORE_W: f32 = 260.0;
+pub const MORE_ROW: f32 = 32.0;
+pub const DOWNLOADS_W: f32 = 340.0;
+pub const DOWNLOAD_ROW: f32 = 48.0;
+/// The share sheet's slot and the chosen app's (share-sheet.md §5).
+pub const SHARE_SLOT: u64 = 0x5348_5245; // "SHRE"
+pub const SHARE_TARGET_SLOT: u64 = 0x5348_5447; // "SHTG"
 
 /// The most remembered origins the UI keeps track of.
 pub const LIVE_REMEMBERED_MAX: usize = 256;
@@ -332,6 +431,9 @@ pub enum Out {
     /// Print the page on screen (§7 "Print"): its child lays it out on
     /// paper and the print sheet opens over the window.
     Print,
+    /// Share the page's address through the system's share sheet, with
+    /// the press on Share, which the sheet spends (share-sheet.md §5).
+    Share { url: String, title: String, press: navigator_control::Press },
     /// A branch made its own trail (§4.2): the moved pages' keys, old to
     /// new, so their live children follow them.
     Moved { keys: Vec<((u64, PageId), (u64, PageId))> },
@@ -415,6 +517,17 @@ pub struct Geo {
     pub media: bool,
     /// The sign-in window's bar: the network's name and the page's form.
     pub form: Option<Rect>,
+    /// Keep, inside the Where field's right end (§15.1).
+    pub keep: Rect,
+    /// The presence pill shows its words (else only its icon).
+    pub presence_label: bool,
+    /// Downloads, Share (none when folded into More), More, and the
+    /// Downloads list and More menu while open.
+    pub downloads: Rect,
+    pub share: Option<Rect>,
+    pub more: Rect,
+    pub downloads_menu: Option<Rect>,
+    pub more_menu: Option<Rect>,
 }
 
 /// The network's name when this window is its sign-in window
@@ -458,7 +571,7 @@ pub fn fit_persona(p: &str) -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None, live_remembered: Vec::new() }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None, live_remembered: Vec::new(), downloads: Vec::new(), downloads_new: false, downloads_open: false, more_open: false, sharing: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -589,8 +702,20 @@ impl Shell {
         let x0 = rail + 1.0;
         let media = self.store.trail().page().is_some_and(|p| p.media != crate::trail::Media::None);
         let fx = x0 + em(111.0);
-        let right = em(236.0) + if media { em(32.0) } else { 0.0 };
+        // Right to left: More, Share, Downloads, Aa (Share and Aa fold
+        // into More when narrow), then the presence pill, then media.
+        let room = w - x0;
+        let fold = room < em(BAR_TOOLS_FOLD);
+        let presence_label = room >= em(BAR_PRESENCE_LABEL);
+        let tool = |i: f32| Rect::new(w - em(40.0) - i * em(TOOL_PITCH), em(6.0), em(28.0), em(28.0));
+        let more = tool(0.0);
+        let (share, downloads, aa) = if fold { (None, tool(1.0), more) } else { (Some(tool(1.0)), tool(2.0), tool(3.0)) };
+        let tools_x = if fold { downloads.x() } else { aa.x() };
+        let pw = em(if presence_label { PRESENCE_PILL } else { PRESENCE_ICON });
+        let presence = Rect::new(tools_x - em(8.0) - pw, em(6.0), pw, em(28.0));
+        let right = w - presence.x() + em(12.0) + if media { em(32.0) } else { 0.0 };
         let where_ = Rect::new(fx, em(6.0), (w - fx - right).max(em(160.0)), em(28.0));
+        let keep = Rect::new(where_.x() + where_.w() - em(28.0), where_.y() + em(2.0), em(24.0), em(24.0));
         let mut y = bar() + 1.0;
         let page = self.store.trail().page();
         let find = (self.find.is_some() && page.is_some() && self.history.is_none()).then(|| {
@@ -621,10 +746,8 @@ impl Shell {
                 let pw = em(POPOVER_W).min(w - where_.x() - 8.0);
                 Rect::new(where_.x(), bar() + 4.0, pw, popover_height(self, pw))
             });
-        let aa = Rect::new(w - em(104.0), em(6.0), em(28.0), em(28.0));
         let reading = (self.reading_open && self.store.trail().page().is_some())
             .then(|| Rect::new((aa.x() + aa.w() - em(READING_W)).max(x0 + 8.0), bar() + 4.0, em(READING_W), em(READING_H)));
-        let presence = Rect::new(where_.x() + where_.w() + em(12.0) + if media { em(32.0) } else { 0.0 }, em(6.0), em(112.0), em(28.0));
         let presence_menu = (self.presence_open && self.store.trail().page().is_some())
             .then(|| Rect::new((presence.x() + presence.w() - em(PRESENCE_W)).max(x0 + 8.0), bar() + 4.0, em(PRESENCE_W), presence_height(self)));
         let sections_button = find.filter(|_| !self.sections.is_empty()).map(|f| Rect::new(f.x() + f.w() - em(140.0), f.y() + em(6.0), em(92.0), em(28.0)));
@@ -636,7 +759,15 @@ impl Shell {
         let persona_menu = (self.persona_open && rail > em(100.0)).then(|| {
             Rect::new(em(8.0), persona_chip.y() + persona_chip.h() + 4.0, em(PERSONA_W), em(PERSONA_ROW) * self.persona_rows().len() as f32 + em(16.0) + em(26.0))
         });
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button, form }
+        let more_menu = self.more_open.then(|| {
+            let n = self.more_rows_at(fold).len() as f32;
+            Rect::new((more.x() + more.w() - em(MORE_W)).max(x0 + 8.0), bar() + 4.0, em(MORE_W), em(16.0) + n * em(MORE_ROW))
+        });
+        let downloads_menu = self.downloads_open.then(|| {
+            let n = self.downloads.len().max(1) as f32;
+            Rect::new((downloads.x() + downloads.w() - em(DOWNLOADS_W)).max(x0 + 8.0), bar() + 4.0, em(DOWNLOADS_W), em(40.0) + n * em(DOWNLOAD_ROW))
+        });
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button, form, keep, presence_label, downloads, share, more, downloads_menu, more_menu }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -1120,9 +1251,15 @@ impl Shell {
             (Prompt::NotPrivate { .. }, "Go back") => {
                 self.store.trail_mut().back();
             }
-            (Prompt::Download { id, .. }, "Save") if live => self.outbox.push(Out::Save { id: *id, press }),
+            (Prompt::Download { id, file, size, origin, .. }, "Save") if live => {
+                self.outbox.push(Out::Save { id: *id, press });
+                self.note_download(*id, file, size, origin, DownloadState::Saving);
+            }
             (Prompt::Download { id, .. }, "Cancel") if live => self.outbox.push(Out::Discard { id: *id }),
-            (Prompt::Download { id, .. }, "Open") if live => self.outbox.push(Out::OpenFile { id: *id, press }),
+            (Prompt::Download { id, file, size, origin, .. }, "Open") if live => {
+                self.outbox.push(Out::OpenFile { id: *id, press });
+                self.note_download(*id, file, size, origin, DownloadState::Opening);
+            }
             (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open") if live => {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
             }
@@ -1284,6 +1421,8 @@ impl Shell {
         let site = crate::trail::site(&url).to_string();
         self.popover = false;
         self.reading_open = false;
+        self.more_open = false;
+        self.downloads_open = false;
         self.presence_open = true;
         self.accounts = None;
         if self.store.knows(&site) {
@@ -1572,7 +1711,9 @@ impl Shell {
     /// Escape closes what is on top: a pop-up, then the Where field, then
     /// the history view, then find. Returns whether it closed anything.
     pub fn escape(&mut self) -> bool {
-        if self.popover || self.reading_open || self.presence_open || self.sections_open || self.persona_open {
+        if self.popover || self.reading_open || self.presence_open || self.sections_open || self.persona_open || self.more_open || self.downloads_open {
+            self.more_open = false;
+            self.downloads_open = false;
             self.persona_open = false;
             self.popover = false;
             self.reading_open = false;
@@ -1592,6 +1733,131 @@ impl Shell {
             return false;
         }
         true
+    }
+
+    // -- the toolbar's right end (§15.1) --------------------------------------
+
+    /// What the presence pill says for `site`.
+    pub fn presence(&self, site: &str) -> Presence {
+        if !self.store.knows(site) {
+            return Presence::NotKnown;
+        }
+        match &self.accounts {
+            Some((s, Accounts::Known(v))) if s == site => v.first().map_or(Presence::Remembers, |a| Presence::SignedIn(a.name.clone())),
+            _ => Presence::Remembers,
+        }
+    }
+
+    fn close_popups(&mut self) {
+        self.popover = false;
+        self.reading_open = false;
+        self.presence_open = false;
+        self.persona_open = false;
+        self.sections_open = false;
+        self.more_open = false;
+        self.downloads_open = false;
+    }
+
+    /// A file answered for, or an answer about one from navigatord.
+    fn note_download(&mut self, id: u32, file: &str, size: &str, origin: &str, state: DownloadState) {
+        match self.downloads.iter_mut().find(|d| d.id == id) {
+            Some(d) => d.state = state,
+            None => {
+                if self.downloads.len() >= DOWNLOADS_KEPT {
+                    self.downloads.remove(0);
+                }
+                self.downloads.push(Download { id, file: file.into(), size: size.into(), origin: origin.into(), state });
+            }
+        }
+        self.downloads_new = !self.downloads_open;
+    }
+
+    /// navigatord's answer for download `id`; false when the list has no
+    /// such download (answered before this run, or dropped from the list).
+    pub fn download_done(&mut self, id: u32, state: DownloadState) -> bool {
+        let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) else { return false };
+        d.state = state;
+        self.downloads_new = !self.downloads_open;
+        true
+    }
+
+    pub fn toggle_downloads(&mut self) {
+        let open = !self.downloads_open;
+        self.close_popups();
+        self.end_edit();
+        self.downloads_open = open;
+        if open {
+            self.downloads_new = false;
+        }
+    }
+
+    pub fn toggle_more(&mut self) {
+        let open = !self.more_open;
+        self.close_popups();
+        self.end_edit();
+        self.more_open = open;
+    }
+
+    pub fn toggle_reading(&mut self) {
+        let open = !self.reading_open;
+        self.close_popups();
+        self.reading_open = open && self.store.trail().page().is_some();
+    }
+
+    /// The More menu's rows: Reading and Share first when they are folded
+    /// into it.
+    pub fn more_rows(&self) -> Vec<MoreRow> {
+        self.more_rows_at(self.w - self.rail_w() - 1.0 < em(BAR_TOOLS_FOLD))
+    }
+
+    fn more_rows_at(&self, fold: bool) -> Vec<MoreRow> {
+        let mut v = if fold { vec![MoreRow::Reading, MoreRow::Share] } else { vec![] };
+        v.extend([MoreRow::OpenWith, MoreRow::Find, MoreRow::Print, MoreRow::History, MoreRow::StatusBar]);
+        v
+    }
+
+    /// A press on a More row, with frescod's token for the press (Share
+    /// and Open with spend it).
+    pub fn press_more(&mut self, row: MoreRow, press: Option<navigator_control::Press>, now: f64) {
+        self.more_open = false;
+        match row {
+            MoreRow::Reading => self.toggle_reading(),
+            MoreRow::Share => {
+                self.share(press);
+            }
+            MoreRow::OpenWith => {
+                if self.open_with(press) {
+                    self.last_note = Some("open with: asked Monstrator".into());
+                } else {
+                    self.last_note = Some("open with: no page shown".into());
+                }
+            }
+            MoreRow::Find => self.apply(Action::Find, now),
+            MoreRow::Print => self.apply(Action::Print, now),
+            MoreRow::History => self.apply(Action::History, now),
+            MoreRow::StatusBar => self.apply(Action::ToggleStatus, now),
+        }
+    }
+
+    /// Share: the page shown, through the system's share sheet, which
+    /// spends the press. One sheet at a time; needs a page and a press.
+    pub fn share(&mut self, press: Option<navigator_control::Press>) -> bool {
+        self.close_popups();
+        let (Some(press), Some(LivePage::Shown(url)), false) = (press, self.live.as_ref(), self.sharing) else {
+            self.last_note = Some("share: nothing to share now".into());
+            return false;
+        };
+        let url = url.clone();
+        let title = self.store.trail().page().map(|p| p.title.clone()).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| url.clone());
+        self.sharing = true;
+        self.outbox.push(Out::Share { url, title, press });
+        true
+    }
+
+    /// The share ended (shared, closed, or failed: `note` says which).
+    pub fn shared(&mut self, note: String) {
+        self.sharing = false;
+        self.last_note = Some(note);
     }
 
     // -- reading controls (§7) ---------------------------------------------
@@ -3201,5 +3467,92 @@ mod tests {
         assert_ne!(s.store.trail().title(), title);
         s.apply(Action::BringBack, 0.0);
         assert_eq!(s.store.trail().title(), title);
+    }
+
+    #[test]
+    fn the_toolbar_holds_its_tools_and_folds_them_when_narrow() {
+        // Wide: More, Share, Downloads, Aa from the right, on a 32 pt
+        // pitch, then the presence pill with its words; Keep in the field.
+        let s = shell();
+        let g = s.geo();
+        let x = |r: Rect| (g.w - r.x()) as i32;
+        assert_eq!((x(g.more), x(g.share.unwrap()), x(g.downloads), x(g.aa)), (40, 72, 104, 136));
+        assert!(g.presence_label && g.presence.x() + g.presence.w() <= g.aa.x() - 8.0);
+        assert!(g.where_.x() + g.where_.w() <= g.presence.x() - 12.0, "the field ends before the pill");
+        assert!(g.keep.x() > g.where_.x() && g.keep.x() + g.keep.w() <= g.where_.x() + g.where_.w(), "Keep is inside the field");
+        assert_eq!(s.more_rows()[0], MoreRow::OpenWith);
+        // Narrower: the pill keeps only its icon.
+        let mut s = shell();
+        s.w = em(RAIL_NARROW) + 1.0 + em(BAR_PRESENCE_LABEL) - 10.0;
+        let g = s.geo();
+        assert!(!g.presence_label && g.presence.w() == em(PRESENCE_ICON) && g.share.is_some());
+        // Narrower still: Reading and Share move into More; Back, the
+        // chip's field and More stay.
+        s.w = em(RAIL_NARROW) + 1.0 + em(BAR_TOOLS_FOLD) - 10.0;
+        let g = s.geo();
+        assert!(g.share.is_none() && g.aa == g.more);
+        assert_eq!(&s.more_rows()[..2], &[MoreRow::Reading, MoreRow::Share]);
+        assert!(g.where_.w() >= em(160.0) && g.more.x() + g.more.w() <= g.w);
+    }
+
+    #[test]
+    fn downloads_list_what_was_answered_and_how_it_ended() {
+        let mut s = shell();
+        let url = s.store.trail().page().unwrap().url.clone();
+        s.live = Some(LivePage::Shown(url));
+        let dl = |id: u32, f: &str| Prompt::Download { id, file: f.into(), size: "1 KB".into(), origin: "atlas.example".into(), kind: "PDF".into() };
+        assert!(s.ask(dl(7, "plan.pdf"), 0.0));
+        assert!(s.answer_pressed(2, 600.0, Some([1; 16])), "Save");
+        assert_eq!(s.downloads, vec![Download { id: 7, file: "plan.pdf".into(), size: "1 KB".into(), origin: "atlas.example".into(), state: DownloadState::Saving }]);
+        assert!(s.downloads_new, "the button's dot");
+        assert!(s.download_done(7, DownloadState::Saved("Downloads/plan.pdf".into())));
+        assert!(!s.download_done(8, DownloadState::Failed("x".into())), "an answer for no download in the list");
+        assert_eq!(s.downloads[0].state, DownloadState::Saved("Downloads/plan.pdf".into()));
+        s.toggle_downloads();
+        assert!(s.downloads_open && !s.downloads_new && s.geo().downloads_menu.is_some());
+        assert!(s.escape() && !s.downloads_open);
+        // Cancel is not a download; the list keeps the newest few.
+        assert!(s.ask(dl(9, "a.pdf"), 1000.0));
+        assert!(s.answer_pressed(0, 2000.0, None));
+        assert_eq!(s.downloads.len(), 1);
+        for i in 0..(DOWNLOADS_KEPT as u32 + 3) {
+            s.note_download(100 + i, "f", "1 B", "o", DownloadState::Opening);
+        }
+        assert_eq!(s.downloads.len(), DOWNLOADS_KEPT);
+        assert_eq!(s.downloads.last().unwrap().id, 100 + DOWNLOADS_KEPT as u32 + 2);
+    }
+
+    #[test]
+    fn share_needs_a_page_shown_and_a_press_and_goes_once() {
+        let mut s = shell();
+        assert!(!s.share(Some([1; 16])), "no page from navigatord");
+        let url = s.store.trail().page().unwrap().url.clone();
+        let title = s.store.trail().page().unwrap().title.clone();
+        s.live = Some(LivePage::Shown(url.clone()));
+        assert!(!s.share(None), "no press, no sheet");
+        assert!(s.share(Some([2; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::Share { url: url.clone(), title, press: [2; 16] }));
+        assert!(!s.share(Some([3; 16])), "one sheet at a time");
+        s.shared("share: shared".into());
+        assert!(!s.sharing);
+        // From More, as a narrow window has it.
+        s.toggle_more();
+        assert!(s.more_open);
+        s.press_more(MoreRow::Share, Some([4; 16]), 0.0);
+        assert!(!s.more_open && s.sharing);
+        assert!(matches!(s.outbox.pop(), Some(Out::Share { press: [4, ..], .. })));
+    }
+
+    #[test]
+    fn the_presence_pill_says_who_the_site_knows() {
+        let mut s = shell();
+        let site = crate::trail::site(&s.store.trail().page().unwrap().url).to_string();
+        assert_eq!(s.presence(&site), Presence::NotKnown);
+        s.store.set_knows(&site, true);
+        assert_eq!(s.presence(&site), Presence::Remembers);
+        s.accounts = Some((site.clone(), Accounts::Known(vec![navigator_control::Account { kind: navigator_control::AccountKind::Password, name: "ana".into() }])));
+        assert_eq!(s.presence(&site), Presence::SignedIn("ana".into()));
+        s.accounts = Some(("other.example".into(), Accounts::Known(vec![navigator_control::Account { kind: navigator_control::AccountKind::Password, name: "ana".into() }])));
+        assert_eq!(s.presence(&site), Presence::Remembers, "another site's accounts say nothing here");
     }
 }

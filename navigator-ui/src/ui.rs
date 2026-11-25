@@ -57,6 +57,10 @@ pub mod ph {
     pub const TRASH_SIMPLE: char = '\u{e4a8}';
     pub const CHECK: char = '\u{e182}';
     pub const APP_WINDOW: char = '\u{e5da}';
+    pub const SHARE_NETWORK: char = '\u{e408}';
+    pub const COOKIE: char = '\u{e6ca}';
+    pub const PRINTER: char = '\u{e3dc}';
+    pub const CLOCK_COUNTER_CLOCKWISE: char = '\u{e1a0}';
 }
 
 /// The app clock for the prompt row's 500 ms rule.
@@ -98,7 +102,7 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={} tools={} more={}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
@@ -142,6 +146,20 @@ pub fn trace(s: &mut Shell) {
                 let at = |v: &[(usize, Rect)]| v.iter().map(|(_, r)| format!("{},{}", (r.x() + em(10.0)) as i32, (r.y() + r.h() / 2.0) as i32)).collect::<Vec<_>>().join(";");
                 if s.form.is_none() { "-".to_string() } else { format!("{}|{}", at(&rows), buttons.iter().map(|(_, r)| format!("{},{}", (r.x() + r.w() / 2.0) as i32, (r.y() + r.h() / 2.0) as i32)).collect::<Vec<_>>().join(";")) }
             },
+            // Where to press each toolbar control (§15.1), and each More row.
+            {
+                let g = s.geo();
+                let c = |r: Rect| format!("{},{}", (r.x() + r.w() / 2.0) as i32, (r.y() + r.h() / 2.0) as i32);
+                let mut v = vec![format!("presence:{}", c(g.presence)), format!("keep:{}", c(g.keep)), format!("downloads:{}", c(g.downloads)), format!("more:{}", c(g.more))];
+                if let Some(r) = g.share {
+                    v.push(format!("aa:{}", c(g.aa)));
+                    v.push(format!("share:{}", c(r)));
+                }
+                v.join(";")
+            },
+            s.geo().more_menu.map_or("-".to_string(), |m| {
+                s.more_rows().iter().enumerate().map(|(i, r)| format!("{:?}:{},{}", r, (m.x() + em(60.0)) as i32, (m.y() + em(8.0) + em(shell::MORE_ROW) * (i as f32 + 0.5)) as i32)).collect::<Vec<_>>().join(";")
+            }),
         );
     }
 }
@@ -375,6 +393,26 @@ impl View for ShellView {
             let (st, st2) = (self.state.clone(), self.state.clone());
             let (prefs, site) = (s.store.reading(), trail::site(&p.url).to_string());
             floating(ctx, r, g.aa, move || with(&st, |s| s.reading_open = false), move |ctx| reading_controls(ctx, r, prefs, &site, &st2));
+        }
+        if let Some(r) = g.more_menu {
+            let (st, st2) = (self.state.clone(), self.state.clone());
+            let (rows, status_on) = (s.more_rows(), s.status_bar);
+            floating(ctx, r, g.more, move || with(&st, |s| s.more_open = false), move |ctx| more_menu(ctx, r, rows, status_on, &st2));
+        }
+        if let Some(r) = g.downloads_menu {
+            let st = self.state.clone();
+            let rows = s.downloads.clone();
+            floating(ctx, r, g.downloads, move || with(&st, |s| s.downloads_open = false), move |ctx| downloads_menu(ctx, r, rows));
+        }
+        // The share sheet, then the app chosen in it, over the window
+        // (share-sheet.md §5).
+        if s.sharing {
+            let id = ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, s.w, s.h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, shell::SHARE_SLOT);
+            ctx.pop();
+            let id = ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, s.w, s.h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, shell::SHARE_TARGET_SLOT);
+            ctx.pop();
         }
         // The print sheet, over the whole window (printing.md §5.1).
         if s.printing {
@@ -686,65 +724,152 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let f = g.where_;
     match &s.editing {
         Some(e) => where_editing(ctx, f, e),
-        None => where_at_rest(ctx, s, f, st),
+        None => where_at_rest(ctx, s, g, st),
     }
 
-    // Media (when this page plays), presence, then Aa, Keep, More.
-    let px = f.x() + f.w() + em(12.0);
+    // Media (when this page plays), presence, then Aa, Downloads, Share,
+    // More (§15.1); Aa and Share fold into More when narrow.
+    let px = g.presence.x() - em(32.0);
     if g.media {
         let m = tr.row_media().unwrap_or(RowMedia::Sound);
         let i = s.store.current;
         let st2 = st.clone();
-        icon_button(ctx, px - 2.0, em(6.0), media_glyph(m), true, t.text_secondary(), "Mute this trail (Ctrl-M)", move || with(&st2, |s| s.toggle_mute(i)));
+        icon_button(ctx, px, em(6.0), media_glyph(m), true, t.text_secondary(), "Mute this trail (Ctrl-M)", move || with(&st2, |s| s.toggle_mute(i)));
     }
     if let Some(p) = page {
-        let site = trail::site(&p.url).to_string();
-        let knows = s.store.knows(&site);
-        let st2 = st.clone();
-        let (fill, hover) = if knows { (t.accent_bg(), t.accent_bg()) } else { (t.bg_surface(), t.state_hover()) };
-        let edge = if knows { t.accent_mark() } else { t.border_default() };
-        let p = g.presence;
-        let (y, h, mid) = (p.y(), p.h(), p.y() + p.h() / 2.0);
-        rect(ctx, p.x(), y, p.w(), h, edge, h / 2.0);
-        let id = area(ctx, Rect::new(p.x() + 1.0, y + 1.0, p.w() - 2.0, h - 2.0), h / 2.0 - 1.0, fill, hover, move || with(&st2, |s| s.toggle_presence_menu()));
-        let (gx, tx) = (p.x() + em(9.0), p.x() + em(29.0));
-        if knows {
-            icon(ctx, gx, mid - em(8.0), ph::USER, 16.0, t.accent_strong());
-            let ts = sans(type_size::XS, Weight::Semibold, t.accent_strong());
-            text(ctx, tx, mid, &fit(&site, &ts, p.x() + p.w() - em(7.0) - tx), type_size::XS, Weight::Semibold, t.accent_strong());
-        } else {
-            icon(ctx, gx, mid - em(8.0), ph::EYE_SLASH, 16.0, t.text_secondary());
-            let ts = sans(type_size::XS, Weight::Medium, t.text_secondary());
-            text(ctx, tx, mid, &fit("Anonymous", &ts, p.x() + p.w() - em(7.0) - tx), type_size::XS, Weight::Medium, t.text_secondary());
-        }
-        ctx.pop();
-        ctx.tooltip(id, if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") });
+        presence_pill(ctx, s, g, &trail::site(&p.url).to_string(), st);
     }
     let has = page.is_some();
+    if g.share.is_some() {
+        let st2 = st.clone();
+        let aa = s.reading_open;
+        icon_button(ctx, g.aa.x(), g.aa.y(), ph::TEXT_AA, has, if aa { t.accent_fg() } else { t.text_secondary() }, "Reading controls", move || with(&st2, |s| s.toggle_reading()));
+    }
     let st2 = st.clone();
-    let aa = s.reading_open;
-    icon_button(ctx, g.aa.x(), g.aa.y(), ph::TEXT_AA, has, if aa { t.accent_fg() } else { t.text_secondary() }, "Reading controls", move || with(&st2, |s| {
-        s.popover = false;
-        s.presence_open = false;
-        s.reading_open = !aa;
-    }));
-    let kept = page.is_some_and(|p| s.store.is_kept(&p.url));
+    let d = g.downloads;
+    let dl_on = s.downloads_open;
+    icon_button(ctx, d.x(), d.y(), ph::DOWNLOAD, true, if dl_on { t.accent_fg() } else { t.text_secondary() }, "Downloads", move || with(&st2, |s| s.toggle_downloads()));
+    if s.downloads_new {
+        // The dot: a download started or ended since the list was open.
+        rect(ctx, d.x() + d.w() - em(9.0), d.y() + em(4.0), em(6.0), em(6.0), t.accent_fg(), em(3.0));
+    }
+    if let Some(r) = g.share {
+        let st2 = st.clone();
+        let can = matches!(s.live, Some(shell::LivePage::Shown(_))) && !s.sharing;
+        icon_button(ctx, r.x(), r.y(), ph::SHARE_NETWORK, can, t.text_secondary(), "Share this page", move || with(&st2, |s| {
+            s.share(pergola::clipboard::current_activation());
+        }));
+    }
     let st2 = st.clone();
-    icon_button(ctx, g.w - em(72.0), em(6.0), ph::STAR, has, if kept { t.accent_fg() } else { t.text_secondary() }, if kept { "Kept · click to stop keeping" } else { "Keep this page (Ctrl-D)" }, move || with(&st2, |s| s.store.toggle_keep()));
-    // Open with… (personas.md §6): another app, or this page in another
-    // persona, asked in Monstrator's sheet.
-    let st2 = st.clone();
-    icon_button(ctx, g.w - em(40.0), em(6.0), ph::ARROW_SQUARE_OUT, has, t.text_secondary(), "Open with\u{2026} (another app or persona)", move || with(&st2, |s| {
-        if s.open_with(pergola::clipboard::current_activation()) {
-            s.last_note = Some("open with: asked Monstrator".into());
-        }
-    }));
+    let more_on = s.more_open;
+    icon_button(ctx, g.more.x(), g.more.y(), ph::DOTS_THREE, true, if more_on { t.accent_fg() } else { t.text_secondary() }, "More", move || with(&st2, |s| s.toggle_more()));
 }
 
-/// The Where field at rest (§5.3): the tier chip with its light, the
-/// title, then the address with the registrable domain emphasised.
-fn where_at_rest(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
+/// The presence pill (§6.2, §15.1): whether this site knows you, in
+/// words while the toolbar has room, else only its icon.
+fn presence_pill(ctx: &mut Ctx, s: &Shell, g: &Geo, site: &str, st: &Mutable<Shell>) {
     let t = ctx.theme;
+    let presence = s.presence(site);
+    let knows = presence != shell::Presence::NotKnown;
+    let st2 = st.clone();
+    let (fill, hover) = if knows { (t.accent_bg(), t.accent_bg()) } else { (t.bg_surface(), t.state_hover()) };
+    let edge = if knows { t.accent_mark() } else { t.border_default() };
+    let p = g.presence;
+    let (y, h, mid) = (p.y(), p.h(), p.y() + p.h() / 2.0);
+    rect(ctx, p.x(), y, p.w(), h, edge, h / 2.0);
+    let id = area(ctx, Rect::new(p.x() + 1.0, y + 1.0, p.w() - 2.0, h - 2.0), h / 2.0 - 1.0, fill, hover, move || with(&st2, |s| s.toggle_presence_menu()));
+    let (glyph, words, fg) = match &presence {
+        shell::Presence::NotKnown => (ph::EYE_SLASH, "Not known here".to_string(), t.text_secondary()),
+        shell::Presence::Remembers => (ph::COOKIE, "Remembers you".to_string(), t.accent_strong()),
+        shell::Presence::SignedIn(name) => (ph::USER, format!("Signed in as {name}"), t.accent_strong()),
+    };
+    if g.presence_label {
+        let tx = p.x() + em(29.0);
+        icon(ctx, p.x() + em(9.0), mid - em(8.0), glyph, 16.0, fg);
+        let ts = sans(type_size::XS, if knows { Weight::Semibold } else { Weight::Medium }, fg);
+        text(ctx, tx, mid, &fit(&words, &ts, p.x() + p.w() - em(9.0) - tx), type_size::XS, if knows { Weight::Semibold } else { Weight::Medium }, fg);
+    } else {
+        icon(ctx, p.x() + (p.w() - em(16.0)) / 2.0, mid - em(8.0), glyph, 16.0, fg);
+    }
+    ctx.pop();
+    let tip = match presence {
+        shell::Presence::NotKnown => format!("{site} doesn't know you"),
+        shell::Presence::Remembers => format!("{site} remembers you"),
+        shell::Presence::SignedIn(name) => format!("Signed in to {site} as {name}"),
+    };
+    ctx.tooltip(id, tip);
+}
+
+/// The More menu (§15.1): Reading and Share when folded, Open with, Find,
+/// Print, History, the status bar.
+fn more_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::MoreRow>, status_on: bool, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
+    let mut y = r.y() + em(8.0);
+    for row in rows {
+        let st2 = st.clone();
+        area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(shell::MORE_ROW)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
+            s.press_more(row, pergola::clipboard::current_activation(), now_ms());
+        }));
+        let g = match row {
+            shell::MoreRow::Reading => ph::TEXT_AA,
+            shell::MoreRow::Share => ph::SHARE_NETWORK,
+            shell::MoreRow::OpenWith => ph::ARROW_SQUARE_OUT,
+            shell::MoreRow::Find => ph::MAGNIFYING_GLASS,
+            shell::MoreRow::Print => ph::PRINTER,
+            shell::MoreRow::History => ph::CLOCK_COUNTER_CLOCKWISE,
+            shell::MoreRow::StatusBar => if status_on { ph::CHECK } else { ph::MINUS },
+        };
+        let cy = y + em(shell::MORE_ROW) / 2.0;
+        icon(ctx, r.x() + em(16.0), cy - em(8.0), g, 16.0, t.text_secondary());
+        text(ctx, r.x() + em(42.0), cy, row.label(), type_size::SM, Weight::Regular, t.text_primary());
+        let k = row.keys();
+        if !k.is_empty() {
+            let ks = sans(type_size::XS, Weight::Regular, t.text_tertiary());
+            text(ctx, r.x() + r.w() - em(16.0) - width(k, &ks), cy, k, type_size::XS, Weight::Regular, t.text_tertiary());
+        }
+        ctx.pop();
+        y += em(shell::MORE_ROW);
+    }
+}
+
+/// The Downloads list (§15.1): this run's files, newest first, each with
+/// where it went or why it didn't.
+fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>) {
+    let t = ctx.theme;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
+    let x = r.x() + em(16.0);
+    text(ctx, x, r.y() + em(20.0), "DOWNLOADS", type_size::XXS, Weight::Semibold, t.text_tertiary());
+    let mut y = r.y() + em(32.0);
+    if rows.is_empty() {
+        text(ctx, x, y + em(shell::DOWNLOAD_ROW) / 2.0, "Nothing downloaded in this window yet", type_size::SM, Weight::Regular, t.text_tertiary());
+        return;
+    }
+    let room = r.w() - em(64.0);
+    for d in rows.iter().rev() {
+        let (g, c, line) = match &d.state {
+            shell::DownloadState::Saving => (ph::DOWNLOAD, t.accent_fg(), format!("{} · saving · {}", d.size, d.origin)),
+            shell::DownloadState::Opening => (ph::DOWNLOAD, t.accent_fg(), format!("{} · opening · {}", d.size, d.origin)),
+            shell::DownloadState::Saved(path) => (ph::CHECK_CIRCLE, t.success_fg(), format!("Saved in {path}")),
+            shell::DownloadState::Opened(app) => (ph::CHECK_CIRCLE, t.success_fg(), format!("Opened in {app}")),
+            shell::DownloadState::Failed(why) => (ph::PROHIBIT, t.danger_fg(), format!("Not kept · {why}")),
+        };
+        icon(ctx, x, y + em(8.0), g, 16.0, c);
+        let fs = sans(type_size::SM, Weight::Medium, t.text_primary());
+        text(ctx, x + em(26.0), y + em(15.0), &fit(&d.file, &fs, room), type_size::SM, Weight::Medium, t.text_primary());
+        let ls = sans(type_size::XS, Weight::Regular, t.text_secondary());
+        text(ctx, x + em(26.0), y + em(33.0), &fit(&line, &ls, room), type_size::XS, Weight::Regular, t.text_secondary());
+        y += em(shell::DOWNLOAD_ROW);
+    }
+}
+
+/// The Where field at rest (§5.3, §15.1): what runs (the tier chip with
+/// its light), then who: "Not private" for http, the registrable domain
+/// emphasised and the path after it, and Keep at its right end. The title
+/// is the rail's.
+fn where_at_rest(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    let f = g.where_;
     rect(ctx, f.x(), f.y(), f.w(), f.h(), t.border_default(), 6.0);
     let st2 = st.clone();
     area(ctx, Rect::new(f.x() + 1.0, f.y() + 1.0, f.w() - 2.0, f.h() - 2.0), 5.0, t.bg_canvas(), t.bg_canvas(), move || with(&st2, |s| s.begin_edit()));
@@ -756,22 +881,16 @@ fn where_at_rest(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
     };
     let cw = tier_chip(ctx, s, f.x() + em(4.0), f.y() + (f.h() - em(22.0)) / 2.0, p, st);
     let x = f.x() + em(4.0) + cw + em(10.0);
-    let end = f.x() + f.w() - em(10.0);
+    let end = g.keep.x() - em(6.0);
     let body = |c: Color, w: Weight| sans(type_size::SM, w, c);
     let mut runs: Vec<(String, TextStyle)> = vec![];
     if p.facts.insecure {
         runs.push(("Not private".into(), body(t.warning_fg(), Weight::Semibold)));
     }
-    let title_st = body(t.text_primary(), Weight::Medium);
     let (before, domain, after) = trail::split_address(&p.url);
-    let addr_w = width(before, &body(t.text_tertiary(), Weight::Regular)) + width(domain, &body(t.text_primary(), Weight::Semibold));
-    let room = end - x;
-    // The title gets what the domain leaves; the domain is never cut.
-    let title_max = (room - addr_w - em(40.0)).max(em(60.0)).min(room * 0.55);
-    let title = if p.search.is_some() { p.title.clone() } else { fit(&p.title, &title_st, title_max) };
-    let used: f32 = runs.iter().map(|r| width(&r.0, &r.1) + em(8.0)).sum::<f32>() + width(&title, &title_st) + em(16.0) + addr_w;
-    runs.push((title, title_st));
-    runs.push(("·".into(), body(t.text_tertiary(), Weight::Regular)));
+    let dom_st = body(t.text_primary(), Weight::Semibold);
+    let used: f32 = runs.iter().map(|r| width(&r.0, &r.1) + em(8.0)).sum::<f32>()
+        + width(before, &body(t.text_tertiary(), Weight::Regular)) + width(domain, &dom_st);
     let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(x, f.y() + f.h() / 2.0 - em(type_size::SM) * 0.75, 0.0, 0.0), em(8.0)));
     ctx.set_flex(r, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
     for (sx, sst) in &runs {
@@ -782,15 +901,25 @@ fn where_at_rest(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
     if !before.is_empty() {
         ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: before.into(), style: body(t.text_tertiary(), Weight::Regular) });
     }
-    ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: domain.into(), style: body(t.text_primary(), Weight::Semibold) });
+    // The domain is never cut; the path gets what is left (§15.1: it is
+    // the first thing a narrow window drops).
+    ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: domain.into(), style: dom_st });
     let path_st = body(t.text_tertiary(), Weight::Regular);
-    let path = fit(after, &path_st, room - used);
+    let path = fit(after, &path_st, end - x - used);
     if !path.is_empty() {
         ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: path, style: path_st });
     }
     ctx.pop();
     ctx.pop();
     ctx.pop();
+    // Keep, inside the field (Ctrl-D, §5.6).
+    let kept = s.store.is_kept(&p.url);
+    let st2 = st.clone();
+    let k = g.keep;
+    let id = area(ctx, k, em(5.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.store.toggle_keep()));
+    icon(ctx, k.x() + (k.w() - em(16.0)) / 2.0, k.y() + (k.h() - em(16.0)) / 2.0, ph::BOOKMARK, 16.0, if kept { t.accent_fg() } else { t.text_tertiary() });
+    ctx.pop();
+    ctx.tooltip(id, if kept { "Kept · click to stop keeping" } else { "Keep this page (Ctrl-D)" });
 }
 
 /// The tier chip (§6.3) with the light before the word (§6.5). Returns
@@ -812,6 +941,10 @@ fn tier_chip(ctx: &mut Ctx, s: &Shell, x: f32, y: f32, p: &trail::Page, st: &Mut
     let st2 = st.clone();
     let open = s.popover;
     let id = area(ctx, Rect::new(x, y, total, ch), ch / 2.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
+        s.more_open = false;
+        s.downloads_open = false;
+        s.reading_open = false;
+        s.presence_open = false;
         s.popover = !open;
         s.end_edit();
     }));

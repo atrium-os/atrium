@@ -1570,7 +1570,7 @@ Each step runs in the VM on headless frescod before the next.
 
 ## 15. The window, redrawn (proposed 2026-11-25)
 
-**Proposed, waiting for Shankar.** Drawn on the
+**Accepted by Shankar, 2026-11-25.** Drawn on the
 [design canvas](https://claude.ai/artifact/1oFaV95u3LVaUmQHkk9t2m) (the window, Start, a live
 page, asking, and the toolbar states with dark and the icon map), the same way Artifex's was
 (dev-tools.md §3.5). It keeps every decision in §13 (trails, rail and one toolbar, local-only
@@ -1630,3 +1630,36 @@ its own checks (trace lines plus a screenshot at each width the step touches).
    popover, the opened-beside row.
 5. **Dark and narrow**: dark tokens everywhere, and screenshots at 1440, 1024 and 720 px in
    light and dark.
+
+### 15.3 As built
+
+*Step 1, 2026-11-25* (`navigator-ui/src/ui.rs` `toolbar`, `where_at_rest`,
+`presence_pill`, `more_menu`, `downloads_menu`; `shell.rs` the toolbar's right end):
+- **Where field**: the tier chip, then "Not private" for http, the domain and the path
+  (cut first). The title is no longer in the field. Keep (bookmark) is inside its right end.
+  The chip keeps D8's words (Static, Replayed, Live code, and live parts as a count): the
+  canvas's "Document" was a sketch word, and §13 stands. The sign-in window keeps its form
+  bar rather than a Sign-in chip.
+- **Presence pill**: "Not known here", "Remembers you" (cookie), or "Signed in as *name*"
+  once Arca has named an account for the site (`Shell::presence`).
+- **Right end**, on a 32 pt pitch from the right: More, Share, Downloads, Aa.
+  - **More** holds Open with… (moved off the bar), Find, Print, History, and the status bar.
+  - **Downloads** lists this run's Save and Open answers, at most 16, with where each went
+    or why it didn't (`Event::Saved`, `NotSaved`, `FileOpened`). A dot shows when one
+    changed since the list was last open.
+  - **Share** hands the page's address (`text/uri-list` and `text/plain`, titled with the
+    page) to the system's share sheet through `pergola::share::Sharing`, which spends the
+    press, in slots `SHRE` and `SHTG` over the window. One sheet at a time.
+- **Narrow**: the rail folds below 900 pt (as before). Below 760 pt right of the rail the
+  pill keeps only its icon. Below 620 pt, Reading and Share move to the top of More. Back,
+  the chip, the domain and More always stay.
+- The toolbar stays 40 pt, not the canvas's 44, so §8's reference dimensions and the
+  gates' press points hold.
+- The trace gains `tools=` (the centre of each control) and `more=` (each More row). The
+  live and confined gates press from those rather than fixed points. `navigator-live-vm.sh`
+  checks More and Downloads, and `navigator-confined-vm.sh` reaches Open with… through More.
+- Host tests: `the_toolbar_holds_its_tools_and_folds_them_when_narrow`,
+  `downloads_list_what_was_answered_and_how_it_ended`,
+  `share_needs_a_page_shown_and_a_press_and_goes_once`,
+  `the_presence_pill_says_who_the_site_knows`; `tests/text_size.rs` checks the pill folds
+  to its icon at 1.5× in a 1400 pt window.

@@ -153,6 +153,8 @@ pub struct Live {
     idle: Duration,
     /// The print sheet, while it is open (printing.md §5.1).
     printing: Option<Printing>,
+    /// The share sheet and the app chosen in it (share-sheet.md §5).
+    sharing: Option<pergola::share::Sharing>,
     /// The page child asked to lay its page out on paper: its embed, the
     /// title, and whether the sheet is already open (a new paper size).
     print_ask: Option<(EmbedId, String, bool)>,
@@ -326,6 +328,7 @@ impl Live {
                 fresh: HashSet::new(),
                 idle,
                 printing: None,
+                sharing: None,
                 print_ask: None,
                 arca: None,
                 arca_post: None,
@@ -456,6 +459,30 @@ impl Live {
         match r {
             Ok(()) => eprintln!("navigator-ui: print sheet {} ({pages} pages{}, {} bytes)", if again { "has the page again" } else { "open" }, if cut { ", cut short" } else { "" }, pdf.len()),
             Err(why) => self.print_done(s, Outcome::Failed(why)),
+        }
+    }
+
+    /// Share `url` through the system's share sheet (share-sheet.md §5):
+    /// as a link and as text, titled with the page's title. The sheet
+    /// spends `press`; a stale one gets nothing shown.
+    fn share(&mut self, s: &mut Shell, url: &str, title: &str, press: navigator_control::Press) {
+        use limen::share_target::{Body, Format, Item, MAX_TITLE};
+        let title: String = limen::doc_viewer::cut(&title.chars().filter(|c| !c.is_control()).collect::<String>(), MAX_TITLE);
+        let item = Item { title, formats: vec![
+            Format { mime: "text/uri-list".into(), body: Body::Inline(format!("{url}\r\n").into_bytes()) },
+            Format { mime: "text/plain".into(), body: Body::Inline(url.as_bytes().to_vec()) },
+        ] };
+        let r = match (&self.embeds, self.window) {
+            (Some(e), Some(w)) => pergola::share::Sharing::begin(e, w, press, item, Vec::new(), (crate::shell::SHARE_SLOT, crate::shell::SHARE_TARGET_SLOT))
+                .map_err(|e| format!("the share sheet didn't open ({e:?})")),
+            _ => Err("Limen isn't running".into()),
+        };
+        match r {
+            Ok(sh) => {
+                eprintln!("navigator-ui: share: the sheet is up for {url}");
+                self.sharing = Some(sh);
+            }
+            Err(why) => s.shared(format!("share: failed: {why}")),
         }
     }
 
@@ -844,13 +871,23 @@ impl Live {
                         self.shown = None;
                     }
                 }
-                Event::Saved { path, .. } => s.last_note = Some(format!("saved as {path}")),
-                Event::NotSaved { why, .. } => s.last_note = Some(format!("not saved: {why}")),
-                Event::FileOpened { app, why, .. } => {
-                    let note = match (app, why) {
-                        (Some(a), _) => format!("opened in {a}"),
-                        (None, w) => format!("not opened: {}", w.unwrap_or_default()),
+                Event::Saved { id, path } => {
+                    s.download_done(id, crate::shell::DownloadState::Saved(path.clone()));
+                    s.last_note = Some(format!("saved as {path}"))
+                }
+                Event::NotSaved { id, why } => {
+                    s.download_done(id, crate::shell::DownloadState::Failed(why.clone()));
+                    s.last_note = Some(format!("not saved: {why}"))
+                }
+                Event::FileOpened { id, app, why } => {
+                    let (note, state) = match (app, why) {
+                        (Some(a), _) => (format!("opened in {a}"), crate::shell::DownloadState::Opened(a)),
+                        (None, w) => {
+                            let w = w.unwrap_or_default();
+                            (format!("not opened: {w}"), crate::shell::DownloadState::Failed(w))
+                        }
                     };
+                    s.download_done(id, state);
                     eprintln!("navigator-ui: download {note}");
                     s.last_note = Some(note);
                 }
@@ -1029,7 +1066,22 @@ impl Live {
                     break;
                 }
             };
-            // The print sheet's own events first.
+            // The share sheet's events, then the print sheet's.
+            if let (Some(sh), Some(e)) = (self.sharing.as_mut(), self.embeds.clone()) {
+                if sh.owns(&ev) {
+                    if let Some(o) = sh.event(&e, &ev) {
+                        self.sharing = None;
+                        s.shared(match o {
+                            pergola::share::Outcome::Shared => "share: shared".into(),
+                            pergola::share::Outcome::NotShared => "share: not shared".into(),
+                            pergola::share::Outcome::Failed(why) => format!("share: failed: {why}"),
+                        });
+                    }
+                    changed = true;
+                    continue;
+                }
+            }
+            // The print sheet's own events.
             if let (Some(p), Some(e)) = (self.printing.as_mut(), self.embeds.clone()) {
                 match p.handle(&e, &ev) {
                     None => {}
@@ -1357,6 +1409,7 @@ impl Live {
                     let (w, h, m) = PRINT_FIRST;
                     self.ask_print(s, w, h, m, false);
                 }
+                Out::Share { url, title, press } => self.share(s, &url, &title, press),
                 Out::Jump { anchor } => {
                     if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
                         eprintln!("navigator-ui: jump to section #{anchor}");

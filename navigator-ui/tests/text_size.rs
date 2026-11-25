@@ -11,15 +11,20 @@ static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn the_toolbar_grows_with_the_text_size() {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let at = |milli| {
+    let at = |milli, w| {
         pergola::text::set_text_scale(milli);
-        let mut s = Shell::scene(Scene::Main, 1400.0, 900.0);
+        let mut s = Shell::scene(Scene::Main, w, 900.0);
         s.reading_open = true;
         s.geo()
     };
-    let one = at(1000);
-    let big = at(1500);
+    let one = at(1000, 2000.0);
+    let big = at(1500, 2000.0);
+    // At 1.5x a 1400 pt window is narrow for the bar: the pill keeps
+    // only its icon (§15.1), and grows with the text all the same.
+    let (one_narrow, big_narrow) = (at(1000, 1400.0), at(1500, 1400.0));
     pergola::text::set_text_scale(1000);
+    assert!(one_narrow.presence_label && !big_narrow.presence_label);
+    assert_eq!(big_narrow.presence.w(), shell::PRESENCE_ICON * 1.5);
     assert_eq!(shell::BAR * 1.5, big.page.y() - 1.0, "the bar is 1.5x as tall");
     assert_eq!(one.page.y(), shell::BAR + 1.0);
     assert_eq!((big.aa.w(), big.where_.h(), big.presence.h()), (one.aa.w() * 1.5, one.where_.h() * 1.5, one.presence.h() * 1.5));
