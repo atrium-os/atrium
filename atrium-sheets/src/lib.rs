@@ -11,6 +11,7 @@ pub mod condfmt;
 pub mod data;
 pub mod doc;
 pub mod files;
+pub mod fnhelp;
 pub mod format;
 pub mod lists;
 pub mod pivotpane;
