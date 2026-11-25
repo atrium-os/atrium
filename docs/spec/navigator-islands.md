@@ -3133,7 +3133,10 @@ worked. jaild logged no WARNs.
   - It is written whole: a fresh 0600 file, synced, then renamed. This is
     the same writer as the localStorage stores.
   - It is read again on every check, so another window of the same
-    persona sees a change at once.
+    persona sees a change at once, even when another navigatord serves
+    it. Each change holds an exclusive lock on the sibling file
+    `.live-origins.lock` from its read to its write, so a revoke in one
+    navigatord and a remember in another can't lose either.
   - A file that is too long, has too many lines, or has any line that is
     not exactly such an origin counts as empty. An unreadable list never
     runs anything unasked.
@@ -3151,13 +3154,24 @@ worked. jaild logged no WARNs.
     off the list.
   - A page that already runs live goes on running until Stop or until
     the person leaves it.
+- **What vouches for the choice.** frescod's press proves that the person
+  pressed an answer of the prompt. It doesn't prove which one: the UI's
+  word picks `remember`, as it does for every other answer. The UI is the
+  trusted side here; frescod does not bind the choice.
+- **What "Always" allows.** With an origin remembered, every top-level
+  page of that origin opened in a recorded trail runs live, with its
+  cookies and no press. That includes a page another page linked to or
+  sent the person to. This is the exception to "live needs a press"
+  (threat model §2): the person granted it for that origin, the chip
+  says Live code, and the chip takes it back.
 - **Left for later.** Listing and revoking from Curia waits for
   Navigator's Curia integration, which does not exist yet. Until then the
   chip is the only place to revoke.
 - **Tests.**
   - navigatord: `live_remembered` (kept across navigatords until
     forgotten, bounded with the oldest dropped, bad lists count as empty
-    with a positive control).
+    with a positive control, and eight writers at once lose no change,
+    which fails with the lock taken out).
   - navigator-ui: `a_site_chosen_always_runs_live_unasked_until_the_chip_asks_again`.
 
 #### Costs
