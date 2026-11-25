@@ -222,7 +222,14 @@ impl View for CodeGrid {
         let digits = b.len_lines().to_string().len().max(3);
         let cell = Node::measure_text("M", &self.style(theme.text_primary())).w.max(1.0);
         let line_h = (Node::measure_text("Mg", &self.style(theme.text_primary())).h * 1.15).round().max(1.0);
-        let m = Metrics { cell, line: line_h, gutter: if self.gutter { (digits as f32 + 2.0) * cell } else { 0.0 }, pad: 4.0 };
+        // The gutter, left to right: a column for the stopped arrow and a
+        // diagnostic mark, the number, and a column of its own for a
+        // breakpoint's dot, so neither covers a digit.
+        let (arrow_h, dot_d) = ((line_h * 0.5).max(4.0), line_h * 0.55);
+        let lead = (arrow_h + 4.0).max(cell);
+        let num_x = lead;
+        let dot_x = num_x + digits as f32 * cell + 4.0;
+        let m = Metrics { cell, line: line_h, gutter: if self.gutter { dot_x + dot_d + 4.0 } else { 0.0 }, pad: 4.0 };
         let (rows, cols) = (m.rows(r), m.cols(r));
         let text_x = r.x() + m.gutter + m.pad;
         let y_of = |row: usize| r.y() + m.pad + row as f32 * line_h;
@@ -266,13 +273,13 @@ impl View for CodeGrid {
                 let color = if line == primary_line { theme.text_secondary() } else { theme.text_tertiary() };
                 let st = self.style(color);
                 let sz = Node::measure_text(&n, &st);
-                ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(r.x() + cell, y, sz.w, sz.h), content: n, style: st });
+                ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(r.x() + num_x, y, sz.w, sz.h), content: n, style: st });
                 if let Some((_, sev)) = self.marks.iter().find(|(l, _)| *l == line) {
                     let c = match sev { 0 => theme.danger_fg(), 1 => theme.warning_fg(), _ => theme.info_fg() };
                     ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + 2.0, y + 2.0, 3.0, line_h - 4.0), fill: c, radius: 1.5 });
                 }
-                let d = (line_h * 0.55).min(m.gutter * 0.4);
-                let dot = Rect::new(r.x() + m.gutter - d - 3.0, y + (line_h - d) / 2.0, d, d);
+                let d = dot_d;
+                let dot = Rect::new(r.x() + dot_x, y + (line_h - d) / 2.0, d, d);
                 if self.off_breakpoints.contains(&line) {
                     // Off: a ring.
                     ctx.tree.insert(Some(bg), Node::Rect { rect: dot, fill: theme.danger_fg(), radius: d / 2.0 });
@@ -282,7 +289,7 @@ impl View for CodeGrid {
                 }
                 if self.stopped == Some(line) {
                     // Where it stopped: an arrow (a bar and a point) left of the number.
-                    let (ax, ah) = (r.x() + 2.0, (line_h * 0.5).max(4.0));
+                    let (ax, ah) = (r.x() + 2.0, arrow_h);
                     let ay = y + (line_h - ah) / 2.0;
                     ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(ax, ay + ah * 0.3, ah * 0.5, ah * 0.4), fill: theme.accent_fg(), radius: 0.0 });
                     for k in 0..4 {
@@ -490,5 +497,21 @@ mod tests {
         assert!(texts.iter().any(|t| t == "line 500"));
         assert!(!texts.iter().any(|t| t == "line 0" || t == "line 999"));
         assert!(texts.len() < 60, "a screenful, not the file: {}", texts.len());
+    }
+
+    #[test]
+    fn a_breakpoint_dot_and_the_stopped_arrow_leave_the_number_clear() {
+        let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let grid = CodeGrid::new(Mutable::new(CodeBuffer::new(&text)), Mutable::new(CodeView { top: 100, left: 0 }))
+            .rect(Rect::new(0.0, 0.0, 400.0, 200.0)).breakpoints(vec![105]).stopped(Some(105));
+        let (tree, _) = crate::view::render(&grid, Semantic::LIGHT);
+        let num = tree.iter().find_map(|(_, n)| match n { Node::Text { rect, content, .. } if content.trim() == "106" => Some(*rect), _ => None }).unwrap();
+        let red = Semantic::LIGHT.danger_fg();
+        let dot = tree.iter().find_map(|(_, n)| match n { Node::Rect { rect, fill, .. } if *fill == red => Some(*rect), _ => None }).unwrap();
+        assert!(dot.x() >= num.x() + num.w(), "the dot {dot:?} is right of the number {num:?}");
+        let arrow = Semantic::LIGHT.accent_fg();
+        let right = tree.iter().filter_map(|(_, n)| match n { Node::Rect { rect, fill, .. } if *fill == arrow => Some(rect.x() + rect.w()), _ => None })
+            .fold(0.0f32, f32::max);
+        assert!(right > 0.0 && right <= num.x(), "the arrow ends at {right}, before the number at {}", num.x());
     }
 }
