@@ -12,7 +12,7 @@ builds and runs on stock FreeBSD too (spec §4.1). Atrium-only parts will sit be
 | `pdl/` | packet grammars: `hci_packets.pdl` (Android's, Apache-2.0, see `pdl/NOTICE`), `gap.pdl` (ours) |
 | `vinculum-hci-proto/` | generated HCI and GAP parsers, H4 framing, btsnoop traces with key redaction |
 | `vinculum-host/` | the host core, sans-I/O: command flow, bring-up, LE scan/connect, connection bound, ACL credits, L2CAP reassembly |
-| `vinculum-hci/` | the transport: owns one controller (TCP, UART, USB), Realtek firmware loader, H4 relay, command allowlist, resets the controller when the host leaves; `--serve-tcp` dev bridge |
+| `vinculum-hci/` | the transport: owns one controller (TCP, UART, USB), Realtek firmware loader, H4 relay, command allowlist, resets the controller when the host leaves; `--serve-tcp` dev bridge (feature `dev-bridge`, never packaged) |
 | `firmware/` | how the development dongles get their controller firmware (nothing here ships) |
 | `vinculumd/` | the host daemon (B1: dev modes; service sockets from B2) |
 | `vinculum-probe/` | dev tool: drives a controller over H4/TCP and prints parsed traffic |

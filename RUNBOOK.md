@@ -5619,7 +5619,7 @@ Classic devices pair with `vinculum-ctl pair ADDR --classic`. `peer_hid_keyboard
 Real controllers (B1b, `vinculum/firmware/README.md` for the dongles' firmware):
 
 ```sh
-cd vinculum && cargo build -p vinculum-hci -p vinculum-probe   # needs libusb-1.0 on a dev host (brew install libusb)
+cd vinculum && cargo build -p vinculum-hci --features dev-bridge -p vinculum-probe   # needs libusb-1.0 on a dev host (brew install libusb)
 vinculum-hci --controller usb --host-listen hci.sock            # first USB controller (class E0/01/01); usb:2357:0604 picks the UB500
 vinculum-hci --controller usb:2357:0604 --firmware-dir DIR ...  # Realtek patch from DIR (rtl8761bu_fw.bin + _config.bin)
 vinculum-hci --controller usb --serve-tcp 127.0.0.1:6402        # dev bridge: the raw controller as H4 on loopback
@@ -5629,7 +5629,10 @@ vinculum-probe --tcp 127.0.0.1:6402 --scan 10                   # through the br
 A guest on QEMU's user network reaches the bridge as `10.0.2.2:6402`, so the VM's
 `vinculum-hci --controller tcp:10.0.2.2:6402` uses a dongle on the Mac without USB
 passthrough (full-speed passthrough has panicked the Mac before: ask first).
-`--serve-tcp` refuses any address that is not loopback.
+`--serve-tcp` refuses any address that is not loopback, and exists only in a build with
+the `dev-bridge` feature: any local uid reaching it drives the raw controller with no
+allowlist, so a package never enables it. `--host-listen` without `--host-uid` admits only
+vinculum-hci's own uid.
 
 ### 13.6c Navigator UI shell on frescod (`scripts/navigator-ui-vm.sh`)
 

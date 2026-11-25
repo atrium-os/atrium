@@ -14,6 +14,9 @@ libc = "0.2"
 # libusb-1.0 on a macOS/Linux development host. Off, only tcp: and uart: exist.
 default = ["usb"]
 usb = []
+# --serve-tcp, the development bridge: the raw controller with no allowlist
+# on loopback. Only for a dev host (RUNBOOK §13.6b); never in a package.
+dev-bridge = []
 
 [[bin]]
 name = "vinculum-hci"

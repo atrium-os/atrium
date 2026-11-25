@@ -106,12 +106,14 @@ const DEFAULT_FIRMWARE_DIR: &str = "/usr/local/share/atrium/firmware/bluetooth";
 /// new host anyway (the new host's own Reset then sorts it out).
 const RESET_WAIT_MS: u64 = 3000;
 
-/// Development bridge: serves the raw controller as H4 over TCP on a
+/// Development bridge (cargo feature `dev-bridge`, never in an installed
+/// build: any local uid reaching it drives the raw controller): serves the raw controller as H4 over TCP on a
 /// loopback address, so a stack elsewhere (vinculum-hci in a VM through
 /// QEMU's user network, which reaches the host's loopback as 10.0.2.2, or
 /// vinculum-probe on the host) can use a dongle plugged into this machine
 /// without USB passthrough. No allowlist here: the far side's vinculum-hci
 /// applies it. One client at a time; the controller is reset when it leaves.
+#[cfg(feature = "dev-bridge")]
 fn bridge(spec: &str, addr: &str, firmware_dir: &std::path::Path) -> ! {
     let die = |m: String| -> ! {
         eprintln!("vinculum-hci: {m}");
@@ -191,13 +193,13 @@ fn usage() -> ! {
 }
 
 /// The host on `s` is one we serve: its uid is in `uids` (vinculumd's,
-/// `_vinculum`), or with none given, any. A refused peer is logged and closed.
+/// `_vinculum`), or with none given, our own. A refused peer is logged and
+/// closed.
 fn peer_allowed(s: &UnixStream, uids: &[u32]) -> bool {
-    if uids.is_empty() {
-        return true;
-    }
     let uid = peer_uid(s);
-    if uid.is_some_and(|u| uids.contains(&u)) {
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    let own = unsafe { libc::getuid() };
+    if uid.is_some_and(|u| if uids.is_empty() { u == own } else { uids.contains(&u) }) {
         return true;
     }
     eprintln!("vinculum-hci: refused a host (uid {uid:?})");
@@ -244,8 +246,14 @@ fn main() {
             _ => usage(),
         }
     }
-    if let (Some(spec), Some(addr)) = (controller_spec.as_deref(), serve_tcp.as_deref()) {
-        bridge(spec, addr, &firmware_dir);
+    if let (Some(_spec), Some(_addr)) = (controller_spec.as_deref(), serve_tcp.as_deref()) {
+        #[cfg(feature = "dev-bridge")]
+        bridge(_spec, _addr, &firmware_dir);
+        #[cfg(not(feature = "dev-bridge"))]
+        {
+            eprintln!("vinculum-hci: --serve-tcp needs a development build (cargo feature dev-bridge)");
+            std::process::exit(2)
+        }
     }
     let Some(spec) = controller_spec else { usage() };
     let side = match (listen, connect) {
