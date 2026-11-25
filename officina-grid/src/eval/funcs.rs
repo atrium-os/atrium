@@ -18,6 +18,9 @@ use super::matrix::*;
 use super::complex::*;
 use super::mathx::*;
 use super::spread::*;
+use super::database::*;
+use super::textmore::*;
+use super::convert::convert;
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -516,6 +519,44 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("WORKDAY.INTL", 2, 4, workday_intl),
     f!("NETWORKDAYS.INTL", 2, 4, networkdays_intl),
     f!("TIMEVALUE", 1, 1, timevalue),
+    f!("DSUM", 3, 3, dsum),
+    f!("DAVERAGE", 3, 3, daverage),
+    f!("DCOUNT", 3, 3, dcount),
+    f!("DCOUNTA", 3, 3, dcounta),
+    f!("DGET", 3, 3, dget),
+    f!("DMAX", 3, 3, dmax),
+    f!("DMIN", 3, 3, dmin),
+    f!("DPRODUCT", 3, 3, dproduct),
+    f!("DSTDEV", 3, 3, dstdev),
+    f!("DSTDEVP", 3, 3, dstdevp),
+    f!("DVAR", 3, 3, dvar),
+    f!("DVARP", 3, 3, dvarp),
+    f!("REGEXTEST", 2, 3, regextest),
+    f!("REGEXEXTRACT", 2, 4, regexextract),
+    f!("REGEXREPLACE", 3, 5, regexreplace),
+    f!("ARRAYTOTEXT", 1, 2, arraytotext),
+    f!("VALUETOTEXT", 1, 2, valuetotext),
+    f!("ENCODEURL", 1, 1, encodeurl),
+    f!("ASC", 1, 1, asc),
+    f!("DBCS", 1, 1, dbcs),
+    f!("JIS", 1, 1, dbcs),
+    f!("FINDB", 2, 3, find),
+    f!("SEARCHB", 2, 3, search),
+    f!("LEFTB", 1, 2, left),
+    f!("RIGHTB", 1, 2, right),
+    f!("MIDB", 3, 3, mid),
+    f!("LENB", 1, 1, len),
+    f!("REPLACEB", 4, 4, replace),
+    f!("CONVERT", 3, 3, convert),
+    f!("BESSELI", 2, 2, besseli),
+    f!("BESSELJ", 2, 2, besselj),
+    f!("BESSELK", 2, 2, besselk),
+    f!("BESSELY", 2, 2, bessely),
+    f!("AMORLINC", 6, 7, amorlinc),
+    f!("AMORDEGRC", 6, 7, amordegrc),
+    f!("AREAS", 1, 1, areas),
+    f!("PERCENTOF", 2, 2, percentof),
+    f!("TRIMRANGE", 1, 3, trimrange),
 ];
 
 /// The id of a function by its upper-case name.

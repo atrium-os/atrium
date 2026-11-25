@@ -26,6 +26,9 @@ mod matrix;
 mod complex;
 mod mathx;
 mod spread;
+mod database;
+mod textmore;
+mod convert;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;

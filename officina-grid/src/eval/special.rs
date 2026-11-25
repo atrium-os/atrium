@@ -221,6 +221,131 @@ pub fn invert(f: &dyn Fn(f64) -> f64, target: f64, mut lo: f64, mut hi: f64) -> 
     Some(0.5 * (lo + hi))
 }
 
+// ---------- Bessel functions of integer order ----------
+
+/// Points one panel of composite Gauss–Legendre quadrature uses.
+const GL_POINTS: usize = 16;
+
+/// Gauss–Legendre nodes and weights on [−1, 1], found by Newton's method on
+/// the Legendre polynomial once.
+fn gauss_legendre() -> &'static [(f64, f64)] {
+    static NODES: std::sync::OnceLock<Vec<(f64, f64)>> = std::sync::OnceLock::new();
+    NODES.get_or_init(|| {
+        let n = GL_POINTS;
+        (0..n)
+            .map(|i| {
+                let mut x = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+                let mut dp = 1.0;
+                for _ in 0..100 {
+                    // P_n(x) and its derivative by the three-term recurrence.
+                    let (mut p0, mut p1) = (1.0, x);
+                    for k in 2..=n {
+                        let k = k as f64;
+                        (p0, p1) = (p1, ((2.0 * k - 1.0) * x * p1 - (k - 1.0) * p0) / k);
+                    }
+                    dp = n as f64 * (x * p1 - p0) / (x * x - 1.0);
+                    let dx = p1 / dp;
+                    x -= dx;
+                    if dx.abs() < 1e-16 {
+                        break;
+                    }
+                }
+                (x, 2.0 / ((1.0 - x * x) * dp * dp))
+            })
+            .collect()
+    })
+}
+
+/// ∫ f over [a, b] in `panels` equal panels of Gauss–Legendre.
+fn quad(f: &dyn Fn(f64) -> f64, a: f64, b: f64, panels: usize) -> f64 {
+    let h = (b - a) / panels as f64;
+    let nodes = gauss_legendre();
+    let mut sum = 0.0;
+    for p in 0..panels {
+        let mid = a + (p as f64 + 0.5) * h;
+        for &(x, w) in nodes {
+            sum += w * f(mid + 0.5 * h * x);
+        }
+    }
+    sum * 0.5 * h
+}
+
+/// Σ (±x²/4)^k / (k! (k+n)!) times (x/2)^n: J_n (alternating) or I_n.
+fn bessel_series(x: f64, n: u32, alternate: bool) -> f64 {
+    let q = x * x / 4.0 * if alternate { -1.0 } else { 1.0 };
+    let (mut term, mut sum) = (1.0f64, 1.0f64);
+    for k in 1..20_000u32 {
+        term *= q / (f64::from(k) * f64::from(k + n));
+        sum += term;
+        if term.abs() <= sum.abs() * 1e-17 {
+            break;
+        }
+    }
+    let lead = (f64::from(n) * (x.abs() / 2.0).ln() - ln_gamma(f64::from(n) + 1.0)).exp();
+    let sign = if x < 0.0 && n % 2 == 1 { -1.0 } else { 1.0 };
+    if x == 0.0 {
+        return if n == 0 { 1.0 } else { 0.0 };
+    }
+    sign * lead * sum
+}
+
+/// The largest |x| the Bessel functions take.
+pub const BESSEL_MAX_X: f64 = 1e5;
+
+/// J_n(x): the series for small x (or order large beside x), else
+/// (1/π)∫₀^π cos(nτ − x sin τ) dτ by the trapezoid rule, which converges
+/// geometrically on that periodic integrand.
+pub fn bessel_j(x: f64, n: u32) -> f64 {
+    let nf = f64::from(n);
+    if x.abs() <= 5.0 || nf > x * x / 4.0 {
+        return bessel_series(x, n, true);
+    }
+    let steps = (2.0 * (x.abs() + nf)) as usize + 64;
+    let h = std::f64::consts::PI / steps as f64;
+    let f = |t: f64| (nf * t - x * t.sin()).cos();
+    let mut sum = 0.5 * (f(0.0) + f(std::f64::consts::PI));
+    for k in 1..steps {
+        sum += f(k as f64 * h);
+    }
+    sum * h / std::f64::consts::PI
+}
+
+/// I_n(x) by its series, whose terms all have one sign.
+pub fn bessel_i(x: f64, n: u32) -> f64 {
+    bessel_series(x, n, false)
+}
+
+/// Where e^(−x cosh t + n t) has fallen below e^−745 beside its peak.
+fn tail_end(x: f64, n: f64, grow: fn(f64) -> f64) -> f64 {
+    let peak = if n > x { (n / x).acosh() } else { 0.0 };
+    let top = n * peak - x * grow(peak);
+    let mut t = peak + 1.0;
+    while t < 800.0 && n * t - x * grow(t) > top - 745.0 {
+        t += 1.0;
+    }
+    t
+}
+
+/// K_n(x), x > 0: ∫₀^∞ e^(−x cosh t) cosh(nt) dt.
+pub fn bessel_k(x: f64, n: u32) -> f64 {
+    let nf = f64::from(n);
+    let end = tail_end(x, nf, f64::cosh);
+    let f = |t: f64| (-x * t.cosh() + nf * t).exp() * 0.5 * (1.0 + (-2.0 * nf * t).exp());
+    quad(&f, 0.0, end, (end * 4.0).ceil() as usize)
+}
+
+/// Y_n(x), x > 0: (1/π)∫₀^π sin(x sin θ − nθ) dθ
+/// − (1/π)∫₀^∞ (e^(nt) + (−1)^n e^(−nt)) e^(−x sinh t) dt.
+pub fn bessel_y(x: f64, n: u32) -> f64 {
+    let nf = f64::from(n);
+    let pi = std::f64::consts::PI;
+    let first = quad(&|t: f64| (x * t.sin() - nf * t).sin(), 0.0, pi, (x + nf).ceil() as usize + 4);
+    let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+    let end = tail_end(x, nf, f64::sinh);
+    let second = quad(&|t: f64| (nf * t - x * t.sinh()).exp() + sign * (-nf * t - x * t.sinh()).exp(), 0.0, end, (end * 4.0).ceil() as usize);
+    (first - second) / pi
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +365,13 @@ mod tests {
         assert!(close(norm_cdf(-1.0), 0.158_655_253_931_457_05, 1e-14));
         assert!(close(gamma_p(3.0, 2.0), 0.323_323_583_816_936_5, 1e-14));
         assert!(close(beta_i(0.4, 2.0, 3.0), 0.5248, 1e-13));
+        assert!(close(bessel_j(1.9, 2), 0.329_925_727_692_387_15, 1e-12));
+        assert!(close(bessel_j(30.0, 3), 0.129_211_228_759_725, 1e-10));
+        assert!(close(bessel_i(1.5, 1), 0.981_666_428_577_907_8, 1e-13));
+        assert!(close(bessel_k(1.5, 1), 0.277_387_800_456_843_8, 1e-12));
+        assert!(close(bessel_y(2.5, 1), 0.145_918_137_966_785_8, 1e-12));
+        assert!(close(bessel_y(0.1, 10), -1.183_133_513_204_519_7e18, 1e-10));
+        assert!(close(bessel_k(0.01, 0), 4.721_244_730_161_095, 1e-12));
         let x = invert(&norm_cdf, 0.975, -40.0, 40.0).unwrap();
         assert!(close(x, 1.959_963_984_540_054, 1e-12));
     }

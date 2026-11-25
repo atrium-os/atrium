@@ -285,3 +285,27 @@ pub(super) fn ceiling_precise(c: &Ctx, a: &[Expr]) -> Ev {
 pub(super) fn floor_precise(c: &Ctx, a: &[Expr]) -> Ev {
     precise(c, a, false)
 }
+
+// ---------- Bessel functions ----------
+
+/// BESSELJ, BESSELI, BESSELK and BESSELY(x, n): n truncated and at least 0;
+/// K and Y need x > 0.
+fn bessel(c: &Ctx, a: &[Expr], f: fn(f64, u32) -> f64, positive: bool) -> Ev {
+    let (x, order) = (tri!(num(c, &a[0])), tri!(num(c, &a[1])).trunc());
+    if order < 0.0 || order > 1e4 || x.abs() > super::special::BESSEL_MAX_X || (positive && x <= 0.0) {
+        return e(ErrorKind::Num);
+    }
+    n(f(x, order as u32))
+}
+pub(super) fn besselj(c: &Ctx, a: &[Expr]) -> Ev {
+    bessel(c, a, super::special::bessel_j, false)
+}
+pub(super) fn besseli(c: &Ctx, a: &[Expr]) -> Ev {
+    bessel(c, a, super::special::bessel_i, false)
+}
+pub(super) fn besselk(c: &Ctx, a: &[Expr]) -> Ev {
+    bessel(c, a, super::special::bessel_k, true)
+}
+pub(super) fn bessely(c: &Ctx, a: &[Expr]) -> Ev {
+    bessel(c, a, super::special::bessel_y, true)
+}
