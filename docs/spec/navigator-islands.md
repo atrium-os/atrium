@@ -3767,6 +3767,26 @@ against the pinned Ladybird, and the engine passes the JIT audit.
 4. One quota: after the IndexedDB gate's Fill 30 MiB, a 30 MiB
    `cache.put` fails with `QuotaExceededError`.
 
+**Gate results on arm64 Tessera, 2026-11-25.** The engine was
+`c44e3525…`, built with `live-cache.patch` (79e70be73) and passing the JIT
+audit, and navigatord was at 06172658e. jaild logged no WARNs, and
+evidence is in `~/atrium-vm/evidence/navigator-i6-7-cache-20261125/` on
+the Mac.
+
+1. Passed: 1 cached, then 2 after Stop and a new live run, then 3 after a
+   navigatord restart.
+2. Passed: an Unrecorded trail read 1 cached and wrote no file.
+3. Passed: `live-idb/app.example.cache-log` was 0600, owned by the
+   Navigator's uid for the person, and `app.example.idb-log` held only its
+   header.
+4. Passed. After Fill 30 MiB, a 30 MiB `cache.put` (a button on a copy of
+   the fixture) failed with `QuotaExceededError`, and navigatord logged
+   "over the site's storage quota".
+
+The next live run after the Fill died loading the page. The fixture's
+`show()` still sets each IndexedDB item as text, so the 30 MiB array
+becomes one text node of about 2.2 GB. It needs the "N bytes" form.
+
 #### I6.8 as built (2026-11-25): a new window on a real press
 
 Host-tested (limen, navigatord); frescod's part cross-checked for arm64
@@ -3785,7 +3805,10 @@ every real press and records when one last reached each window
   window. Spends are bounded as presses are (4096; stale ones go first,
   and when all are fresh it refuses rather than forgets one). A click
   injected without a token (no `FRESCOD_INJECT_ACTIVATION`) records no
-  press, so it proves nothing either.
+  press, so it proves nothing either. Neither does a key repeat (no
+  token), Escape or a modifier alone (a token, but no press: HTML's
+  activation-triggering input leaves them out). Enter and other keys
+  count, so a link works from the keyboard.
 - **Limen**: `op::SPEND_PRESS` (`SpendPress { embed }`): the embed's own
   parent only (`NOT_YOURS` otherwise), a bound web island only, and a
   press on the island's window, not the parent's chrome, within

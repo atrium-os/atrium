@@ -1234,6 +1234,9 @@ fn spend_press(shared: &Arc<Shared>, conn: ConnId, p: proto::SpendPress) -> Resu
         Some(w) if e.island.is_some() && e.bound => w,
         _ => return Err(Reply::Refused { reason: refusal::NO_PRESS }),
     };
+    // Not held across frescod's answer: a slow frescod must not stall
+    // every other connection. An island gone meanwhile costs one press.
+    drop(st);
     // Only a press in the island itself: one on the parent's own chrome
     // is not the page's.
     if shared.compositor.lock().unwrap().spend_press(child_w, catalogue::ISLAND_PRESS_MS) {
