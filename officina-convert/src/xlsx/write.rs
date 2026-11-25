@@ -26,7 +26,7 @@ const MAX_EXTRA: usize = 4_000_000;
 /// Functions newer than Excel 2007 carry a prefix in files.
 const FUTURE: &[&str] = &[
     "FORMULATEXT",
-    "XLOOKUP", "XMATCH", "IFS", "SWITCH", "MAXIFS", "MINIFS", "CONCAT", "TEXTJOIN", "TEXTAFTER", "IFNA", "STDEV.S", "STDEV.P", "VAR.S", "VAR.P", "CEILING.MATH", "FLOOR.MATH", "DAYS", "ISOWEEKNUM", "SEQUENCE", "SORTBY", "UNIQUE", "LET", "XOR", "IFERROR.X", "RANDARRAY", "TRANSPOSE.X", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "LAMBDA", "MAP", "REDUCE", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "ISOMITTED", "UNICHAR", "UNICODE",
+    "XLOOKUP", "XMATCH", "IFS", "SWITCH", "MAXIFS", "MINIFS", "CONCAT", "TEXTJOIN", "TEXTAFTER", "IFNA", "STDEV.S", "STDEV.P", "VAR.S", "VAR.P", "CEILING.MATH", "FLOOR.MATH", "DAYS", "ISOWEEKNUM", "SEQUENCE", "SORTBY", "UNIQUE", "LET", "XOR", "IFERROR.X", "RANDARRAY", "TRANSPOSE.X", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "LAMBDA", "MAP", "REDUCE", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "ISOMITTED", "UNICHAR", "UNICODE", "RANK.EQ", "RANK.AVG", "PERCENTILE.INC", "PERCENTILE.EXC", "QUARTILE.INC", "QUARTILE.EXC", "MODE.SNGL",
 ];
 
 /// Newer still: in the worksheet-function namespace too (`_xlfn._xlws.FILTER`).
@@ -1033,6 +1033,7 @@ mod tests {
     fn future_functions_get_their_prefix() {
         assert_eq!(formula_out("=XLOOKUP(A1,B:B,C:C)+SUM(A1)"), "_xlfn.XLOOKUP(A1,B:B,C:C)+SUM(A1)");
         assert_eq!(formula_out("=UNICHAR(65)&CEILING.MATH(A1)&CEILING(A1,1)&ISOWEEKNUM(A1)"), "_xlfn.UNICHAR(65)&_xlfn.CEILING.MATH(A1)&CEILING(A1,1)&_xlfn.ISOWEEKNUM(A1)");
+        assert_eq!(formula_out("=RANK.EQ(1,A:A)+RANK(1,A:A)+MAXIFS(A:A,B:B,1)+PERCENTILE.INC(A:A,0.5)"), "_xlfn.RANK.EQ(1,A:A)+RANK(1,A:A)+_xlfn.MAXIFS(A:A,B:B,1)+_xlfn.PERCENTILE.INC(A:A,0.5)");
         assert_eq!(formula_out("=\"IFS(\"&IFS(A1,1)"), "\"IFS(\"&_xlfn.IFS(A1,1)");
         assert_eq!(formula_out("='IFS(x'!A1"), "'IFS(x'!A1");
         assert_eq!(formula_out("=MYIFS(1)"), "MYIFS(1)");

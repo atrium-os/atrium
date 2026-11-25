@@ -365,6 +365,56 @@ const CASES: &[(&str, &str)] = &[
     ("=T(19)", ""),
     ("=SUM(EVEN(A1:A3))", "8"),
     ("=SUM(--ISODD(A1:A5))", "3"),
+    // third batch (§16.133), from Microsoft's function pages
+    ("=MAXIFS(A1:A5,B1:B5,\"apple*\")", "4"),
+    ("=MINIFS(A1:A5,B1:B5,\"apple*\")", "1"),
+    ("=MAXIFS(A1:A5,B1:B5,\"zzz\")", "0"),
+    ("=MAXIFS(A1:A5,A1:A5,\">2\")", "5"),
+    ("=MINIFS(A1:A5,A1:A5,\">2\")", "3"),
+    ("=MAXIFS(A1:A5,B1:B5,\"date\")", "5"),
+    ("=MINIFS(A1:A5,B1:B5,\"date\",A1:A5,\"<3\")", "0"),
+    ("=MAXIFS(A1:A5,B1:B3,\"apple\")", "#VALUE!"),
+    ("=RANK(3,A1:A5)", "3"),
+    ("=RANK(3,A1:A5,1)", "3"),
+    ("=RANK.EQ(5,A1:A5)", "1"),
+    ("=RANK(7,A1:A5)", "#N/A"),
+    ("=RANK.AVG(2,A1:A5,1)", "2"),
+    ("=PERCENTILE.INC(A1:A5,0.3)", "2.2"),
+    ("=PERCENTILE({1,3,2,4},0.3)", "1.9"),
+    ("=PERCENTILE.EXC({1,2,3,6,6,6,7,8,9},0.25)", "2.5"),
+    ("=PERCENTILE.EXC({1,2,3,6,6,6,7,8,9},0)", "#NUM!"),
+    ("=PERCENTILE.EXC({1,2,3,6,6,6,7,8,9},0.01)", "#NUM!"),
+    ("=PERCENTILE(A1:A5,1.5)", "#NUM!"),
+    ("=QUARTILE({1,2,4,7,8,9,10,12},1)", "3.5"),
+    ("=QUARTILE.EXC({6,7,15,36,39,40,41,42,43,47,49},1)", "15"),
+    ("=QUARTILE.EXC({6,7,15,36,39,40,41,42,43,47,49},3)", "43"),
+    ("=QUARTILE.INC(A1:A5,4)", "5"),
+    ("=MODE({5.6,4,4,3,2,4})", "4"),
+    ("=MODE.SNGL(1,2,2,3,3)", "2"),
+    ("=MODE({1,2,3})", "#N/A"),
+    ("=XMATCH(4,A1:A5)", "4"),
+    ("=XMATCH(4.5,A1:A5,1)", "5"),
+    ("=XMATCH(4.5,A1:A5,-1)", "4"),
+    ("=XMATCH(\"app*\",B1:B5,2)", "1"),
+    ("=XMATCH(\"APPLE\",B1:B5,0,-1)", "1"),
+    ("=XMATCH(9,A1:A5)", "#N/A"),
+    ("=XMATCH(1,A1:A5,0,0)", "#VALUE!"),
+    ("=ROUND(PMT(0.08/12,10,10000),2)", "-1037.03"),
+    ("=PMT(0,10,1000)", "-100"),
+    ("=ROUND(FV(0.06/12,10,-200,-500,1),2)", "2581.4"),
+    ("=ROUND(PV(0.08/12,12*20,500,,0),2)", "-59777.15"),
+    ("=ROUND(NPER(0.12/12,-100,-1000,10000,1),0)", "60"),
+    ("=ROUND(RATE(4*12,-200,8000),4)", "0.0077"),
+    ("=ROUND(NPV(0.1,-10000,3000,4200,6800),2)", "1188.44"),
+    ("=NPV(-1,1)", "#DIV/0!"),
+    ("=ROUND(IPMT(0.1/12,1,3*12,8000),2)", "-66.67"),
+    ("=ROUND(IPMT(0.1,3,3,8000),2)", "-292.45"),
+    ("=ROUND(PPMT(0.1/12,1,2*12,2000),2)", "-75.62"),
+    ("=IPMT(0.1,4,3,8000)", "#NUM!"),
+    ("=ROUND(IRR({-70000,12000,15000,18000,21000,26000}),4)", "0.0866"),
+    ("=ROUND(IRR({-70000,12000,15000,18000,21000}),4)", "-0.0212"),
+    ("=ROUND(IRR({-70000,12000,15000},-0.1),4)", "-0.4435"),
+    ("=IRR({1,2})", "#NUM!"),
 ];
 
 #[test]
@@ -397,6 +447,34 @@ fn print_parse_round_trip() {
         let moved = officina_grid::formula::to_a1(&e, 50, 30, &|s| wb.sheet_name(s));
         if !moved.contains("#REF!") {
             assert_eq!(wb.parse(&moved, 0, 50, 30).unwrap(), e, "{f} moved as {moved}");
+        }
+    }
+}
+
+/// MAXIFS and MINIFS on equal-criteria keys, called often enough that the
+/// ranges are indexed: the index keeps each key's largest and smallest.
+#[test]
+fn maxifs_and_minifs_agree_with_and_without_the_index() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("S").unwrap();
+    for (r, (k, x)) in [("a", 5.0), ("b", -2.0), ("a", 9.0), ("b", 7.0), ("c", 1.0), ("a", -4.0)].iter().enumerate() {
+        wb.set_input(CellAddr::new(0, r as u32, 0), k).unwrap();
+        wb.set_input(CellAddr::new(0, r as u32, 1), &x.to_string()).unwrap();
+    }
+    let want = [("a", "9", "-4"), ("b", "7", "-2"), ("c", "1", "1"), ("d", "0", "0")];
+    for round in 0..3 {
+        for (i, (k, _, _)) in want.iter().enumerate() {
+            let r = 10 + (round * 8 + i * 2) as u32;
+            wb.set_input(CellAddr::new(0, r, 3), &format!("=MAXIFS($B$1:$B$6,$A$1:$A$6,\"{k}\")")).unwrap();
+            wb.set_input(CellAddr::new(0, r + 1, 3), &format!("=MINIFS($B$1:$B$6,$A$1:$A$6,\"{k}\")")).unwrap();
+        }
+    }
+    wb.recalc();
+    for round in 0..3 {
+        for (i, (k, max, min)) in want.iter().enumerate() {
+            let r = 10 + (round * 8 + i * 2) as u32;
+            assert_eq!(wb.get(CellAddr::new(0, r, 3)).display(), *max, "MAXIFS {k}, round {round}");
+            assert_eq!(wb.get(CellAddr::new(0, r + 1, 3)).display(), *min, "MINIFS {k}, round {round}");
         }
     }
 }

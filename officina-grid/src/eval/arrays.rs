@@ -115,6 +115,23 @@ const LIFT: &[(&str, u32)] = &[
     ("NETWORKDAYS", 0b11), // holidays are a set, not lifted
     ("WORKDAY", 0b11),
     ("SWITCH", 1),
+    ("RANK", 1),
+    ("RANK.EQ", 1),
+    ("RANK.AVG", 1),
+    ("PERCENTILE", 0b10),
+    ("PERCENTILE.INC", 0b10),
+    ("PERCENTILE.EXC", 0b10),
+    ("QUARTILE", 0b10),
+    ("QUARTILE.INC", 0b10),
+    ("QUARTILE.EXC", 0b10),
+    ("XMATCH", 1),
+    ("PMT", ALL),
+    ("IPMT", ALL),
+    ("PPMT", ALL),
+    ("FV", ALL),
+    ("PV", ALL),
+    ("NPER", ALL),
+    ("RATE", ALL),
 ];
 
 /// Functions whose result may be an array whatever their arguments.

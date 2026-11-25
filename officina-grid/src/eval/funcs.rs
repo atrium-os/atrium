@@ -6,6 +6,7 @@ use super::criteria::{Criterion, Key};
 use super::ifcache;
 use super::arrays::*;
 use super::more::*;
+use super::fin::*;
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -218,6 +219,30 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("ISODD", 1, 1, isodd),
     f!("N", 1, 1, n_fn),
     f!("T", 1, 1, t_fn),
+    // the third batch (more.rs, fin.rs)
+    f!("MAXIFS", 3, N, maxifs),
+    f!("MINIFS", 3, N, minifs),
+    f!("RANK", 2, 3, rank_eq),
+    f!("RANK.EQ", 2, 3, rank_eq),
+    f!("RANK.AVG", 2, 3, rank_avg),
+    f!("PERCENTILE", 2, 2, percentile_inc),
+    f!("PERCENTILE.INC", 2, 2, percentile_inc),
+    f!("PERCENTILE.EXC", 2, 2, percentile_exc),
+    f!("QUARTILE", 2, 2, quartile_inc),
+    f!("QUARTILE.INC", 2, 2, quartile_inc),
+    f!("QUARTILE.EXC", 2, 2, quartile_exc),
+    f!("MODE", 1, N, mode_sngl),
+    f!("MODE.SNGL", 1, N, mode_sngl),
+    f!("XMATCH", 2, 4, xmatch),
+    f!("PMT", 3, 5, pmt),
+    f!("IPMT", 4, 6, ipmt),
+    f!("PPMT", 4, 6, ppmt),
+    f!("FV", 3, 5, fv),
+    f!("PV", 3, 5, pv),
+    f!("NPER", 3, 5, nper),
+    f!("RATE", 3, 6, rate),
+    f!("NPV", 2, N, npv),
+    f!("IRR", 1, 2, irr),
 ];
 
 /// The id of a function by its upper-case name.
@@ -604,7 +629,7 @@ fn sumproduct(c: &Ctx, a: &[Expr]) -> Ev {
     n(s)
 }
 
-fn rect_arg(c: &Ctx, a: &Expr) -> Result<Rect, ErrorKind> {
+pub(super) fn rect_arg(c: &Ctx, a: &Expr) -> Result<Rect, ErrorKind> {
     match c.eval(a) {
         Ev::R(r) => Ok(r),
         Ev::V(Value::Err(k)) => Err(k),
@@ -680,6 +705,23 @@ fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr]) -> Result<i
 
 /// Counts and totals only the rows that pass every criterion.
 fn matching(c: &Ctx, value_range: Option<Rect>, crits: &[(Rect, Criterion)]) -> Result<ifcache::Agg, ErrorKind> {
+    matching_with(c, value_range, crits, false)
+}
+
+/// MAXIFS and MINIFS: the matching cells' largest and smallest numbers, so
+/// not from the sorted index, which keeps only running totals.
+pub(super) fn matching_extremes(c: &Ctx, value_range: Rect, pairs_args: &[Expr]) -> Result<ifcache::Agg, ErrorKind> {
+    let mut crits = Vec::new();
+    for p in pairs_args.chunks(2) {
+        if p.len() < 2 {
+            return Err(ErrorKind::Value);
+        }
+        crits.push((rect_arg(c, &p[0])?, Criterion::new(&c.scalar(&p[1]))));
+    }
+    matching_with(c, Some(value_range), &crits, true)
+}
+
+fn matching_with(c: &Ctx, value_range: Option<Rect>, crits: &[(Rect, Criterion)], extremes: bool) -> Result<ifcache::Agg, ErrorKind> {
     let (first, fc) = &crits[0];
     if crits.iter().any(|(r, _)| r.rows() != first.rows() || r.cols() != first.cols()) {
         return Err(ErrorKind::Value);
@@ -715,8 +757,10 @@ fn matching(c: &Ctx, value_range: Option<Rect>, crits: &[(Rect, Criterion)]) -> 
         });
         if let Some(agg) = built { return Ok(agg); }
     }
-    if let Some(a) = sorted_if(c, value_range, crits, value_range.is_some()) {
-        return Ok(a);
+    if !extremes {
+        if let Some(a) = sorted_if(c, value_range, crits, value_range.is_some()) {
+            return Ok(a);
+        }
     }
     let with_empty = fc.matches_empty();
     let mut agg = ifcache::Agg::default();
@@ -1627,20 +1671,18 @@ fn hlookup(c: &Ctx, a: &[Expr]) -> Ev {
     vhlookup(c, a, false)
 }
 
-fn xlookup(c: &Ctx, a: &[Expr]) -> Ev {
-    let key = c.scalar(&a[0]);
-    if let Value::Err(k) = key {
-        return e(k);
+/// XLOOKUP's and XMATCH's search: the position of `key` in `look` by
+/// match mode (0 exact, -1 or next smaller, 1 or next larger, 2 wildcards)
+/// and search mode (1 first to last, -1 last to first; the binary modes
+/// 2 and -2 search the same way, as their results agree on sorted data).
+fn xfind(c: &Ctx, look: &Vector, key: &Value, mode: i32, search: i32) -> Result<Option<u32>, ErrorKind> {
+    if !matches!(search, 1 | -1 | 2 | -2) {
+        return Err(ErrorKind::Value);
     }
-    let lv = c.eval(&a[1]);
-    let look = tri!(Vector::from(c, lv.clone()));
-    let ret = c.eval(&a[2]);
-    let mode = tri!(opt_num(c, a, 4, 0.0)) as i32;
-    let search = tri!(opt_num(c, a, 5, 1.0)) as i32;
-    let reverse = search == -1;
-    let hit = match mode {
-        0 => find_exact(c, &look, &key, false, reverse),
-        2 => find_exact(c, &look, &key, true, reverse),
+    let reverse = search == -1 || search == -2;
+    Ok(match mode {
+        0 => find_exact(c, look, key, false, reverse),
+        2 => find_exact(c, look, key, true, reverse),
         -1 | 1 => {
             // Exact, else the next smaller (-1) or next larger (1), by a scan.
             let mut best: Option<(u32, Value)> = None;
@@ -1648,10 +1690,10 @@ fn xlookup(c: &Ctx, a: &[Expr]) -> Ev {
             let mut exact = None;
             for i in it {
                 let x = look.get(c, i);
-                if x.is_empty() || std::mem::discriminant(&x) != std::mem::discriminant(&key) {
+                if x.is_empty() || std::mem::discriminant(&x) != std::mem::discriminant(key) {
                     continue;
                 }
-                let o = compare(&x, &key);
+                let o = compare(&x, key);
                 if o == Ordering::Equal {
                     exact = Some(i);
                     break;
@@ -1668,8 +1710,35 @@ fn xlookup(c: &Ctx, a: &[Expr]) -> Ev {
             }
             exact.or(best.map(|b| b.0))
         }
-        _ => return e(ErrorKind::Value),
-    };
+        _ => return Err(ErrorKind::Value),
+    })
+}
+
+fn xmatch(c: &Ctx, a: &[Expr]) -> Ev {
+    let key = c.scalar(&a[0]);
+    if let Value::Err(k) = key {
+        return e(k);
+    }
+    let look = tri!(Vector::from(c, c.eval(&a[1])));
+    let mode = tri!(opt_num(c, a, 2, 0.0)) as i32;
+    let search = tri!(opt_num(c, a, 3, 1.0)) as i32;
+    match tri!(xfind(c, &look, &key, mode, search)) {
+        Some(i) => n(f64::from(i) + 1.0),
+        None => e(ErrorKind::NA),
+    }
+}
+
+fn xlookup(c: &Ctx, a: &[Expr]) -> Ev {
+    let key = c.scalar(&a[0]);
+    if let Value::Err(k) = key {
+        return e(k);
+    }
+    let lv = c.eval(&a[1]);
+    let look = tri!(Vector::from(c, lv.clone()));
+    let ret = c.eval(&a[2]);
+    let mode = tri!(opt_num(c, a, 4, 0.0)) as i32;
+    let search = tri!(opt_num(c, a, 5, 1.0)) as i32;
+    let hit = tri!(xfind(c, &look, &key, mode, search));
     match hit {
         Some(i) => match ret {
             Ev::R(r) => {
