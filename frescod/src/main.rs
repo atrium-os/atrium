@@ -1687,7 +1687,7 @@ fn render_one_frame(
         let at = rects.iter().position(|(l, _)| *l == id)?;
         let r = rects[at].1;
         let covers = rects[at + 1..].iter().map(|(_, rect)| *rect).collect();
-        let covered = fresco_scene_server::window::island_covered(rects.iter().map(|&(l, r)| (l as u16, r)), id as u16);
+        let covered = comp.lock().unwrap().island_covered_in(rects.iter().map(|&(l, r)| (l as u16, r)), id as u16);
         let can_stop = comp.lock().unwrap().windows.get(&(id as u16)).is_some_and(|w| w.island_stop.is_some());
         Some(chrome::Island { rect: r, covered, covers, can_stop, origin })
     };

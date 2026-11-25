@@ -3060,7 +3060,10 @@ engine change:
   for another island in the UI's window at `z` 2, over the page's island,
   places it at the page's place plus the frame's, cut to the page area
   (`frame_rect`), hides it while none of it shows, and moves it with the
-  page. Limits: 4 frames at once, 16 frame engines over a run, nothing
+  page. frescod's rule that a covered island takes no input leaves out
+  another island of the same parent lying wholly inside it
+  (`island_covered_in`), so the page keeps its clicks and keys outside the
+  frame and the frame takes its own. Limits: 4 frames at once, 16 frame engines over a run, nothing
   smaller than 16 × 16 pixels (a tracking pixel is not started), 64
   reports waiting.
 - **Its own engine.** The same engine, served by `serve` with the frame's
