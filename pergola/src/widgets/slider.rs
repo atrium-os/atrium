@@ -72,7 +72,9 @@ pub fn snap(v: f64, min: f64, max: f64, step: f64) -> f64 {
 }
 
 impl View for Slider {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let r = Rect::new(self.rect.x(), self.rect.y(), self.rect.w(), em(THUMB));
         let span = (self.max - self.min).abs().max(f64::EPSILON);
@@ -174,6 +176,7 @@ mod tests {
 
     struct One(Slider);
     impl View for One {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) { self.0.render(ctx) }
     }
 
@@ -208,7 +211,9 @@ mod tests {
     /// corner: a press still lands where the pointer is on the track.
     struct Nested(Mutable<f64>, Mutable<crate::widgets::ScrollState>);
     impl View for Nested {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let v = self.0.clone();
             let body = crate::view::Draw(move |ctx: &mut Ctx| {
                 let g = ctx.push(Node::stack(crate::geom::Axis::Vertical, Rect::new(0.0, 0.0, 400.0, 600.0), 0.0));

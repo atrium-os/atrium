@@ -454,3 +454,33 @@ fn an_event_stream_comes_one_event_at_a_time_masked() {
     let f = arca_courier::send::read_frame(&mut &out[..]).unwrap().unwrap();
     assert!(matches!(Response::decode(&f).unwrap(), Response::Http { status: 401, .. }));
 }
+
+#[test]
+fn an_origin_is_sent_only_as_a_plain_https_origin() {
+    let p = pki(&["api.app.example"]);
+    let (at, seen) = serve(&p, "api.app.example", Arc::new(|_: &[u8]| http("200 OK", &["Access-Control-Allow-Origin: https://app.example"], b"{}")));
+    let net = Net { map: HashMap::from([("api.app.example".into(), at)]), lookups: Default::default() };
+    let mut c = Courier::new(ep("api.app.example"), &net, tls(&p), LOOPBACK);
+    let mut v = vault();
+    let mut req = get_with_bearer("/status");
+    req.slots.clear();
+    req.headers.push((Header::Origin, b"https://app.example".to_vec()));
+    let r = c.handle(&req.encode(), &mut v);
+    let Response::Http { headers, .. } = r else { panic!("{r:?}") };
+    let sent = String::from_utf8(seen.lock().unwrap()[0].clone()).unwrap();
+    assert!(sent.contains("\r\nOrigin: https://app.example\r\n"), "{sent}");
+    assert!(headers.iter().any(|(k, v)| k == "access-control-allow-origin" && v == "https://app.example"), "{headers:?}");
+    for bad in [&b"http://app.example"[..], b"https://App.example", b"https://app.example/", b"https://app.example:0",
+                b"https://app.example:65536", b"https://", b"null", b"https://app.example, https://evil.example", b"https://.example"] {
+        let mut req = get_with_bearer("/status");
+        req.slots.clear();
+        req.headers.push((Header::Origin, bad.to_vec()));
+        assert!(Request::decode(&req.encode()).is_err(), "{}", String::from_utf8_lossy(bad));
+        assert_eq!(c.handle(&req.encode(), &mut v), Response::Refused(Refusal::Malformed));
+    }
+    for good in [&b"https://app.example:8443"[..], b"https://10.0.0.1"] {
+        let mut req = get_with_bearer("/status");
+        req.headers.push((Header::Origin, good.to_vec()));
+        assert!(Request::decode(&req.encode()).is_ok(), "{}", String::from_utf8_lossy(good));
+    }
+}

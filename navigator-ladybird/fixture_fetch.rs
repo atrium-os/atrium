@@ -212,6 +212,13 @@ unsafe fn fixture_request(
 /// site. Requests are numbered on from the page's; one at a time.
 static LIVE_NEXT: Mutex<u32> = Mutex::new(1);
 
+thread_local! {
+    /// The CORS answer navigatord passed with the last live exchange on
+    /// this thread (I6.5): `Access-Control-Allow-Origin` and whether
+    /// credentials are allowed. Taken by [`navigator_live_cors`].
+    static LIVE_CORS: std::cell::RefCell<Option<(String, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
 /// One whole GET on the channel: (status, final URL, content type, length)
 /// with the body in `out`. `None` on a refusal, a failure, or anything out
 /// of shape (a body over `out`, data out of order, a second head).
@@ -235,6 +242,7 @@ fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wa
     };
     open.limits.max_bytes = out.len() as u64;
     open.retry.max_attempts = 0;
+    LIVE_CORS.with(|c| c.borrow_mut().take());
     client.open(open).ok()?;
     let until = Instant::now() + wait;
     let mut head = None;
@@ -245,6 +253,14 @@ fn live_exchange_with(url: &str, post: Option<(&str, &[u8])>, out: &mut [u8], wa
                 if got == id && head.is_none() && n <= out.len() as u64 =>
             {
                 head = Some((status, final_url, content_type, n as usize));
+            }
+            // Once, after the head and before the body.
+            Ok(Some(Event::Cors { id: got, allow_origin, allow_credentials }))
+                if got == id && head.is_some() && used == 0 && LIVE_CORS.with(|c| c.borrow().is_none()) =>
+            {
+                if nuntius::cors_origin(&allow_origin) {
+                    LIVE_CORS.with(|c| *c.borrow_mut() = Some((allow_origin, allow_credentials)));
+                }
             }
             Ok(Some(Event::Data { id: got, offset, bytes }))
                 if got == id && offset == used as u64 && head.as_ref().is_some_and(|h| bytes.len() <= h.3 - used) =>
@@ -307,6 +323,27 @@ pub unsafe extern "C" fn navigator_live_get(
         *kind_len = content_type.len();
     }
     n as isize
+}
+
+/// The CORS answer of the last [`navigator_live_get`] or
+/// [`navigator_live_post`] on this thread (I6.5), taken once: the
+/// `Access-Control-Allow-Origin` value in `out` (its length returned) and
+/// `credentials` set when `Access-Control-Allow-Credentials: true` came
+/// with it. -1: none, so the engine's own CORS check fails as it should.
+/// # Safety
+/// `out` is writable for `cap` bytes and `credentials` for one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_cors(out: *mut u8, cap: usize, credentials: *mut bool) -> isize {
+    if out.is_null() || credentials.is_null() { return -1; }
+    let Some((origin, allowed)) = LIVE_CORS.with(|c| c.borrow_mut().take()) else { return -1 };
+    if origin.len() > cap { return -1; }
+    // SAFETY: the caller passes `out` writable for `cap` bytes, and
+    // `credentials` writable; `origin` fits.
+    unsafe {
+        std::ptr::copy_nonoverlapping(origin.as_ptr(), out, origin.len());
+        *credentials = allowed;
+    }
+    origin.len() as isize
 }
 
 /// A script's POST (I6.3): `body` as `content_type` to `url`, which

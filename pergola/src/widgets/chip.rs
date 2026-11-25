@@ -74,7 +74,9 @@ impl<C: View> Chip<C> {
 }
 
 impl<C: View> View for Chip<C> {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let (x, y) = self.at.unwrap_or((0.0, 0.0));
 
@@ -162,7 +164,9 @@ impl<C: View> ListRow<C> {
 }
 
 impl<C: View> View for ListRow<C> {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
 
         let outer = ctx.push(Node::stack_filled(

@@ -564,6 +564,10 @@ pub struct NodeTree {
     min_size: Option<crate::geom::Size>,
     /// Stacks that are text with inline objects ([`crate::flow`]).
     flows: HashMap<NodeId, crate::flow::Shared>,
+    /// Where in the app's source each node was made (dev builds only;
+    /// [`crate::inspect`]).
+    #[cfg(debug_assertions)]
+    sites: HashMap<NodeId, &'static std::panic::Location<'static>>,
 }
 
 impl NodeTree {
@@ -702,6 +706,20 @@ impl NodeTree {
 
     pub fn len(&self) -> usize { self.nodes.len() }
     pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+
+    /// Record the source line `id` was made at (dev builds).
+    #[cfg(debug_assertions)]
+    pub fn set_site(&mut self, id: NodeId, at: &'static std::panic::Location<'static>) {
+        self.sites.insert(id, at);
+    }
+
+    /// The source line `id` was made at: always `None` in a release build.
+    pub fn site(&self, id: NodeId) -> Option<&'static std::panic::Location<'static>> {
+        #[cfg(debug_assertions)]
+        return self.sites.get(&id).copied();
+        #[cfg(not(debug_assertions))]
+        { let _ = id; None }
+    }
 
     /// The nearest Stack or Scroll strictly above `id`: the node whose
     /// group it is drawn in.

@@ -47,7 +47,10 @@ fn main() {
     let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
     let queue = Arc::new(Mutex::new(Vec::new()));
     let new_name = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
-    let view = ArtifexView { state: state.clone(), new_name: new_name.clone(), doc: doc.clone(), size: size.clone(), queue: queue.clone() };
+    let eval_field = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
+    let view = ArtifexView { state: state.clone(), new_name: new_name.clone(), doc: doc.clone(), size: size.clone(), queue: queue.clone(),
+        eval_field: eval_field.clone(), cond_field: Mutable::with_dirty(TextEdit::new(""), dirty.clone()),
+        bp_chosen: Mutable::with_dirty(None, dirty.clone()) };
     let mut app = App::new_with_flag(view, dirty.clone());
     let mut engine = Engine::new(exec);
     engine.set_dirty_flag(dirty);
@@ -79,7 +82,7 @@ fn main() {
         let mut s = state.get_cloned();
         let before = s.clone();
         // Rows the editor shows, for highlighting what's visible.
-        let er = editor_rect(win.width, win.height, s.panel_open);
+        let er = editor_rect(win.width, win.height, artifex::ui::panel_of(&s));
         engine.rows = (er.h() / 17.0).ceil().max(1.0) as usize;
         let acts: Vec<Act> = std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
         let mut swap = false;
@@ -92,6 +95,10 @@ fn main() {
                         new_name.set(TextEdit::new(""));
                     }
                     Act::Create(name)
+                }
+                Act::Evaluate(e) => {
+                    eval_field.set(TextEdit::new(""));
+                    Act::Evaluate(e)
                 }
                 a => a,
             };
@@ -106,7 +113,7 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?}",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?}",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -139,7 +146,14 @@ fn main() {
                         artifex::iconedit::Fill::None => 'n', artifex::iconedit::Fill::Solid(_) => 's',
                         artifex::iconedit::Fill::Linear(..) => 'l', artifex::iconedit::Fill::Radial(..) => 'r',
                     }).collect::<String>(),
-                    e.pen.len(), e.changed, e.note.as_deref())));
+                    e.pen.len(), e.changed, e.note.as_deref())),
+                // The inspector: (app, live, answers, rows, picking, bounds,
+                // chosen kind and its line, the strip entry's place)
+                s.inspect.as_ref().map(|v| (&v.app, v.live, v.answers, v.rows.len(), v.picking, v.bounds,
+                    v.chosen_row().map(|r| r.kind.clone()),
+                    v.chosen_row().and_then(|r| r.site.as_ref()).map(|(f, l, local)| format!("{}:{l}", local.as_deref().unwrap_or(f))),
+                    2 + 2 * s.composition.is_some() as usize + s.fuzz.is_some() as usize
+                        + (s.debug.is_some() || !s.breakpoints.is_empty()) as usize)));
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;

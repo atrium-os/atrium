@@ -1661,7 +1661,9 @@ impl GridView {
 }
 
 impl View for GridView {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -2919,7 +2921,9 @@ mod tests {
             reported: Rc<RefCell<Vec<CellRange>>>,
         }
         impl View for Probe {
+            #[cfg_attr(debug_assertions, track_caller)]
             fn render(&self, ctx: &mut Ctx) {
+                ctx.widget_site();
                 let reported = self.reported.clone();
                 GridView::new(self.sheet.clone(), self.scroll.clone(), Mutable::new(GridState::default()), Rect::new(0.0, 0.0, 400.0, 220.0))
                     .on_visible(move |r| reported.borrow_mut().push(r)).emit(ctx);
@@ -2944,7 +2948,9 @@ mod tests {
     fn every_cell_icon_draws_inside_its_square() {
         struct Icons;
         impl View for Icons {
+            #[cfg_attr(debug_assertions, track_caller)]
             fn render(&self, ctx: &mut Ctx) {
+                ctx.widget_site();
                 ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, 800.0, 40.0), fill: Color::TRANSPARENT, radius: 0.0 });
                 let all = [
                     CellIcon::Arrow(2), CellIcon::Arrow(1), CellIcon::Arrow(0), CellIcon::Arrow(-1), CellIcon::Arrow(-2), CellIcon::Dot, CellIcon::Flag,
@@ -3077,7 +3083,9 @@ mod tests {
     }
 
     impl View for Host {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let log = self.log.clone();
             let grid = self.grid.clone();
             GridView::new(self.grid.clone(), self.scroll.clone(), self.state.clone(), Rect::new(0.0, 0.0, 800.0, 600.0))
@@ -3120,7 +3128,9 @@ mod tests {
     fn a_star_fill_puts_the_sign_left_and_the_number_right() {
         struct One(CellView, f32);
         impl View for One {
+            #[cfg_attr(debug_assertions, track_caller)]
             fn render(&self, ctx: &mut Ctx) {
+                ctx.widget_site();
                 draw_cell(ctx, &crate::theme::Semantic::LIGHT, &self.0, 0.0, 0.0, self.1, 20.0);
             }
         }

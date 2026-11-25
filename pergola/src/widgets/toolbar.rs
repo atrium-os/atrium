@@ -92,7 +92,9 @@ impl Toolbar {
 }
 
 impl View for Toolbar {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let h = if self.rect.h() > 0.0 { self.rect.h() } else { size::toolbar() };
         let bh = size::button_height().min(h);
         let y = self.rect.y() + (h - bh) / 2.0;
@@ -165,7 +167,9 @@ mod tests {
     }
 
     impl View for Bar {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let items = ["New folder", "Rename", "Delete", "Copy", "Cut", "Paste"]
                 .iter()
                 .enumerate()

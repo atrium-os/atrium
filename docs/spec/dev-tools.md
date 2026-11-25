@@ -345,6 +345,111 @@ through a temporary and a rename, and refuses a linked `assets/` or
 `vm-artifex-check.sh` draws one of each shape, reorders, saves, and checks
 the saved icon is decoded and passes the dock's check.
 
+### 3.6 Debugging in Artifex after the redesign, and inspecting an app's UI (Shankar, 2026-11-25)
+
+Breakpoints (gutter, F9), F5 Debug and Continue, F10/F11/Shift+F11 and a
+Debug panel of frames and top-level locals came before the redesign (M12,
+§7). Accepted, in this order: the stepping VM check and the TCG fixes, then
+A, then B.
+
+**A. The debugger's UI.**
+- D19: debugging stays a panel under the code (stepping is through code);
+  the view strip gets a Debug entry that opens it, with a dot while the
+  program is stopped.
+- D20: while a program is debugged the toolbar's controls are one group
+  with icons and key hints: Continue or Pause, Over, Into, Out, Restart,
+  Stop.
+- D21: the editor marks the stopped line (an arrow and a highlight),
+  breakpoints are dots in the gutter, and hovering a name while stopped
+  shows its value (DAP `evaluate` in the hover context).
+- D22: the panel is three columns: the call stack; variables that expand
+  (structs, arrays, Rust's `Vec` and `String`, through DAP
+  `variablesReference`); breakpoints, each with a tick to disable it, a
+  condition, and Remove. Under them, a line evaluates an expression in the
+  selected frame.
+
+**B. Inspecting a dev app's interface.**
+- D23: Inspect, on the toolbar while a dev app runs: pick an element in the
+  app's window and see what it is, its box, colours and fonts, and the
+  line of the app's source that drew it (a jump to it); a live tree of the
+  app's interface, a row hovered outlines its element in the app; a toggle
+  that draws every element's bounds.
+- D24: read-only to start; no live editing of styles.
+- D25: only a dev build, only for the Artifex that started it. Pergola
+  records source lines only in dev builds, so a shipped app carries none;
+  Artifex reaches the app inside the workspace as the debugger does, so
+  nothing new is opened to other apps.
+
+**As built (2026-11-25).**
+- *Debug under emulation.* Two causes kept the VM check's Debug red on the
+  cloud's TCG guest. lldb gives up on the gdb-remote handshake after about
+  6 s, and the first reply comes only once portcullisd has made the app's
+  jail and lldb-server has started the app; a timed-out handshake drops the
+  connection, and lldb-dap then waits out its attach `timeout` for a stop
+  that cannot come. Artifex's attach now sets
+  `plugin.process.gdb-remote.packet-timeout` to 60 s first
+  (`dap::HANDSHAKE_S`) and gives the attach 120 s. And a base older than
+  2a7b458a7 has the `atrium.app.mk` whose `CFLAGS?= -O2 -g` loses to
+  sys.mk's, so the app had no line table; the check now installs this
+  tree's rules, in the base and in each workspace's own `/usr/share/mk`.
+  Debug builds a make project with `make ATRIUM_DEBUG=1`, which
+  `atrium.app.mk` turns into `-O0` (its objects depend on the flags they
+  were built with, so the next plain build redoes them): at `-O2` lldb
+  showed most locals as optimised away. The check steps from the
+  toolbar (Into `span_of`, Out to main, Over to a later line, Continue to
+  the next frame, Stop ends lldb-dap and the app's jail). Toolbar, not
+  F-keys: with frescod alone the app's window keeps the keyboard.
+- A Makefile with a `run:` target of its own gets a Run task, as one with
+  `atrium.app.mk` does.
+- *A.* The toolbar group (`ui.rs`) replaces Debug while a session is live;
+  New project and Terminal go to icons then. The editor (`CodeGrid`) draws
+  the stopped arrow, a ring for a breakpoint that is off, and a note box
+  under the hovered name (`on_point`, through Pergola's new
+  `Ctx::on_pointer_local`); Artifex evaluates the name under the pointer
+  (`a.b`, `p->q` included) in the shown frame. The panel
+  (`views::debug_panel`) has the stack, variables that open (members fetched
+  per `variablesReference`, at most 200 a level, 64 levels open; what was
+  open stays open across steps), and breakpoints with a tick, a condition
+  field and Remove; the evaluate line shows the last result. lldb's
+  `watch` context gives bare values (`repl` and `hover` add `(int) $0 =`).
+- *B, the transport.* `WorkspaceInspect` is Run with a socket: portcullisd
+  makes a socketpair, puts one end at the dev app's fd 3 through jaild's
+  extra descriptors (`ATRIUM_INSPECT_FD=3`) and sends the other to the
+  app that pressed Run, after `WorkspaceRan`. Only `dev.` apps. It is a
+  descriptor, never a path, so only that Artifex holds it; Artifex's Run
+  always asks for it, and an app that doesn't answer (a C app) is just Run.
+- *B, the app's side* (`pergola::inspect`, compiled only with debug
+  assertions). `Ctx::add`/`push` are `track_caller` in a dev build and
+  record each node's line; every Pergola widget's `render` is
+  `track_caller` and calls `Ctx::widget_site` first, so what a widget draws
+  is put down to the app's line that drew the widget, never Pergola's own;
+  a node a widget inserts straight into the tree takes its parent's line.
+  The window reads the socket between events (every 200 ms while it is
+  open): `Tree` (every node's kind, window box, colours, fonts and text in a
+  line, and line), `Pick` (the next press in the window is the
+  inspector's, answered with the deepest node under it), `Highlight` and
+  `Bounds` (outlines drawn over everything as extra nodes, which the tree
+  and picks leave out). Frames are a `u32` length and postcard, at most
+  8 MiB, 20 000 nodes; a bad frame drops the IDE.
+- *B, Artifex.* An Inspect entry at the end of the view strip, once the app
+  has answered; the view (`views::inspect`): the tree (rows fold, the wheel
+  scrolls, a hovered row outlines its node in the app), Pick, Bounds,
+  Refresh, and the chosen node's box, look (with swatches) and line, with
+  Go to source for a file of `work`. When the app ends its last tree stays,
+  marked so. The app is bounded as a peer (`inspector.rs`).
+- Deviations from D23/D25 as written: Inspect is a full view from the strip,
+  like Fuzz and Assets, rather than a toolbar button; and Artifex reaches
+  the app by the socket portcullisd hands it rather than through the
+  workspace, which keeps D25's point (nothing new is open to other apps)
+  without putting Artifex in the workspace.
+- C apps (libatrium) draw through `fresco-client` directly and are not
+  inspected yet.
+- `vm-artifex-check.sh` covers both: stepping as above, then Run on the
+  app template's Pergola app: portcullisd puts the socket at fd 3, the app
+  answers with its tree, the strip's Inspect shows it, Pick and a press on
+  the app's button give its Text at `ui/src/main.rs:35`, Bounds, Go to
+  source opens line 35, and the ended app's tree stays marked ended.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today
@@ -759,3 +864,5 @@ decided. T2 and T3 together already give a usable terminal development setup.
 | D16 | Icons drawn in Artifex | ACCEPTED: filled, multi-colour icons, capped at what the dock draws (64 shapes; no masks, booleans, text, filters) |
 | D17 | Pictures from an app's bundle | ACCEPTED: `assets::image` through the system image service (C6), never decoded in the core |
 | D18 | Importing SVG from other tools | ACCEPTED: the dock's checker; convert what it can, name what it can't keep |
+| D19–D22 | Artifex's debugger UI (2026-11-25) | BUILT: a panel with a strip entry, one toolbar group, the stopped line and hover values, stack, expanding variables, breakpoints with conditions, an evaluate line (§3.6) |
+| D23–D25 | Inspecting a dev app's UI (2026-11-25) | BUILT: pick, tree and bounds; read-only; dev builds and their own Artifex only (§3.6) |

@@ -77,7 +77,8 @@ pub fn detect(dir: &Path, project: &str) -> Vec<Task> {
         out.push(mk(Kind::Build, tool, argv(&[tool])));
         out.push(mk(Kind::Test, tool, argv(&[tool, "test"])));
         let mk_text = ["Makefile", "makefile", "BSDmakefile"].iter().filter_map(|f| std::fs::read_to_string(dir.join(f)).ok()).collect::<String>();
-        if mk_text.contains("atrium.app.mk") {
+        // Run when the rules give it one: the SDK's, or a `run:` of its own.
+        if mk_text.contains("atrium.app.mk") || mk_text.lines().any(|l| l.starts_with("run:")) {
             out.push(mk(Kind::Run, tool, argv(&[tool, "run"])));
         }
     } else if let Some(c) = single_c(dir) {
@@ -260,6 +261,9 @@ mod tests {
         assert!(detect(&d, "").is_empty());
         std::fs::write(d.join("Makefile"), "").unwrap();
         assert_eq!(detect(&d, "")[0].label, "Build (make)");
+        assert!(!detect(&d, "").iter().any(|t| t.kind == Kind::Run));
+        std::fs::write(d.join("Makefile"), "all:\n\ttrue\nrun:\n\tatrium-run ui\n").unwrap();
+        assert_eq!(detect(&d, "").last().map(|t| (t.kind, t.argv.clone())), Some((Kind::Run, vec!["make".into(), "run".into()])));
         std::fs::write(d.join("Cargo.toml"), "").unwrap();
         let t = detect(&d, "");
         assert_eq!(t.iter().map(|t| t.kind).collect::<Vec<_>>(), vec![Kind::Build, Kind::Test, Kind::Run]);

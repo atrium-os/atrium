@@ -2967,6 +2967,95 @@ Not built: a page's own `copy` and `paste` events with clipboardData, and rich (
 The Mac gate types into the fixture, then runs Ctrl-C and Ctrl-V with a frescod rebuilt
 for §2.6.
 
+#### I6.5 as built (2026-11-25, first part: the page's own site answers its scripts)
+
+D12 lets a page's scripts reach its sibling hosts, but until now their
+answers failed LibWeb's CORS check: the request carried no `Origin`, and
+the answer reached the engine with only its content type.
+
+- **`Origin`.** Arca's courier takes a new client header, `Origin`
+  (`Header::Origin` = 8 in `arca-courier/src/schema.rs`), only in the shape
+  `https://host[:port]` (`origin_value`); anything else refuses the whole
+  request. The client states it as it already states the ticket's
+  initiator, which Arca's same-site rule trusts. `navigator_cookies::Fetch`
+  carries it (`from_origin`), only from a live view, on the first hop only.
+  navigatord's `LiveJar` sends the page's origin with a request to another
+  host of the site, with every script POST and with a form.
+- **The answer.** navigatord reads the server's one
+  `Access-Control-Allow-Origin` (`*`, `null` or one origin) and
+  `Access-Control-Allow-Credentials: true`, and sends them to the engine
+  as a new Nuntius event, `Event::Cors`, after the head and before the
+  body. Two such headers, a list, or a value out of shape pass nothing on.
+  The engine's `navigator_live_cors` hands them to LibWeb's response
+  headers (`live-page.patch`), and LibWeb's own check decides.
+- **Not yet.** A preflighted request (a POST with a JSON body to a sibling
+  host, or any custom header) needs `OPTIONS`, which neither the engine's
+  loader nor the courier sends; it fails closed. The jar adds the site's
+  cookies whatever the script's `credentials` mode, because the engine
+  does not pass the mode.
+
+Tests: `an_origin_is_sent_only_as_a_plain_https_origin` (arca-courier),
+the live jar's origin checks in navigator-cookies' broker test,
+`a_cors_answer_is_one_origin_or_none` (nuntius wire),
+`a_servers_cors_answer_is_passed_on_only_in_its_one_shape` and the serve
+test's sibling-host answer (navigatord). The fixture's `same-site-api`
+line is the Mac check.
+
+#### I6.5 as built (2026-11-25, second part: cross-origin frames)
+
+D11 runs each cross-origin frame in its own engine jail, composed by Limen
+over the page. It is built at navigatord and in the page script, with no
+engine change:
+
+- **Which frames run.** A frame whose address is a plain `https` address
+  of another origin than the page's (`live_frames::frame_address`). Its
+  site may be any site: D12 bounds what a page's scripts fetch, and a
+  frame's document is the frame's own page, which gets D12 for its own
+  site in its own engine. That is how the reading here takes D11's "third
+  party frames refused by D12 are not started": a frame that isn't a plain
+  https address, or past the limits below, is not started and the popover
+  names it. A same-origin frame loads in the page's engine as before.
+- **Reported, never loaded here.** The reporter, in the page, finds each
+  cross-origin `<iframe>`, points it at `about:blank` (the page still reads
+  its address from `src`), and reports its place in device pixels
+  (`LIVE_FRAME`) whenever it moves, and when it goes. navigatord asks Limen
+  for another island in the UI's window at `z` 2, over the page's island,
+  places it at the page's place plus the frame's, cut to the page area
+  (`frame_rect`), hides it while none of it shows, and moves it with the
+  page. Limits: 4 frames at once, 16 frame engines over a run, nothing
+  smaller than 16 × 16 pixels (a tracking pixel is not started), 64
+  reports waiting.
+- **Its own engine.** The same engine, served by `serve` with the frame's
+  address as its page, so its scope is its own site. Its jar is thrown
+  away: a fresh in-memory Arca partition per frame, forgotten when it ends
+  (`close_throwaway`), and no `localStorage`. It reports `Started` with its
+  own origin or is ended. Its navigations, forms and file inputs are
+  refused and named in the popover; its copy and paste go to the UI as the
+  page's do.
+- **postMessage.** The page's `iframe.contentWindow` for a frame is a
+  stand-in with `postMessage`; the frame's `window.parent` is a stand-in
+  whose only member is `postMessage` (anything else throws `SecurityError`,
+  as across origins). A message is JSON text, at most 64 KiB, POSTed to
+  `LIVE_MESSAGE` with its target. navigatord's `Mailbox` delivers it only
+  to a receiver at the target's origin (`*` any, `/` the sender's own),
+  stamped with the sender's real origin, at most 32 waiting per engine.
+  Each side reads `LIVE_MESSAGES` every 250 ms while it has a frame or is
+  one, and dispatches a `message` event. Messages and reports don't count
+  toward a page's 4,096 network requests.
+- **Not yet.** `window.top` in a frame is the frame itself
+  (`[LegacyUnforgeable]`, the script can't replace it); messages carry
+  JSON, not transferables or ports; a frame's own frames are not run; a
+  frame the page's script hides from the reporter (built before it runs,
+  or in a closed shadow root) is never started. The page's engine may
+  have asked for the frame's document before the reporter pointed it
+  away, which shows as a refused request in the popover.
+
+Tests: `live_frames` (address, placement, the mailbox),
+`a_page_and_its_frame_run_apart_and_talk_only_through_the_mailbox` and the
+reporter's parse checks (navigatord), and the frames half of
+`scripts/navigator-live-reporter-check.js`. The fixture's `frame` line is
+the Mac check.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

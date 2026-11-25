@@ -1,17 +1,18 @@
 --- a/Libraries/LibWeb/Loader/ResourceLoader.cpp
 +++ b/Libraries/LibWeb/Loader/ResourceLoader.cpp
-@@ -39,6 +39,10 @@
+@@ -39,6 +39,11 @@
  #endif
  extern "C" size_t navigator_page_get(u8 const*, size_t, u8*, size_t);
  extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
 +#ifdef ATRIUM_I6_PAGE
 +extern "C" ssize_t navigator_live_get(u8 const*, size_t, u8*, size_t, u16*, u8*, size_t, size_t*);
 +extern "C" ssize_t navigator_live_post(u8 const*, size_t, u8 const*, size_t, u8 const*, size_t, u8*, size_t, u16*, u8*, size_t, size_t*);
++extern "C" ssize_t navigator_live_cors(u8*, size_t, bool*);
 +#endif
  #endif
  
  namespace Web {
-@@ -518,6 +522,43 @@
+@@ -518,6 +523,52 @@
      }
  
  #ifdef ATRIUM_I0_EDITOR
@@ -42,6 +43,15 @@
 +                auto headers = HTTP::HeaderList::create();
 +                if (kind_length > 0)
 +                    headers->append({ "Content-Type"sv, StringView { kind, kind_length } });
++                // The server's own CORS answer (I6.5), for LibWeb's check.
++                u8 allow[300];
++                bool credentials = false;
++                ssize_t allowed = navigator_live_cors(allow, sizeof(allow), &credentials);
++                if (allowed > 0 && static_cast<size_t>(allowed) <= sizeof(allow)) {
++                    headers->append({ "Access-Control-Allow-Origin"sv, StringView { allow, static_cast<size_t>(allowed) } });
++                    if (credentials)
++                        headers->append({ "Access-Control-Allow-Credentials"sv, "true"sv });
++                }
 +                on_headers_received->function()(nullptr, *headers, status, {}, Requests::CacheState::NotCached);
 +                on_data_received->function()(nullptr, Requests::ResponseData::from_bytes(body.bytes().slice(0, static_cast<size_t>(got))));
 +                on_complete->function()(true, {}, {}, {});

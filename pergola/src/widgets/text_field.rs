@@ -163,7 +163,9 @@ fn shown(e: &TextEdit) -> (String, impl Fn(usize) -> usize + '_) {
 }
 
 impl View for TextField {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let theme = ctx.theme;
         let edit = self.state.get_cloned();
 
@@ -377,6 +379,7 @@ mod tests {
 
     struct Form { field: TextField }
     impl View for Form {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) { self.field.render(ctx) }
     }
 

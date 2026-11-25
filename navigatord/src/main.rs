@@ -55,6 +55,7 @@ mod mail_sheet;
 mod credential_get;
 mod inbox_fixture;
 mod live_page;
+mod live_frames;
 mod live_storage;
 mod press;
 mod settings;

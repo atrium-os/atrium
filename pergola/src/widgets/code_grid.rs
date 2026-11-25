@@ -53,6 +53,14 @@ pub struct CodeGrid {
     stopped: Option<usize>,
     /// A press in the gutter, with its line.
     gutter_click: Option<Rc<dyn Fn(usize)>>,
+    /// Breakpoints switched off (a ring in the gutter).
+    off_breakpoints: Vec<usize>,
+    /// A note under a span of text: line, its first column (a char index
+    /// of the line), the text (a debugger's value for a name).
+    note: Option<(usize, usize, String)>,
+    /// The pointer over the text: its line and char index in the line, or
+    /// `None` off the text.
+    on_point: Option<Rc<dyn Fn(Option<(usize, usize)>)>>,
 }
 
 /// What [`CodeGrid::on_other_key`] gets: the key, its modifiers, its text.
@@ -80,6 +88,9 @@ impl CodeGrid {
             other_key: None,
             breakpoints: Vec::new(),
             stopped: None,
+            off_breakpoints: Vec::new(),
+            note: None,
+            on_point: None,
             gutter_click: None,
         }
     }
@@ -94,6 +105,9 @@ impl CodeGrid {
     pub fn on_other_key(mut self, f: OtherKey) -> Self { self.other_key = Some(f); self }
     pub fn breakpoints(mut self, lines: Vec<usize>) -> Self { self.breakpoints = lines; self }
     pub fn stopped(mut self, line: Option<usize>) -> Self { self.stopped = line; self }
+    pub fn off_breakpoints(mut self, lines: Vec<usize>) -> Self { self.off_breakpoints = lines; self }
+    pub fn note(mut self, n: Option<(usize, usize, String)>) -> Self { self.note = n; self }
+    pub fn on_point(mut self, f: Rc<dyn Fn(Option<(usize, usize)>)>) -> Self { self.on_point = Some(f); self }
     /// A press in the gutter calls `f` with its line (toggle a breakpoint).
     pub fn on_gutter_click(mut self, f: Rc<dyn Fn(usize)>) -> Self { self.gutter_click = Some(f); self }
 
@@ -198,7 +212,9 @@ pub fn keep_in_view(b: &CodeBuffer, v: CodeView, rows: usize, cols: usize) -> Co
 }
 
 impl View for CodeGrid {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let theme = ctx.theme;
         let b = self.buffer.get_cloned();
         let v = self.view.get_cloned();
@@ -255,9 +271,24 @@ impl View for CodeGrid {
                     let c = match sev { 0 => theme.danger_fg(), 1 => theme.warning_fg(), _ => theme.info_fg() };
                     ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + 2.0, y + 2.0, 3.0, line_h - 4.0), fill: c, radius: 1.5 });
                 }
-                if self.breakpoints.contains(&line) {
-                    let d = (line_h * 0.55).min(m.gutter * 0.4);
-                    ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + m.gutter - d - 3.0, y + (line_h - d) / 2.0, d, d), fill: theme.danger_fg(), radius: d / 2.0 });
+                let d = (line_h * 0.55).min(m.gutter * 0.4);
+                let dot = Rect::new(r.x() + m.gutter - d - 3.0, y + (line_h - d) / 2.0, d, d);
+                if self.off_breakpoints.contains(&line) {
+                    // Off: a ring.
+                    ctx.tree.insert(Some(bg), Node::Rect { rect: dot, fill: theme.danger_fg(), radius: d / 2.0 });
+                    ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(dot.x() + 1.5, dot.y() + 1.5, d - 3.0, d - 3.0), fill: theme.bg_surface(), radius: d / 2.0 - 1.5 });
+                } else if self.breakpoints.contains(&line) {
+                    ctx.tree.insert(Some(bg), Node::Rect { rect: dot, fill: theme.danger_fg(), radius: d / 2.0 });
+                }
+                if self.stopped == Some(line) {
+                    // Where it stopped: an arrow (a bar and a point) left of the number.
+                    let (ax, ah) = (r.x() + 2.0, (line_h * 0.5).max(4.0));
+                    let ay = y + (line_h - ah) / 2.0;
+                    ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(ax, ay + ah * 0.3, ah * 0.5, ah * 0.4), fill: theme.accent_fg(), radius: 0.0 });
+                    for k in 0..4 {
+                        let f = k as f32 / 4.0;
+                        ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(ax + ah * 0.5 + f * ah * 0.5, ay + f * ah * 0.5, ah * 0.5 / 4.0 + 0.5, ah * (1.0 - f)), fill: theme.accent_fg(), radius: 0.0 });
+                    }
                 }
             }
             // Text.
@@ -281,6 +312,21 @@ impl View for CodeGrid {
                     ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x, y_of(line - v.top), 2.0, line_h), fill: theme.accent_fg(), radius: 0.0 });
                 }
             }
+        }
+
+        // The note, under its span: a box of one line.
+        if let Some((line, col, text)) = self.note.as_ref().filter(|n| n.0 >= v.top && n.0 < last) {
+            let dcol = b.display_col(*line, *col);
+            let st = self.style(theme.text_primary());
+            let w = Node::measure_text(text, &st).w + 2.0 * m.pad + 4.0;
+            let x = x_of(dcol).max(text_x).min(r.x() + r.w() - w).max(r.x());
+            let below = y_of(line - v.top) + line_h + 2.0;
+            let y = if below + line_h + 6.0 > r.y() + r.h() { y_of(line - v.top) - line_h - 8.0 } else { below };
+            let bx = Rect::new(x, y, w, line_h + 6.0);
+            ctx.tree.insert(Some(bg), Node::Rect { rect: bx, fill: theme.border_strong(), radius: 4.0 });
+            ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, w - 2.0, line_h + 4.0), fill: theme.bg_elevated(), radius: 3.0 });
+            let sz = Node::measure_text(text, &st);
+            ctx.tree.insert(Some(bg), Node::Text { rect: Rect::new(x + m.pad + 2.0, y + 3.0, sz.w, sz.h), content: text.clone(), style: st });
         }
 
         ctx.focusable(bg);
@@ -322,6 +368,23 @@ impl View for CodeGrid {
                 buffer.set(b);
             }
         });
+        if let Some(f) = self.on_point.clone() {
+            let (buffer, view) = (self.buffer.clone(), self.view.clone());
+            ctx.on_pointer_local(bg, move |p| {
+                let at = p.filter(|p| p.x >= m.gutter + m.pad).and_then(|p| {
+                    let b = buffer.get_cloned();
+                    let v = view.get_cloned();
+                    let line = v.top + ((p.y - m.pad) / m.line).floor().max(0.0) as usize;
+                    if line >= b.len_lines() {
+                        return None;
+                    }
+                    let d = ((p.x - m.gutter - m.pad) / m.cell).floor().max(0.0) as usize + v.left;
+                    let c = b.col_at_display(line, d);
+                    (c < b.line_len(line)).then_some((line, c))
+                });
+                f(at);
+            });
+        }
         let (buffer, view) = (self.buffer.clone(), self.view.clone());
         let gutter_click = self.gutter_click.clone();
         // A press that began in the gutter selects nothing as it moves.

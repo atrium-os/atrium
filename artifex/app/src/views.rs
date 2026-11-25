@@ -22,6 +22,8 @@ pub enum Main {
     Composition,
     Fuzz,
     Assets,
+    /// The inspector's view of the app a Run started.
+    Inspect,
 }
 
 /// The preview pane's width (Move into a worker).
@@ -1133,4 +1135,325 @@ fn icon_editor(ctx: &mut Ctx, e: &crate::iconedit::Editor, q: &Queue, area: Rect
     ctx.key(9111);
     Button::ghost(if e.changed { "Discard" } else { "Close" }).at(sx + em(106.0), y1 - em(52.0)).width(em(96.0))
         .on_click(plain(q, Act::IconClose)).render(ctx);
+}
+
+/// The Debug panel (dev-tools.md §3.6, D22): the call stack, the shown
+/// frame's variables (members under what's open), the breakpoints with
+/// their ticks and conditions, and a line that evaluates in the frame.
+#[allow(clippy::too_many_arguments)]
+pub fn debug_panel(ctx: &mut Ctx, s: &State, q: &Queue, eval: &pergola::Mutable<pergola::text_edit::TextEdit>,
+                   cond: &pergola::Mutable<pergola::text_edit::TextEdit>, chosen: &pergola::Mutable<Option<(String, usize)>>, area: Rect) {
+    use pergola::widgets::TextField;
+    let t = ctx.theme;
+    let (x0, y0, x1, y1) = (area.x(), area.y(), area.x() + area.w(), area.y() + area.h());
+    let (sw, vw) = (area.w() * 0.30, area.w() * 0.38);
+    let (sx, vx, bx) = (x0 + em(8.0), x0 + sw + em(8.0), x0 + sw + vw + em(8.0));
+    let rh = em(20.0);
+    let top = y0 + em(30.0);
+    let bottom = y1 - em(66.0);
+    let fits = ((bottom - top) / rh).floor().max(1.0) as usize;
+    for x in [x0 + sw, x0 + sw + vw] {
+        ctx.add(Node::Rect { rect: Rect::new(x, y0 + em(4.0), 1.0, y1 - y0 - em(8.0)), fill: t.border_default(), radius: 0.0 });
+    }
+    let d = s.debug.as_ref();
+    let run = d.map(|d| d.run.as_str()).unwrap_or("Not running");
+    heading(ctx, sx, y0 + em(14.0), "CALL STACK", t);
+    let hw = Node::measure_text("CALL STACK", &style(font::SANS, type_size::XXS, Weight::Semibold, t.text_tertiary())).w;
+    text(ctx, sx + hw + em(10.0), y0 + em(14.0), &fit(run, sw - hw - em(24.0), type_size::XS), type_size::XS, Weight::Medium,
+         if d.is_some_and(|d| d.stopped) { t.accent_fg() } else { t.text_secondary() });
+    heading(ctx, vx, y0 + em(14.0), "VARIABLES", t);
+    heading(ctx, bx, y0 + em(14.0), "BREAKPOINTS", t);
+
+    // The stack.
+    if let Some(d) = d {
+        for (i, (name, file, line)) in d.frames.iter().take(fits).enumerate() {
+            let y = top + i as f32 * rh;
+            ctx.key(5500 + i as u64);
+            let r = Rect::new(sx - em(4.0), y, sw - em(12.0), rh - em(2.0));
+            row(ctx, r, d.stopped && d.frame == i, t, q, Act::Frame(i));
+            let place = match file { Some(f) => format!("{name}  {f}:{line}"), None => name.clone() };
+            mono(ctx, sx + em(2.0), y + rh / 2.0 - em(1.0), &crate::ui::fit(&place, sw - em(24.0), type_size::SM),
+                 if file.is_some() { t.text_primary() } else { t.text_tertiary() });
+            ctx.pop();
+        }
+        if d.frames.len() > fits {
+            text(ctx, sx, bottom + em(6.0), &format!("{} more frames", d.frames.len() - fits), type_size::XXS, Weight::Regular, t.text_tertiary());
+        }
+        // The variables: a caret for what has members.
+        for (i, v) in d.vars.iter().take(fits).enumerate() {
+            let y = top + i as f32 * rh;
+            let ind = em(14.0) * v.depth.min(6) as f32;
+            ctx.key(5600 + i as u64);
+            let r = Rect::new(vx - em(4.0), y, vw - em(12.0), rh - em(2.0));
+            row(ctx, r, false, t, q, Act::ToggleVar(i));
+            if v.members {
+                icon(ctx, vx + ind, y + rh / 2.0 - em(1.0), if v.open { phosphor::CARET_DOWN } else { phosphor::CARET_RIGHT }, type_size::XS, t.text_secondary());
+            }
+            let nx = vx + ind + em(14.0);
+            let nw = Node::measure_text(&v.name, &style(font::MONO, type_size::SM, Weight::Regular, t.text_primary())).w.min(vw * 0.45);
+            mono(ctx, nx, y + rh / 2.0 - em(1.0), &crate::ui::fit(&v.name, vw * 0.45, type_size::SM), t.info_fg());
+            mono(ctx, nx + nw + em(6.0), y + rh / 2.0 - em(1.0), &crate::ui::fit(&format!("= {}", v.value), (vx + vw - em(16.0)) - (nx + nw + em(6.0)), type_size::SM), t.text_primary());
+            ctx.pop();
+        }
+        if d.vars.len() > fits {
+            text(ctx, vx, bottom + em(6.0), &format!("{} more", d.vars.len() - fits), type_size::XXS, Weight::Regular, t.text_tertiary());
+        } else if d.vars.is_empty() && d.stopped {
+            text(ctx, vx, top + rh / 2.0, "No locals in this frame", type_size::XS, Weight::Regular, t.text_tertiary());
+        }
+    }
+    if d.is_none_or(|d| !d.stopped) {
+        text(ctx, vx, top + rh / 2.0, "Shown when the program stops", type_size::XS, Weight::Regular, t.text_tertiary());
+    }
+
+    // The evaluate line, and its last answer above it.
+    let ew = sw + vw - em(24.0);
+    if let Some((e, v, ok)) = d.and_then(|d| d.evals.last()) {
+        let line = format!("{e} = {v}");
+        mono(ctx, sx, y1 - em(52.0), &crate::ui::fit(&line, ew, type_size::SM), if *ok { t.text_primary() } else { t.danger_fg() });
+    }
+    let stopped = d.is_some_and(|d| d.stopped && d.live);
+    let qe = q.clone();
+    ctx.key(5700);
+    TextField::new(eval.clone()).key(5700)
+        .placeholder(if stopped { "Evaluate in the shown frame, e.g. width * 2" } else { "Evaluates when the program stops" })
+        .at(sx, y1 - em(38.0)).width(ew)
+        .on_submit(move |text| crate::ui::push(&qe, Act::Evaluate(text.to_string())))
+        .render(ctx);
+
+    // The breakpoints: a tick, the place and its condition, Remove.
+    let bw = x1 - bx - em(12.0);
+    let picked = chosen.get_cloned();
+    let mut i = 0;
+    for (rel, lines) in &s.breakpoints {
+        for &line in lines {
+            if i >= fits {
+                break;
+            }
+            let y = top + i as f32 * rh;
+            let st = s.bp_state.get(&(rel.clone(), line)).cloned().unwrap_or_default();
+            ctx.key(5800 + i as u64);
+            let r = Rect::new(bx - em(4.0), y, bw - em(24.0), rh - em(2.0));
+            let id = ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: radius::SM });
+            let on_row = picked.as_ref() == Some(&(rel.clone(), line));
+            let fill = if on_row { t.selection_idle() } else if ctx.is_hovered(id) { t.state_hover() } else { Color::TRANSPARENT };
+            if let Some(Node::Rect { fill: f, .. }) = ctx.tree.get_mut(id) {
+                *f = fill;
+            }
+            {
+                let (chosen, cond, rel, c) = (chosen.clone(), cond.clone(), rel.clone(), st.condition.clone().unwrap_or_default());
+                ctx.on_click(id, move || {
+                    chosen.set(Some((rel.clone(), line)));
+                    cond.set(pergola::text_edit::TextEdit::new(&c));
+                });
+            }
+            ctx.pop();
+            // The tick: on or off.
+            let tick = Rect::new(bx, y + (rh - em(14.0)) / 2.0 - em(1.0), em(14.0), em(14.0));
+            framed(ctx, tick, if st.off { t.bg_surface() } else { t.danger_fg() }, if st.off { t.border_strong() } else { t.danger_fg() }, radius::SM);
+            ctx.key(5900 + i as u64);
+            row(ctx, Rect::new(tick.x() - em(3.0), tick.y() - em(3.0), em(20.0), em(20.0)), false, t, q, Act::BreakpointOn(rel.clone(), line, st.off));
+            ctx.pop();
+            let file = rel.rsplit('/').next().unwrap_or(rel);
+            let place = format!("{file}:{}", line + 1);
+            let pw = Node::measure_text(&place, &style(font::MONO, type_size::SM, Weight::Regular, t.text_primary())).w;
+            mono(ctx, bx + em(22.0), y + rh / 2.0 - em(1.0), &place, if st.off { t.text_tertiary() } else { t.text_primary() });
+            if let Some(c) = &st.condition {
+                text(ctx, bx + em(30.0) + pw, y + rh / 2.0 - em(1.0), &crate::ui::fit(&format!("when {c}"), bw - pw - em(80.0), type_size::XS),
+                     type_size::XS, Weight::Regular, t.text_secondary());
+            }
+            ctx.key(5950 + i as u64);
+            row(ctx, Rect::new(bx + bw - em(22.0), y, em(20.0), rh - em(2.0)), false, t, q, Act::BreakpointRemove(rel.clone(), line));
+            icon(ctx, bx + bw - em(18.0), y + rh / 2.0 - em(1.0), phosphor::TRASH_SIMPLE, type_size::XS, t.text_secondary());
+            ctx.pop();
+            i += 1;
+        }
+    }
+    if s.breakpoints.is_empty() {
+        para(ctx, bx, top + rh / 2.0, "Click a line number, or press F9, to stop there.", bw, type_size::XS, Weight::Regular, t.text_tertiary(), 2);
+    }
+    // The chosen breakpoint's condition.
+    if let Some((rel, line)) = picked.filter(|(r, l)| s.breakpoints.get(r).is_some_and(|ls| ls.contains(l))) {
+        let file = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        text(ctx, bx, y1 - em(52.0), &format!("Condition for {file}:{}", line + 1), type_size::XXS, Weight::Semibold, t.text_tertiary());
+        let qc = q.clone();
+        ctx.key(5710);
+        TextField::new(cond.clone()).key(5710).placeholder("Stop only when… e.g. n > 3 (Enter)")
+            .at(bx, y1 - em(38.0)).width(bw)
+            .on_submit(move |text| crate::ui::push(&qc, Act::BreakpointCondition(rel.clone(), line, text.to_string())))
+            .render(ctx);
+    }
+}
+
+/// The Inspect view (dev-tools.md §3.6, D23): the app's tree on the left,
+/// the chosen node's kind, box, colours, fonts and source line on the
+/// right; Pick takes the next press in the app, Bounds outlines every box.
+/// Read-only (D24): nothing here changes the app.
+pub fn inspect(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
+    let t = ctx.theme;
+    let Some(v) = &s.inspect else { return };
+    let (x0, y0, x1) = (area.x(), area.y(), area.x() + area.w());
+    let head = em(56.0);
+    text(ctx, x0 + em(16.0), y0 + em(20.0), &fit(&format!("Inspecting {}", v.app), area.w() - em(420.0), type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
+    let status = if !v.live {
+        "The app has ended; this is its last tree."
+    } else if !v.answers {
+        "Waiting for the app. Only Pergola dev builds answer the inspector."
+    } else if v.picking {
+        "Press on something in the app's window to pick it."
+    } else {
+        "Hover a row to outline it in the app; read-only."
+    };
+    text(ctx, x0 + em(16.0), y0 + em(40.0), status, type_size::XS, Weight::Regular, t.text_secondary());
+    // Pick, Bounds and Refresh, right-aligned: the app's window may cover
+    // Artifex's top-left corner.
+    let by = y0 + em(12.0);
+    if v.live && v.answers {
+        ctx.key(9000);
+        let pick = if v.picking { Button::primary("Picking…") } else { Button::secondary("Pick") };
+        pick.lead(phosphor::MAGNIFYING_GLASS).tooltip("Pick an element in the app").at(x1 - em(332.0), by).width(em(112.0))
+            .on_click(plain(q, Act::InspectPick)).render(ctx);
+        ctx.key(9001);
+        chip(ctx, Rect::new(x1 - em(212.0), by + em(4.0), em(92.0), em(26.0)), "Bounds", v.bounds, t, q, Act::InspectBounds);
+        ctx.key(9002);
+        Button::ghost("Refresh").icon(phosphor::ARROW_CLOCKWISE).at(x1 - em(112.0), by).width(em(36.0))
+            .on_click(plain(q, Act::InspectRefresh)).render(ctx);
+    }
+    ctx.add(Node::Rect { rect: Rect::new(x0, y0 + head, area.w(), 1.0), fill: t.border_default(), radius: 0.0 });
+
+    // The tree.
+    let lw = (area.w() * 0.56).max(em(320.0));
+    ctx.add(Node::Rect { rect: Rect::new(x0 + lw, y0 + head, 1.0, area.h() - head), fill: t.border_default(), radius: 0.0 });
+    let rh = em(22.0);
+    let list = Rect::new(x0, y0 + head + 1.0, lw, area.h() - head - 1.0);
+    let shown = v.visible();
+    let fits = ((list.h() - em(8.0)) / rh).floor().max(1.0) as usize;
+    let mut y = list.y() + em(4.0);
+    if v.answers && v.rows.is_empty() {
+        text(ctx, x0 + em(16.0), y + em(12.0), "Nothing drawn yet.", type_size::SM, Weight::Regular, t.text_tertiary());
+    }
+    // The rows sit in the list's box, which hears the wheel.
+    ctx.key(9099);
+    let wheel = ctx.push(Node::Rect { rect: list, fill: Color::TRANSPARENT, radius: 0.0 });
+    for (k, &i) in shown.iter().enumerate().skip(v.top).take(fits) {
+        let r = &v.rows[i];
+        ctx.key(9100 + k as u64 - v.top as u64);
+        let rr = Rect::new(x0 + em(4.0), y, lw - em(8.0), rh);
+        // A row: chosen look, click, and hovering outlines it in the app.
+        let id = ctx.push(Node::Rect { rect: rr, fill: Color::TRANSPARENT, radius: radius::SM });
+        let fill = if v.chosen == Some(r.id) { t.selection_idle() } else if ctx.is_hovered(id) || v.hover == Some(r.id) { t.state_hover() } else { Color::TRANSPARENT };
+        if let Some(Node::Rect { fill: f, .. }) = ctx.tree.get_mut(id) {
+            *f = fill;
+        }
+        ctx.on_click(id, plain(q, Act::InspectChoose(r.id)));
+        let (qq, rid, inside) = (q.clone(), r.id, std::cell::Cell::new(false));
+        ctx.on_pointer_local(id, move |p| {
+            if inside.replace(p.is_some()) != p.is_some() {
+                crate::ui::push(&qq, Act::InspectHover(rid, p.is_some()));
+            }
+        });
+        let indent = em(14.0) * r.depth.min(24) as f32;
+        let mid = y + rh / 2.0;
+        if r.children {
+            let open = !v.closed.contains(&r.id);
+            ctx.key(9300 + k as u64 - v.top as u64);
+            let mut b = Button::ghost(if open { "Fold" } else { "Unfold" }).icon(if open { phosphor::CARET_DOWN } else { phosphor::CARET_RIGHT })
+                .at(rr.x() + indent, y + em(1.0)).width(em(20.0));
+            b.rect.size.h = em(20.0);
+            b.on_click(plain(q, Act::InspectFold(r.id))).render(ctx);
+        }
+        let tx = rr.x() + indent + em(22.0);
+        let site = r.site.as_ref().map(|(f, l, _)| format!("{}:{l}", f.rsplit('/').next().unwrap_or(f))).unwrap_or_default();
+        let sw = if site.is_empty() { 0.0 } else { Node::measure_text(&site, &style(font::MONO, type_size::XS, Weight::Regular, t.text_tertiary())).w + em(12.0) };
+        let kw = Node::measure_text(&r.kind, &style(font::SANS, type_size::SM, Weight::Semibold, t.text_primary())).w;
+        text(ctx, tx, mid, &r.kind, type_size::SM, Weight::Semibold, t.text_primary());
+        let room = rr.x() + rr.w() - sw - (tx + kw + em(8.0)) - em(4.0);
+        if room > em(24.0) {
+            text(ctx, tx + kw + em(8.0), mid, &fit(&r.detail, room, type_size::XS), type_size::XS, Weight::Regular, t.text_secondary());
+        }
+        if !site.is_empty() {
+            text(ctx, rr.x() + rr.w() - sw + em(4.0), mid, &site, type_size::XS, Weight::Regular, t.text_tertiary());
+        }
+        ctx.pop();
+        y += rh;
+    }
+    ctx.pop();
+    // The wheel moves the list.
+    let qq = q.clone();
+    ctx.on_scroll(wheel, move |input| {
+        if let pergola::interaction::ScrollKind::Wheel { dy, .. } = input.kind {
+            let n = (dy / em(22.0)).round() as i32;
+            if n != 0 {
+                crate::ui::push(&qq, Act::InspectScroll(n));
+            }
+        }
+    });
+
+    // The chosen node.
+    let pad = em(20.0);
+    let cx = x0 + lw + pad;
+    let cw = x1 - cx - pad;
+    let mut y = y0 + head + em(24.0);
+    let Some(r) = v.chosen_row() else {
+        para(ctx, cx, y, "Choose a row, or Pick an element in the app, to see its box, colours, fonts and the line that drew it.",
+             cw, type_size::SM, Weight::Regular, t.text_secondary(), 4);
+        return;
+    };
+    text(ctx, cx, y, &r.kind, type_size::LG, Weight::Semibold, t.text_primary());
+    // At a fixed place, whatever the details below run to.
+    if let Some((_, line, Some(rel))) = &r.site {
+        ctx.key(9010);
+        Button::secondary("Go to source").lead(phosphor::CODE).tooltip(format!("Open {rel} at line {line}"))
+            .at(x1 - pad - em(140.0), y0 + head + em(12.0)).width(em(140.0))
+            .on_click(plain(q, Act::InspectSource(rel.clone(), *line as usize))).render(ctx);
+    }
+    y += em(28.0);
+    heading(ctx, cx, y, "BOX", t);
+    y += em(16.0);
+    let b = match r.rect {
+        Some([x, yy, w, h]) => format!("{x:.1}, {yy:.1}   {w:.1} × {h:.1} pt"),
+        None => "Not on screen (scrolled away, or no size)".into(),
+    };
+    mono(ctx, cx, y, &b, t.text_primary());
+    y += em(26.0);
+    heading(ctx, cx, y, "LOOK", t);
+    y += em(16.0);
+    let st = style(font::MONO, type_size::SM, Weight::Regular, t.text_primary());
+    for l in wrap(&r.detail, cw, &st, 4) {
+        mono(ctx, cx, y, &l, t.text_primary());
+        y += em(18.0);
+    }
+    // The colours it names, as swatches.
+    let mut sx = cx;
+    for c in r.detail.split_whitespace().filter_map(parse_hex).take(4) {
+        framed(ctx, Rect::new(sx, y, em(22.0), em(22.0)), c, t.border_default(), radius::SM);
+        sx += em(28.0);
+    }
+    if sx > cx {
+        y += em(30.0);
+    }
+    y += em(8.0);
+    heading(ctx, cx, y, "DRAWN BY", t);
+    y += em(16.0);
+    match &r.site {
+        Some((file, line, local)) => {
+            mono(ctx, cx, y, &fitm(&format!("{file}:{line}"), cw), t.text_primary());
+            y += em(18.0);
+            if local.is_none() {
+                text(ctx, cx, y + em(8.0), "Not a file in this workspace (a library's).", type_size::XS, Weight::Regular, t.text_tertiary());
+            }
+        }
+        None => {
+            text(ctx, cx, y, "Not recorded (only dev builds record where).", type_size::XS, Weight::Regular, t.text_tertiary());
+        }
+    }
+}
+
+/// A `#rrggbb` or `#rrggbbaa` word as a colour.
+fn parse_hex(w: &str) -> Option<Color> {
+    let h = w.strip_prefix('#')?;
+    if !(h.len() == 6 || h.len() == 8) || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|v| v as f32 / 255.0);
+    Some(Color::rgba(p(0)?, p(2)?, p(4)?, if h.len() == 8 { p(6)? } else { 1.0 }))
 }

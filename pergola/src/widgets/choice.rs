@@ -145,7 +145,9 @@ fn box_and_label(ctx: &mut Ctx, x: f32, y: f32, label: &str, round: bool, enable
 }
 
 impl View for Checkbox {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let v = self.value.get();
         let (target, bx, ring, edge) = box_and_label(ctx, self.x, self.y, &self.label, false, self.enabled);
@@ -234,7 +236,9 @@ impl Toggle {
 }
 
 impl View for Toggle {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let on = self.value.get();
         let color = if self.enabled { t.text_primary() } else { t.text_disabled() };
@@ -352,7 +356,9 @@ impl RadioGroup {
 }
 
 impl View for RadioGroup {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let chosen = self.value.get();
         let row_h = em(BOX).max(Node::measure_text("Mg", &label_style(t.text_primary(), type_size::MD)).h);
@@ -416,7 +422,9 @@ impl Segmented {
 }
 
 impl View for Segmented {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let n = self.labels.len().max(1);
         let chosen = self.value.get();
@@ -482,7 +490,9 @@ impl Tabs {
 }
 
 impl View for Tabs {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let t = ctx.theme;
         let r = self.rect;
         let chosen = self.value.get();
@@ -551,6 +561,7 @@ mod tests {
 
     struct One<V: View>(V);
     impl<V: View> View for One<V> {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) { self.0.render(ctx) }
     }
 

@@ -59,6 +59,10 @@ pub struct Ctx<'a> {
     placements: Vec<(NodeId, Placement)>,
     /// The pop-up being drawn ([`Ctx::popup`]), for [`Ctx::popup_room`].
     popup_root: Option<NodeId>,
+    /// The app's source line the nodes now being made belong to: the last
+    /// one outside Pergola that made a node (dev builds; [`crate::inspect`]).
+    #[cfg(debug_assertions)]
+    site: Option<&'static std::panic::Location<'static>>,
 }
 
 /// A placed widget waiting for its laid-out rect.
@@ -104,7 +108,11 @@ impl<'a> Ctx<'a> {
         theme: Semantic,
         state: InteractionState,
     ) -> Self {
-        Self { tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new(), placements: Vec::new(), popup_root: None }
+        Self {
+            tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new(), placements: Vec::new(), popup_root: None,
+            #[cfg(debug_assertions)]
+            site: None,
+        }
     }
 
     /// Whether `id` is the current hover target. Valid for nodes whose
@@ -116,18 +124,52 @@ impl<'a> Ctx<'a> {
     pub fn is_focus_visible(&self, id: NodeId) -> bool { self.state.focus_visible && self.is_focused(id) }
 
     /// Add a leaf node under the current parent.
+    #[cfg_attr(debug_assertions, track_caller)]
     pub fn add(&mut self, node: Node) -> NodeId {
         let parent = self.parent_stack.last().copied();
-        self.tree.insert(parent, node)
+        let id = self.tree.insert(parent, node);
+        #[cfg(debug_assertions)]
+        self.note_site(id, std::panic::Location::caller());
+        id
     }
 
     /// Add a container node and push it as the parent for subsequent
     /// `add` calls. Caller must `pop` when finished.
+    #[cfg_attr(debug_assertions, track_caller)]
     pub fn push(&mut self, container: Node) -> NodeId {
         let parent = self.parent_stack.last().copied();
         let id = self.tree.insert(parent, container);
+        #[cfg(debug_assertions)]
+        self.note_site(id, std::panic::Location::caller());
         self.parent_stack.push(id);
         id
+    }
+
+    /// A widget's `render` calls this first: what it draws is put down to
+    /// the app's line that drew it (dev builds; a no-op otherwise).
+    #[cfg_attr(debug_assertions, track_caller)]
+    #[inline]
+    pub fn widget_site(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let at = std::panic::Location::caller();
+            if !crate::inspect::is_pergola(at) {
+                self.site = Some(at);
+            }
+        }
+    }
+
+    /// Record where `id` was made: `at` when that is the app's own code
+    /// (a widget's `render` passes its caller on, being `track_caller`),
+    /// else the app's line that led here.
+    #[cfg(debug_assertions)]
+    fn note_site(&mut self, id: NodeId, at: &'static std::panic::Location<'static>) {
+        if !crate::inspect::is_pergola(at) {
+            self.site = Some(at);
+        }
+        if let Some(s) = self.site {
+            self.tree.set_site(id, s);
+        }
     }
 
     pub fn pop(&mut self) {
@@ -171,6 +213,15 @@ impl<'a> Ctx<'a> {
     pub fn on_drag_local<F: Fn(crate::interaction::DragPhase, crate::geom::Point) + 'static>(&mut self, id: NodeId, handler: F) {
         let h = self.interactions.entry(id);
         h.on_drag = Some(Box::new(handler));
+        h.drag_local = true;
+    }
+
+    /// Hear where the pointer is over `id`, relative to the node's laid-out
+    /// top-left (as [`Ctx::on_drag_local`]), on every move, and `None`
+    /// once it leaves: a code editor showing what's under the pointer.
+    pub fn on_pointer_local<F: Fn(Option<crate::geom::Point>) + 'static>(&mut self, id: NodeId, handler: F) {
+        let h = self.interactions.entry(id);
+        h.on_pointer = Some(Box::new(handler));
         h.drag_local = true;
     }
 
@@ -245,7 +296,19 @@ impl<'a> Ctx<'a> {
     /// Draw `f` above everything the view draws, at the window's top
     /// level, after the view has rendered: a menu or dialog escapes its
     /// parent's layout and clip, and is hit before what it covers.
+    #[cfg_attr(debug_assertions, track_caller)]
     pub fn overlay(&mut self, f: impl for<'b> FnOnce(&mut Ctx<'b>) + 'static) {
+        #[cfg(debug_assertions)]
+        {
+            // Drawn later, still as the line that asked for it.
+            let at = std::panic::Location::caller();
+            let site = if crate::inspect::is_pergola(at) { self.site } else { Some(at) };
+            self.overlays.push(Box::new(move |ctx: &mut Ctx| {
+                ctx.site = site;
+                f(ctx)
+            }));
+        }
+        #[cfg(not(debug_assertions))]
         self.overlays.push(Box::new(f));
     }
 
@@ -253,12 +316,14 @@ impl<'a> Ctx<'a> {
     /// natural size takes part in layout (grow, align, baseline, grid
     /// cell) and the widget draws in the rect layout gives the slot.
     /// Returns the slot.
+    #[cfg_attr(debug_assertions, track_caller)]
     pub fn place<W: Widget>(&mut self, w: W) -> NodeId {
         self.place_with(w, crate::layout::FlexStyle::default())
     }
 
     /// [`Ctx::place`] with the slot's flex parameters (grow, align_self,
     /// min/max). A grown or stretched widget draws at its grown size.
+    #[cfg_attr(debug_assertions, track_caller)]
     pub fn place_with<W: Widget>(&mut self, w: W, style: crate::layout::FlexStyle) -> NodeId {
         let s = w.natural_size();
         let fills = w.fills();
@@ -288,6 +353,9 @@ impl<'a> Ctx<'a> {
             for (slot, draw) in std::mem::take(&mut self.placements) {
                 let Some(r) = self.tree.get(slot).map(|n| n.rect()) else { continue };
                 let saved = std::mem::replace(&mut self.parent_stack, vec![slot]);
+                // What it draws is the placing line's.
+                #[cfg(debug_assertions)]
+                { self.site = self.tree.site(slot); }
                 draw(self, r);
                 self.parent_stack = saved;
                 for c in self.tree.children_of(slot).to_vec() {
@@ -412,12 +480,17 @@ impl<'a> Ctx<'a> {
 
 /// Anything that can produce render output by emitting nodes into a `Ctx`.
 pub trait View {
+    /// Draw into `ctx`. Pergola's own widgets pass their caller on in a
+    /// dev build (`track_caller` on each `render`), so what a widget draws
+    /// is put down to the app's line that drew it ([`crate::inspect`]); an
+    /// app's own views are put down to their own lines.
     fn render(&self, ctx: &mut Ctx);
 }
 
 /// `()` is the empty view — useful as a no-op default and for
 /// optional-content patterns later.
 impl View for () {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, _ctx: &mut Ctx) {}
 }
 
@@ -426,7 +499,9 @@ impl View for () {
 pub struct Draw<F: Fn(&mut Ctx)>(pub F);
 
 impl<F: Fn(&mut Ctx)> View for Draw<F> {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         (self.0)(ctx)
     }
 }
@@ -434,7 +509,9 @@ impl<F: Fn(&mut Ctx)> View for Draw<F> {
 /// `Vec<V>` renders each element in order. Lets a View produce a
 /// sequence of children without a custom container type.
 impl<V: View> View for Vec<V> {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         for v in self {
             v.render(ctx);
         }

@@ -120,7 +120,7 @@ pub fn post_licence(mut client: nuntius::Client, url: &str, request: Vec<u8>) ->
             Event::Error { code, .. } => return Err(format!("licence request: {code:?}")),
             Event::Head { .. } | Event::Fd { .. } | Event::Progress { .. } | Event::Retrying { .. } => {}
             // Never asked for here.
-            Event::Records { .. } => return Err("an answer to no request".into()),
+            Event::Records { .. } | Event::Cors { .. } => return Err("an answer to no request".into()),
         }
     }
 }

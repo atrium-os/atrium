@@ -76,7 +76,9 @@ fn serve(p: &Pki, name: &str, handler: Handler) -> (SocketAddr, Arc<Mutex<Vec<(S
                     target = format!("{target}#{}", String::from_utf8_lossy(&body));
                 }
                 let cookie = head.lines().find_map(|l| l.strip_prefix("Cookie: ").or_else(|| l.strip_prefix("cookie: "))).unwrap_or("").to_string();
-                log.lock().unwrap().push((target.clone(), cookie.clone()));
+                // An Origin header is logged after the target as `@origin`.
+                let origin = head.lines().find_map(|l| l.strip_prefix("Origin: ")).map(|o| format!("@{o}")).unwrap_or_default();
+                log.lock().unwrap().push((format!("{target}{origin}"), cookie.clone()));
                 if t.write_all(&h(&target, &cookie)).and_then(|_| t.flush()).is_err() { return }
             }
         });
@@ -624,6 +626,23 @@ fn a_live_page_signs_in_with_a_form_and_its_scripts_post_in_its_own_jar() {
     let mut typed = Fetch::subresource(&format!("{}/echo", w.news), "www.news.example");
     typed.content_type = Some("text/plain".into());
     assert!(matches!(w.b.fetch(LIVE, &typed), Err(Refused::Malformed(_))));
+    // Its origin goes with a script's request and a form when navigatord
+    // names it, on the first hop only, and only from a live view.
+    let origin = w.news.trim_end_matches('/').to_string();
+    w.b.fetch_once(LIVE, &Fetch::subresource(&format!("{}/echo", w.news), "www.news.example").from_origin(&origin)).unwrap();
+    w.b.fetch(LIVE, &form.clone().from_origin(&origin)).unwrap();
+    {
+        let log = w.news_log.lock().unwrap();
+        assert!(log.iter().any(|(t, _)| *t == format!("/echo@{origin}")), "{log:?}");
+        assert!(log.iter().any(|(t, _)| *t == format!("/login#user=ana@{origin}")), "{log:?}");
+        assert_eq!(log.last().map(|(t, _)| t.as_str()), Some("/echo"), "not on the redirect's hop");
+    }
+    for bad in ["http://www.news.example", "https://www.news.example/", "https://x\r\nEvil: 1"] {
+        let f = Fetch::subresource(&format!("{}/echo", w.news), "www.news.example").from_origin(bad);
+        assert!(matches!(w.b.fetch_once(LIVE, &f), Err(Refused::Malformed(_))), "{bad}");
+    }
+    let f = Fetch::subresource(&format!("{}/echo", w.news), "www.news.example").from_origin(&origin);
+    assert!(matches!(w.b.fetch(NEWS_VIEW, &f), Err(Refused::Malformed(_))), "not from the document lane");
     // The same site in another jar (the Personal one) has no session.
     const OTHER: ViewId = 8;
     w.b.show_live(OTHER, &format!("{}/app", w.news), None).unwrap();

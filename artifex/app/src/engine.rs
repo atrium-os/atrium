@@ -93,8 +93,19 @@ pub struct Engine {
     debugger: Option<(dap::Session, Proc)>,
     /// Start debugging when the build that's running succeeds.
     debug_after_build: bool,
+    /// Debug again when the session that's ending ends (Restart).
+    restart_debug: bool,
+    /// Variables shown open, by their path of names (kept across steps).
+    open_vars: std::collections::BTreeSet<Vec<String>>,
+    /// Where the pointer last asked for a value.
+    hover_at: Option<(usize, usize, String)>,
     /// The dev app the running Run task started (for its note).
     ran: Option<String>,
+    /// The inspector's socket to the app a Run started (dev-tools.md §3.6).
+    inspector: Option<crate::inspector::Client>,
+    /// When the tree was last asked for, and whether it changed since.
+    inspect_asked: Option<Instant>,
+    inspect_stale: bool,
 }
 
 fn title_of(rel: &str) -> String {
@@ -136,7 +147,13 @@ impl Engine {
             rows: 40,
             debugger: None,
             debug_after_build: false,
+            restart_debug: false,
+            open_vars: Default::default(),
+            hover_at: None,
             ran: None,
+            inspector: None,
+            inspect_asked: None,
+            inspect_stale: false,
         }
     }
 
@@ -191,6 +208,9 @@ impl Engine {
                 s.view = v;
                 if v == Main::Assets {
                     self.refresh_assets(None, s);
+                }
+                if v == Main::Inspect {
+                    self.ask_tree();
                 }
                 // A full view has the window to itself.
                 if v != Main::Code {
@@ -384,6 +404,98 @@ impl Engine {
                 }
                 self.debug_after_build = false;
             }
+            Act::Pause => {
+                if let Some((sess, proc)) = &mut self.debugger {
+                    sess.pause();
+                    let out = sess.take_output();
+                    proc.write(&out);
+                }
+            }
+            Act::InspectPick => {
+                if let (Some(c), Some(v)) = (&mut self.inspector, &mut s.inspect) {
+                    v.picking = !v.picking;
+                    c.send(&pergola::inspect::Ask::Pick(v.picking));
+                }
+            }
+            Act::InspectBounds => {
+                if let (Some(c), Some(v)) = (&mut self.inspector, &mut s.inspect) {
+                    v.bounds = !v.bounds;
+                    c.send(&pergola::inspect::Ask::Bounds(v.bounds));
+                }
+            }
+            Act::InspectRefresh => self.ask_tree(),
+            Act::InspectChoose(id) => {
+                if let Some(v) = &mut s.inspect {
+                    v.chosen = Some(id);
+                }
+                self.send_highlight(s);
+            }
+            Act::InspectHover(id, on) => {
+                if let Some(v) = &mut s.inspect {
+                    if on {
+                        v.hover = Some(id);
+                    } else if v.hover == Some(id) {
+                        v.hover = None;
+                    }
+                }
+                self.send_highlight(s);
+            }
+            Act::InspectFold(id) => {
+                if let Some(v) = &mut s.inspect {
+                    if !v.closed.remove(&id) {
+                        v.closed.insert(id);
+                    }
+                    let n = v.visible().len();
+                    v.top = v.top.min(n.saturating_sub(1));
+                }
+            }
+            Act::InspectScroll(n) => {
+                if let Some(v) = &mut s.inspect {
+                    let max = v.visible().len().saturating_sub(1) as i64;
+                    v.top = (v.top as i64 + n as i64).clamp(0, max) as usize;
+                }
+            }
+            Act::InspectSource(rel, line) => {
+                // Only a file of `work` (inspector::local_file checked it).
+                s.view = Main::Code;
+                self.open(&rel, s);
+                self.goto(line.saturating_sub(1), Some(0), None);
+            }
+            Act::RestartDebug => {
+                if let Some((sess, proc)) = &mut self.debugger {
+                    sess.stop();
+                    let out = sess.take_output();
+                    proc.write(&out);
+                    self.restart_debug = true;
+                }
+            }
+            Act::ToggleVar(i) => self.toggle_var(i),
+            Act::Evaluate(expr) => {
+                if let Some((sess, _)) = &mut self.debugger {
+                    sess.evaluate(&expr, false);
+                }
+            }
+            Act::DebugHover(at) => self.debug_hover(at, s),
+            Act::BreakpointOn(rel, line, on) => {
+                let st = s.bp_state.entry((rel.clone(), line)).or_default();
+                st.off = !on;
+                self.send_breakpoints(&rel, s);
+            }
+            Act::BreakpointCondition(rel, line, c) => {
+                let c: String = c.trim().chars().take(dap::MAX_EXPR).collect();
+                s.bp_state.entry((rel.clone(), line)).or_default().condition = (!c.is_empty()).then_some(c);
+                self.send_breakpoints(&rel, s);
+            }
+            Act::BreakpointRemove(rel, line) => {
+                if let Some(list) = s.breakpoints.get_mut(&rel) {
+                    list.retain(|&l| l != line);
+                    if list.is_empty() {
+                        s.breakpoints.remove(&rel);
+                    }
+                }
+                s.bp_state.remove(&(rel.clone(), line));
+                self.send_breakpoints(&rel, s);
+            }
             Act::StepOver | Act::StepIn | Act::StepOut => {
                 if let Some((sess, _)) = &mut self.debugger {
                     match a {
@@ -447,6 +559,13 @@ impl Engine {
                 }
             }
             Act::Frame(i) => {
+                if let Some((sess, proc)) = &mut self.debugger {
+                    if let Some(id) = sess.frames.get(i).map(|f| f.id) {
+                        sess.select_frame(id);
+                        let out = sess.take_output();
+                        proc.write(&out);
+                    }
+                }
                 let f = s.debug.as_ref().and_then(|d| d.frames.get(i)).cloned();
                 if let Some((_, Some(rel), line)) = f {
                     self.open(&rel, s);
@@ -775,7 +894,7 @@ impl Engine {
             line
         };
         let rel = d.rel.clone();
-        let path = d.cells.path.clone();
+        
         let list = s.breakpoints.entry(rel.clone()).or_default();
         if let Some(i) = list.iter().position(|&l| l == line) {
             list.remove(i);
@@ -783,14 +902,74 @@ impl Engine {
             list.push(line);
             list.sort_unstable();
         }
-        let lines: Vec<usize> = list.iter().map(|l| l + 1).collect();
         if list.is_empty() {
             s.breakpoints.remove(&rel);
         }
+        s.bp_state.retain(|(r, l), _| *r != rel || s.breakpoints.get(&rel).is_some_and(|ls| ls.contains(l)));
+        self.send_breakpoints(&rel, s);
+    }
+
+    /// What the debugger is given for `rel`: the breakpoints on, with
+    /// their conditions, 1-based.
+    fn bps_of(s: &State, rel: &str) -> Vec<dap::Bp> {
+        s.breakpoints.get(rel).into_iter().flatten().filter_map(|&l| {
+            let st = s.bp_state.get(&(rel.to_string(), l));
+            (!st.is_some_and(|st| st.off)).then(|| dap::Bp { line: l + 1, condition: st.and_then(|st| st.condition.clone()) })
+        }).collect()
+    }
+
+    fn all_bps(&self, s: &State) -> std::collections::BTreeMap<PathBuf, Vec<dap::Bp>> {
+        s.breakpoints.keys().map(|rel| (self.root.join(rel), Self::bps_of(s, rel))).collect()
+    }
+
+    fn send_breakpoints(&mut self, rel: &str, s: &State) {
+        let bps = Self::bps_of(s, rel);
+        let path = self.root.join(rel);
         if let Some((sess, proc)) = &mut self.debugger {
-            sess.set_breakpoints(&path, lines);
+            sess.set_breakpoints(&path, bps);
             let out = sess.take_output();
             proc.write(&out);
+        }
+    }
+
+    /// Open or close row `i` of the Variables column.
+    fn toggle_var(&mut self, i: usize) {
+        let Some((sess, proc)) = &mut self.debugger else { return };
+        let Some(path) = var_paths(sess, &self.open_vars).into_iter().nth(i) else { return };
+        if !self.open_vars.remove(&path.0) && path.1 > 0 && self.open_vars.len() < dap::MAX_EXPANDED {
+            self.open_vars.insert(path.0);
+            sess.expand(path.1);
+            let out = sess.take_output();
+            proc.write(&out);
+        }
+    }
+
+    /// The pointer over the editor: the value of the name under it.
+    fn debug_hover(&mut self, at: Option<(usize, usize)>, s: &mut State) {
+        let stopped = self.debugger.as_ref().is_some_and(|(x, _)| matches!(x.run, dap::Run::Stopped(_)));
+        let word = at.filter(|_| stopped).and_then(|(line, col)| {
+            let d = self.active.and_then(|i| self.docs.get(i))?;
+            let b = d.cells.buffer.get_cloned();
+            if line >= b.len_lines() {
+                return None;
+            }
+            let chars: Vec<char> = b.text().line(line).chars().take(b.line_len(line)).collect();
+            name_at(&chars, col).map(|(w, start)| (line, start, w))
+        });
+        if word == self.hover_at {
+            return;
+        }
+        self.hover_at = word.clone();
+        if let Some((sess, proc)) = &mut self.debugger {
+            sess.hover = None;
+            if let Some((_, _, w)) = &word {
+                sess.evaluate(w, true);
+                let out = sess.take_output();
+                proc.write(&out);
+            }
+        }
+        if let Some(d) = &mut s.debug {
+            d.hover = None;
         }
     }
 
@@ -826,7 +1005,13 @@ impl Engine {
         match s.tasks.iter().position(|t| t.kind == tasks::Kind::Build) {
             Some(i) => {
                 self.debug_after_build = true;
-                self.run_task(i, s);
+                // make builds at -O0 for a debugger (atrium.app.mk); Cargo's
+                // dev profile and the lone-file cc already do.
+                let mut t = s.tasks[i].clone();
+                if matches!(t.argv.first().map(String::as_str), Some("make" | "gmake")) {
+                    t.argv.push("ATRIUM_DEBUG=1".into());
+                }
+                self.start_task(t, s);
             }
             None => self.start_debug(s),
         }
@@ -867,7 +1052,7 @@ impl Engine {
                 return;
             }
         };
-        let bps = s.breakpoints.iter().map(|(rel, lines)| (self.root.join(rel), lines.iter().map(|l| l + 1).collect())).collect();
+        let bps = self.all_bps(s);
         let sess = dap::Session::new(&self.root, &remote, program, args, &s.project, bps);
         self.debugger = Some((sess, proc));
         s.debug = Some(Debug { run: format!("Starting {program}"), live: true, ..Debug::default() });
@@ -901,7 +1086,7 @@ impl Engine {
                                     jump = Some((f.file.clone().unwrap(), f.line));
                                 }
                             }
-                            dap::Event::State | dap::Event::Locals | dap::Event::Breakpoints(..) => {}
+                            dap::Event::State | dap::Event::Locals | dap::Event::Evaluated | dap::Event::Breakpoints(..) => {}
                         }
                     }
                 }
@@ -923,12 +1108,32 @@ impl Engine {
             dap::Run::Exited(None) => "Ended".to_string(),
         };
         let exited = matches!(sess.run, dap::Run::Exited(_));
+        // Members of what's open that aren't fetched yet (after a step).
+        let paths = var_paths(sess, &self.open_vars);
+        let want: Vec<i64> = paths.iter().filter(|(p, r, _)| *r > 0 && self.open_vars.contains(p) && !sess.members.contains_key(r)).map(|x| x.1).collect();
+        for r in want {
+            sess.expand(r);
+        }
+        let out = sess.take_output();
+        proc.write(&out);
+        let vars = paths.into_iter().map(|(p, r, v)| crate::ui::VarRow {
+            depth: p.len() - 1, name: v.name, value: v.value, kind: v.kind, members: r > 0, open: self.open_vars.contains(&p),
+        }).collect();
+        let hover = self.hover_at.as_ref().zip(sess.hover.as_ref()).filter(|((_, _, w), (e, _))| w == e)
+            .map(|((l, c, w), (_, v))| (*l, *c, w.clone(), v.clone()));
         let d = Debug {
             run,
             stopped: matches!(sess.run, dap::Run::Stopped(_)),
             live: !(ended || exited),
             frames: sess.frames.iter().map(|f| (f.name.clone(), f.file.as_deref().and_then(rel), f.line)).collect(),
             locals: sess.locals.iter().map(|v| (v.name.clone(), v.value.clone())).collect(),
+            frame: sess.frame.and_then(|id| sess.frames.iter().position(|f| f.id == id)).unwrap_or(0),
+            vars,
+            evals: sess.evals.iter().map(|(e, r)| match r {
+                Ok(v) => (e.clone(), v.clone(), true),
+                Err(m) => (e.clone(), m.clone(), false),
+            }).collect(),
+            hover,
         };
         if s.debug.as_ref() != Some(&d) {
             s.debug = Some(d);
@@ -941,6 +1146,10 @@ impl Engine {
                 proc.write(&out);
             }
             self.debugger = None;
+            self.hover_at = None;
+            if std::mem::take(&mut self.restart_debug) {
+                self.debug(s);
+            }
         }
         if let Some((p, line)) = jump {
             if let Some(r) = tree::relative(&self.root, &p) {
@@ -1059,6 +1268,8 @@ impl Engine {
             marks: self.cell(Vec::new()),
             breakpoints: self.cell(Vec::new()),
             stopped: self.cell(None),
+            off_breakpoints: self.cell(Vec::new()),
+            note: self.cell(None),
         };
         let mut doc = Doc { cells, rel: rel.to_string(), lang, syntax, seen: 0, spans_at: (u64::MAX, 0), lsp_sent: 0, last_edit: Instant::now() };
         self.highlight(&mut doc, true);
@@ -1182,9 +1393,12 @@ impl Engine {
         let Some(folder) = s.ask.take() else { return };
         let answer = match (press, self.ws.clone()) {
             (Some(token), Some(ws)) => match self.exec.run(&ws, &folder, token) {
-                Ok(app) => {
+                Ok((app, sock)) => {
                     s.output.push_str(&format!("[Running {app}]\n"));
                     s.note = Some((format!("Running {app}"), false));
+                    if let Some(fd) = sock {
+                        self.attach_inspector(&app, &folder, fd, s);
+                    }
                     self.ran = Some(app);
                     tasks::ask_ok(0)
                 }
@@ -1204,6 +1418,113 @@ impl Engine {
     /// The person's answer to Debug as an app: with a press, portcullisd
     /// installs the dev build waiting for a debugger on the workspace's
     /// loopback, and lldb-dap in the workspace attaches to it there.
+    /// Inspect `app`, which a Run started from `project`, over `fd`.
+    pub fn attach_inspector(&mut self, app: &str, project: &str, fd: std::os::fd::OwnedFd, s: &mut State) {
+        match crate::inspector::Client::new(fd) {
+            Ok(c) => {
+                self.inspector = Some(c);
+                self.inspect_asked = None;
+                self.inspect_stale = true;
+                s.inspect = Some(crate::inspector::Inspect { app: app.into(), project: project.into(), live: true, ..Default::default() });
+            }
+            Err(e) => s.output.push_str(&format!("[Inspector: {e}]\n")),
+        }
+    }
+
+    /// Ask for the tree (once one asked for is in, or after a while).
+    fn ask_tree(&mut self) {
+        if let Some(c) = &mut self.inspector {
+            c.send(&pergola::inspect::Ask::Tree);
+            self.inspect_asked = Some(Instant::now());
+            self.inspect_stale = false;
+        }
+    }
+
+    /// Outline the row under the pointer, else the chosen one.
+    fn send_highlight(&mut self, s: &State) {
+        let (Some(c), Some(v)) = (&mut self.inspector, &s.inspect) else { return };
+        c.send(&pergola::inspect::Ask::Highlight(v.hover.or(v.chosen)));
+    }
+
+    fn read_inspector(&mut self, s: &mut State) {
+        use pergola::inspect::Tell;
+        let Some(c) = &mut self.inspector else { return };
+        let told = match c.poll() {
+            Ok(t) => t,
+            Err(_) => {
+                // The app ended (or broke the wire): its last tree stays,
+                // if it had one to show.
+                self.inspector = None;
+                if s.inspect.as_ref().is_some_and(|v| !v.answers) {
+                    s.inspect = None;
+                    if s.view == Main::Inspect {
+                        s.view = Main::Code;
+                    }
+                }
+                if let Some(v) = &mut s.inspect {
+                    v.live = false;
+                    v.picking = false;
+                }
+                return;
+            }
+        };
+        let Some(v) = &mut s.inspect else { return };
+        let mut want_tree = false;
+        let mut picked = false;
+        for t in told {
+            match t {
+                Tell::Hello { .. } => {
+                    v.answers = true;
+                    want_tree = true;
+                }
+                Tell::Tree(items) => {
+                    v.answers = true;
+                    v.rows = crate::inspector::rows(items, &v.project, self.remote_root.as_deref());
+                    if v.chosen.is_some_and(|id| !v.rows.iter().any(|r| r.id == id)) {
+                        v.chosen = None;
+                    }
+                    let n = v.visible().len();
+                    v.top = v.top.min(n.saturating_sub(1));
+                    self.inspect_asked = None;
+                }
+                Tell::Picked(id) => {
+                    v.picking = false;
+                    v.chosen = Some(id);
+                    v.hover = None;
+                    // Its row, once the tree that has it is in.
+                    v.picked_pending = true;
+                    picked = true;
+                    want_tree = true;
+                }
+                Tell::Changed => self.inspect_stale = true,
+            }
+        }
+        if picked {
+            s.view = Main::Inspect;
+            s.panel_open = false;
+        }
+        // A fresh tree when the view shows and the old one is stale; one
+        // question at a time (a lost answer is asked again after 2 s).
+        let waiting = self.inspect_asked.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+        if (want_tree || (self.inspect_stale && s.view == Main::Inspect)) && !waiting {
+            self.ask_tree();
+        }
+        // Show a picked node's row.
+        if let Some(v) = &mut s.inspect {
+            if let Some(id) = v.chosen.filter(|_| v.picked_pending) {
+                if v.rows.iter().any(|r| r.id == id) {
+                    v.reveal(id);
+                    if let Some(k) = v.visible().iter().position(|&i| v.rows[i].id == id) {
+                        if k < v.top || k >= v.top + 12 {
+                            v.top = k.saturating_sub(4);
+                        }
+                    }
+                    v.picked_pending = false;
+                }
+            }
+        }
+    }
+
     fn answer_debug(&mut self, press: Option<[u8; 16]>, s: &mut State) {
         let Some(folder) = s.ask.take() else { return };
         let (Some(token), Some(ws), Some(remote)) = (press, self.ws.clone(), self.remote_root.clone()) else { return };
@@ -1226,7 +1547,7 @@ impl Engine {
                 return;
             }
         };
-        let bps = s.breakpoints.iter().map(|(rel, lines)| (self.root.join(rel), lines.iter().map(|l| l + 1).collect())).collect();
+        let bps = self.all_bps(s);
         let sess = dap::Session::new(&self.root, &remote, &program, &[], &s.project, bps).attaching(&address);
         self.debugger = Some((sess, proc));
         self.ran = Some(app.clone());
@@ -1238,10 +1559,15 @@ impl Engine {
     }
 
     fn run_task(&mut self, i: usize, s: &mut State) {
+        if let Some(t) = s.tasks.get(i).cloned() {
+            self.start_task(t, s);
+        }
+    }
+
+    fn start_task(&mut self, t: tasks::Task, s: &mut State) {
         if s.running.is_some() {
             return;
         }
-        let Some(t) = s.tasks.get(i).cloned() else { return };
         // Unsaved files are saved first: the build sees what's on screen.
         let a = self.active;
         for j in 0..self.docs.len() {
@@ -1377,6 +1703,7 @@ impl Engine {
         self.read_jobs(s);
         self.read_servers(s);
         self.read_debugger(s);
+        self.read_inspector(s);
         // Background fuzzing: the next target, never while a task runs
         // (they'd fight over the build folder).
         if s.running.is_none() {
@@ -1742,6 +2069,15 @@ impl Engine {
         if d.cells.stopped.get_cloned() != stopped {
             d.cells.stopped.set(stopped);
         }
+        let off: Vec<usize> = s.bp_state.iter().filter(|((r, _), st)| *r == d.rel && st.off).map(|((_, l), _)| *l).collect();
+        if d.cells.off_breakpoints.get_cloned() != off {
+            d.cells.off_breakpoints.set(off);
+        }
+        let note = s.debug.as_ref().filter(|x| x.stopped && x.live).and_then(|x| x.hover.as_ref())
+            .map(|(l, c, w, v)| (*l, *c, format!("{w} = {v}")));
+        if d.cells.note.get_cloned() != note {
+            d.cells.note.set(note);
+        }
     }
 
     /// Ask every server to stop (the app is closing).
@@ -1775,6 +2111,8 @@ fn placeholder() -> Doc {
             marks: Mutable::new(Vec::new()),
             breakpoints: Mutable::new(Vec::new()),
             stopped: Mutable::new(None),
+            off_breakpoints: Mutable::new(Vec::new()),
+            note: Mutable::new(None),
         },
         rel: String::new(),
         lang: None,
@@ -1793,6 +2131,63 @@ fn quiet(argv: &[&str]) -> Vec<String> {
     let mut v: Vec<String> = ["sh", "-c", "exec \"$0\" \"$@\" 2>/dev/null"].iter().map(|a| a.to_string()).collect();
     v.extend(argv.iter().map(|a| a.to_string()));
     v
+}
+
+/// The Variables column in order: each variable's path of names, its
+/// members' handle, and itself; members follow what's open, at most 8
+/// deep and 2000 rows.
+fn var_paths(sess: &dap::Session, open: &std::collections::BTreeSet<Vec<String>>) -> Vec<(Vec<String>, i64, dap::Variable)> {
+    fn walk(sess: &dap::Session, open: &std::collections::BTreeSet<Vec<String>>, vars: &[dap::Variable], at: &[String],
+            out: &mut Vec<(Vec<String>, i64, dap::Variable)>) {
+        for v in vars {
+            if out.len() >= 2000 {
+                return;
+            }
+            let mut p = at.to_vec();
+            p.push(v.name.clone());
+            out.push((p.clone(), v.reference, v.clone()));
+            if v.reference > 0 && p.len() < 8 && open.contains(&p) {
+                if let Some(m) = sess.members.get(&v.reference) {
+                    walk(sess, open, m, &p, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(sess, open, &sess.locals, &[], &mut out);
+    out
+}
+
+/// The name at `col` of a line: an identifier, with the fields before it
+/// (`a.b`, `p->q`), and where it starts.
+fn name_at(chars: &[char], col: usize) -> Option<(String, usize)> {
+    let id = |c: char| c.is_alphanumeric() || c == '_';
+    if !chars.get(col).copied().is_some_and(id) {
+        return None;
+    }
+    let mut end = col;
+    while end < chars.len() && id(chars[end]) {
+        end += 1;
+    }
+    let mut start = col;
+    loop {
+        while start > 0 && id(chars[start - 1]) {
+            start -= 1;
+        }
+        if start > 0 && chars[start - 1] == '.' {
+            start -= 1;
+        } else if start > 1 && chars[start - 1] == '>' && chars[start - 2] == '-' {
+            start -= 2;
+        } else {
+            break;
+        }
+        if start == 0 || !id(chars[start - 1]) {
+            return None;
+        }
+    }
+    let w: String = chars[start..end].iter().collect();
+    // A number, or a keyword's worth of nothing, isn't a value to show.
+    (!w.starts_with(|c: char| c.is_ascii_digit()) && w.len() <= 200).then_some((w, start))
 }
 
 /// An icon's text, at most the dock's size and never through a link.
@@ -2157,10 +2552,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The panel's parts against a real lldb-dap: a condition, a struct's
+    /// members, another frame's locals, an evaluation, a hover's value,
+    /// and a breakpoint switched off.
+    #[test]
+    fn the_debug_panel_with_lldb_dap() {
+        let llvm = PathBuf::from("/usr/lib/llvm-18/bin");
+        let found = std::env::var("PATH").unwrap_or_default().split(':').any(|d| Path::new(d).join("lldb-dap").is_file());
+        if !found {
+            if !llvm.join("lldb-dap").is_file() {
+                return;
+            }
+            std::env::set_var("PATH", format!("{}:{}", llvm.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let (d, mut e, mut s) = setup("dap-panel");
+        std::fs::write(d.join("proj/hello.c"), "#include <stdio.h>\n\nstruct pt { int x; int y; };\n\nstatic int twice(int v) {\n\treturn v * 2;\n}\n\nint main(void) {\n\tstruct pt p = { 1, 2 };\n\tfor (int n = 1; n <= 5; n++) {\n\t\tp.x = twice(n);\n\t\tprintf(\"%d\\n\", p.x);\n\t}\n\treturn 0;\n}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("hello.c".into()), &mut s);
+        e.act(Act::Breakpoint(11), &mut s); // p.x = twice(n);
+        e.act(Act::BreakpointCondition("hello.c".into(), 11, " n == 3 ".into()), &mut s);
+        assert_eq!(s.bp_state.get(&("hello.c".to_string(), 11)).and_then(|b| b.condition.clone()).as_deref(), Some("n == 3"));
+        e.act(Act::Debug, &mut s);
+        let wait = |e: &mut Engine, s: &mut State, f: &dyn Fn(&State) -> bool| {
+            for _ in 0..1500 {
+                e.tick(s);
+                if f(s) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let stopped = wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && !d.vars.is_empty()));
+        if !stopped && s.debug.as_ref().is_some_and(|d| !d.live) {
+            eprintln!("debugger couldn't run here: {:?} {:?}", s.debug, s.note);
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert!(stopped, "{:?} {:?}\n{}", s.debug, s.note, s.output);
+        // The condition held it until n was 3.
+        let dbg = s.debug.clone().unwrap();
+        assert_eq!(dbg.frames[0].2, 12);
+        assert!(dbg.locals.iter().any(|(n, v)| n == "n" && v == "3"), "{:?}", dbg.locals);
+        // p opens to its members.
+        let i = dbg.vars.iter().position(|v| v.name == "p").expect("p");
+        assert!(dbg.vars[i].members && !dbg.vars[i].open);
+        e.act(Act::ToggleVar(i), &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.vars.iter().any(|v| v.depth == 1 && v.name == "y" && v.value == "2"))), "{:?}", s.debug);
+        // Into twice, then main's frame shown again.
+        e.act(Act::StepIn, &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && d.frames.first().is_some_and(|f| f.0.contains("twice") && f.2 == 6) && !d.vars.is_empty())), "{:?}", s.debug);
+        assert!(s.debug.as_ref().unwrap().vars.iter().any(|v| v.name == "v" && v.value == "3"));
+        e.act(Act::Frame(1), &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.frame == 1 && d.vars.iter().any(|v| v.name == "n"))), "{:?}", s.debug);
+        // p stays open across the step.
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.vars.iter().any(|v| v.depth == 1 && v.name == "x"))), "{:?}", s.debug);
+        // Evaluated in main's frame.
+        e.act(Act::Evaluate("n * 10".into()), &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.evals.last().is_some_and(|x| x.0 == "n * 10" && x.1 == "30" && x.2))), "{:?}", s.debug);
+        e.act(Act::Evaluate("no_such_name".into()), &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.evals.last().is_some_and(|x| x.0 == "no_such_name" && !x.2))), "{:?}", s.debug);
+        // The pointer on the x of `p.x` (line 12): p.x's value, under it.
+        e.act(Act::Open("hello.c".into()), &mut s);
+        e.act(Act::DebugHover(Some((11, 4))), &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.hover.as_ref().is_some_and(|h| h.0 == 11 && h.1 == 2 && h.2 == "p.x" && h.3 == "4")) ), "{:?}", s.debug);
+        e.tick(&mut s);
+        assert_eq!(e.active_doc().unwrap().note.get_cloned(), Some((11, 2, "p.x = 4".to_string())));
+        e.act(Act::DebugHover(None), &mut s);
+        e.tick(&mut s);
+        assert_eq!(e.active_doc().unwrap().note.get_cloned(), None);
+        // Off: it runs to the end.
+        e.act(Act::BreakpointOn("hello.c".into(), 11, false), &mut s);
+        e.tick(&mut s);
+        assert_eq!(e.active_doc().unwrap().off_breakpoints.get_cloned(), vec![11]);
+        e.act(Act::Debug, &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| !d.live)), "{:?}", s.debug);
+        assert!(s.output.contains("10"), "{}", s.output);
+        // Removed, with its state.
+        e.act(Act::BreakpointRemove("hello.c".into(), 11), &mut s);
+        assert!(s.breakpoints.is_empty() && s.bp_state.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_inspector_follows_the_app_and_jumps_to_the_line_that_drew_a_node() {
+        use pergola::inspect::{encode, Ask, Decoder, Item, Site, Tell};
+        use std::io::{Read, Write};
+        let (d, mut e, mut s) = setup("inspect");
+        std::fs::create_dir_all(d.join("proj/ui/src")).unwrap();
+        std::fs::write(d.join("proj/ui/src/main.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        let (ours, mut app) = std::os::unix::net::UnixStream::pair().unwrap();
+        app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut asked = Decoder::default();
+        let mut next_ask = |app: &mut std::os::unix::net::UnixStream| -> Ask {
+            loop {
+                if let Some(a) = asked.next::<Ask>().unwrap() {
+                    return a;
+                }
+                let mut b = [0u8; 256];
+                let n = app.read(&mut b).expect("an ask");
+                asked.push(&b[..n]);
+            }
+        };
+        e.attach_inspector("dev.p.proj.org.example.ui", "ui", ours.into(), &mut s);
+        assert!(s.inspect.as_ref().is_some_and(|v| v.live && !v.answers));
+        let site = |line| Some(Site { file: "src/main.rs".into(), line, col: 5 });
+        let items = vec![
+            Item { id: 1, parent: None, depth: 0, kind: "Stack".into(), rect: Some([0.0, 0.0, 360.0, 160.0]), detail: "column spacing 0".into(), site: site(1) },
+            Item { id: 2, parent: Some(1), depth: 1, kind: "Text".into(), rect: Some([24.0, 24.0, 90.0, 20.0]), detail: "\"Pressed 0 times\" sans 20pt weight 600 #1a1a1f".into(), site: site(2) },
+            Item { id: 3, parent: Some(1), depth: 1, kind: "Rect".into(), rect: Some([24.0, 72.0, 120.0, 32.0]), detail: "fill #572205 radius 6".into(), site: site(3) },
+        ];
+        // Hello: it answers, and the tree is asked for.
+        app.write_all(&encode(&Tell::Hello { pid: 1 }).unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        e.tick(&mut s);
+        assert!(s.inspect.as_ref().unwrap().answers);
+        assert_eq!(next_ask(&mut app), Ask::Tree);
+        app.write_all(&encode(&Tell::Tree(items.clone())).unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        e.tick(&mut s);
+        let v = s.inspect.as_ref().unwrap();
+        assert_eq!(v.rows.len(), 3);
+        assert_eq!(v.rows[1].site, Some(("src/main.rs".into(), 2, Some("ui/src/main.rs".into()))));
+
+        // Choosing outlines it; hovering another outlines that until the
+        // pointer leaves.
+        e.act(Act::View(Main::Inspect), &mut s);
+        assert_eq!(next_ask(&mut app), Ask::Tree, "the view asks for a fresh tree");
+        e.act(Act::InspectChoose(2), &mut s);
+        assert_eq!(next_ask(&mut app), Ask::Highlight(Some(2)));
+        e.act(Act::InspectHover(3, true), &mut s);
+        assert_eq!(next_ask(&mut app), Ask::Highlight(Some(3)));
+        e.act(Act::InspectHover(3, false), &mut s);
+        assert_eq!(next_ask(&mut app), Ask::Highlight(Some(2)));
+        e.act(Act::InspectBounds, &mut s);
+        assert_eq!(next_ask(&mut app), Ask::Bounds(true));
+
+        // Pick: the app answers with the node pressed on.
+        e.act(Act::InspectPick, &mut s);
+        assert_eq!(next_ask(&mut app), Ask::Pick(true));
+        assert!(s.inspect.as_ref().unwrap().picking);
+        e.act(Act::InspectFold(1), &mut s);
+        assert_eq!(s.inspect.as_ref().unwrap().visible(), vec![0]);
+        e.act(Act::View(Main::Code), &mut s);
+        app.write_all(&encode(&Tell::Picked(3)).unwrap()).unwrap();
+        app.write_all(&encode(&Tell::Tree(items)).unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        e.tick(&mut s);
+        let v = s.inspect.as_ref().unwrap();
+        assert_eq!((s.view, v.picking, v.chosen), (Main::Inspect, false, Some(3)));
+        assert_eq!(v.visible(), vec![0, 1, 2], "its row is shown");
+        assert_eq!(v.chosen_row().map(|r| r.kind.as_str()), Some("Rect"));
+
+        // Go to source: the file of work, at the line.
+        e.act(Act::InspectSource("ui/src/main.rs".into(), 3), &mut s);
+        assert_eq!(s.view, Main::Code);
+        assert_eq!(s.tabs.last().map(|t| t.rel.as_str()), Some("ui/src/main.rs"));
+        e.tick(&mut s);
+        assert_eq!(s.caret, (3, 1));
+
+        // The app ends: its last tree stays, marked so.
+        drop(app);
+        e.tick(&mut s);
+        let v = s.inspect.as_ref().unwrap();
+        assert!(!v.live && v.rows.len() == 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_name_under_the_pointer() {
+        let c: Vec<char> = "\tp.x = q->y + 2 * width;".chars().collect();
+        assert_eq!(name_at(&c, 1), Some(("p".into(), 1)));
+        assert_eq!(name_at(&c, 3), Some(("p.x".into(), 1)));
+        assert_eq!(name_at(&c, 10), Some(("q->y".into(), 7)));
+        assert_eq!(name_at(&c, 19), Some(("width".into(), 18)));
+        assert_eq!(name_at(&c, 14), None); // 2
+        assert_eq!(name_at(&c, 5), None); // =
+        assert_eq!(name_at(&c, 99), None);
+    }
+
     /// A dev app (an atrium.toml) is debugged as an app: F5 asks, a press
     /// starts it waiting under lldb-server (here, Local's stand-in for
     /// portcullisd's), and lldb-dap attaches over gdb-remote and stops at
     /// the breakpoint.
+    #[test]
+    fn a_debug_build_of_a_make_project_is_unoptimised() {
+        let (d, mut e, mut s) = setup("dbgmake");
+        std::fs::create_dir_all(d.join("proj/app")).unwrap();
+        std::fs::write(d.join("proj/app/Makefile"), "all:\n\ttrue\n").unwrap();
+        std::fs::write(d.join("proj/app/app.c"), "int main(void) { return 0; }\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("app/app.c".into()), &mut s);
+        assert_eq!(s.tasks.first().map(|t| t.argv.clone()), Some(vec!["make".to_string()]));
+        e.act(Act::Debug, &mut s);
+        assert!(s.output.starts_with("$ make ATRIUM_DEBUG=1\n"), "{:?}", s.output);
+        e.wait_jobs(&mut s);
+        assert_eq!(s.tasks[0].argv, vec!["make".to_string()], "the Build task itself is unchanged");
+    }
+
     #[test]
     fn debugs_a_dev_app_by_attaching() {
         let llvm = PathBuf::from("/usr/lib/llvm-18/bin");

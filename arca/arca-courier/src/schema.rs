@@ -82,6 +82,11 @@ pub enum Header {
     IfModifiedSince = 5,
     Range = 6,
     CacheControl = 7,
+    /// The origin of the page whose script or form made the request
+    /// (navigator-islands.md I6.5): `https://host` or `https://host:port`,
+    /// nothing else ([`origin_value`]). The client states it as it states
+    /// the ticket's initiator, which Arca's same-site rule already trusts.
+    Origin = 8,
 }
 
 impl Header {
@@ -94,6 +99,7 @@ impl Header {
             5 => Header::IfModifiedSince,
             6 => Header::Range,
             7 => Header::CacheControl,
+            8 => Header::Origin,
             _ => return None,
         })
     }
@@ -107,6 +113,7 @@ impl Header {
             Header::IfModifiedSince => "If-Modified-Since",
             Header::Range => "Range",
             Header::CacheControl => "Cache-Control",
+            Header::Origin => "Origin",
         }
     }
 }
@@ -175,6 +182,21 @@ fn uri_bytes(b: &[u8], path: bool) -> bool {
     b.iter().all(|&c| (0x21..=0x7e).contains(&c) && c != b'#' && !(path && c == b'?'))
 }
 
+/// An `Origin` value: `https://`, a lower-case host name or IPv4 address
+/// (letters, digits, '-' and '.', at most 253), and an optional port.
+pub fn origin_value(b: &[u8]) -> bool {
+    let Some(rest) = b.strip_prefix(b"https://") else { return false };
+    let (host, port) = match rest.iter().position(|&c| c == b':') {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    let host_ok = !host.is_empty() && host.len() <= 253 && host[0] != b'.' && host[0] != b'-'
+        && host.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.');
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p[0] != b'0' && p.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(p).ok().and_then(|p| p.parse::<u16>().ok()).is_some());
+    host_ok && port_ok
+}
+
 fn header_value(b: &[u8]) -> bool {
     !b.is_empty() && b.iter().all(|&c| (0x20..=0x7e).contains(&c)) && b[0] != b' ' && b[b.len() - 1] != b' '
 }
@@ -204,7 +226,7 @@ impl Request {
         for _ in 0..n {
             let h = self::Header::from_u8(r.u8().map_err(t)?).ok_or(Header)?;
             let v = r.bytes(HEADER_VALUE_MAX).map_err(|_| Header)?;
-            if !header_value(v) || headers.iter().any(|(k, _)| *k == h) {
+            if !header_value(v) || h == self::Header::Origin && !origin_value(v) || headers.iter().any(|(k, _)| *k == h) {
                 return Err(Header);
             }
             headers.push((h, v.to_vec()));

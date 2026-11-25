@@ -14,6 +14,7 @@ pub mod exec;
 pub mod fuzz;
 pub mod git;
 pub mod iconedit;
+pub mod inspector;
 pub mod lsp;
 pub mod tasks;
 pub mod tree;

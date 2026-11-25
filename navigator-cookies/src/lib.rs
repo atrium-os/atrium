@@ -85,6 +85,10 @@ pub struct Fetch {
     /// A live page's script POST: its body's type (printable, at most
     /// [`CONTENT_TYPE_MAX`] bytes); `None` is a form's.
     pub content_type: Option<String>,
+    /// A live page's origin (`https://host[:port]`), sent as `Origin` on
+    /// the first hop of its script's request or form (I6.5), so a sibling
+    /// host's CORS answer is the server's own. Only a live view sends one.
+    pub origin: Option<String>,
 }
 
 /// The longest body a request through a courier carries.
@@ -95,26 +99,30 @@ pub const CONTENT_TYPE_MAX: usize = 128;
 
 impl Fetch {
     pub fn navigation(url: &str, initiator: Option<&str>, gesture: bool) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![], secret: None, content_type: None }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![], secret: None, content_type: None, origin: None }
     }
     pub fn subresource(url: &str, page_host: &str) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![], secret: None, content_type: None }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![], secret: None, content_type: None, origin: None }
     }
     /// A form the reader pressed to send, as a POST of `body` from a page
     /// on `page_host`. Only a sign-in window's view sends one.
     pub fn form(url: &str, page_host: &str, body: Vec<u8>) -> Fetch {
-        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body, secret: None, content_type: None }
+        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body, secret: None, content_type: None, origin: None }
     }
     /// A live page's script POST (`fetch`, XHR) of `body` as
     /// `content_type`, from a page on `page_host`. Only a live view sends one.
     pub fn script_post(url: &str, page_host: &str, content_type: &str, body: Vec<u8>) -> Fetch {
         Fetch { url: url.into(), method: Method::Post, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false,
-                body, secret: None, content_type: Some(content_type.into()) }
+                body, secret: None, content_type: Some(content_type.into()), origin: None }
     }
     /// A form a live page submitted (I6.3): a POST navigation of `body`,
     /// `application/x-www-form-urlencoded`. Only a live view sends one.
     pub fn live_form(url: &str, page_host: &str, body: Vec<u8>) -> Fetch {
         Fetch { gesture: false, ..Fetch::form(url, page_host, body) }
+    }
+    /// The same request, saying it comes from a live page at `origin`.
+    pub fn from_origin(self, origin: &str) -> Fetch {
+        Fetch { origin: Some(origin.into()), ..self }
     }
 }
 
@@ -364,6 +372,15 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// The view closed.
     pub fn close(&mut self, view: ViewId) { self.views.remove(&view); }
 
+    /// Close a live view whose jar was for this run only (a live page's
+    /// frame, navigator-islands.md I6.5), and have Arca forget it.
+    pub fn close_throwaway(&mut self, view: ViewId) {
+        if let Some(v) = self.views.get(&view).filter(|v| v.live) {
+            let _ = self.arca.forget(&v.partition, false);
+        }
+        self.close(view);
+    }
+
     /// Whether (and why) a view is cookied.
     pub fn cookied(&self, view: ViewId) -> Option<Why> { self.views.get(&view).and_then(|v| v.cookied) }
 
@@ -420,6 +437,9 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         if f.reason == Reason::Form && !form { return Err(Refused::Method) }
         if f.content_type.is_some() && !script { return Err(Refused::Malformed("a content type only on a live page's script POST".into())) }
         if f.body.len() > arca_courier::schema::BODY_MAX { return Err(Refused::Malformed("the form is too big".into())) }
+        if f.origin.as_ref().is_some_and(|o| !live || !arca_courier::schema::origin_value(o.as_bytes())) {
+            return Err(Refused::Malformed("an origin only from a live page, as https://host".into()))
+        }
         let (mut method, mut reason, mut form_body) = (f.method, f.reason, f.body.clone());
         if f.secret.is_some_and(|(at, _)| at > f.body.len() || !form) { return Err(Refused::Malformed("a password goes only in a sign-in window's form".into())) }
         let mut secret = f.secret;
@@ -457,6 +477,11 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             if method == Method::Post {
                 let kind = f.content_type.as_deref().filter(|_| script).unwrap_or("application/x-www-form-urlencoded");
                 headers.push((Header::ContentType, kind.as_bytes().to_vec()));
+            }
+            // The page's origin goes with its own request, not with a
+            // redirect's next hop.
+            if let Some(o) = f.origin.as_ref().filter(|_| redirects == 0) {
+                headers.push((Header::Origin, o.as_bytes().to_vec()));
             }
             let segs = |at: Option<usize>| match at {
                 // The password's place: Arca's courier puts it there.

@@ -714,6 +714,13 @@ pub enum Request {
     /// builds: installed apps are never debuggable (D9). Answer:
     /// `WorkspaceDebugging`.
     WorkspaceDebug { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
+    /// Run with the inspector (dev-tools.md §3.6, D23–D25): as
+    /// `WorkspaceRun`, and the answer `WorkspaceRan` is followed by one
+    /// descriptor, a stream socket whose other end the dev app finds at fd 3
+    /// (`ATRIUM_INSPECT_FD=3`). A Pergola dev build answers the inspector's
+    /// questions on it (`pergola::inspect`); anything else ignores it. Only
+    /// dev builds, only to the app that pressed Run.
+    WorkspaceInspect { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
     /// Move the cores the workspace's dev builds left in their own overlays
     /// into its `work/.atrium/cores/` (dev-tools.md §7.2), as
     /// `<app id>.<core name>`. Answer: `WorkspaceCores`, the copies' paths

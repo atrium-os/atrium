@@ -78,7 +78,9 @@ impl Label {
 }
 
 impl View for Label {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -130,7 +132,9 @@ impl Glyph {
 }
 
 impl View for Glyph {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }

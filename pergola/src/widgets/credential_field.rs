@@ -124,7 +124,9 @@ impl crate::view::Widget for CredentialField {
 }
 
 impl View for CredentialField {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let fill = ctx.theme.bg_canvas();
         let id = ctx.add(Node::Rect { rect: self.rect, fill, radius: radius::XS });
         // Not focusable and no key handler: keys for this field go to
@@ -143,7 +145,9 @@ mod tests {
 
     struct Form { f: CredentialField }
     impl View for Form {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let col = ctx.push(Node::vstack(Rect::new(20.0, 30.0, 300.0, 0.0), 8.0));
             self.f.render(ctx);
             ctx.pop();
@@ -196,7 +200,9 @@ mod tests {
 
     struct Inner { f: CredentialField, gap: f32 }
     impl View for Inner {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             // A spacer, then the field at y 80 in a 100-tall view.
             let fill = ctx.theme.bg_canvas();
             ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 300.0, self.gap), fill, radius: 0.0 });
@@ -205,7 +211,9 @@ mod tests {
     }
     struct Scrolled { inner: Inner, s: Mutable<crate::widgets::ScrollState> }
     impl View for Scrolled {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             ScrollView::new(self.s.clone(), Rect::new(0.0, 0.0, 300.0, 100.0), Inner { f: self.inner.f.clone(), gap: self.inner.gap }).emit(ctx);
         }
     }

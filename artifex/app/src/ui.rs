@@ -82,8 +82,37 @@ pub enum Act {
     /// A breakpoint on (0-based) line of the active file, on or off;
     /// `usize::MAX`: the caret's line.
     Breakpoint(usize),
-    /// Show a frame of the stopped program.
+    /// Show a frame of the stopped program (its line and its locals).
     Frame(usize),
+    /// Show or hide a variable's members (a row of the Variables column).
+    ToggleVar(usize),
+    /// Evaluate an expression in the shown frame.
+    Evaluate(String),
+    /// The pointer over the editor's text at (line, column), or off it.
+    DebugHover(Option<(usize, usize)>),
+    /// A breakpoint (file, 0-based line) on or off.
+    BreakpointOn(String, usize, bool),
+    /// A breakpoint's condition (empty: none).
+    BreakpointCondition(String, usize, String),
+    BreakpointRemove(String, usize),
+    Pause,
+    /// Stop, then debug again.
+    RestartDebug,
+    /// The inspector (dev-tools.md §3.6): take the next press in the app.
+    InspectPick,
+    /// Outline every box in the app, or stop.
+    InspectBounds,
+    /// Ask the app for its tree again.
+    InspectRefresh,
+    InspectChoose(u32),
+    /// The pointer came onto (true) or left a row.
+    InspectHover(u32, bool),
+    /// Show or hide a row's children.
+    InspectFold(u32),
+    /// Rows to move the list by.
+    InspectScroll(i32),
+    /// Open the file in `work` at the line that drew the chosen node.
+    InspectSource(String, usize),
     /// Fuzzing on or off for the project.
     Fuzz,
     /// Go to where a fuzz crash happened.
@@ -139,7 +168,36 @@ pub struct Debug {
     pub live: bool,
     /// name, file in work, 1-based line.
     pub frames: Vec<(String, Option<String>, usize)>,
+    /// The shown frame's top-level locals.
     pub locals: Vec<(String, String)>,
+    /// Which of `frames` is shown (its locals; evaluations run in it).
+    pub frame: usize,
+    /// The variables as the panel lists them, members under what's open.
+    pub vars: Vec<VarRow>,
+    /// The evaluate line's history: expression, answer, whether it worked.
+    pub evals: Vec<(String, String, bool)>,
+    /// The value of the name under the pointer: line, column (0-based),
+    /// the name, its value.
+    pub hover: Option<(usize, usize, String, String)>,
+}
+
+/// A row of the Variables column.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VarRow {
+    pub depth: usize,
+    pub name: String,
+    pub value: String,
+    pub kind: Option<String>,
+    /// It has members, and whether they're shown.
+    pub members: bool,
+    pub open: bool,
+}
+
+/// A breakpoint's state beyond its line: off, and its condition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BpState {
+    pub off: bool,
+    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -170,6 +228,10 @@ pub struct DocCells {
     pub breakpoints: Mutable<Vec<usize>>,
     /// The line the debugger stopped at, in this file.
     pub stopped: Mutable<Option<usize>>,
+    /// Breakpoints switched off, in this file.
+    pub off_breakpoints: Mutable<Vec<usize>>,
+    /// A value shown under a name while stopped: line, column, text.
+    pub note: Mutable<Option<(usize, usize, String)>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -210,6 +272,8 @@ pub struct State {
     pub template: usize,
     /// Breakpoints: file in work → 0-based lines.
     pub breakpoints: std::collections::BTreeMap<String, Vec<usize>>,
+    /// Breakpoints switched off or given a condition: (file, 0-based line).
+    pub bp_state: std::collections::BTreeMap<(String, usize), BpState>,
     pub debug: Option<Debug>,
     pub fuzz: Option<crate::fuzz::Fuzz>,
     /// A Run task's question (atrium-run, W5): the folder it asks to Run.
@@ -227,6 +291,8 @@ pub struct State {
     pub crash_bytes: Option<(String, Vec<u8>)>,
     /// The Assets view: the project's `assets/` and an import under way.
     pub assets: Option<crate::assets::Assets>,
+    /// The app a Run started, as the inspector sees it.
+    pub inspect: Option<crate::inspector::Inspect>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -277,6 +343,11 @@ pub struct ArtifexView {
     pub state: Mutable<State>,
     /// New project's name field.
     pub new_name: Mutable<TextEdit>,
+    /// The Debug panel's evaluate line, and the chosen breakpoint's
+    /// condition (with which breakpoint it is).
+    pub eval_field: Mutable<TextEdit>,
+    pub cond_field: Mutable<TextEdit>,
+    pub bp_chosen: Mutable<Option<(String, usize)>>,
     pub doc: Mutable<Option<DocCells>>,
     pub size: Mutable<(f32, f32)>,
     pub queue: Queue,
@@ -345,12 +416,17 @@ pub fn left() -> f32 { strip_w() + side_w() }
 pub fn tabs_h() -> f32 { em(32.0) }
 pub fn status_h() -> f32 { em(24.0) }
 pub fn panel_h() -> f32 { em(200.0) }
+/// The panel's height as `s` shows it: the debugger's is taller, for its
+/// three columns and the evaluate line.
+pub fn panel_of(s: &State) -> f32 {
+    if !s.panel_open { 0.0 } else if s.panel == Panel::Debug { em(260.0) } else { panel_h() }
+}
 pub fn row_h() -> f32 { em(22.0) }
 
 /// Where the code grid goes in a window `w`×`h`.
-pub fn editor_rect(w: f32, h: f32, panel: bool) -> Rect {
+pub fn editor_rect(w: f32, h: f32, panel: f32) -> Rect {
     let top = bar_h() + tabs_h();
-    let bottom = h - status_h() - if panel { panel_h() } else { 0.0 };
+    let bottom = h - status_h() - panel;
     Rect::new(left(), top, (w - left()).max(em(100.0)), (bottom - top).max(em(60.0)))
 }
 
@@ -402,20 +478,41 @@ impl View for ArtifexView {
                     buttons.push(("Debug", Some(phosphor::BUG), Act::Debug));
                 }
             } else {
+                // One group while debugging: what each does, with its key.
                 if stopped {
-                    buttons.extend([("Continue", Some(phosphor::PLAY), Act::Debug), ("Over", None, Act::StepOver), ("Into", None, Act::StepIn), ("Out", None, Act::StepOut)]);
+                    buttons.push(("Continue", Some(phosphor::PLAY), Act::Debug));
+                } else {
+                    buttons.push(("Pause", Some(phosphor::PAUSE), Act::Pause));
                 }
-                buttons.push(("Stop", Some(phosphor::X), Act::StopDebug));
+                if stopped {
+                    buttons.extend([("Over", Some(phosphor::CARET_RIGHT), Act::StepOver), ("Into", Some(phosphor::CARET_DOWN), Act::StepIn),
+                        ("Out", Some(phosphor::ARROWS_OUT_SIMPLE), Act::StepOut)]);
+                }
+                buttons.extend([("Restart", Some(phosphor::ARROW_CLOCKWISE), Act::RestartDebug), ("Stop", Some(phosphor::X), Act::StopDebug)]);
             }
-            for (i, (label, icon, a)) in buttons.into_iter().enumerate() {
+            let group_x = x;
+            for (i, (label, icon, a)) in buttons.iter().cloned().enumerate() {
                 ctx.key(30 + i as u64);
                 let bw = em(if icon.is_some() { 40.0 } else { 18.0 } + 8.0 * label.len() as f32);
-                let mut b = Button::ghost(label);
+                let tip = match label {
+                    "Debug" | "Continue" => format!("{label} (F5)"),
+                    "Over" => "Step over (F10)".into(),
+                    "Into" => "Step into (F11)".into(),
+                    "Out" => "Step out (Shift+F11)".into(),
+                    "Pause" => "Pause the program".into(),
+                    "Restart" => "Stop, then debug again".into(),
+                    _ => "Stop debugging (ends the program)".into(),
+                };
+                let mut b = Button::ghost(label).tooltip(tip);
                 if let Some(ch) = icon {
                     b = b.lead(ch);
                 }
                 b.at(x, by).width(bw).on_click(plain(q, a)).render(ctx);
                 x += bw + em(2.0);
+            }
+            if live {
+                // The group, framed, so it reads as one control.
+                ctx.add(Node::Rect { rect: Rect::new(group_x - em(4.0), by - em(2.0), x - group_x + em(6.0), 1.0), fill: t.accent_strong(), radius: 0.0 });
             }
         }
         if let Some(r) = &s.running {
@@ -425,10 +522,18 @@ impl View for ArtifexView {
             text(ctx, x, mid, &format!("{r}…"), type_size::SM, Weight::Regular, t.text_secondary());
         }
         if s.ws.is_some() {
-            ctx.key(41);
-            Button::ghost("Terminal").lead(phosphor::TERMINAL_WINDOW).at(w - em(110.0), by).width(em(100.0)).on_click(pressed(q, Act::Terminal)).render(ctx);
-            ctx.key(42);
-            Button::ghost("New project").lead(phosphor::PACKAGE).at(w - em(240.0), by).width(em(124.0)).on_click(plain(q, Act::NewProject)).render(ctx);
+            // While debugging, the group needs the room: icons only.
+            if s.debug.as_ref().is_some_and(|d| d.live) {
+                ctx.key(41);
+                Button::ghost("Terminal").icon(phosphor::TERMINAL_WINDOW).tooltip("Terminal").at(w - em(46.0), by).width(em(36.0)).on_click(pressed(q, Act::Terminal)).render(ctx);
+                ctx.key(42);
+                Button::ghost("New project").icon(phosphor::PACKAGE).tooltip("New project").at(w - em(86.0), by).width(em(36.0)).on_click(plain(q, Act::NewProject)).render(ctx);
+            } else {
+                ctx.key(41);
+                Button::ghost("Terminal").lead(phosphor::TERMINAL_WINDOW).at(w - em(110.0), by).width(em(100.0)).on_click(pressed(q, Act::Terminal)).render(ctx);
+                ctx.key(42);
+                Button::ghost("New project").lead(phosphor::PACKAGE).at(w - em(240.0), by).width(em(124.0)).on_click(plain(q, Act::NewProject)).render(ctx);
+            }
         }
 
         // The view strip: Files, then the views the project has.
@@ -453,8 +558,15 @@ impl View for ArtifexView {
             if s.composition.is_some() {
                 views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
             }
-            if s.debug.is_some() {
+            // Debug: while a program is debugged, or breakpoints are set; a
+            // dot while it is stopped.
+            let stopped = s.debug.as_ref().is_some_and(|d| d.stopped && d.live);
+            if s.debug.is_some() || !s.breakpoints.is_empty() {
                 views.push(("Debug", phosphor::BUG, Act::Panel(Panel::Debug), code && s.panel_open && s.panel == Panel::Debug, 0));
+            }
+            // Inspect: an app a Run started that answers (a Pergola dev build).
+            if s.inspect.as_ref().is_some_and(|v| v.answers) {
+                views.push(("Inspect", phosphor::STACK_SIMPLE, Act::View(Main::Inspect), s.view == Main::Inspect, 0));
             }
             for (i, (label, icon, act, on, count)) in views.into_iter().enumerate() {
                 let y = st_top + em(8.0) + i as f32 * em(42.0);
@@ -466,6 +578,9 @@ impl View for ArtifexView {
                 b.rect.size.h = em(36.0);
                 b = b.on_click(plain(q, act));
                 b.render(ctx);
+                if label == "Debug" && stopped {
+                    ctx.add(Node::Rect { rect: Rect::new(em(29.0), y + em(4.0), em(9.0), em(9.0)), fill: t.accent_strong(), radius: em(4.5) });
+                }
                 if count > 0 {
                     let label = if count > 9 { "9+".to_string() } else { count.to_string() };
                     ctx.add(Node::Rect { rect: Rect::new(em(26.0), y + em(2.0), em(15.0), em(15.0)), fill: t.danger_fg(), radius: em(7.5) });
@@ -477,9 +592,9 @@ impl View for ArtifexView {
         }
 
         // The tree, the tabs and the editor; or a full view.
-        let er = editor_rect(w, h, s.panel_open);
+        let er = editor_rect(w, h, panel_of(&s));
         if s.view != Main::Code {
-            let bottom = h - status_h() - if s.panel_open { panel_h() } else { 0.0 };
+            let bottom = h - status_h() - panel_of(&s);
             let area = Rect::new(strip_w(), bar_h(), w - strip_w(), bottom - bar_h());
             ctx.key(8050);
             ctx.push(Node::Rect { rect: area, fill: t.bg_canvas(), radius: 0.0 });
@@ -487,6 +602,7 @@ impl View for ArtifexView {
                 Main::Fuzz => crate::views::fuzz(ctx, &s, q, area),
                 Main::Composition => crate::views::composition(ctx, &s, q, area),
                 Main::Assets => crate::views::assets(ctx, &s, q, area),
+                Main::Inspect => crate::views::inspect(ctx, &s, q, area),
                 Main::Code => {}
             }
             ctx.pop();
@@ -624,6 +740,14 @@ impl View for ArtifexView {
                 .marks(doc.marks.get_cloned())
                 .breakpoints(doc.breakpoints.get_cloned())
                 .stopped(doc.stopped.get_cloned())
+                .off_breakpoints(doc.off_breakpoints.get_cloned())
+                .note(doc.note.get_cloned())
+                .on_point({
+                    let q3 = q.clone();
+                    let last = Rc::new(std::cell::Cell::new(None));
+                    // Only a change of place is news.
+                    Rc::new(move |at| if last.replace(at) != at { push(&q3, Act::DebugHover(at)) })
+                })
                 .on_gutter_click({
                     let q3 = q.clone();
                     Rc::new(move |line| push(&q3, Act::Breakpoint(line)))
@@ -658,11 +782,11 @@ impl View for ArtifexView {
             // Under the editor, or across a full view.
             let pl = if s.view == Main::Code { left() } else { strip_w() };
             let py = er.y() + er.h();
-            ctx.add(Node::Rect { rect: Rect::new(pl, py, w - pl, panel_h()), fill: t.bg_surface(), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(pl, py, w - pl, panel_of(&s)), fill: t.bg_surface(), radius: 0.0 });
             ctx.add(Node::Rect { rect: Rect::new(pl, py, w - pl, 1.0), fill: t.border_default(), radius: 0.0 });
             let mut px = pl + em(8.0);
             let mut tabs = vec![(Panel::Output, phosphor::CODE, "Output".to_string()), (Panel::Problems, phosphor::WARNING, format!("Problems ({})", s.problems.len()))];
-            if s.debug.is_some() {
+            if s.debug.is_some() || !s.breakpoints.is_empty() {
                 tabs.push((Panel::Debug, phosphor::BUG, "Debug".to_string()));
             }
             for (i, (p, icon, label)) in tabs.into_iter().enumerate() {
@@ -713,28 +837,8 @@ impl View for ArtifexView {
                     }
                 }
                 Panel::Debug => {
-                    let Some(d) = &s.debug else { return };
-                    text(ctx, pl + em(12.0), body_y, &d.run, type_size::SM, Weight::Medium, t.text_primary());
-                    let half = (w - pl) / 2.0;
-                    for (i, (name, file, line)) in d.frames.iter().take(lines_fit.saturating_sub(1)).enumerate() {
-                        let y = body_y + (i + 1) as f32 * em(18.0);
-                        ctx.key(5500 + i as u64);
-                        let id = ctx.push(Node::Rect { rect: Rect::new(pl + em(4.0), y - em(9.0), half - em(8.0), em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
-                        if ctx.is_hovered(id) {
-                            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
-                                *fill = t.state_hover();
-                            }
-                        }
-                        ctx.on_click(id, plain(q, Act::Frame(i)));
-                        let place = match file { Some(f) => format!("{name}  {f}:{line}"), None => name.clone() };
-                        mono(ctx, pl + em(12.0), y, &fit(&place, half - em(24.0), type_size::SM),
-                            if file.is_some() { t.text_primary() } else { t.text_tertiary() });
-                        ctx.pop();
-                    }
-                    for (i, (name, value)) in d.locals.iter().take(lines_fit.saturating_sub(1)).enumerate() {
-                        let y = body_y + (i + 1) as f32 * em(18.0);
-                        mono(ctx, pl + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
-                    }
+                    let area = Rect::new(pl, body_y - em(10.0), w - pl, py + panel_of(&s) - (body_y - em(10.0)));
+                    crate::views::debug_panel(ctx, &s, q, &self.eval_field, &self.cond_field, &self.bp_chosen, area);
                 }
                 Panel::Problems => {
                     if s.problems.is_empty() {

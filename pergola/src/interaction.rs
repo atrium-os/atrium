@@ -52,6 +52,9 @@ pub type FrameHandler = Box<dyn Fn(f64, &Node) -> bool + 'static>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DragPhase { Start, Move, End }
 pub type DragHandler = Box<dyn Fn(DragPhase, Point) + 'static>;
+/// Where the pointer is over a node (its own layout units), or `None` when
+/// it left.
+pub type PointerHandler = Box<dyn Fn(Option<Point>) + 'static>;
 
 #[derive(Default)]
 pub struct Handlers {
@@ -88,6 +91,9 @@ pub struct Handlers {
     /// `on_drag` gets points relative to the node's own top-left, in its
     /// layout units ([`crate::view::Ctx::on_drag_local`]), not window px.
     pub drag_local: bool,
+    /// Every move of the pointer over this node, relative to its top-left
+    /// ([`crate::view::Ctx::on_pointer_local`]), and `None` when it leaves.
+    pub on_pointer: Option<PointerHandler>,
     /// This node is where another process's surface is embedded (a Limen
     /// slot, e.g. Arca's credential field): the App reports its window
     /// rect to the binder whenever it changes ([`crate::slot`]).

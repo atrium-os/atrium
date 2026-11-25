@@ -114,7 +114,9 @@ impl VirtualList {
 }
 
 impl crate::view::View for VirtualList {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -148,7 +150,9 @@ mod tests {
     }
 
     impl View for Big {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             VirtualList::new(self.state.clone(), Rect::new(0.0, 0.0, 300.0, 320.0), 100_000, 32.0, |i, ctx| {
                 ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 300.0, 32.0), fill: Color::rgba((i % 7) as f32 / 7.0, 0.0, 0.0, 1.0), radius: 0.0 });
             })

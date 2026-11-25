@@ -119,3 +119,21 @@ fn lookups_and_records_on_the_wire() {
     let long = WireEvent::Records { id: 1, records: vec![Record::Txt("x".repeat(TXT_MAX + 1))], secure: false };
     assert_eq!(WireEvent::decode(&long.encode()), None);
 }
+
+#[test]
+fn a_cors_answer_is_one_origin_or_none() {
+    let ok = WireEvent::Cors { id: 3, allow_origin: "https://app.example".into(), allow_credentials: true };
+    assert_eq!(WireEvent::decode(&ok.encode()), Some(ok));
+    for v in ["", "*", "null", "https://app.example:8443"] {
+        let e = WireEvent::Cors { id: 3, allow_origin: v.into(), allow_credentials: false };
+        assert_eq!(WireEvent::decode(&e.encode()), Some(e), "{v}");
+    }
+    for v in ["https://a.example, https://b.example", "https://a.example/", "https://a.example\r\nX: 1", "ftp://a.example",
+              &format!("https://{}", "a".repeat(CORS_ORIGIN_MAX))] {
+        let e = WireEvent::Cors { id: 3, allow_origin: v.to_string(), allow_credentials: true };
+        assert_eq!(WireEvent::decode(&e.encode()), None, "{v:?}");
+        // The sender turns it into no allowance rather than sending it.
+        let (wire, _) = WireEvent::from_event(Event::Cors { id: 3, allow_origin: v.to_string(), allow_credentials: true });
+        assert_eq!(wire, WireEvent::Cors { id: 3, allow_origin: String::new(), allow_credentials: true });
+    }
+}

@@ -50,6 +50,8 @@ pub struct App<V: View> {
     focus_visible: bool,
     /// The node following the held press (`Ctx::on_drag`), if any.
     dragging: Option<NodeId>,
+    /// The node with `on_pointer` under the pointer.
+    pointing: Option<NodeId>,
     /// Where focus was before an autofocus layer took it, to go back to.
     focus_return: Option<NodeId>,
     /// The autofocus layer that is up (a dialog, an open menu): Tab stays
@@ -86,6 +88,12 @@ pub struct App<V: View> {
     slot_changes: Vec<(crate::slot::SlotKey, Option<crate::geom::Rect>)>,
     /// Menus open as pop-up windows (set by `Window`).
     popups: bool,
+    /// What the inspector outlines, and the nodes drawn for it, which are
+    /// not the app's (dev builds; [`crate::inspect`]).
+    #[cfg(debug_assertions)]
+    marks: crate::inspect::Marks,
+    #[cfg(debug_assertions)]
+    mark_ids: std::collections::HashSet<NodeId>,
 }
 
 impl<V: View> App<V> {
@@ -115,6 +123,7 @@ impl<V: View> App<V> {
             focused: None,
             focus_visible: false,
             dragging: None,
+            pointing: None,
             focus_return: None,
             modal: None,
             hover_since: 0.0,
@@ -132,8 +141,25 @@ impl<V: View> App<V> {
             slots: Default::default(),
             slot_changes: Vec::new(),
             popups: false,
+            #[cfg(debug_assertions)]
+            marks: Default::default(),
+            #[cfg(debug_assertions)]
+            mark_ids: Default::default(),
         }
     }
+
+    /// Outline what the inspector asks for, from the next frame.
+    #[cfg(debug_assertions)]
+    pub fn set_marks(&mut self, marks: crate::inspect::Marks) {
+        if marks != self.marks {
+            self.marks = marks;
+            self.invalidate();
+        }
+    }
+
+    /// The nodes the inspector's outlines are drawn with.
+    #[cfg(debug_assertions)]
+    pub fn mark_ids(&self) -> &std::collections::HashSet<NodeId> { &self.mark_ids }
 
     pub fn with_theme(mut self, theme: Semantic) -> Self {
         self.theme = theme;
@@ -298,6 +324,10 @@ impl<V: View> App<V> {
             if let (Some(cb), Some(node)) = (interactions.get(id).and_then(|h| h.on_reflow.as_ref()), next.get(id)) {
                 cb(y, node);
             }
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.mark_ids = if self.marks.any() { crate::inspect::draw_marks(&mut next, &self.marks) } else { Default::default() };
         }
         // The render pass laid it out (`Ctx::flush_overlays`).
         let deltas = if std::mem::take(&mut self.resend) {
@@ -585,6 +615,19 @@ impl<V: View> App<V> {
                     // don't say so, and frames stop.
                     self.animating = true;
                 }
+                let pointing = hit_test(&self.prev_tree, *at).and_then(|id| self.bubble_to(id, |h| h.on_pointer.is_some()));
+                if self.pointing != pointing {
+                    if let Some(cb) = self.pointing.and_then(|p| self.interactions.get(p)).and_then(|h| h.on_pointer.as_ref()) {
+                        cb(None);
+                    }
+                    self.pointing = pointing;
+                }
+                if let Some(p) = pointing {
+                    let local = self.drag_point(p, *at);
+                    if let Some(cb) = self.interactions.get(p).and_then(|h| h.on_pointer.as_ref()) {
+                        cb(Some(local));
+                    }
+                }
                 // Hover target = nearest interactive ancestor (clickable
                 // or focusable) under the pointer.
                 let hover = hit_test(&self.prev_tree, *at)
@@ -786,6 +829,28 @@ mod tests {
                 ctx.focusable(id);
             }
         }
+    }
+
+    /// A rect at (100, 50) hearing the pointer over it.
+    struct Pointed(std::sync::Arc<std::sync::Mutex<Vec<Option<(f32, f32)>>>>);
+    impl View for Pointed {
+        fn render(&self, ctx: &mut Ctx) {
+            let id = ctx.tree.insert(None, Node::Rect { rect: Rect::new(100.0, 50.0, 80.0, 40.0), fill: Color::rgba(0.5, 0.5, 0.5, 1.0), radius: 0.0 });
+            let heard = self.0.clone();
+            ctx.on_pointer_local(id, move |p| heard.lock().unwrap().push(p.map(|p| (p.x, p.y))));
+        }
+    }
+
+    #[test]
+    fn the_pointer_is_heard_over_a_node_in_its_own_units_and_when_it_leaves() {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut app = App::new(Pointed(heard.clone()));
+        app.tick();
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(10.0, 10.0) });
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(110.0, 60.0) });
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(130.0, 70.0) });
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(300.0, 70.0) });
+        assert_eq!(*heard.lock().unwrap(), vec![Some((10.0, 10.0)), Some((30.0, 20.0)), None]);
     }
 
     #[test]
