@@ -1072,9 +1072,16 @@ mod tests {
         assert!(may_spend(&Some(vec![purpose::PROMPT]), purpose::PROMPT));
         assert!(!may_spend(&Some(vec![purpose::PROMPT]), purpose::PASTE), "navigatord can't paste");
         let named: Vec<u8> = DEFAULT_CONSUMERS.iter().flat_map(|(_, p)| p.iter().copied()).collect();
-        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::APPROVE, purpose::LINK] {
+        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::LINK] {
             assert_eq!(named.iter().filter(|&&q| q == p).count(), 1, "purpose {p}: exactly one default broker");
         }
+        // APPROVE has two: portcullisd (root) for Allow in Settings' window,
+        // and _arca-ui for its own sheets (the S/MIME sheet, arca.md). A
+        // press is spent only for the uid whose window took it (WRONG_UID
+        // otherwise), so neither can spend the other's presses.
+        let approvers: Vec<&str> = DEFAULT_CONSUMERS.iter()
+            .filter(|(_, p)| p.contains(&purpose::APPROVE)).map(|(n, _)| *n).collect();
+        assert_eq!(approvers, ["root", "_arca-ui"], "APPROVE's brokers");
         for p in SELF_SPENT {
             assert!(!named.contains(p), "purpose {p} is self-spent, no broker's");
         }
