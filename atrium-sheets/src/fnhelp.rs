@@ -144,6 +144,41 @@ pub fn args(func: &str) -> Option<Vec<&'static str>> {
     Some(if a.is_empty() { Vec::new() } else { a.split(", ").collect() })
 }
 
+/// Formula AutoComplete: `typed` (a formula, the caret at its end) with the
+/// name being typed finished, when exactly one function (then `(`) or
+/// defined name begins with it. Not inside a string or a quoted sheet name,
+/// and not after a sheet name (`Sheet1!A`) or a digit.
+pub fn complete_formula(typed: &str, names: &[String]) -> Option<String> {
+    if !typed.starts_with('=') || typed.len() > MAX_TIP_SCAN {
+        return None;
+    }
+    // Inside quotes, nothing.
+    let mut quote = None;
+    for ch in typed.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None => {}
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let start = typed.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_')).map_or(0, |k| k + 1);
+    let word = &typed[start..];
+    let before = typed[..start].chars().last();
+    if word.is_empty() || !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') || matches!(before, Some('!' | ':' | '$')) {
+        return None;
+    }
+    let w = word.to_ascii_lowercase();
+    let funcs = officina_grid::eval::funcs::FUNCS.iter().map(|f| f.name).filter(|n| !n.starts_with('_')).filter(|n| n.len() > w.len() && n.to_ascii_lowercase().starts_with(&w)).map(|n| format!("{n}("));
+    let names = names.iter().filter(|n| n.len() > w.len() && n.to_lowercase().starts_with(&w)).cloned();
+    let mut hits = funcs.chain(names);
+    let one = hits.next()?;
+    hits.next().is_none().then(|| format!("{}{one}", &typed[..start]))
+}
+
 /// The function the caret at byte `caret` of `text` is inside, and which of
 /// its arguments (from 0) it is in. None outside a function or a formula.
 pub fn call_at(text: &str, caret: usize) -> Option<(String, usize)> {
@@ -247,6 +282,23 @@ mod tests {
         assert_eq!(at("SUM("), None, "not a formula");
         assert_eq!(at("=(1+2"), None);
         assert_eq!(call_at("=ROUND(A1, 2)", 7), Some(("ROUND".into(), 0)));
+    }
+
+    #[test]
+    fn formula_autocomplete_finishes_one_function_or_name() {
+        let names = vec!["Costs".to_string(), "Totals2025".to_string()];
+        let c = |t: &str| complete_formula(t, &names);
+        assert_eq!(c("=vlo").as_deref(), Some("=VLOOKUP("));
+        assert_eq!(c("=1+SUMP").as_deref(), Some("=1+SUMPRODUCT("));
+        assert_eq!(c("=SUM"), None, "SUMIF, SUMIFS and SUMPRODUCT");
+        assert_eq!(c("=co"), None, "functions and a name");
+        assert_eq!(c("=cos").as_deref(), Some("=Costs"));
+        assert_eq!(c("=SUM(tot").as_deref(), Some("=SUM(Totals2025"));
+        assert_eq!(c("=Sheet1!XL"), None, "after a sheet name");
+        assert_eq!(c("=A1:XL"), None);
+        assert_eq!(c("=\"vlo"), None, "in a string");
+        assert_eq!(c("=1"), None);
+        assert_eq!(c("vlo"), None, "not a formula");
     }
 
     #[test]

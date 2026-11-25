@@ -499,6 +499,8 @@ pub struct GridState {
     /// finish the entry and move. Otherwise (F2, Enter, a press in the
     /// editor) they move the caret.
     entering: bool,
+    /// The editor's selected tail is an AutoComplete guess, made by the last key.
+    guess: bool,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -1039,6 +1041,9 @@ impl GridView {
         }
         ctx.pop();
         ctx.focusable(body_id);
+        // Tab moves the cursor (and takes a formula guess), as in Excel;
+        // Ctrl+Tab still moves focus out.
+        ctx.takes_tab(body_id);
         let s = self.scroll.clone();
         ctx.on_scroll(body_id, move |inp: &ScrollInput| {
             let mut st = s.get();
@@ -1316,6 +1321,7 @@ impl GridView {
                 }
                 ctx.pop();
                 ctx.focusable(id);
+                ctx.takes_tab(id);
                 let d = drag.clone();
                 ctx.on_drag(id, move |ph, p| d(ph, p));
                 let kk = keys.clone();
@@ -2550,19 +2556,22 @@ fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
 
 /// AutoComplete after a character typed at the end: the rest of the entry
 /// the source offers, selected, so the next key replaces it and Enter keeps it.
-fn complete(src: &dyn GridSource, at: (u32, u32), ed: &mut TextEdit) {
+/// A formula's guess (a function name) is taken with Tab and dropped by the
+/// keys that move or finish; a text's is kept by Enter, as in Excel.
+fn complete(src: &dyn GridSource, at: (u32, u32), ed: &mut TextEdit) -> bool {
     let typed = ed.text().to_string();
-    if typed.is_empty() || typed.starts_with('=') || ed.has_selection() || ed.caret() != typed.len() {
-        return;
+    if typed.is_empty() || ed.has_selection() || ed.caret() != typed.len() {
+        return false;
     }
-    let Some(full) = src.complete(at.0, at.1, &typed) else { return };
-    let Some((cut, _)) = full.char_indices().nth(typed.chars().count()) else { return };
+    let Some(full) = src.complete(at.0, at.1, &typed) else { return false };
+    let Some((cut, _)) = full.char_indices().nth(typed.chars().count()) else { return false };
     if full[..cut].to_lowercase() != typed.to_lowercase() {
-        return;
+        return false;
     }
     ed.set_text(&full);
     ed.set_caret(cut, false);
     ed.set_caret(full.len(), true);
+    true
 }
 
 /// Close the editor, sending what it holds.
@@ -2648,7 +2657,22 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
     // The editor has the keys, except the ones that end it.
     // How wide the editor's lines may run (a wrapping cell's width).
     let wrap = editor_wrap(src, g);
+    let guessed = std::mem::take(&mut g.guess);
     if let Some(ed) = &mut g.edit {
+        if guessed && ed.text().starts_with('=') && ed.has_selection() {
+            match key {
+                // Tab takes a formula's guess and goes on editing.
+                Key::Tab if !m.shift => {
+                    ed.set_caret(ed.text().len(), false);
+                    return true;
+                }
+                // A typed key replaces it, Backspace and Delete remove it.
+                Key::Char | Key::Backspace | Key::Delete => {}
+                _ => {
+                    ed.backspace(false);
+                }
+            }
+        }
         let finish = |g: &mut GridState, st: &mut ScrollState, dr: i64, dc: i64| {
             commit(g, act);
             let to = step(g.cursor, dr, dc);
@@ -2743,7 +2767,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 return match ed.key(key, m, chars) {
                     KeyOutcome::Changed => {
                         if key == Key::Char && !(m.ctrl || m.meta || m.alt) {
-                            complete(src, g.cursor, ed);
+                            g.guess = complete(src, g.cursor, ed);
                         }
                         true
                     }
@@ -2951,7 +2975,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             // (for Ctrl+Enter).
             let mut ed = TextEdit::new("");
             ed.insert(chars);
-            complete(src, g.cursor, &mut ed);
+            g.guess = complete(src, g.cursor, &mut ed);
             g.edit = Some(ed);
             g.entering = true;
             reveal(src, geom, st, g.cursor);
@@ -3937,7 +3961,7 @@ mod tests {
         key(&mut app, Key::Char, "a", none);
         key(&mut app, Key::Backspace, "", none);
         assert_eq!(text(&state), Some(("A".into(), "".into())));
-        // Another column has nothing to offer; formulas are never completed.
+        // Another column has nothing to offer.
         key(&mut app, Key::Escape, "", none);
         let mut g = state.get_cloned();
         g.select(7, 2);
@@ -3945,9 +3969,36 @@ mod tests {
         key(&mut app, Key::Char, "a", none);
         assert_eq!(text(&state), Some(("a".into(), "".into())));
         key(&mut app, Key::Escape, "", none);
-        grid.cells.borrow_mut().insert((0, 2), "=Apple".into());
-        key(&mut app, Key::Char, "=", none);
-        assert_eq!(text(&state), Some(("=".into(), "".into())));
+        // A formula's guess: Tab takes it and editing goes on; Enter drops it.
+        grid.cells.borrow_mut().insert((0, 2), "=SUMPRODUCT(".into());
+        for ch in ["=", "s"] {
+            key(&mut app, Key::Char, ch, none);
+        }
+        assert_eq!(text(&state), Some(("=SUMPRODUCT(".into(), "UMPRODUCT(".into())));
+        key(&mut app, Key::Tab, "", none);
+        assert_eq!(text(&state), Some(("=SUMPRODUCT(".into(), "".into())));
+        assert_eq!(state.get_cloned().edit.unwrap().caret(), 12);
+        key(&mut app, Key::Escape, "", none);
+        let n = log.borrow().len();
+        for ch in ["=", "s"] {
+            key(&mut app, Key::Char, ch, none);
+        }
+        key(&mut app, Key::Enter, "", none);
+        assert_eq!(log.borrow()[n..], [GridAction::Commit { row: 7, col: 2, text: "=S".into() }], "the guess dropped; the typed letters take the name's case");
+        // A manual selection of a formula's tail is not a guess: Enter keeps it.
+        let mut g = state.get_cloned();
+        g.select(8, 3);
+        let mut ed = TextEdit::new("=1+2");
+        ed.set_caret(2, false);
+        ed.set_caret(4, true);
+        g.edit = Some(ed);
+        state.set(g);
+        key(&mut app, Key::Enter, "", none);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Commit { row: 8, col: 3, text: "=1+2".into() }));
+        // Tab reaches the grid (not focus traversal): one cell right, as in Excel.
+        let c = state.get_cloned().cursor;
+        key(&mut app, Key::Tab, "", none);
+        assert_eq!(state.get_cloned().cursor, (c.0, c.1 + 1));
     }
 
     #[test]

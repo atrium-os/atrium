@@ -769,6 +769,9 @@ impl GridSource for SheetSource {
     }
     fn complete(&self, r: u32, c: u32, prefix: &str) -> Option<String> {
         let d = self.doc.borrow();
+        if prefix.starts_with('=') {
+            return crate::fnhelp::complete_formula(prefix, &crate::data::paste_names(&d));
+        }
         crate::data::complete_entry(&crate::data::column_entries(&d.wb, d.sheet, r, c), prefix)
     }
     fn now_text(&self, time: bool) -> Option<String> {

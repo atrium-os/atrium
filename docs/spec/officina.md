@@ -4939,6 +4939,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - `fnhelp::ARGS` holds Excel's argument names for each of Sheets' 128 functions. A test checks that every function has an entry and that its required and total arguments match the evaluator's `min` and `max`, so a new function without names fails the build's tests.
 - Tests: `every_function_has_its_arguments_and_they_match_its_counts`, `the_caret_s_function_and_argument_are_found`, `the_tip_marks_the_current_argument` and `a_formula_being_typed_shows_its_function_s_arguments`. All 151 Sheets lib tests pass.
 
+### 16.122 Formula AutoComplete, and Tab reaches the grid (2026-11-25)
+
+- **Formula AutoComplete.** While typing a formula, the name being typed is finished when exactly one function or defined name begins with it. A function's guess ends with `(`. For example, `=vlo` becomes `=VLOOKUP(` with `OKUP(` selected. **Tab** takes the guess and editing goes on. A typed key replaces the guess, and Backspace or Delete removes it. Enter, the arrows and the other keys drop it before they act, so a formula is never committed with an unwanted guess. Text AutoComplete (§16.119) keeps its guess on Enter, as Excel does.
+- There is no guess inside a string or a quoted sheet name, after `!`, `:` or `$` (a reference such as `Sheet1!XL`), or for a word that starts with a digit (`fnhelp::complete_formula`). The grid marks a guess it made (`GridState::guess`), so a tail that was selected by hand is never dropped.
+- **Tab now reaches the grid.** The App used to take Tab for focus traversal, so the grid's Tab handling never ran. The grid now claims Tab (`takes_tab`): Tab moves one cell right and Shift+Tab one cell left, and in the editor Tab enters the cell and moves right. Ctrl+Tab still moves focus out of the grid.
+- Tests: `formula_autocomplete_finishes_one_function_or_name` (Sheets) and `typing_completes_from_the_source_and_the_next_key_replaces_it` (pergola, extended). All 152 Sheets and 240 pergola lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
