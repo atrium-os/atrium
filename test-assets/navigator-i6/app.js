@@ -91,6 +91,22 @@ document.getElementById("grow").addEventListener("click", () => {
 });
 document.getElementById("release").addEventListener("click", () => { held = []; showHeld(); });
 
+// I6.7: navigatord's 50 MiB a site. Fill puts 30 MiB in one transaction;
+// the second Fill must abort with QuotaExceededError.
+async function write(change) {
+    const d = await db();
+    return new Promise((ok, no) => {
+        const t = d.transaction("items", "readwrite");
+        change(t.objectStore("items"));
+        t.oncomplete = ok;
+        t.onabort = () => no(t.error || new Error("aborted"));
+    });
+}
+document.getElementById("fill").addEventListener("click", () =>
+    step("indexeddb-fill", async () => { await write(s => s.add(new Uint8Array(30 * 1024 * 1024).fill(7))); return "30 MiB kept"; }));
+document.getElementById("empty").addEventListener("click", () =>
+    step("indexeddb-empty", async () => { await write(s => s.clear()); await show(); return "emptied"; }));
+
 // D12: a sibling host on the registrable domain is reachable.
 await step("same-site-api", async () => {
     const r = await fetch("https://api.app.example/status", { credentials: "include" });

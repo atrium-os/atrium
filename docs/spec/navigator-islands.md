@@ -3569,6 +3569,12 @@ button:
    and the next run reads the store as it was.
 5. `live-idb/app.example.idb-log` (and `.idb` after a fold) is 0600,
    owned by the persona's Navigator user.
+6. navigatord's own bound and a fold (added after the first run, whose
+   60 MiB value was refused by the engine's per-change bound instead):
+   press Fill 30 MiB (`indexeddb-fill` passes, and the log folds into
+   `app.example.idb`), then Fill again (`indexeddb-fill` fails with
+   `QuotaExceededError`, navigatord logging the quota), then Stop and run
+   live: one fill is stored. Empty clears it.
 
 
 **Gate results on arm64 Tessera, 2026-11-25.** The engine was
