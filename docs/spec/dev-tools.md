@@ -663,6 +663,19 @@ says `read: false`. Building it means an `ExecInstance` field naming the
 workspace, which portcullisd checks against the parent's picks and the
 plugin's manifest before it nullfs-mounts that workspace's `work`
 read-only at `/work` in the plugin's jail.
+P6 (2026-11-25): the SDK crate `sdk/atrium-artifex-ext` (the session
+over Limen, LSP helpers, a stdio `bridge`, an in-memory channel for
+tests) and two samples in `artifex/plugins/`: `md-links`
+(`org.atrium.sample.md-links`: Markdown anchors no heading has, empty
+targets, undefined references as warnings, the closest heading as a fix,
+a palette command) and `todo-lens` (`org.atrium.sample.todo-lens`: TODOs
+and FIXMEs as hints, a quick fix to mark one done, a count command, and
+a panel listing them in its own Pergola window). `md-links`'s
+`tests/end_to_end.rs` runs limend's own daemon code on a real socket,
+Artifex's `LimenLink` and `Host`, and the real plugin program on its
+Limen channel: listed, started, warned, fixed, commanded, re-checked,
+and it exits when detached. **Not done yet:** a VM check with jails and
+frescod (the panel shown in Artifex), and the C header.
 
 **Decisions.**
 

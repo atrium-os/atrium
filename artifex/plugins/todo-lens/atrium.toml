@@ -1,0 +1,23 @@
+# A sample Artifex plugin (docs/spec/dev-tools.md §3.8): the TODOs and
+# FIXMEs in the files the person opens, listed in a panel of its own (its
+# window, in Artifex's bottom panel), counted by a palette command, and
+# marked done by a quick fix.
+[app]
+id          = "org.atrium.sample.todo-lens"
+name        = "TODO lens"
+version     = "0.1.0"
+entry       = "bin/todo-lens"
+description = "Lists the TODOs in the files you open."
+icon        = "list-checks"
+
+[capabilities]
+graphics = "fresco"
+network  = "none"
+
+[roles]
+implements = ["editor-extension"]
+
+[roles.editor-extension]
+languages = ["*"]
+commands  = ["todo-lens.count"]
+panel     = "TODOs"

@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aqueduct"
+version = "0.1.0"
+dependencies = [
+ "atrium-fdpass",
+ "libc",
+ "sha2",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -30,11 +39,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-artifex-ext"
+version = "0.1.0"
+dependencies = [
+ "limen",
+ "serde_json",
+]
+
+[[package]]
 name = "atrium-assets"
 version = "0.1.0"
 dependencies = [
  "atrium-message",
  "atrium-worker",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -53,6 +77,13 @@ version = "0.1.0"
 dependencies = [
  "idna",
  "url",
+]
+
+[[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -376,6 +407,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fresco-protocol"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "postcard",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -597,6 +638,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "limen"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "atrium-listen",
+ "fresco-protocol",
+ "libc",
+ "lyra-protocol",
+ "portcullis-ipc",
+ "portcullis-peer",
+ "portcullis-policy",
+ "portcullis-toml",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -616,6 +674,16 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lyra-protocol"
+version = "0.1.0"
+dependencies = [
+ "atrium-fdpass",
+ "libc",
+ "postcard",
+ "serde",
+]
 
 [[package]]
 name = "memchr"
@@ -700,6 +768,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6"
 dependencies = [
  "arrayvec",
+]
+
+[[package]]
+name = "portcullis-ipc"
+version = "0.1.0"
+dependencies = [
+ "atrium-fdpass",
+ "libc",
+ "portcullis-policy",
+ "portcullis-toml",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

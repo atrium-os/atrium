@@ -4,6 +4,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "atrium-artifex-ext",
     "atrium-assets",
     "atrium-icon",
     "atrium-message",

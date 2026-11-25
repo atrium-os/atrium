@@ -77,6 +77,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-artifex-ext"
+version = "0.1.0"
+dependencies = [
+ "limen",
+ "serde_json",
+]
+
+[[package]]
 name = "atrium-assets"
 version = "0.1.0"
 dependencies = [
@@ -786,6 +794,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-links"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "artifex",
+ "atrium-artifex-ext",
+ "limen",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1395,6 +1413,17 @@ checksum = "abc840c238154d58f9e86b2792261edfde565a17696e1cda1a449de27979801a"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "todo-lens"
+version = "0.1.0"
+dependencies = [
+ "atrium-artifex-ext",
+ "fresco-client",
+ "fresco-protocol",
+ "limen",
+ "pergola",
 ]
 
 [[package]]

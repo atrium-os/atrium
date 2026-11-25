@@ -1,0 +1,11 @@
+[package]
+name = "atrium-artifex-ext"
+description = "Write an Artifex plugin: the editor-extension role's session, LSP over Limen (dev-tools.md §3.8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+limen = { path = "../../limen" }
+serde_json = "1"
