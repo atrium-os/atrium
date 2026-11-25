@@ -834,8 +834,9 @@ pub fn package(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
 
     // 5. Publishing.
     let y = card(ctx, 4, "Publish");
-    line(ctx, y + em(44.0), "In a catalog of your own: opifex catalog add <catalog> <bundle> --arch <a> --archive <.insula> --url <where you host it>, then sign a new head.", false);
-    line(ctx, y + em(68.0), &format!("The public key to register: {}", crate::package::PUB_FILE), false);
+    // Two short lines: a longer one wraps onto the next.
+    line(ctx, y + em(44.0), "opifex catalog add <catalog> <tree> --arch <a> --archive <.insula> --url <url>", false);
+    line(ctx, y + em(68.0), &format!("then sign a new head; the public key to register is {}", crate::package::PUB_FILE), false);
 }
 
 pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
