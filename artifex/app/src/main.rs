@@ -149,7 +149,8 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?} menu={:?} tip={:?} refs={} rename={:?} palette={:?}",
+            let strip: Vec<&str> = artifex::ui::strip(&s).into_iter().map(|v| v.0).collect();
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?} inspect={:?} menu={:?} tip={:?} refs={} rename={:?} palette={:?} strip=[{}] plugins=[{}] ppanels=[{}] dmsgs=[{}]",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -188,10 +189,15 @@ fn main() {
                 s.inspect.as_ref().map(|v| (&v.app, v.live, v.answers, v.rows.len(), v.picking, v.bounds,
                     v.chosen_row().map(|r| r.kind.clone()),
                     v.chosen_row().and_then(|r| r.site.as_ref()).map(|(f, l, local)| format!("{}:{l}", local.as_deref().unwrap_or(f))),
-                    2 + 2 * s.composition.is_some() as usize + s.fuzz.is_some() as usize
-                        + (s.debug.is_some() || !s.breakpoints.is_empty()) as usize)),
+                    strip.iter().position(|l| *l == "Inspect").unwrap_or(strip.len()))),
                 s.menu, s.tip, s.refs.len(), s.renaming,
-                s.palette.as_ref().map(|p| (p.1.len(), p.1.first().map(|r| r.0.clone()))));
+                s.palette.as_ref().map(|p| (p.1.len(), p.1.first().map(|r| r.0.clone()))),
+                strip.join(","),
+                // The Plugins view's rows: (app, on, running or why stopped).
+                s.plugin_rows.iter().map(|r| format!("{}:{}:{}", r.app, if r.on { "on" } else { "off" }, r.state)).collect::<Vec<_>>().join("|"),
+                s.plugin_panels.iter().map(|p| p.1.as_str()).collect::<Vec<_>>().join(","),
+                // The active file's marks: line and message.
+                s.diags.iter().map(|d| format!("{}:{}", d.0 + 1, d.2.chars().take(80).collect::<String>())).collect::<Vec<_>>().join("|"));
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;

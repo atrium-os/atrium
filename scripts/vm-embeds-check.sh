@@ -13,7 +13,9 @@
 #   - Bare: the same program, no `embeds`.
 # Embedder has limend's socket in its jail; Bare has none. limend lets
 # Embedder ask for doc-viewer (no provider installed: refusal 2) and
-# editor-extension, which it gives to Share, read from Share's manifest:
+# editor-extension only as a plugin it names (dev-tools.md §3.8): limend
+# lists Share, gives it to Embedder, read from Share's manifest, and
+# refuses Bare (not a plugin, 18):
 # portcullisd starts Share as a uid of Embedder's instance (not limend's,
 # not Embedder's); map and picker are refused (15, NOT_EMBEDDABLE).
 # share-target has no default since the share sheet (share-sheet.md §3):
@@ -80,7 +82,7 @@ mk() { # folder id bin extra-toml
        printf '[app]\nid = \"$2\"\nname = \"$1\"\nversion = \"1\"\nentry = \"bin/app\"\n$4' > $W/scratch/work/$1/atrium.toml; \
        chown -R alice:files-alice $W/scratch/work/$1"
 }
-mk share org.example.share embeds_provider '\n[roles]\nimplements = [\"editor-extension\", \"share-target\"]\n'
+mk share org.example.share embeds_provider '\n[roles]\nimplements = [\"editor-extension\", \"share-target\"]\n\n[roles.editor-extension]\nlanguages = [\"*\"]\n'
 mk embedder org.example.embedder embeds_gate '\n[capabilities]\nembeds = [\"doc-viewer\", \"editor-extension\"]\narca = true\n'
 mk bare org.example.bare embeds_gate ''
 
@@ -97,7 +99,16 @@ socks=$(V "grep 'embeds-gate socket' $LOG" | sed 's/.*socket //' | sort | tr '\n
 arcas=$(V "grep 'embeds-gate arca' $LOG" | sed 's/.*arca //' | sort | tr '\n' ' ')
 [ "$arcas" = "no yes " ] && ok "arca = true puts arcad's socket in Embedder's jail, and Bare has none" || bad "arca: [$arcas]"
 r=$(line doc-viewer); [ "$r" = "refused 2" ] && ok "doc-viewer passes the embeds check (no provider installed: 2)" || bad "doc-viewer: $r"
-r=$(line editor-extension); [ "$r" = "refused 9" ] && ok "editor-extension goes to a provider (ends at frescod: 9)" || bad "editor-extension: $r ($(V "tail -5 $LLOG"))"
+r=$(line editor-extension); [ "$r" = "refused 2" ] && ok "editor-extension as a plain embed: no provider (2), a plugin is named" || bad "editor-extension: $r ($(V "tail -5 $LLOG"))"
+# (Other plugins installed on this guest, Artifex's samples, may be listed too.)
+r=$(line plugins); case ",$r," in *",dev.alice.scratch.org.example.share:*,"*) ok "limend lists Share as Embedder's person's plugin" ;; *) bad "plugins: $r" ;; esac
+# Starting the jail can outlast the client's 5 s under TCG: then limend's
+# log says how far it got.
+r=$(line plugin)
+if [ "$r" = "refused 9" ] || { case "$r" in *"did not answer"*) true ;; *) false ;; esac && V "grep -q 'example.share for editor-extension: frescod refused' $LLOG"; }; then
+    ok "Share named as a plugin goes to it (ends at frescod: $r)"
+else bad "plugin: $r ($(V "tail -5 $LLOG"))"; fi
+r=$(line not-a-plugin); [ "$r" = "refused 18" ] && ok "Bare named as a plugin is refused (18, NO_PLUGIN)" || bad "not-a-plugin: $r"
 r=$(line share-target); [ "$r" = "refused 2" ] && ok "share-target without a choice in the share sheet: no provider (2)" || bad "share-target: $r"
 r=$(line map); [ "$r" = "refused 15" ] && ok "map is refused: not in embeds" || bad "map: $r"
 r=$(line picker); [ "$r" = "refused 15" ] && ok "picker is refused: not in embeds" || bad "picker: $r"

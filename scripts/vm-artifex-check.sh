@@ -20,6 +20,11 @@
 # library closure, loader), and the VM unarchives and installs it through
 # opifex's trust gate (needs cargo-atrium and opifex built for the host:
 # sdk/target/release and portcullis/target/release).
+# With limend up (as _limen), the two sample plugins (artifex/plugins,
+# dev-tools.md §3.8) are installed like any app: the palette shows the
+# Plugins view, Switch on starts them in jails of their own held to the
+# plugin limits (rctl), md-links marks notes.md's dead anchor and its quick
+# fix mends it, and todo-lens' command and panel come from the palette.
 # Ends "artifex: N failed".
 #
 #   sh scripts/vm-artifex-check.sh [out-dir]
@@ -52,7 +57,8 @@ xb frescod "--bin frescod"
 xb portcullis "-p portcullisd -p portcullis-cli -p opifex -p jaild -p atrium-volumes --bin portcullisd --bin portcullis --bin opifex --bin atrium-jaild --bin atrium-volumes"
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
-xb artifex "-p artifex --bin artifex"
+xb artifex "-p artifex -p md-links -p todo-lens --bin artifex --bin md-links --bin todo-lens"
+xb limen "--bin limend"
 xb atrium-image-decode ""
 [ -z "${FORUM:-}" ] || xb forum-wm "--bin forum-wm"
 # The Inspect section's dev app: the SDK's app template as `cargo atrium new`
@@ -73,7 +79,7 @@ fi
 
 echo "=== install"
 B=/var/tmp/artifexchk
-V "pkill -x portcullisd; pkill -x frescod; pkill -x forum-wm; pkill -x stoad; pkill -f atrium-term-socket; pkill -x artifex; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+V "pkill -x portcullisd; pkill -x frescod; pkill -x forum-wm; pkill -x stoad; pkill -f atrium-term-socket; pkill -x artifex; pkill -x limend; pkill -x md-links; pkill -x todo-lens; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 V "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     V "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -q $K -P 2222 "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
@@ -82,10 +88,13 @@ V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bi
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/atrium-jaild portcullis/target/$TARGET/release/atrium-volumes \
          atrium-term-socket/target/$TARGET/release/atrium-term-socket \
-         stoa/target/$TARGET/release/stoad artifex/target/$TARGET/release/artifex; do
+         stoa/target/$TARGET/release/stoad artifex/target/$TARGET/release/artifex \
+         artifex/target/$TARGET/release/md-links artifex/target/$TARGET/release/todo-lens limen/target/$TARGET/release/limend; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "artifex: 1 failed"; exit 1; }
 done
 scp -q $K -P 2222 "$ROOT/artifex/app/atrium.toml" root@localhost:$B/artifex.toml
+# The two sample plugins (dev-tools.md §3.8), with their checked-in manifests.
+for x in md-links todo-lens; do scp -q $K -P 2222 "$ROOT/artifex/plugins/$x/atrium.toml" root@localhost:$B/$x.toml; done
 # The system's image decoder, for the Assets view's previews.
 for f in atrium-image-decode/target/$TARGET/release/atrium-image-decode scripts/image-decode-bundle.sh etc/jaild.policy.toml; do
     scp -q $K -P 2222 "$ROOT/$f" root@localhost:$B/ || { echo "copy $f failed"; echo "artifex: 1 failed"; exit 1; }
@@ -109,6 +118,7 @@ fi
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 TERM_ID=org.atrium.terminal; ART=org.atrium.artifex
+MDL=org.atrium.sample.md-links; TODO=org.atrium.sample.todo-lens
 V 'sh -s' <<EOS
 set -e
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
@@ -128,7 +138,7 @@ fi
 test -f /root/of-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out /root/of-key.pem
 mkdir -p /etc/atrium/publishers; openssl ec -in /root/of-key.pem -pubout -out /etc/atrium/publishers/of-gate.pem 2>/dev/null
 sign() { openssl dgst -sha256 -sign /root/of-key.pem -out \$1/atrium.toml.sig \$1/atrium.toml; }
-for id in $TERM_ID $ART; do opifex uninstall \$id >/dev/null 2>&1 || true; rm -rf /home/alice/.atrium/apps/\$id; done
+for id in $TERM_ID $ART $MDL $TODO; do opifex uninstall \$id >/dev/null 2>&1 || true; rm -rf /home/alice/.atrium/apps/\$id; done
 if [ -n "${BUNDLE:-}" ]; then
   # The SDK's archives, as a publisher would ship them. The index covers every
   # file, so the check's two files (trace on, the window at 40,30) go into
@@ -151,6 +161,16 @@ O=$B/b-$ART; mkdir -p \$O/bin; cp $B/artifex \$O/bin/; cp $B/artifex.toml \$O/at
 echo on > \$O/.trace; echo 40,30 > \$O/.at
 sign \$O; opifex install \$O >/dev/null
 fi
+# The sample plugins, installed like any app (editor-extension in [roles]).
+for x in md-links:$MDL todo-lens:$TODO; do
+  n=\${x%%:*}; id=\${x#*:}
+  O=$B/b-\$id; mkdir -p \$O/bin; cp $B/\$n \$O/bin/; cp $B/\$n.toml \$O/atrium.toml
+  sign \$O; opifex install \$O >/dev/null
+done
+# limend, the embed broker, as _limen (vm-embeds-check.sh does the same):
+# it lists the plugins to Artifex and starts them through portcullisd.
+install -m 0755 $B/limend /usr/local/bin/limend
+id _limen >/dev/null 2>&1 || pw useradd _limen -u 65022 -d /nonexistent -s /usr/sbin/nologin
 # The image decoder (vm-image-decode-check.sh installs it the same way):
 # jaild's policy with its uid and rctl on (the bundle has [resources]).
 cp $B/jaild.policy.toml $B/jaild.policy.new
@@ -170,12 +190,18 @@ for a in $TERM_ID $ART; do V "su -m alice -c 'portcullis policy grant $a' >/dev/
 echo "=== frescod"
 V "grep -q AVX2 /var/run/dmesg.boot" || { bad "the VM's CPU has no AVX2: cloud-vm.sh down, then up with QEMU_BIN=\$HOME/qemu-atrium/build/qemu-system-x86_64 TCG_CPU=Haswell-noTSX"; echo "artifex: $fails failed"; exit 1; }
 V "mkdir -p /atrium/sockets/fresco; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$B/screen FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock FRESCOD_WM_SOCK=$B/wm.sock \
-   FRESCOD_INPUT_SOCK=$B/inject.sock FRESCOD_ACTIVATION_SOCK=$B/activation.sock FRESCOD_SLOT_UIDS=0 FRESCOD_DEV_CAPS=all \
+   FRESCOD_INPUT_SOCK=$B/inject.sock FRESCOD_ACTIVATION_SOCK=$B/activation.sock FRESCOD_SLOT_UIDS=0,65022 FRESCOD_DEV_CAPS=all \
    FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=${TOKEN_LIFE_MS:-15000} FRESCOD_ACTIVATION_UIDS=0 \
    daemon -f -o $B/frescod.log $B/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! V "test -S /atrium/sockets/fresco/fresco.sock"; do sleep 2; i=$((i+1)); done
 V "chmod 666 $B/*.sock /atrium/sockets/fresco/fresco.sock"
 V "test -S $B/activation.sock" && ok "frescod is up" || { bad "frescod: $(V "tail -3 $B/frescod.log")"; echo "artifex: $fails failed"; exit 1; }
+# limend binds its slots on frescod's activation socket (FRESCOD_SLOT_UIDS).
+LLOG=$B/limend.log
+V "mkdir -p /atrium/sockets/limen; chown _limen /atrium/sockets/limen; rm -f /atrium/sockets/limen/limend.sock; : > $LLOG; chmod 666 $LLOG; \
+   env LIMEN_FRESCOD_ACTIVATION=$B/activation.sock daemon -f -u _limen -o $LLOG /usr/local/bin/limend </dev/null"
+i=0; while [ $i -lt 20 ] && ! V "test -S /atrium/sockets/limen/limend.sock"; do sleep 1; i=$((i+1)); done
+V "test -S /atrium/sockets/limen/limend.sock" && ok "limend is up (as _limen)" || bad "limend: $(V "tail -3 $LLOG")"
 inj() { V "printf '%s\n' $(printf "'%s' " "$@") | nc -N -U $B/inject.sock" >/dev/null; }
 press() { inj "MOVE $1 $2" "BTN 1 1" "BTN 1 0"; sleep ${GAP:-4}; }
 ctrl() { inj "KEY 0xe0 1 1" "KEY $1 1 1" "KEY $1 0 1" "KEY 0xe0 0 0"; sleep ${GAP:-4}; }
@@ -291,6 +317,9 @@ int main(void) {
 }
 C
 printf '# proj\n' > $W/proj/work/README.md
+# For the sample plugins: an anchor no heading has (md-links) and a TODO
+# (todo-lens).
+printf '# Notes\n\nSee [usage](#usge).\n\n## Usage\n\nTODO: write this\n' > $W/proj/work/notes.md
 # For the language server features: a name used three times, and a
 # statement short of its ';' (clangd's quick fix). In a folder of its own:
 # a second C file beside hello.c would take hello.c's Build task away.
@@ -468,6 +497,82 @@ total = coun"
     inj "KEY 0x29 1" "KEY 0x29 0"; sleep 2
 else
     echo "  (no clangd in proj, or SKIP has lsp: skipped)"
+fi
+
+# Before Run and Debug: without Forum a dev app's window keeps the keyboard.
+echo "=== plugins (dev-tools.md §3.8)"
+if want plugins; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    plugins() { state | sed 's/.* plugins=\[\([^]]*\)\].*/\1/'; }
+    # The palette (Ctrl+Shift+P), a query, and Enter on its first row.
+    # A press in the editor first: the window takes the keyboard.
+    pal() {
+        press 700 200
+        inj "KEY 0xe0 1 1" "KEY 0xe1 1 3" "KEY 0x13 1 3" "KEY 0x13 0 3" "KEY 0xe1 0 1" "KEY 0xe0 0 0"; sleep 3
+        waitstate 'palette=Some' 20 || { bad "the palette didn't open: $(state)"; return 1; }
+        typ "$1"
+        waitstate "palette=Some(([0-9]*, Some(\"$2\")))" 20 || { bad "the palette's first row for $1: $(state | grep -o 'palette=.*')"; inj "KEY 0x29 1" "KEY 0x29 0"; return 1; }
+        inj "KEY 0x28 1" "KEY 0x28 0"; sleep 3
+    }
+    pal "plugins" "Show the plugins" && waitstate 'view=Plugins' 20 && ok "the palette shows the Plugins view" || bad "plugins view: $(state)"
+    waitstate "plugins=\[$MDL:off:|$TODO:off:\]" 60 && ok "limend lists both sample plugins, both off" \
+        || bad "listed: [$(plugins)] $(V "grep 'plugins' $B/artifex.log | tail -2; tail -3 $LLOG")"
+    shot artifex-plugins-1-view
+    # Switch on (views.rs: right of each row, 760 wide; md-links' row is
+    # 96 tall, so todo-lens' button is at 282 and md-links' at 176).
+    press 757 282
+    waitstate "plugins=\[[^]]*$TODO:on:Running" 120 && ok "Switch on starts TODO lens for the open files" \
+        || bad "todo-lens: [$(plugins)] $(V "grep -i 'todo-lens\|plugin' $LLOG $LOG | tail -4")"
+    press 757 176
+    waitstate "plugins=\[$MDL:on:On: starts with a file of its languages" 20 && ok "Markdown links is on, waiting for a Markdown file" || bad "md-links: [$(plugins)]"
+    # Artifex's HOME in its jail, from its environment.
+    STORE=$(V "p=\$(pgrep -x artifex | head -1); h=\$(procstat -e \$p | tr ' ' '\\n' | sed -n 's/^HOME=//p'); r=\$(jls -j \$(ps -o jid= -p \$p) path); cat \$r\$h/.config/artifex/plugins" 2>/dev/null)
+    check "kept for proj in Artifex's own file" "2" "$(printf '%s\n' "$STORE" | grep -c "^proj	org.atrium.sample")"
+    shot artifex-plugins-2-on
+    # Each is a jail of its own, as a uid that isn't Artifex's, held to the
+    # plugin limits whatever its manifest says (256 MiB, half a CPU).
+    AU=$(V "ps -axo uid,comm | awk '\$2 == \"artifex\" {print \$1; exit}'")
+    J=$(V "ps -axo jid,uid,comm | awk '\$3 == \"todo-lens\" {print \$1\" \"\$2; exit}'")
+    TJ=${J%% *}; TU=${J#* }
+    if [ -n "$TJ" ] && [ "$TJ" != 0 ] && [ -n "$TU" ] && [ "$TU" != "$AU" ]; then ok "TODO lens runs jailed (jid $TJ) as uid $TU, not Artifex's $AU"; else bad "todo-lens process: [$J] artifex uid [$AU]"; fi
+    TN=$(V "jls -j $TJ name 2>/dev/null")
+    R=$(V "rctl 2>/dev/null | grep '^jail:$TN:'" | tr '\n' ' ')
+    case "$R" in *memoryuse:sigkill=268435456*pcpu:deny=50*|*pcpu:deny=50*memoryuse:sigkill=268435456*) ok "its jail $TN has memoryuse 256M and pcpu 50" ;; *) bad "rctl for [$TN]: [$R]" ;; esac
+    # notes.md: md-links starts and marks the anchor no heading has.
+    press 64 100               # the strip's Files
+    waitstate 'view=Code' 20 || bad "files: $(state)"
+    ROW=$(rows | grep -n '^notes.md$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'tabs=\[[^]]*notes.md\]' 20 && ok "notes.md opens" || bad "notes.md: $(state)"
+    waitstate "plugins=\[$MDL:on:Running" 120 && ok "and starts Markdown links" || bad "md-links: [$(plugins)] $(V "tail -3 $LLOG")"
+    waitstate 'dmsgs=\[3:No heading here has the anchor #usge (Markdown links)' 120 \
+        && ok "it marks line 3's #usge, a warning from the plugin" || bad "md-links marks: $(state | sed 's/.*dmsgs=//')"
+    shot artifex-plugins-3-marked
+    # Its quick fix (Ctrl+.) on line 3: the closest heading's anchor.
+    press 700 200; i=0; while [ $i -lt 40 ]; do inj "KEY 0x4a 1 1" "KEY 0x4a 0 1"; state | grep -q 'caret=(1, 1)' && break; sleep 1; i=$((i+1)); done
+    inj "KEY 0x51 1" "KEY 0x51 0" "KEY 0x51 1" "KEY 0x51 0"; sleep 3
+    waitstate 'caret=(3,' 20 || bad "caret: $(state)"
+    ctrl 0x37
+    waitstate 'menu=Some(([0-9]*, "Link to #usage' 60 && ok "Ctrl+. offers its fix ($(state | grep -o 'menu=Some(([0-9]*, "[^"]*"'))" || bad "md-links fix: $(state)"
+    inj "KEY 0x28 1" "KEY 0x28 0"; sleep 3
+    waitstate 'menu=None' 20 || bad "accept: $(state)"
+    ctrl 0x16
+    waitstate 'Saved notes.md' 30 || bad "save: $(state)"
+    check "Enter applied it and Ctrl+S saved it" "See [usage](#usage)." "$(V "sed -n 3p $W/proj/work/notes.md")"
+    waitstate 'dmsgs=\[\]$' 60 && ok "and the plugin takes its mark away" || bad "marks after the fix: $(state | sed 's/.*dmsgs=//')"
+    # TODO lens' command, from the palette: its answer in the status line.
+    pal "count the todos" "Count the TODOs in the open files" \
+        && waitstate 'lsp=Some("[^"]*TODO lens: [1-9][0-9]* TODOs* in [1-9]' 60 && ok "the palette runs TODO lens' command ($(state | grep -o 'TODO lens: [^"]*'))" || bad "count: $(state | grep -o 'lsp=Some("[^"]*")')"
+    # Its panel: its own window, in Artifex's bottom panel.
+    waitstate 'ppanels=\[TODOs\]' 30 && ok "TODO lens opened its panel" || bad "panels: $(state | sed 's/.*ppanels=//')"
+    pal "show todos" "Show the panel TODOs" && waitstate 'panel=Some(Plugin(0))' 20 && ok "the palette shows it in the bottom panel" || bad "panel: $(state)"
+    waitstate 'running=None' 5 >/dev/null
+    shot artifex-plugins-4-panel
+    # Back to the Output panel for Run's question.
+    ctrl 0x0d
+    waitstate 'panel=Some(Output)' 20 || bad "output: $(state)"
+else
+    echo "  (SKIP has plugins: skipped)"
 fi
 
 echo "=== composition and Run"

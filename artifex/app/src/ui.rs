@@ -520,6 +520,39 @@ pub fn file_icon(name: &str) -> char {
     }
 }
 
+/// The view strip's entries, top to bottom: label, icon, what a press
+/// does, whether it's the one shown, and its badge count.
+pub fn strip(s: &State) -> Vec<(&'static str, char, Act, bool, usize)> {
+    // Files, Composition and Fuzz fill the window; Problems and
+    // Debug open the panel under the code.
+    let code = s.view == Main::Code;
+    let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
+    let mut views: Vec<(&'static str, char, Act, bool, usize)> = vec![
+        ("Files", phosphor::FILES, Act::View(Main::Code), code, 0),
+        ("Problems", phosphor::WARNING, Act::Panel(Panel::Problems), code && s.panel_open && s.panel == Panel::Problems, errors),
+    ];
+    if s.composition.is_some() {
+        views.push(("Composition", phosphor::GRAPH, Act::View(Main::Composition), s.view == Main::Composition, 0));
+    }
+    if let Some(f) = &s.fuzz {
+        views.push(("Fuzz", phosphor::LIGHTNING, Act::View(Main::Fuzz), s.view == Main::Fuzz, f.crashes.len()));
+    }
+    if s.composition.is_some() {
+        views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
+    }
+    let stopped = s.plugin_rows.iter().filter(|r| r.stopped).count();
+    views.push(("Plugins", phosphor::PUZZLE_PIECE, Act::View(Main::Plugins), s.view == Main::Plugins, stopped));
+    // Debug: while a program is debugged, or breakpoints are set.
+    if s.debug.is_some() || !s.breakpoints.is_empty() {
+        views.push(("Debug", phosphor::BUG, Act::Panel(Panel::Debug), code && s.panel_open && s.panel == Panel::Debug, 0));
+    }
+    // Inspect: an app a Run started that answers (a Pergola dev build).
+    if s.inspect.as_ref().is_some_and(|v| v.answers) {
+        views.push(("Inspect", phosphor::STACK_SIMPLE, Act::View(Main::Inspect), s.view == Main::Inspect, 0));
+    }
+    views
+}
+
 pub fn bar_h() -> f32 { em(44.0) }
 /// The view strip down the left edge.
 pub fn strip_w() -> f32 { em(48.0) }
@@ -654,35 +687,8 @@ impl View for ArtifexView {
         ctx.add(Node::Rect { rect: Rect::new(0.0, st_top, strip_w(), h - st_top - status_h()), fill: t.bg_surface(), radius: 0.0 });
         ctx.add(Node::Rect { rect: Rect::new(strip_w() - 1.0, st_top, 1.0, h - st_top - status_h()), fill: t.border_default(), radius: 0.0 });
         if s.ws.is_some() {
-            // Files, Composition and Fuzz fill the window; Problems and
-            // Debug open the panel under the code.
-            let code = s.view == Main::Code;
-            let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
-            let mut views: Vec<(&str, char, Act, bool, usize)> = vec![
-                ("Files", phosphor::FILES, Act::View(Main::Code), code, 0),
-                ("Problems", phosphor::WARNING, Act::Panel(Panel::Problems), code && s.panel_open && s.panel == Panel::Problems, errors),
-            ];
-            if s.composition.is_some() {
-                views.push(("Composition", phosphor::GRAPH, Act::View(Main::Composition), s.view == Main::Composition, 0));
-            }
-            if let Some(f) = &s.fuzz {
-                views.push(("Fuzz", phosphor::LIGHTNING, Act::View(Main::Fuzz), s.view == Main::Fuzz, f.crashes.len()));
-            }
-            if s.composition.is_some() {
-                views.push(("Assets", phosphor::IMAGE, Act::View(Main::Assets), s.view == Main::Assets, 0));
-            }
-            let stopped = s.plugin_rows.iter().filter(|r| r.stopped).count();
-            views.push(("Plugins", phosphor::PUZZLE_PIECE, Act::View(Main::Plugins), s.view == Main::Plugins, stopped));
-            // Debug: while a program is debugged, or breakpoints are set; a
-            // dot while it is stopped.
             let stopped = s.debug.as_ref().is_some_and(|d| d.stopped && d.live);
-            if s.debug.is_some() || !s.breakpoints.is_empty() {
-                views.push(("Debug", phosphor::BUG, Act::Panel(Panel::Debug), code && s.panel_open && s.panel == Panel::Debug, 0));
-            }
-            // Inspect: an app a Run started that answers (a Pergola dev build).
-            if s.inspect.as_ref().is_some_and(|v| v.answers) {
-                views.push(("Inspect", phosphor::STACK_SIMPLE, Act::View(Main::Inspect), s.view == Main::Inspect, 0));
-            }
+            let views = strip(&s);
             for (i, (label, icon, act, on, count)) in views.into_iter().enumerate() {
                 let y = st_top + em(8.0) + i as f32 * em(42.0);
                 if on {

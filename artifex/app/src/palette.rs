@@ -1,7 +1,7 @@
 //! The command palette (Ctrl+Shift+P; dev-tools.md §3.8): Artifex's own
 //! acts and the commands of the plugins running, found by typing.
 
-use crate::ui::{Act, Panel};
+use crate::ui::{Act, Main, Panel};
 
 /// What a row does.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +40,7 @@ pub fn own() -> Vec<Entry> {
         e(Act::Complete, "Complete the word", "Ctrl+Space"),
         e(Act::Panel(Panel::Output), "Show the output", "Ctrl+J"),
         e(Act::Panel(Panel::Problems), "Show the problems", "Ctrl+Shift+M"),
+        e(Act::View(Main::Plugins), "Show the plugins", ""),
         e(Act::CloseTab(usize::MAX), "Close the tab", "Ctrl+W"),
     ]
 }

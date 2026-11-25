@@ -432,12 +432,16 @@ impl Engine {
             Act::StartRename => self.start_rename(s),
             Act::Rename(name) => self.rename(name.trim(), s),
             Act::Palette => {
-                // Artifex's own, then each running plugin's.
+                // Artifex's own, then each running plugin's, then its panels.
                 let mut all = palette::own();
                 for r in &self.plugins.runs {
                     for (id, label) in &r.commands {
                         all.push(palette::Entry { cmd: palette::Cmd::Plugin { app: r.info.app.clone(), id: id.clone() }, label: label.clone(), hint: r.info.name.clone() });
                     }
+                }
+                for (i, (app, title)) in s.plugin_panels.iter().enumerate().take(8) {
+                    let name = self.plugins.runs.iter().find(|r| r.info.app == *app).map(|r| r.info.name.clone()).unwrap_or_default();
+                    all.push(palette::Entry { cmd: palette::Cmd::Act(Act::Panel(Panel::Plugin(i as u8))), label: format!("Show the panel {title}"), hint: name });
                 }
                 self.palette = all;
                 self.close_popup(s);
@@ -4027,6 +4031,13 @@ mod tests {
         e.act(Act::HidePanel, &mut s);
         e.tick(&mut s);
         assert_eq!(*shown.borrow(), vec![Some(id), None, Some(id), None]);
+        // The palette shows it too.
+        e.act(Act::Palette, &mut s);
+        e.act(Act::PaletteQuery("show todos".into()), &mut s);
+        assert_eq!(rows(&s), vec!["Show the panel TODOs | TODO lens".to_string()]);
+        e.act(Act::PaletteRun(0), &mut s);
+        e.tick(&mut s);
+        assert_eq!((s.panel, s.panel_open, shown.borrow().last().cloned()), (Panel::Plugin(0), true, Some(Some(id))));
         // A plugin that stops takes its tab with it.
         e.act(Act::Panel(Panel::Plugin(0)), &mut s);
         e.plugins.stop("org.example.todo", "switched off");
