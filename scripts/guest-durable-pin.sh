@@ -27,7 +27,7 @@ S() { sysctl -n kern.tessera.$1 2>/dev/null || echo 0; }
 gen() { sysctl -n kern.tessera.mounts | awk -v m="$M" '$1==m { for (i=1;i<=NF;i++) if ($i ~ /^gen=/) { sub("gen=","",$i); print $i } }'; }
 
 cleanup() {
-    sysctl kern.tessera.fault_commit_fail=0 kern.tessera.commit_failed_clear=1 >/dev/null 2>&1
+    sysctl kern.tessera.fault_commit_fail=0 >/dev/null 2>&1
     mount | grep -q " $M " && timeout 120 umount $M 2>/dev/null
     mount | grep -q " $M " || gpart destroy -F $DISK >/dev/null 2>&1
     echo "cleanup: done"
@@ -58,13 +58,15 @@ arm() {
 
     # 2. Every commit on THIS volume now fails after the flush's drains have
     #    run: the in-memory blob index advances, the durable one stays at gdur.
+    #    The first refused commit latches the volume, and a latched volume
+    #    flushes nothing more until remount, so the later rounds and the reuse
+    #    in step 4 stay in RAM: what the cut tests is that one refused commit.
     dmesg -c >/dev/null 2>&1
     cf0=$(S commit_failed)
     sysctl kern.tessera.fault_commit_fail=2 >/dev/null
     r=0; while [ $r -lt 6 ]; do
         files $M/round$r 500 round$r
         sync; sleep 7
-        sysctl kern.tessera.commit_failed_clear=1 >/dev/null
         r=$((r+1))
     done
     pend=$(sysctl -n kern.tessera.mounts | awk -v m="$M" '$1==m' | sed -n 's/.* pending=\([0-9]*\).*/\1/p')
@@ -78,7 +80,6 @@ arm() {
     r=0; while [ $r -lt 4 ]; do
         files $M/reuse$r 800 reuse$r
         sync; sleep 7
-        sysctl kern.tessera.commit_failed_clear=1 >/dev/null
         r=$((r+1))
     done
     echo "armed: durable_gen=$gdur gen_now=$(gen) commit_failures=$(( $(S commit_failed) - cf0 )) pending_before_drain=$pend free_before_drain=$free0 free_after_drain=$free1 stale_live=$(dmesg | grep -c STALE)"
