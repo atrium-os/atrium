@@ -1,0 +1,20 @@
+# A sample Artifex plugin in C (docs/spec/dev-tools.md §3.8, the C SDK's
+# atrium_plugin.h): a palette command that counts the words and lines of
+# the active Markdown file. It sees only the files the person opens.
+[app]
+id          = "org.atrium.sample.words"
+name        = "Word count"
+version     = "0.1.0"
+entry       = "bin/words"
+description = "Counts the words in the Markdown file you are editing."
+icon        = "text-aa"
+
+[capabilities]
+network = "none"
+
+[roles]
+implements = ["editor-extension"]
+
+[roles.editor-extension]
+languages = ["markdown"]
+commands  = ["words.count"]
