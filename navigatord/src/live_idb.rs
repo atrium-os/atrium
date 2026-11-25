@@ -34,6 +34,8 @@ use limen::web_island::idb::tag;
 
 /// What every Unrecorded store together may hold.
 pub const MEMORY_MAX: usize = 4 * QUOTA;
+/// What runs not yet finished hold, across every site together.
+pub const PENDING_MAX: usize = 2 * RUN_MAX;
 /// What file-backed stores stay loaded together; past it, the others are
 /// dropped and read again when next asked for.
 pub const LOADED_MAX: usize = 3 * QUOTA;
@@ -106,6 +108,11 @@ enum Undo {
     Database(Vec<u8>, Option<Database>),
     Store(Vec<u8>, Vec<u8>, Option<Store>),
     Index(Vec<u8>, Vec<u8>, Vec<u8>, Option<Index>),
+    /// A rename, put back by moving the store (or index) home again: no copy.
+    RenameStore(Vec<u8>, Vec<u8>, Vec<u8>),
+    RenameIndex(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    /// A clear: the records it took.
+    Records(Vec<u8>, Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>),
     Record(Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>),
     /// An append: the value's length before it.
     Truncate(Vec<u8>, Vec<u8>, Vec<u8>, usize),
@@ -184,8 +191,7 @@ fn apply_op(dbs: &mut Databases, op: Op, at: &mut At, undo: &mut Vec<Undo>) -> R
             let d = dbs.get_mut(&db).ok_or("the selected database went")?;
             if d.stores.contains_key(&to) { return Err("a rename onto a store that is there".into()); }
             let s = d.stores.remove(&from).ok_or("a rename of an object store that isn't there")?;
-            undo.push(Undo::Store(db.clone(), from.clone(), Some(s.clone())));
-            undo.push(Undo::Store(db, to.clone(), None));
+            undo.push(Undo::RenameStore(db, from.clone(), to.clone()));
             d.stores.insert(to.clone(), s);
             if at.store.as_ref() == Some(&from) { at.store = Some(to); }
         }
@@ -217,8 +223,8 @@ fn apply_op(dbs: &mut Databases, op: Op, at: &mut At, undo: &mut Vec<Undo>) -> R
         Op::Clear => {
             let (db, sn) = store_names(at)?;
             let s = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)).ok_or("the selected store went")?;
-            let old = Store { about: s.about.clone(), key_generator: s.key_generator, records: std::mem::take(&mut s.records), indexes: s.indexes.clone() };
-            undo.push(Undo::Store(db, sn, Some(old)));
+            let records = std::mem::take(&mut s.records);
+            undo.push(Undo::Records(db, sn, records));
         }
         Op::Index(n) => {
             let (db, sn) = store_names(at)?;
@@ -245,8 +251,7 @@ fn apply_op(dbs: &mut Databases, op: Op, at: &mut At, undo: &mut Vec<Undo>) -> R
             let s = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)).ok_or("the selected store went")?;
             if s.indexes.contains_key(&to) { return Err("a rename onto an index that is there".into()); }
             let i = s.indexes.remove(&from).ok_or("a rename of an index that isn't there")?;
-            undo.push(Undo::Index(db.clone(), sn.clone(), from.clone(), Some(i.clone())));
-            undo.push(Undo::Index(db, sn, to.clone(), None));
+            undo.push(Undo::RenameIndex(db, sn, from.clone(), to.clone()));
             s.indexes.insert(to.clone(), i);
             if at.index.as_ref() == Some(&from) { at.index = Some(to); }
         }
@@ -278,6 +283,13 @@ fn revert(dbs: &mut Databases, undo: Vec<Undo>) {
             Undo::Database(n, old) => set(dbs, n, old),
             Undo::Version(n, v) => if let Some(d) = dbs.get_mut(&n) { d.version = v },
             Undo::Store(db, n, old) => if let Some(d) = dbs.get_mut(&db) { set(&mut d.stores, n, old) },
+            Undo::RenameStore(db, from, to) => if let Some(d) = dbs.get_mut(&db) {
+                if let Some(s) = d.stores.remove(&to) { d.stores.insert(from, s); }
+            },
+            Undo::RenameIndex(db, sn, from, to) => if let Some(s) = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)) {
+                if let Some(i) = s.indexes.remove(&to) { s.indexes.insert(from, i); }
+            },
+            Undo::Records(db, sn, records) => if let Some(s) = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)) { s.records = records },
             Undo::Index(db, sn, n, old) => if let Some(s) = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)) { set(&mut s.indexes, n, old) },
             Undo::Record(db, sn, k, old) => if let Some(s) = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)) { set(&mut s.records, k, old) },
             Undo::Truncate(db, sn, k, len) => if let Some(v) = dbs.get_mut(&db).and_then(|d| d.stores.get_mut(&sn)).and_then(|s| s.records.get_mut(&k)) { v.truncate(len) },
@@ -367,13 +379,27 @@ impl Stores {
                 let generation = u64::from_le_bytes(head[8..16].try_into().map_err(|_| "no generation")?);
                 if generation == site.generation {
                     site.log_len = 16;
+                    // Replay up to the first commit cut short or out of
+                    // shape (a write torn by a crash, a damaged block):
+                    // the image and the commits before it are kept.
                     while let Some((len, more)) = rest.split_first_chunk::<4>() {
                         let len = u32::from_le_bytes(*len) as usize;
                         let Some((entry, more)) = more.split_at_checked(len) else { break };
-                        let ops = decode_ops(entry, RUN_MAX).ok_or("a commit in the log is out of shape")?;
-                        apply_ops(&mut site.dbs, ops, &mut vec![])?;
+                        let Some(ops) = decode_ops(entry, RUN_MAX) else { break };
+                        let mut undo = vec![];
+                        if let Err(why) = apply_ops(&mut site.dbs, ops, &mut undo) {
+                            revert(&mut site.dbs, undo);
+                            eprintln!("navigatord: {}'s IndexedDB log: {why}", key.site);
+                            break;
+                        }
                         site.log_len += 4 + len;
                         rest = more;
+                    }
+                    if !rest.is_empty() {
+                        eprintln!("navigatord: {}'s IndexedDB log ends in {} bytes not kept; the commits before them are", key.site, rest.len());
+                        // Never append after them: the next commit writes
+                        // the next generation whole.
+                        site.log_len = usize::MAX / 2;
                     }
                 }
             }
@@ -428,6 +454,8 @@ impl Stores {
         let n = u32::from_le_bytes(head[8..12].try_into().map_err(|_| "no part")?);
         let last = match head[12] { 0 => false, 1 => true, _ => return Err("a part out of shape".into()) };
         let memory_used: usize = self.open.iter().filter(|(k, _)| k.jar.is_some() && *k != key).map(|(_, s)| s.size).sum();
+        let pending_elsewhere: usize = self.open.iter().filter(|(k, _)| *k != key)
+            .filter_map(|(_, s)| s.pending.as_ref()).map(|p| p.ops.len()).sum();
         let files = self.files(key);
         let site = self.site(key);
         let mut pending = match site.pending.take() {
@@ -436,6 +464,7 @@ impl Stores {
             _ => return Err("a part out of order".into()),
         };
         if pending.ops.len() + body.len() > RUN_MAX { return Err("a commit over its bound".into()); }
+        if pending_elsewhere + pending.ops.len() + body.len() > PENDING_MAX { return Err("too many commits being received at once".into()); }
         pending.ops.extend_from_slice(body);
         pending.next = n.checked_add(1).ok_or("too many parts")?;
         if !last {
@@ -489,12 +518,19 @@ fn append(site: &mut Site, image: &PathBuf, log: &PathBuf, ops: &[u8]) -> Result
         img.extend(generation.to_le_bytes());
         img.extend(encode(&site.dbs));
         crate::live_storage::write(image, &img)?;
-        let mut head = LOG_MAGIC.to_vec();
-        head.extend(generation.to_le_bytes());
-        crate::live_storage::write(log, &head)?;
+        // The image is in place and holds this commit, and the old log is
+        // of an older generation, so the commit is kept whatever follows.
         site.generation = generation;
         site.image_len = img.len();
-        site.log_len = head.len();
+        let mut head = LOG_MAGIC.to_vec();
+        head.extend(generation.to_le_bytes());
+        site.log_len = match crate::live_storage::write(log, &head) {
+            Ok(()) => head.len(),
+            Err(e) => {
+                eprintln!("navigatord: {e}; the next commit writes the image again");
+                usize::MAX / 2
+            }
+        };
         return Ok(());
     }
     if site.log_len == 0 {
@@ -506,17 +542,28 @@ fn append(site: &mut Site, image: &PathBuf, log: &PathBuf, ops: &[u8]) -> Result
     let mut entry = Vec::with_capacity(4 + ops.len());
     entry.extend((ops.len() as u32).to_le_bytes());
     entry.extend(ops);
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new().append(true).custom_flags(libc::O_NOFOLLOW).open(log)?;
-        f.write_all(&entry)?;
-        f.sync_data()
-    })();
+    // Ok, or the error and whether the log was cut back to before it.
+    let result: Result<(), (std::io::Error, bool)> = match std::fs::OpenOptions::new().append(true).custom_flags(libc::O_NOFOLLOW).open(log) {
+        Err(e) => Err((e, true)),
+        Ok(mut f) => match f.write_all(&entry).and_then(|()| f.sync_data()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Take back what may have reached the log, so the failed
+                // commit doesn't come back on the next read.
+                let cut = u64::try_from(site.log_len).is_ok_and(|len| f.set_len(len).and_then(|()| f.sync_data()).is_ok());
+                Err((e, cut))
+            }
+        },
+    };
     match result {
         Ok(()) => { site.log_len += entry.len(); Ok(()) }
-        Err(e) => {
-            // The log may now end in part of this commit; the next read
-            // drops a cut-short end, and the next write starts afresh.
-            site.log_len = usize::MAX / 2;
+        Err((e, cut)) => {
+            // Not cut back: the log may end in some of this commit. The next
+            // read drops an end cut short or out of shape, and the next
+            // commit writes the next generation whole without it. Only a
+            // crash before that next commit, with the whole of this one in
+            // the log, brings back a commit the engine was told failed.
+            if !cut { site.log_len = usize::MAX / 2; }
             Err(format!("{}: {e}", log.display()))
         }
     }
@@ -616,6 +663,68 @@ mod tests {
         // Garbage starts the site empty.
         std::fs::write(d.0.join("app.example.idb"), b"AIDBimg1\0\0\0\0\0\0\0\0\xff\xff").unwrap();
         assert_eq!(Stores::new(Some(d.0.clone())).load(&k), b"");
+    }
+
+    #[test]
+    fn renames_are_put_back_by_moving_not_copying() {
+        let mut s = Stores::new(None);
+        let k = key(Some(1));
+        let mut ops = schema();
+        ops.extend((0..64u32).map(|i| Op::Put(i.to_le_bytes().to_vec(), vec![1; 32 * 1024])));
+        commit(&mut s, &k, 1, &ops).unwrap();
+        let before = s.load(&k);
+        // 2 MiB of records renamed back and forth: a copy per rename would
+        // be tens of gigabytes.
+        let mut ops = vec![Op::Database(b("mail")), Op::Store(b("messages")), Op::Index(b("by-date"))];
+        for _ in 0..20_000 {
+            ops.extend([Op::RenameStore(b("messages"), b("m2")), Op::RenameStore(b("m2"), b("messages")),
+                        Op::RenameIndex(b("by-date"), b("d2")), Op::RenameIndex(b("d2"), b("by-date")), Op::Clear]);
+        }
+        ops.push(Op::Store(b("gone")));
+        assert!(commit(&mut s, &k, 2, &ops).is_err());
+        assert_eq!(s.load(&k), before, "every rename and clear put back");
+    }
+
+    #[test]
+    fn runs_being_received_are_held_to_a_bound_across_sites() {
+        let mut s = Stores::new(None);
+        let body = vec![0u8; PART_MAX - HEADER];
+        let part = |run: u64, n: u32| { let mut p = run.to_le_bytes().to_vec(); p.extend(n.to_le_bytes()); p.push(0); p.extend(&body); p };
+        let per_run = RUN_MAX / body.len();
+        for jar in [1, 2] {
+            for n in 0..per_run as u32 { s.apply(&key(Some(jar)), &part(jar, n)).unwrap(); }
+            // Topped up to the run's bound exactly.
+            let mut last = part(jar, per_run as u32);
+            last.truncate(HEADER + RUN_MAX - per_run * body.len());
+            s.apply(&key(Some(jar)), &last).unwrap();
+        }
+        assert!(s.apply(&key(Some(3)), &part(3, 0)).is_err(), "a third run past the bound");
+        s.forget_jar(1);
+        s.apply(&key(Some(3)), &part(3, 0)).unwrap();
+    }
+
+    #[test]
+    fn a_log_commit_out_of_shape_keeps_the_image_and_the_commits_before_it() {
+        let d = Dir::new("bad");
+        let k = key(None);
+        let mut s = Stores::new(Some(d.0.clone()));
+        commit(&mut s, &k, 1, &schema()).unwrap();
+        commit(&mut s, &k, 2, &visit(1)).unwrap();
+        let log = d.0.join("app.example.idb-log");
+        // A whole entry that names a store that isn't there, then a good one.
+        let mut bytes = std::fs::read(&log).unwrap();
+        for ops in [vec![Op::Database(b("mail")), Op::Put(b("x"), b("y")), Op::Store(b("nope"))], visit(9)] {
+            let e = encode_ops(&ops);
+            bytes.extend((e.len() as u32).to_le_bytes());
+            bytes.extend(e);
+        }
+        std::fs::write(&log, &bytes).unwrap();
+        let mut again = Stores::new(Some(d.0.clone()));
+        assert_eq!(visits(&mut again, &k), Some(1), "the commits before it, and none after");
+        // The next commit is not appended after the bad entry, where a read
+        // would never reach it.
+        commit(&mut again, &k, 3, &visit(2)).unwrap();
+        assert_eq!(visits(&mut Stores::new(Some(d.0.clone())), &k), Some(2));
     }
 
     #[test]

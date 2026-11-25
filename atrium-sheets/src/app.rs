@@ -2680,11 +2680,13 @@ impl View for Sheets {
         };
         // Whether the editor is entering or editing, at the right, as Excel's
         // status bar shows it (F2 switches).
-        let mode = self.grid.get_cloned().edit_mode().map(|m| match m {
+        let gs = self.grid.get_cloned();
+        let mode = gs.edit_mode().map(|m| match m {
             pergola::widgets::EditMode::Enter => "Enter",
             pergola::widgets::EditMode::Edit => "Edit",
-        });
-        let mut room = if mode.is_some() { 72.0 } else { 0.0 };
+        }).or(gs.extending().then_some("Extend Selection"));
+        let mode_w = if mode == Some("Extend Selection") { 120.0 } else { 60.0 };
+        let mut room = if mode.is_some() { mode_w + 12.0 } else { 0.0 };
         if self.doc.borrow().wb.recalc_pending() {
             let notice = "Calculating…";
             let style = st(type_size::XS, Weight::Semibold, t.text_secondary());
@@ -2717,7 +2719,7 @@ impl View for Sheets {
         }
         ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0 - room).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
         if let Some(m) = mode {
-            ctx.add(Node::Text { rect: Rect::new((w - 12.0 - 60.0).max(0.0), sy + 4.0, 60.0, 18.0), content: m.into(), style: st(type_size::XS, Weight::Semibold, t.text_primary()) });
+            ctx.add(Node::Text { rect: Rect::new((w - 12.0 - mode_w).max(0.0), sy + 4.0, mode_w, 18.0), content: m.into(), style: st(type_size::XS, Weight::Semibold, t.text_primary()) });
         }
 
         // The fill options button's menu, under the button.
@@ -7839,6 +7841,27 @@ mod tests {
         g.edit = None;
         s.grid.set(g);
         assert!(parts(&s).is_empty());
+    }
+
+    #[test]
+    fn the_status_bar_shows_extend_selection_while_f8_is_on() {
+        let s = sheets_of(b"1,2\n3,4\n");
+        let mut app = App::new(s.clone());
+        app.tick();
+        // A press in the grid's body gives it the keys.
+        let at = pergola::geom::Point::new(200.0, TOOLBAR_H + FORMULA_H + 60.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        let has = |_: &App<Sheets>| pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Extend Selection"));
+        assert!(!has(&app));
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::F(8), modifiers: Modifiers::default(), chars: String::new() });
+        app.tick();
+        assert!(s.grid.get_cloned().extending());
+        assert!(has(&app));
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::F(8), modifiers: Modifiers::default(), chars: String::new() });
+        app.tick();
+        assert!(!has(&app));
     }
 
     #[test]
