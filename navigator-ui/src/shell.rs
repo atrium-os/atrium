@@ -215,6 +215,9 @@ pub struct Download {
     pub size: String,
     pub origin: String,
     pub state: DownloadState,
+    /// Its own name in the persona's Downloads, once saved there: what
+    /// "Show in Files" asks Files to show.
+    pub in_downloads: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,9 +296,14 @@ pub const MORE_W: f32 = 260.0;
 pub const MORE_ROW: f32 = 32.0;
 pub const DOWNLOADS_W: f32 = 340.0;
 pub const DOWNLOAD_ROW: f32 = 48.0;
+/// The "Show in Files" button on a saved download's row.
+pub const SHOW_IN_FILES_W: f32 = 92.0;
 /// The share sheet's slot and the chosen app's (share-sheet.md §5).
 pub const SHARE_SLOT: u64 = 0x5348_5245; // "SHRE"
 pub const SHARE_TARGET_SLOT: u64 = 0x5348_5447; // "SHTG"
+/// The slot a "Show in Files" ask is made in: Files' own window shows
+/// the file, so nothing is ever drawn there.
+pub const SHOW_SLOT: u64 = 0x5348_4f57; // "SHOW"
 
 /// The most remembered origins the UI keeps track of.
 pub const LIVE_REMEMBERED_MAX: usize = 256;
@@ -401,12 +409,28 @@ pub struct LiveRun {
     /// What its site keeps in its stores, of what it may (bytes), as
     /// navigatord last said.
     pub stored: Option<(u64, u64)>,
+    /// Its engine jail's resident memory and the cap it is held to
+    /// (bytes), as navigatord last said.
+    pub memory: Option<(u64, Option<u64>)>,
 }
 
 /// A size as the popover says it: "12 MB", "340 KB", "0 KB".
 pub fn bytes_words(n: u64) -> String {
     const MB: u64 = 1_000_000;
     if n >= MB { format!("{} MB", (n + MB / 2) / MB) } else { format!("{} KB", n.div_ceil(1000)) }
+}
+
+/// Memory as the popover says it, in binary units as the cap is set:
+/// "70 MB", "1 GB", "1.5 GB".
+pub fn memory_words(n: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if n >= GIB {
+        let tenths = (n * 10 + GIB / 2) / GIB;
+        if tenths % 10 == 0 { format!("{} GB", tenths / 10) } else { format!("{}.{} GB", tenths / 10, tenths % 10) }
+    } else {
+        format!("{} MB", (n + MIB / 2) / MIB)
+    }
 }
 
 /// navigatord's own cap on windows one run opens (I6.8).
@@ -478,6 +502,8 @@ pub enum Out {
     /// Share the page's address through the system's share sheet, with
     /// the press on Share, which the sheet spends (share-sheet.md §5).
     Share { url: String, title: String, press: navigator_control::Press },
+    /// Ask Files to show the file `name` in this persona's Downloads.
+    ShowInFiles { name: String },
     /// A branch made its own trail (§4.2): the moved pages' keys, old to
     /// new, so their live children follow them.
     Moved { keys: Vec<((u64, PageId), (u64, PageId))> },
@@ -978,7 +1004,7 @@ impl Shell {
             || !matches!(&self.live, Some(LivePage::Shown(u)) if u == url) {
             return false;
         }
-        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new(), stored: None });
+        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new(), stored: None, memory: None });
         let jar = self.store.trail().jar();
         self.outbox.push(Out::ContinueLive { url: url.to_string(), jar });
         true
@@ -1047,6 +1073,15 @@ impl Shell {
         true
     }
 
+    /// navigatord's word on the running page's engine memory. A cap below
+    /// the use is a reading from two moments: kept, it says so as it is.
+    pub fn live_memory(&mut self, from: &str, used: u64, cap: Option<u64>) -> bool {
+        let Some(run) = self.live_run.as_mut().filter(|r| r.url == from && r.origin.is_some()) else { return false };
+        if cap == Some(0) { return false; }
+        run.memory = Some((used, cap));
+        true
+    }
+
     /// Whether the page `key` was opened beside by the page running live.
     pub fn opened_beside(&self, key: (u64, PageId)) -> bool {
         self.live_run.as_ref().is_some_and(|r| r.beside.contains(&key))
@@ -1059,7 +1094,11 @@ impl Shell {
         let persona = self.window_persona.clone().unwrap_or_else(|| "Personal".into());
         let n = run.beside.len();
         vec![
-            "Memory: capped by its jail. Past the cap, the page stops.".into(),
+            match run.memory {
+                Some((used, Some(cap))) => format!("Memory: {} of {}. Past that, the page stops.", memory_words(used), memory_words(cap)),
+                Some((used, None)) => format!("Memory: {}, capped by its jail.", memory_words(used)),
+                None => "Memory: capped by its jail. Past the cap, the page stops.".into(),
+            },
             {
                 let used = run.stored.map_or(String::new(), |(n, max)| format!("{} of {}, ", bytes_words(n), bytes_words(max)));
                 if self.store.trail().unrecorded { format!("Storage: {used}kept only until this trail closes.") } else { format!("Storage: {used}kept on this computer, in your {persona} persona.") }
@@ -1375,7 +1414,7 @@ impl Shell {
             }
             (Prompt::RunPageLive { recorded, .. }, "Run live" | "Always for this site") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
-                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new(), stored: None });
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new(), stored: None, memory: None });
                     let jar = self.store.trail().jar();
                     let remember = *recorded && what == "Always for this site" && !jar.unrecorded();
                     self.outbox.push(Out::RunPageLive { url, press, jar, remember });
@@ -1868,7 +1907,7 @@ impl Shell {
                 if self.downloads.len() >= DOWNLOADS_KEPT {
                     self.downloads.remove(0);
                 }
-                self.downloads.push(Download { id, file: plain(file), size: plain(size), origin: plain(origin), state });
+                self.downloads.push(Download { id, file: plain(file), size: plain(size), origin: plain(origin), state, in_downloads: None });
             }
         }
         self.downloads_new = !self.downloads_open;
@@ -1880,6 +1919,25 @@ impl Shell {
         let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) else { return false };
         d.state = state;
         self.downloads_new = !self.downloads_open;
+        true
+    }
+
+    /// navigatord saved download `id`: `path` in the popover's words, and
+    /// `name`, its own name when it went into the persona's Downloads.
+    pub fn download_saved(&mut self, id: u32, path: &str, name: Option<&str>) -> bool {
+        if !self.download_done(id, DownloadState::Saved(plain(path))) { return false; }
+        if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+            d.in_downloads = name.filter(|n| limen::picker::plain_name(n)).map(str::to_string);
+        }
+        true
+    }
+
+    /// "Show in Files" on download `id` (§15.3): Files opens a window of
+    /// its own on the file in this persona's Downloads.
+    pub fn show_in_files(&mut self, id: u32) -> bool {
+        let Some(name) = self.downloads.iter().find(|d| d.id == id).and_then(|d| d.in_downloads.clone()) else { return false };
+        self.downloads_open = false;
+        self.outbox.push(Out::ShowInFiles { name });
         true
     }
 
@@ -3714,11 +3772,20 @@ mod tests {
         let dl = |id: u32, f: &str| Prompt::Download { id, file: f.into(), size: "1 KB".into(), origin: "atlas.example".into(), kind: "PDF".into() };
         assert!(s.ask(dl(7, "plan.pdf"), 0.0));
         assert!(s.answer_pressed(2, 600.0, Some([1; 16])), "Save");
-        assert_eq!(s.downloads, vec![Download { id: 7, file: "plan.pdf".into(), size: "1 KB".into(), origin: "atlas.example".into(), state: DownloadState::Saving }]);
+        assert_eq!(s.downloads, vec![Download { id: 7, file: "plan.pdf".into(), size: "1 KB".into(), origin: "atlas.example".into(), state: DownloadState::Saving, in_downloads: None }]);
         assert!(s.downloads_new, "the button's dot");
         assert!(s.download_done(7, DownloadState::Saved("Downloads/plan.pdf".into())));
         assert!(!s.download_done(8, DownloadState::Failed("x".into())), "an answer for no download in the list");
         assert_eq!(s.downloads[0].state, DownloadState::Saved("Downloads/plan.pdf".into()));
+        assert!(!s.show_in_files(7), "saved somewhere Files can't be asked about");
+        assert!(s.download_saved(7, "“plan (1).pdf” in Downloads", Some("plan (1).pdf")));
+        assert!(!s.download_saved(99, "x", Some("x")), "no such download");
+        s.downloads_open = true;
+        assert!(s.show_in_files(7));
+        assert!(!s.downloads_open, "the list closes for Files' window");
+        assert_eq!(s.outbox.pop(), Some(Out::ShowInFiles { name: "plan (1).pdf".into() }));
+        assert!(s.download_saved(7, "x", Some("../etc/passwd")));
+        assert!(!s.show_in_files(7), "a name with a folder in it is never asked for");
         s.toggle_downloads();
         assert!(s.downloads_open && !s.downloads_new && s.geo().downloads_menu.is_some());
         assert!(s.escape() && !s.downloads_open);
@@ -3892,6 +3959,16 @@ mod tests {
         assert!(s.live_facts()[1].starts_with("Storage: 12 MB of 58 MB, kept"), "{:?}", s.live_facts());
         assert_eq!(bytes_words(0), "0 KB");
         assert_eq!(bytes_words(340_001), "341 KB");
+        // navigatord's reading of the engine jail's memory.
+        assert!(s.live_facts()[0].starts_with("Memory: capped by its jail"), "words until a number came");
+        assert!(!s.live_memory("https://other.example/", 1, None), "another page's");
+        assert!(!s.live_memory(url, 1, Some(0)), "no cap is zero");
+        assert!(s.live_memory(url, 73_400_320, Some(1 << 30)));
+        assert_eq!(s.live_facts()[0], "Memory: 70 MB of 1 GB. Past that, the page stops.");
+        assert!(s.live_memory(url, 70 << 20, None));
+        assert_eq!(s.live_facts()[0], "Memory: 70 MB, capped by its jail.");
+        assert_eq!(memory_words(3 << 29), "1.5 GB");
+        assert_eq!(memory_words(256 << 20), "256 MB");
         // The popover makes room for its lines.
         s.popover = true;
         let with = popover_height(&s, 360.0);

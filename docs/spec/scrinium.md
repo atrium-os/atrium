@@ -236,6 +236,32 @@ which app and whether it may change what it gets, the sidebar of sticks, Up
 and crumbs, the list filtered to the extensions (folders always shown), and
 Cancel plus Open / Choose folder. Escape cancels.
 
+### 4.5 Show in Files
+
+Any app can ask Files to show the person one of their files (2026-11-25,
+first for Navigator's Downloads list): `limen::picker::ToChild::Show {
+folder, name }` on a `picker` embed, or `pergola::files::show`.
+
+- The app names one of the person's five folders (`Folder::Downloads`, ...)
+  and the file's own name (`plain_name`: no `/`, not `.` or `..`, no control
+  characters, at most 255 bytes). Never a path, and never another persona's
+  folder: Scrinium uses the persona limend sent (`ParentPersona`), so a Work
+  app's ask opens Work's Downloads. No persona: refused.
+- Scrinium opens a Files window of its own (the file manager, not a sheet)
+  on that folder with the file selected, or says in it that the file is not
+  there any more. The picker's sheet never comes up.
+- The app gets back only `Done { files: 0 }` once the window is asked for,
+  or `Failed { why }`. It learns nothing of the folder, not even whether the
+  file is there.
+- One window per asking app: a second ask moves it. At most 4 such windows
+  at once, across apps; past that the ask is refused.
+- Ejecting a stick is left to the Files app's own window.
+
+Tests: `show_takes_a_plain_name_in_one_of_the_persons_folders` (limen),
+`show_in_files_opens_the_personas_folder_on_the_file` (scrinium),
+`files_is_asked_to_show_a_name_in_a_folder_and_says_only_whether_it_took_it`
+(pergola, against limend in process).
+
 ## 5. Running it
 
 ```

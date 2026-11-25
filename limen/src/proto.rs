@@ -42,6 +42,9 @@ pub mod op {
     /// [`SpendPress`]: did the person press in this web island lately?
     /// Spends that press (navigator-islands.md I6.8).
     pub const SPEND_PRESS: u16 = 0x0d;
+    /// [`Usage`]: how much memory one of the parent's spawned embeds uses
+    /// now, [`Reply::Usage`] (navigator-ui.md §15.3).
+    pub const USAGE: u16 = 0x0f;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;
@@ -93,6 +96,9 @@ pub mod refusal {
     /// `SPEND_PRESS`: no unspent press routed to the island's window within
     /// `catalogue::ISLAND_PRESS_MS`, or the embed isn't a bound web island.
     pub const NO_PRESS: u8 = 19;
+    /// `USAGE`: the embed's jail can't say (a system provider, no racct,
+    /// or portcullisd didn't answer in time).
+    pub const NO_USAGE: u8 = 20;
 }
 
 pub type EmbedId = u64;
@@ -180,6 +186,11 @@ pub struct Pip { pub embed: EmbedId, pub on: bool, pub aspect: [u32; 2] }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendPress { pub embed: EmbedId }
 
+/// The parent asks how much memory its embed's jail uses now. Only for an
+/// embed limend started; at most one answer a second per embed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage { pub embed: EmbedId }
+
 /// From the share sheet, for one of its `share` embeds: the person chose
 /// `app` (a registry app id). The parent's next `share-target` request,
 /// within `catalogue::CHOICE_MS`, starts that app; nothing else can.
@@ -218,6 +229,8 @@ pub enum Reply {
     Refused { reason: u8 },
     /// `LIST_PLUGINS`: at most [`crate::catalogue::MAX_PLUGINS`].
     Plugins { plugins: Vec<PluginInfo> },
+    /// `USAGE`: resident bytes, and the smallest memory cap on the jail.
+    Usage { memory: u64, cap: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

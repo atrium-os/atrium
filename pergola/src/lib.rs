@@ -29,6 +29,7 @@ pub mod code;
 pub mod color;
 pub mod embed;
 pub mod event;
+pub mod files;
 pub mod flow;
 pub mod geom;
 pub mod icon;

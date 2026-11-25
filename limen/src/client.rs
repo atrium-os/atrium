@@ -217,6 +217,17 @@ impl Parent {
         self.0.ok(op::SPEND_PRESS, &proto::SpendPress { embed })
     }
 
+    /// How much memory our embed's jail uses now: (resident bytes, the
+    /// smallest cap on it). Only for an embed limend started; refused with
+    /// `NO_USAGE` when its jail can't say.
+    pub fn usage(&mut self, embed: EmbedId) -> Result<(u64, Option<u64>), Error> {
+        match self.0.call(op::USAGE, &proto::Usage { embed })? {
+            Reply::Usage { memory, cap } => Ok((memory, cap)),
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            _ => Err(Error::Refused(proto::refusal::MALFORMED)),
+        }
+    }
+
     /// A role message, already encoded with the role's types.
     pub fn send(&mut self, embed: EmbedId, bytes: Vec<u8>) -> Result<(), Error> {
         self.0.ok(op::SEND, &proto::Send { embed, bytes })

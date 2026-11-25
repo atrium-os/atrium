@@ -791,6 +791,17 @@ pub trait Tell: Send + Sync + 'static {
     fn finished(&self, why: Option<String>);
     /// What the page's site keeps in its stores, of what it may (bytes).
     fn usage(&self, _stored: u64, _max: u64) {}
+    /// The engine jail's resident memory and its cap (bytes).
+    fn memory(&self, _used: u64, _cap: Option<u64>) {}
+}
+
+/// Whether a memory reading is worth telling: the first, a new cap, or a
+/// move of a mebibyte or more since the last told.
+pub fn memory_moved(told: Option<(u64, Option<u64>)>, now: (u64, Option<u64>)) -> bool {
+    match told {
+        None => true,
+        Some((used, cap)) => cap != now.1 || used.abs_diff(now.0) >= 1 << 20,
+    }
 }
 
 /// The host of a refused request's target, as `refused_target` spells it.
@@ -1159,10 +1170,24 @@ impl Live {
             let mut frame_starts = 0usize;
             let mut page_rect = size.lock().unwrap().1;
             let cookies = forms.as_ref().map(|j| j.cookies.clone());
+            let memory_every = Duration::from_millis(navigator_control::LIVE_MEMORY_EVERY_MS);
+            let mut memory_asked = Instant::now();
+            let mut memory_told = None::<(u64, Option<u64>)>;
             let why = loop {
                 let mut slot = watched.lock().unwrap();
                 let Some(connection) = slot.as_mut() else { return };
                 if let Ok(u) = delivered.try_recv() { page = Some(u); }
+                // The engine's memory (navigator-ui.md §15.3), from limend,
+                // which asks portcullisd for the jail it launched.
+                if started && memory_asked.elapsed() >= memory_every {
+                    memory_asked = Instant::now();
+                    if let Ok(now) = connection.usage(embed) {
+                        if memory_moved(memory_told, now) {
+                            memory_told = Some(now);
+                            tell.memory(now.0, now.1);
+                        }
+                    }
+                }
                 // The page's frames (I6.5): started, moved or ended as its
                 // script reports them, and moved with the page.
                 let now_rect = size.lock().unwrap().1;
@@ -1436,6 +1461,16 @@ impl Drop for Live {
 mod tests {
     use super::*;
     use nuntius::{Open};
+
+    #[test]
+    fn memory_is_told_first_then_on_a_mebibyte_or_a_new_cap() {
+        let cap = Some(1u64 << 30);
+        assert!(memory_moved(None, (5, cap)));
+        assert!(!memory_moved(Some((70 << 20, cap)), ((70 << 20) + 1000, cap)), "a few pages");
+        assert!(memory_moved(Some((70 << 20, cap)), (71 << 20, cap)));
+        assert!(memory_moved(Some((70 << 20, cap)), (69 << 20, cap)), "down too");
+        assert!(memory_moved(Some((70 << 20, cap)), (70 << 20, Some(256 << 20))), "a new cap");
+    }
 
     #[test]
     fn a_proposed_navigation_is_one_plain_https_address() {

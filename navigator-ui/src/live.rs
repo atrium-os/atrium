@@ -155,6 +155,8 @@ pub struct Live {
     printing: Option<Printing>,
     /// The share sheet and the app chosen in it (share-sheet.md §5).
     sharing: Option<pergola::share::Sharing>,
+    /// A "Show in Files" ask waiting for Files' answer.
+    showing: Option<pergola::embed::EmbedId>,
     /// The page child asked to lay its page out on paper: its embed, the
     /// title, and whether the sheet is already open (a new paper size).
     print_ask: Option<(EmbedId, String, bool)>,
@@ -329,6 +331,7 @@ impl Live {
                 idle,
                 printing: None,
                 sharing: None,
+                showing: None,
                 print_ask: None,
                 arca: None,
                 arca_post: None,
@@ -351,6 +354,7 @@ impl Live {
         self.embeds = Some(embeds);
         // A sheet on the old connection is gone; the shell hears it below.
         self.sharing = None;
+        self.showing = None;
     }
 
     /// How many page children are live (not being parked).
@@ -485,6 +489,26 @@ impl Live {
                 self.sharing = Some(sh);
             }
             Err(why) => s.shared(format!("share: failed: {why}")),
+        }
+    }
+
+    /// Ask Files to show `name` in this persona's Downloads (§15.3): a
+    /// picker embed that never comes up, whose only answer is whether
+    /// Files took the ask.
+    fn show_in_files(&mut self, s: &mut Shell, name: &str) {
+        let r = match (&self.embeds, self.window) {
+            (Some(e), Some(w)) => pergola::files::show(e, w, crate::shell::SHOW_SLOT, limen::picker::Folder::Downloads, name)
+                .map_err(|e| format!("{e:?}")),
+            _ => Err("Limen isn't running".into()),
+        };
+        match r {
+            Ok(embed) => {
+                if let Some(old) = self.showing.replace(embed) {
+                    if let Some(e) = &self.embeds { let _ = e.borrow_mut().detach_embed(old); }
+                }
+                eprintln!("navigator-ui: asked Files to show “{name}”");
+            }
+            Err(why) => s.last_note = Some(format!("not shown in Files: {why}")),
         }
     }
 
@@ -873,8 +897,8 @@ impl Live {
                         self.shown = None;
                     }
                 }
-                Event::Saved { id, path } => {
-                    s.download_done(id, crate::shell::DownloadState::Saved(path.clone()));
+                Event::Saved { id, path, name } => {
+                    s.download_saved(id, &path, name.as_deref());
                     s.last_note = Some(format!("saved as {path}"))
                 }
                 Event::NotSaved { id, why } => {
@@ -1025,6 +1049,9 @@ impl Live {
                 Event::LiveUsage { from, stored, max } => {
                     s.live_usage(&from, stored, max);
                 }
+                Event::LiveMemory { from, used, cap } => {
+                    s.live_memory(&from, used, cap);
+                }
                 Event::LiveRefused { from, what } => {
                     if s.live_refused(&from, &what) {
                         eprintln!("navigator-ui: the live page was refused {what}");
@@ -1081,6 +1108,21 @@ impl Live {
                     break;
                 }
             };
+            // Files' answer to a "Show in Files".
+            if let (Some(embed), Some(e)) = (self.showing, self.embeds.clone()) {
+                if let Some(answer) = pergola::files::shown(&e, embed, &ev) {
+                    self.showing = None;
+                    match answer {
+                        Ok(()) => eprintln!("navigator-ui: Files is showing the download"),
+                        Err(why) => {
+                            eprintln!("navigator-ui: not shown in Files: {why}");
+                            s.last_note = Some(format!("not shown in Files: {why}"));
+                        }
+                    }
+                    changed = true;
+                    continue;
+                }
+            }
             // The share sheet's events, then the print sheet's.
             if let (Some(sh), Some(e)) = (self.sharing.as_mut(), self.embeds.clone()) {
                 if sh.owns(&ev) {
@@ -1425,6 +1467,7 @@ impl Live {
                     self.ask_print(s, w, h, m, false);
                 }
                 Out::Share { url, title, press } => self.share(s, &url, &title, press),
+                Out::ShowInFiles { name } => self.show_in_files(s, &name),
                 Out::Jump { anchor } => {
                     if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
                         eprintln!("navigator-ui: jump to section #{anchor}");

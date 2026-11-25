@@ -414,7 +414,8 @@ impl View for ShellView {
         if let Some(r) = g.downloads_menu {
             let st = self.state.clone();
             let rows = s.downloads.clone();
-            floating(ctx, r, g.downloads, move || with(&st, |s| s.downloads_open = false), move |ctx| downloads_menu(ctx, r, rows));
+            let st2 = self.state.clone();
+            floating(ctx, r, g.downloads, move || with(&st, |s| s.downloads_open = false), move |ctx| downloads_menu(ctx, r, rows, &st2));
         }
         // The share sheet, then the app chosen in it, over the window
         // (share-sheet.md §5).
@@ -956,7 +957,7 @@ fn more_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::MoreRow>, status_on: bool,
 
 /// The Downloads list (§15.1): this run's files, newest first, each with
 /// where it went or why it didn't.
-fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>) {
+fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>, st: &Mutable<Shell>) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let x = r.x() + em(16.0);
@@ -966,8 +967,16 @@ fn downloads_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::Download>) {
         text(ctx, x, y + em(shell::DOWNLOAD_ROW) / 2.0, "Nothing downloaded in this window yet", type_size::SM, Weight::Regular, t.text_tertiary());
         return;
     }
-    let room = r.w() - em(64.0);
+    let full = r.w() - em(64.0);
     for d in rows.iter().rev() {
+        // "Show in Files" at the row's end, for a file in Downloads.
+        let show = matches!(d.state, shell::DownloadState::Saved(_)) && d.in_downloads.is_some();
+        let room = if show { full - em(shell::SHOW_IN_FILES_W + 8.0) } else { full };
+        if show {
+            let (st2, id) = (st.clone(), d.id);
+            let b = Rect::new(r.x() + r.w() - em(16.0 + shell::SHOW_IN_FILES_W), y + em(10.0), em(shell::SHOW_IN_FILES_W), em(26.0));
+            small_button(ctx, b, None, "Show in Files", false, "", move || with(&st2, |s| { s.show_in_files(id); }));
+        }
         let (g, c, line) = match &d.state {
             shell::DownloadState::Saving => (ph::DOWNLOAD, t.accent_fg(), format!("{} · saving · {}", d.size, d.origin)),
             shell::DownloadState::Opening => (ph::DOWNLOAD, t.accent_fg(), format!("{} · opening · {}", d.size, d.origin)),

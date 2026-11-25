@@ -1556,8 +1556,16 @@ fn handle_exec_instance(
     // until the entry exits — and released here, or by the guard's Drop on
     // any early return or panic above.
     drop(slot);
-    if let Some(done) = watch { done.store(true, std::sync::atomic::Ordering::Release) }
-    write_response(writer, &resp)
+    // Under the watch's write lock: a usage answer being written finishes
+    // first, and none is written after.
+    let held = watch.as_ref().map(|w| {
+        let g = w.write.lock().unwrap_or_else(|e| e.into_inner());
+        w.done.store(true, std::sync::atomic::Ordering::Release);
+        g
+    });
+    let r = write_response(writer, &resp);
+    drop(held);
+    r
 }
 
 /// limend's user: the only caller a manifest's `[roles]` provider is
@@ -1589,29 +1597,40 @@ fn jail_name_for(spec: &portcullis_oneshot::Spec) -> Option<String> {
     portcullis_jail::jaild_instance_name(&spec.target, spec.instance.as_deref())
 }
 
-/// Watch `caller` until `done` is set; if it hangs up first, or `until`
+/// The watch on an instance's caller: `done` once the jail is gone, and
+/// the lock any answer on the caller's connection is written under, so a
+/// usage answer and the launch's own last response never interleave.
+struct Watch {
+    done: std::sync::atomic::AtomicBool,
+    write: Mutex<()>,
+}
+
+/// Watch `caller` until the watch is done; if it hangs up first, or `until`
 /// passes, remove the jail `name` (its processes are killed, and
-/// `run_with_stdio` returns).
-fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time::Instant>) -> Arc<std::sync::atomic::AtomicBool> {
+/// `run_with_stdio` returns). Meanwhile it answers the one request the
+/// caller may write there, `InstanceUsage`.
+fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time::Instant>) -> Arc<Watch> {
     use std::sync::atomic::Ordering;
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let d = done.clone();
+    let watch = Arc::new(Watch { done: std::sync::atomic::AtomicBool::new(false), write: Mutex::new(()) });
+    let w = watch.clone();
     let _ = std::thread::Builder::new().name("portcullisd-exec-hup".into()).spawn(move || {
-        while !d.load(Ordering::Acquire) {
+        let mut line: Vec<u8> = Vec::new();
+        let mut answered: Option<std::time::Instant> = None;
+        // A caller that stops reading its answers gets no more of them.
+        let mut deaf = false;
+        while !w.done.load(Ordering::Acquire) {
             let expired = until.is_some_and(|t| std::time::Instant::now() >= t);
             let mut p = libc::pollfd { fd: caller.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             // SAFETY: `p` is one live pollfd on the stack for the call, and
             // `caller` owns the descriptor for the thread's whole life.
             let n = if expired { 0 } else { unsafe { libc::poll(&mut p, 1, 250) } };
-            if !expired && (n <= 0 || d.load(Ordering::Acquire)) { continue }
-            let hung_up = expired || p.revents & (libc::POLLHUP | libc::POLLERR) != 0 || {
-                let mut b = [0u8; 1];
-                // SAFETY: `b` is a 1-byte buffer that outlives the call, and
-                // the length passed is its length.
-                let r = unsafe { libc::recv(caller.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-                r == 0
+            if !expired && (n <= 0 || w.done.load(Ordering::Acquire)) { continue }
+            let mut b = [0u8; 256];
+            let got = if expired || p.revents & (libc::POLLHUP | libc::POLLERR) != 0 { 0 } else {
+                // SAFETY: `b` outlives the call, and the length passed is its length.
+                unsafe { libc::recv(caller.as_raw_fd(), b.as_mut_ptr().cast(), b.len(), libc::MSG_DONTWAIT) }
             };
-            if hung_up {
+            if got == 0 {
                 if expired { eprintln!("portcullisd: worker jail {name} reached its time limit; removing it") }
                 else { eprintln!("portcullisd: caller hung up; removing worker jail {name}") }
                 // SIGKILL first: removing the jail alone sends SIGTERM and
@@ -1623,11 +1642,44 @@ fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time:
                 }
                 return;
             }
-            // The caller wrote something it should not have; do not spin on it.
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            let Ok(got) = usize::try_from(got) else { continue };   // EAGAIN, EINTR
+            line.extend_from_slice(&b[..got.min(b.len())]);
+            while let Some(at) = line.iter().position(|&c| c == b'\n') {
+                let one: Vec<u8> = line.drain(..=at).collect();
+                let resp = match serde_json::from_slice::<Request>(one.trim_ascii_end()) {
+                    Ok(Request::InstanceUsage { seq }) => {
+                        // One answer a gap: each is a jaild round trip.
+                        let gap = std::time::Duration::from_millis(portcullis_ipc::INSTANCE_USAGE_GAP_MS);
+                        if let Some(wait) = answered.and_then(|t| gap.checked_sub(t.elapsed())) { std::thread::sleep(wait) }
+                        answered = Some(std::time::Instant::now());
+                        let (memory, memory_cap) = portcullisd::jaild_jail::memory(&name);
+                        Response::InstanceUsage { seq, memory, memory_cap }
+                    }
+                    _ => Response::Error { message: "only InstanceUsage is asked on an instance's connection".into() },
+                };
+                if !deaf && !answer(&caller, &w, &resp) { deaf = true }
+            }
+            if line.len() > portcullis_ipc::MAX_USAGE_LINE {
+                line.clear();
+                let resp = Response::Error { message: "request too long for an instance's connection".into() };
+                if !deaf && !answer(&caller, &w, &resp) { deaf = true }
+            }
         }
     });
-    done
+    watch
+}
+
+/// Write `resp` to an instance's caller without blocking, under the
+/// watch's write lock and only while the launch has not answered. False
+/// when the whole line could not go at once (the caller isn't reading).
+fn answer(caller: &UnixStream, w: &Watch, resp: &Response) -> bool {
+    let Ok(mut bytes) = serde_json::to_vec(resp) else { return false };
+    bytes.push(b'\n');
+    let _held = w.write.lock().unwrap_or_else(|e| e.into_inner());
+    if w.done.load(std::sync::atomic::Ordering::Acquire) { return true }
+    // SAFETY: `bytes` outlives the call, and the length passed is its length.
+    let sent = unsafe { libc::send(caller.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    usize::try_from(sent).is_ok_and(|n| n == bytes.len())
 }
 
 /// Monotonic milliseconds for the limiter. ★ Monotonic, not wall clock: a
@@ -4453,6 +4505,11 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "Hello already exchanged".into(),
         },
         Request::Ping => Response::Pong,
+        // Only on an instance's own connection, while it runs: there the
+        // watcher answers it, before any request loop could read it.
+        Request::InstanceUsage { .. } => Response::Error {
+            message: "InstanceUsage is asked on the connection holding an ExecInstance".into(),
+        },
         /* Routed in serve(), which has the peer uid this verb is gated on.
          * Reaching here would mean that routing was removed — refuse rather
          * than fall through to a policy path that cannot check the caller. */

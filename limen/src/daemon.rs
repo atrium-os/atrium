@@ -118,6 +118,18 @@ pub trait Launcher: Send {
     }
     /// End the child's jail.
     fn end(&mut self, embed: EmbedId);
+    /// A way to ask how much memory the child's jail uses, outside the
+    /// launcher's lock; `None` for a launcher that can't say.
+    fn usage(&mut self, embed: EmbedId) -> Option<Box<dyn UsageProbe>> {
+        let _ = embed;
+        None
+    }
+}
+
+/// One child's memory use, asked of whoever runs its jail: (resident bytes,
+/// smallest cap), or `None` when it can't say now.
+pub trait UsageProbe: Send {
+    fn ask(&mut self) -> Option<(u64, Option<u64>)>;
 }
 
 /// The installed plugins for a person (limend's reads the installed
@@ -569,6 +581,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             }
             op::PIP => pip(shared, conn, de(payload)?),
             op::SPEND_PRESS => spend_press(shared, conn, de(payload)?),
+            op::USAGE => usage(shared, conn, de(payload)?),
             op::CHOOSE => choose(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
@@ -1287,6 +1300,24 @@ fn spend_press(shared: &Arc<Shared>, conn: ConnId, p: proto::SpendPress) -> Resu
         Ok(Reply::Ok)
     } else {
         Err(Reply::Refused { reason: refusal::NO_PRESS })
+    }
+}
+
+/// The parent's embed's memory use. Only an embed limend spawned has a
+/// jail of its own to measure; a system provider's use is not the parent's.
+fn usage(shared: &Arc<Shared>, conn: ConnId, u: proto::Usage) -> Result<Reply, Reply> {
+    let st = shared.state.lock().unwrap();
+    match st.embeds.get(&u.embed) {
+        Some(e) if e.parent == conn && e.spawned => {}
+        Some(e) if e.parent == conn => return Err(Reply::Refused { reason: refusal::NO_USAGE }),
+        _ => return Err(Reply::Refused { reason: refusal::NOT_YOURS }),
+    }
+    drop(st);
+    // Neither lock held across portcullisd's answer, which can take a second.
+    let probe = shared.launcher.lock().unwrap().usage(u.embed);
+    match probe.and_then(|mut p| p.ask()) {
+        Some((memory, cap)) => Ok(Reply::Usage { memory, cap }),
+        None => Err(Reply::Refused { reason: refusal::NO_USAGE }),
     }
 }
 

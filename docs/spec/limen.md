@@ -481,6 +481,13 @@ parent                    limend                 portcullisd       frescod      
   spends it (frescod `slot::op::SPEND_PRESS`), else `NO_PRESS`. Another
   connection's embed is `NOT_YOURS`. navigatord spends one per new window
   a live page opens (navigator-islands.md I6.8).
+- `USAGE` (0x0f, `Usage { embed }`): the parent asks how much memory its
+  embed's jail uses now, `Reply::Usage { memory, cap }` in bytes. Only for an
+  embed limend spawned (a system provider's use is not the parent's:
+  `NO_USAGE`), and another connection's embed is `NOT_YOURS`. limend asks
+  portcullisd with `InstanceUsage` on the connection holding that
+  instance's `ExecInstance`, outside its locks, with a 2 s timeout
+  (navigator-ui.md §15.3).
 - **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
   caller unless the system policy has a worker rule for it, so every provider needs one:
   `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch

@@ -119,6 +119,14 @@ impl Launcher for Launch {
         self.launch(app, embed, ch)
     }
     fn end(&mut self, embed: EmbedId) { self.1.lock().unwrap().push(embed) }
+    /// This stand-in's jails all use 70 MiB of a 1 GiB cap.
+    fn usage(&mut self, _embed: EmbedId) -> Option<Box<dyn limen::daemon::UsageProbe>> {
+        struct Fixed;
+        impl limen::daemon::UsageProbe for Fixed {
+            fn ask(&mut self) -> Option<(u64, Option<u64>)> { Some((70 << 20, Some(1 << 30))) }
+        }
+        Some(Box::new(Fixed))
+    }
 }
 
 struct World {
@@ -1137,6 +1145,21 @@ fn an_islands_parent_spends_a_press_in_the_island_once() {
     assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS);
     w.fresco.1.lock().unwrap().pressed.push(W_VIEWER);
     app.spend_press(id).unwrap();
+}
+
+#[test]
+fn only_an_embeds_parent_learns_its_memory_use() {
+    let w = World::new();
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    w.fresco.0.lock().unwrap().0.insert(W_APP, 4101);
+    let mut app = w.parent(4101);
+    let id = app.request_island(W_APP, 1).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::IslandFetch { embed: id });
+    // Held: a child whose channel closes is gone, and its embed with it.
+    let (_, _child) = w.spawned();
+    assert_eq!(app.usage(id).unwrap(), (70 << 20, Some(1 << 30)));
+    assert_eq!(refused(w.parent(OTHER).usage(id)), refusal::NOT_YOURS);
+    assert_eq!(refused(app.usage(id + 1)), refusal::NOT_YOURS);
 }
 
 #[test]

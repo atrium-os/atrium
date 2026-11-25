@@ -2118,7 +2118,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     Some(dir) => match files::save(dir, &h) {
                         Ok(path) => {
                             eprintln!("navigatord: saved {} as {}", h.url, path.display());
-                            send(&w, &Event::Saved { id, path: path.display().to_string() });
+                            send(&w, &Event::Saved { id, path: path.display().to_string(), name: None });
                         }
                         Err(why) => send(&w, &Event::NotSaved { id, why }),
                     },
@@ -2129,7 +2129,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                         std::thread::spawn(move || match worker::save_download(&h.name, &h.url, &h.bytes) {
                             Ok((name, place)) => {
                                 eprintln!("navigatord: saved {} in {place} as “{name}”", h.url);
-                                send(&w, &Event::Saved { id, path: format!("“{name}” in {place}") });
+                                send(&w, &Event::Saved { id, path: format!("“{name}” in {place}"), name: Some(name) });
                             }
                             Err(why) => {
                                 eprintln!("navigatord: {} not saved: {why}", h.url);
@@ -3035,6 +3035,7 @@ impl live_page::Tell for LiveTell {
     }
     fn finished(&self, why: Option<String>) { send(&self.w, &Event::LiveEnded { url: self.from.clone(), why }); }
     fn usage(&self, stored: u64, max: u64) { send(&self.w, &Event::LiveUsage { from: self.from.clone(), stored, max }); }
+    fn memory(&self, used: u64, cap: Option<u64>) { send(&self.w, &Event::LiveMemory { from: self.from.clone(), used, cap }); }
     fn print(&self) { send(&self.w, &Event::LivePrint { from: self.from.clone() }); }
     fn copy(&self, text: String, token: [u8; 16]) { send(&self.w, &Event::LiveCopy { from: self.from.clone(), text, token }); }
     fn paste(&self, token: [u8; 16]) { send(&self.w, &Event::LivePaste { from: self.from.clone(), token }); }

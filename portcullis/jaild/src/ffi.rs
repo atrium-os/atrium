@@ -1714,6 +1714,39 @@ pub fn remove_jail_rctl(name: &str) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Other, format!("rctl -r jail:{name}: {}", stderr.trim())))
 }
 
+/// Jail `name`'s resident memory in bytes, from `rctl -u jail:<name>`
+/// (racct's `memoryuse`), or `None` where racct can't say.
+pub fn jail_memory_use(name: &str) -> Option<u64> {
+    if !is_safe_jail_name(name) { return None }
+    let out = std::process::Command::new("rctl").arg("-u").arg(format!("jail:{name}")).output().ok()?;
+    if !out.status.success() { return None }
+    usage_field(&String::from_utf8_lossy(&out.stdout), "memoryuse")
+}
+
+/// The smallest `memoryuse` cap on jail `name`, in bytes: the one the
+/// kernel enforces when several are set.
+pub fn jail_memory_cap(name: &str) -> Option<u64> {
+    if !is_safe_jail_name(name) { return None }
+    let out = std::process::Command::new("rctl").arg(format!("jail:{name}")).output().ok()?;
+    if !out.status.success() { return None }
+    memory_cap_in(&String::from_utf8_lossy(&out.stdout), name)
+}
+
+/// `resource=amount` from `rctl -u` output (amounts in bytes, unscaled
+/// without `-h`). Pure, so it is tested without a kernel.
+pub fn usage_field(listing: &str, resource: &str) -> Option<u64> {
+    listing.lines().map(str::trim).find_map(|l| l.strip_prefix(resource)?.strip_prefix('=')?.parse().ok())
+}
+
+/// The smallest `jail:<name>:memoryuse:<action>=<bytes>` amount in an
+/// `rctl jail:<name>` listing. Pure, so it is tested without a kernel.
+pub fn memory_cap_in(listing: &str, name: &str) -> Option<u64> {
+    let head = format!("jail:{name}:memoryuse:");
+    listing.lines().map(str::trim)
+        .filter_map(|l| l.strip_prefix(&head)?.split_once('=')?.1.parse::<u64>().ok())
+        .min()
+}
+
 /// rctl's answer when no rule matched the filter (ESRCH).
 fn no_matching_rule(stderr: &str) -> bool {
     stderr.trim_end().ends_with("No such process")
@@ -1857,6 +1890,18 @@ mod privilege_drop_tests {
         assert_eq!(super::superseded_rules(listing, "app-x--1", 256, Some(50)),
                    vec!["jail:app-x--1:memoryuse:sigkill=4294967296".to_string(),
                         "jail:app-x--1:pcpu:deny=100".to_string()]);
+    }
+
+    #[test]
+    fn memory_use_and_cap_from_rctl_output() {
+        let usage = "cputime=3\ndatasize=4096\nmemoryuse=73400320\nmemorylocked=0\n";
+        assert_eq!(super::usage_field(usage, "memoryuse"), Some(73_400_320));
+        assert_eq!(super::usage_field(usage, "memorylocked"), Some(0));
+        assert_eq!(super::usage_field("memoryuseX=5\n", "memoryuse"), None, "a longer name is not this one");
+        let rules = "jail:p-1:memoryuse:sigkill=1073741824\njail:p-1:pcpu:deny=50\n\
+                     jail:p-1:memoryuse:sigkill=268435456\njail:p-10:memoryuse:sigkill=1\n";
+        assert_eq!(super::memory_cap_in(rules, "p-1"), Some(268_435_456), "the smallest, and only this jail's");
+        assert_eq!(super::memory_cap_in("", "p-1"), None);
     }
 
     #[test]
