@@ -1351,7 +1351,30 @@ fn isolated_needs_vnet(n: &NetworkConfig) -> bool {
 /// A workspace jail, or an app started under the debugger, may debug its own
 /// processes (`allow.unprivileged_proc_debug`); no other jail gets it.
 fn may_debug(req: &CreateJailRequest) -> bool {
-    matches!(req.class, Some(JailClass::Develop { .. }) | Some(JailClass::App { debug: true, .. }))
+    class_may_debug(req.class.as_ref())
+}
+
+fn class_may_debug(class: Option<&JailClass>) -> bool {
+    matches!(class, Some(JailClass::Develop { .. }) | Some(JailClass::App { debug: true, .. }))
+}
+
+/// Whether a process jaild starts in a jail may write a core dump. Only a
+/// debug launch, which already exposes its memory (mail.md §6.4a A4), and
+/// never a filtered jail: three of the advisories the filter is measured
+/// against are in the ELF core writer, reached by crashing rather than by
+/// a call (jail-sysfil.md §2). A core would carry the app's decrypted data
+/// out of its sealed overlay.
+fn cores_allowed(class: Option<&JailClass>, filtered: bool) -> bool {
+    !filtered && class_may_debug(class)
+}
+
+/// RLIMIT_CORE = 0, hard, in a jaild child before it joins the jail, or
+/// the child exits 105: the app cannot raise it back.
+fn child_no_cores() {
+    if let Err(e) = ffi::disable_core_dumps() {
+        eprintln!("jaild-child: setrlimit(RLIMIT_CORE): {e}");
+        ffi::child_exit(105);
+    }
 }
 
 /// The persistent vnet=new jail both pre-networked modes start from.
@@ -1760,15 +1783,8 @@ fn handle_create_with_exec(
         allow_proc_debug: may_debug(req),
             sysfil,
         };
-        // No core dumps from a filtered jail: three of the advisories the
-        // filter is measured against are in the ELF core writer, reached by
-        // crashing rather than by a call (jail-sysfil.md §2). Hard limit too,
-        // so the app cannot raise it back.
-        if sysfil.is_some() {
-            if let Err(e) = ffi::disable_core_dumps() {
-                eprintln!("jaild-child: setrlimit(RLIMIT_CORE): {e}");
-                ffi::child_exit(105);
-            }
+        if !cores_allowed(req.class.as_ref(), sysfil.is_some()) {
+            child_no_cores();
         }
         let attached = match pre_created {
             // A Routed jail already exists, network and all: just join it.
@@ -1932,7 +1948,7 @@ fn handle_listen_in_jail(
             detail: format!("no jail named {name:?} in jaild state"),
         });
     };
-    if !matches!(jail.class, Some(JailClass::Develop { .. }) | Some(JailClass::App { debug: true, .. })) {
+    if !class_may_debug(jail.class.as_ref()) {
         return Err(JaildError::PolicyViolation {
             rule:   "listen_in_jail.class",
             detail: "a listening socket only in a workspace, or an app under the debugger".into(),
@@ -2097,6 +2113,11 @@ fn handle_exec_in_jail(
         if let Err(e) = set {
             eprintln!("jaild-child: stdio: {e}");
             ffi::child_exit(101);
+        }
+        // The jail's record doesn't keep whether it is filtered: a debug
+        // class is the only one whose processes may dump.
+        if !cores_allowed(jail.class.as_ref(), false) {
+            child_no_cores();
         }
         if let Err(e) = ffi::jail_attach(jid) {
             eprintln!("jaild-child: jail_attach({jid}): {e}");
@@ -2326,5 +2347,24 @@ mod child_log_tests {
         assert_eq!(child_log_path("svc--x", true), "/var/log/atrium/svc--x.log");
         assert_eq!(child_log_path("app---x", true), "/var/log/atrium/app---x.log");
         assert_eq!(child_log_path("app-org-x--", true), "/var/log/atrium/app-org-x--.log");
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::{cores_allowed, JailClass};
+
+    #[test]
+    fn only_an_unfiltered_debug_launch_may_dump() {
+        let app = |debug| JailClass::App { owner: "ada".into(), app_id: "org.atrium.mail".into(), debug };
+        let develop = JailClass::Develop { owner: "ada".into() };
+        let terminal = JailClass::Terminal { owner: "ada".into() };
+        assert!(!cores_allowed(None, false), "an unclassed (service, worker) jail");
+        assert!(!cores_allowed(Some(&app(false)), false), "an app");
+        assert!(!cores_allowed(Some(&terminal), false), "a console");
+        assert!(cores_allowed(Some(&app(true)), false), "an app under the debugger");
+        assert!(cores_allowed(Some(&develop), false), "a workspace");
+        assert!(!cores_allowed(Some(&app(true)), true), "a filtered jail never");
+        assert!(!cores_allowed(Some(&develop), true));
     }
 }

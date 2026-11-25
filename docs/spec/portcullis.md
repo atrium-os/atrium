@@ -2837,3 +2837,17 @@ The opt-out is `plain_app_data = true` in `/etc/atrium/volumes.policy.toml`
 deploys to dev VMs, so it writes `true` on a first deploy, keeps the
 target's value after that, and takes `PLAIN_APP_DATA=true|false`. A product
 image ships without it.
+
+### No core dumps from jails
+
+Accepted in mail.md §6.4a (A4), built 2026-11-25 (FreeBSD cross check of
+jaild with its tests; no VM run yet). Every process jaild starts in a jail,
+by CreateWithExec (apps, workers, one-shots) or ExecInJail, gets
+`RLIMIT_CORE = 0`, soft and hard, before it joins the jail; if setrlimit
+fails the child exits 105 and nothing runs. Its children inherit it and
+cannot raise it back. The only exception is a debug class (an app launched
+under the debugger, a workspace), which already exposes its memory, and
+never a filtered jail (jail-sysfil.md §2). `server::cores_allowed` is the
+rule. The jail record doesn't keep whether a jail is filtered, so an
+ExecInJail into a filtered debug jail may dump; nothing makes one today.
+

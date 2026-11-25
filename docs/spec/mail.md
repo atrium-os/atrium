@@ -575,6 +575,8 @@ plaintext), gets `RLIMIT_CORE=0` (hard), not only filtered jails. The only excep
 which already accepts that its memory is exposed. Mail keeps decrypted mail in memory
 and should never dump it.
 
+As built (2026-11-25): portcullis.md "No core dumps from jails".
+
 **A5. A gate that proves it (scripts/mail-at-rest-vm-check.sh, on Tessera).** It syncs a
 synthetic account (the JMAP fixture) whose message carries a unique marker in four
 places: the subject, the body, an attachment and a search term. The gate then:
