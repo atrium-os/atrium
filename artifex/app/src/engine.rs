@@ -19,6 +19,7 @@ use crate::assist;
 use crate::dap;
 use crate::exec::{Exec, Proc};
 use crate::lsp;
+use crate::palette;
 use crate::plugins;
 use crate::tasks::{self, Severity};
 use crate::tree::{self, Tree};
@@ -152,6 +153,9 @@ pub struct Engine {
     /// answers are still to come.
     fixes: Vec<(lsp::Action, lsp::Encoding)>,
     fixes_waiting: usize,
+    /// The palette's commands while it's up, and the rows shown.
+    palette: Vec<palette::Entry>,
+    palette_rows: Vec<usize>,
 }
 
 /// Who answers a request that takes one answer: the file's workspace
@@ -221,6 +225,8 @@ impl Engine {
             completion_waiting: 0,
             fixes: Vec::new(),
             fixes_waiting: 0,
+            palette: Vec::new(),
+            palette_rows: Vec::new(),
         }
     }
 
@@ -419,6 +425,45 @@ impl Engine {
             }
             Act::StartRename => self.start_rename(s),
             Act::Rename(name) => self.rename(name.trim(), s),
+            Act::Palette => {
+                // Artifex's own, then each running plugin's.
+                let mut all = palette::own();
+                for r in &self.plugins.runs {
+                    for (id, label) in &r.commands {
+                        all.push(palette::Entry { cmd: palette::Cmd::Plugin { app: r.info.app.clone(), id: id.clone() }, label: label.clone(), hint: r.info.name.clone() });
+                    }
+                }
+                self.palette = all;
+                self.close_popup(s);
+                self.palette_query("", s);
+            }
+            Act::PaletteQuery(q) => {
+                if s.palette.is_some() {
+                    self.palette_query(&q, s);
+                }
+            }
+            Act::PaletteRun(i) => {
+                let Some(&k) = self.palette_rows.get(i) else { return false };
+                let Some(e) = self.palette.get(k).cloned() else { return false };
+                s.palette = None;
+                self.palette.clear();
+                match e.cmd {
+                    palette::Cmd::Act(a) => return self.act(a, s),
+                    palette::Cmd::Plugin { app, id } => {
+                        let at = self.active.and_then(|i| self.docs.get(i)).map(|d| {
+                            let b = d.cells.buffer.get_cloned();
+                            (d.cells.path.clone(), b.line_col(b.primary().head).0)
+                        });
+                        if let Err(why) = self.plugins.command(&app, &id, at.as_ref().map(|a| a.0.as_path()), at.as_ref().map_or(0, |a| a.1)) {
+                            s.note = Some((format!("{}: {why}", e.label), true));
+                        }
+                    }
+                }
+            }
+            Act::ClosePalette => {
+                s.palette = None;
+                self.palette.clear();
+            }
             Act::CancelRename => {
                 s.renaming = None;
                 self.rename_at = None;
@@ -2713,6 +2758,13 @@ impl Engine {
         }
     }
 
+    fn palette_query(&mut self, q: &str, s: &mut State) {
+        let q: String = q.chars().take(200).collect();
+        self.palette_rows = palette::filter(&self.palette, &q);
+        let rows = self.palette_rows.iter().map(|&i| (self.palette[i].label.clone(), self.palette[i].hint.clone())).collect();
+        s.palette = Some((q, rows));
+    }
+
     /// Plugins reach limend through `link`; the files open now go to
     /// those for their languages.
     pub fn set_plugin_link(&mut self, link: Box<dyn plugins::Link>) {
@@ -3784,7 +3836,7 @@ mod tests {
         std::fs::set_permissions(bin.join("pylsp"), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
         std::fs::write(d.join("plugin.py"), include_str!("../tests/fixtures/fake_plugin.py")).unwrap();
-        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec![], panel: None, workspace_read: false };
+        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec!["todo.count".into()], panel: None, workspace_read: false };
         e.plugins.on = vec![todo];
         e.set_plugin_link(Box::new(plugins::testing::Stdio::new(&d.join("plugin.py"))));
         std::fs::write(d.join("proj/app.py"), "import os\n\ndef main():\n\tprint('hi')  # TODO say more\n\t\n").unwrap();
@@ -3823,6 +3875,25 @@ mod tests {
         e.tick(&mut s);
         assert_eq!(doc.buffer.get_cloned().line_text(3), "\tprint('hi')  # DONE say more");
         assert!(tick_until(&mut e, &mut s, |s| s.diags.is_empty()), "the plugin saw the edit: {:?}", s.diags);
+
+        // Its command is in the palette with Artifex's own (the one its
+        // manifest doesn't list isn't), and runs in it.
+        e.act(Act::Palette, &mut s);
+        let rows = |s: &State| s.palette.as_ref().unwrap().1.iter().map(|r| format!("{} | {}", r.0, r.1)).collect::<Vec<_>>();
+        e.act(Act::PaletteQuery("count".into()), &mut s);
+        assert_eq!(rows(&s), vec!["Count the TODOs | TODO lens".to_string()]);
+        e.act(Act::PaletteQuery("manifest".into()), &mut s);
+        assert!(rows(&s).is_empty());
+        e.act(Act::PaletteQuery("count".into()), &mut s);
+        e.act(Act::PaletteRun(0), &mut s);
+        assert!(s.palette.is_none());
+        assert!(tick_until(&mut e, &mut s, |s| s.lsp.as_deref().is_some_and(|l| l.contains("TODO lens: 1 TODOs (line 3 of app.py)"))), "{:?}", s.lsp);
+        // And Artifex's own run as their keys do.
+        e.act(Act::Palette, &mut s);
+        e.act(Act::PaletteQuery("refs".into()), &mut s);
+        assert_eq!(rows(&s)[0], "Find references | Shift+F12");
+        e.act(Act::PaletteRun(0), &mut s);
+        assert!(tick_until(&mut e, &mut s, |s| !s.refs.is_empty()), "the server answered the palette's ask");
     }
 
     #[test]

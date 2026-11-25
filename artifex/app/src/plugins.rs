@@ -294,6 +294,19 @@ impl Host {
         self.runs.iter_mut().find(|r| r.id == id)
     }
 
+    /// Run `app`'s command `id` (from the palette), for `path`'s caret
+    /// `line` when a file is active.
+    pub fn command(&mut self, app: &str, id: &str, path: Option<&Path>, line: usize) -> Result<(), String> {
+        let link = self.link.as_mut().ok_or("plugins aren't running")?;
+        let r = self.runs.iter().find(|r| r.info.app == app).ok_or("the plugin has stopped")?;
+        if !r.commands.iter().any(|c| c.0 == id) {
+            return Err("no such command".into());
+        }
+        let file = path.and_then(|p| r.client.uri(p)).filter(|u| u.len() <= 4096);
+        let m = ToChild::Command { id: id.to_string(), file, line: u32::try_from(line).unwrap_or(u32::MAX) };
+        link.send(r.id, m.encode())
+    }
+
     /// The status line's plugin part: each running plugin's own text.
     pub fn status(&self) -> Option<String> {
         let v: Vec<String> = self.runs.iter().filter(|r| !r.status.is_empty()).map(|r| format!("{}: {}", r.info.name, r.status)).collect();
@@ -429,10 +442,14 @@ pub mod testing {
                 ToChild::Init(i) => self.inits.push(i),
                 ToChild::Lsp { last, part } => {
                     if let Some(json) = j.push(last, &part).map_err(|_| "too big")? {
-                        let mut framed = format!("Content-Length: {}\r\n\r\n", json.len()).into_bytes();
-                        framed.extend_from_slice(&json);
-                        c.stdin.as_mut().ok_or("no stdin")?.write_all(&framed).map_err(|e| e.to_string())?;
+                        write_frame(c, &json)?;
                     }
+                }
+                // As the SDK's stdio wrapper says it: an `artifex/command`
+                // notification.
+                ToChild::Command { id, file, line } => {
+                    let v = serde_json::json!({ "jsonrpc": "2.0", "method": "artifex/command", "params": { "id": id, "file": file, "line": line } });
+                    write_frame(c, &serde_json::to_vec(&v).unwrap())?;
                 }
                 _ => {}
             }
@@ -454,15 +471,33 @@ pub mod testing {
                     None => out.push((id, LinkEvent::Gone("it exited".into()))),
                     Some(b) => {
                         for v in dec.feed(&b).unwrap_or_default() {
-                            for p in ext::split(&serde_json::to_vec(&v).unwrap(), false).unwrap() {
-                                out.push((id, LinkEvent::Message(p)));
-                            }
+                            let p = &v["params"];
+                            let s = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+                            let m = match v["method"].as_str() {
+                                Some("artifex/registerCommand") => ToParent::RegisterCommand { id: s("id"), label: s("label") },
+                                Some("artifex/status") => ToParent::Status(s("text")),
+                                Some("artifex/panel") if p["open"].as_bool() == Some(true) => ToParent::Panel(ext::Panel::Open { title: s("title") }),
+                                Some("artifex/panel") => ToParent::Panel(ext::Panel::Close),
+                                _ => {
+                                    for part in ext::split(&serde_json::to_vec(&v).unwrap(), false).unwrap() {
+                                        out.push((id, LinkEvent::Message(part)));
+                                    }
+                                    continue;
+                                }
+                            };
+                            out.push((id, LinkEvent::Message(m.encode())));
                         }
                     }
                 }
             }
             out
         }
+    }
+
+    fn write_frame(c: &mut std::process::Child, json: &[u8]) -> Result<(), String> {
+        let mut framed = format!("Content-Length: {}\r\n\r\n", json.len()).into_bytes();
+        framed.extend_from_slice(json);
+        c.stdin.as_mut().ok_or("no stdin")?.write_all(&framed).map_err(|e| e.to_string())
     }
 
     impl Drop for Stdio {

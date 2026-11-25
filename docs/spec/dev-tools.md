@@ -635,6 +635,11 @@ file's first client's encoding), quick fixes (each applied in its own
 encoding) and diagnostics; definition, hover, references, rename,
 signature help and formatting go to the workspace's server, else the
 first plugin. Tested with a scripted plugin beside the scripted server.
+P3 (2026-11-25): the command palette (Ctrl+Shift+P, `artifex::palette`)
+lists Artifex's own acts with their keys and each running plugin's
+registered commands (only those its manifest lists) with its name; typed
+letters match in order, a word's start first, 12 rows at most. A plugin
+command goes as `Command { id, file, line }` for the active file.
 
 **Decisions.**
 

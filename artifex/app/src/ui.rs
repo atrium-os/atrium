@@ -175,6 +175,12 @@ pub enum Act {
     QuickFix,
     /// Format the file (Shift+Alt+F).
     Format,
+    /// The command palette (Ctrl+Shift+P): open it, what's typed in it,
+    /// run its `i`th row, close it.
+    Palette,
+    PaletteQuery(String),
+    PaletteRun(usize),
+    ClosePalette,
 }
 
 /// The debugger as the window shows it.
@@ -325,6 +331,9 @@ pub struct State {
     pub menu: Option<(usize, String)>,
     /// The signature shown (for the trace).
     pub tip: Option<String>,
+    /// The command palette is up: what's typed, and its rows (label, key
+    /// or plugin).
+    pub palette: Option<(String, Vec<(String, String)>)>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -363,6 +372,7 @@ pub fn shortcut(key: Key, m: Modifiers, chars: &str) -> Option<Act> {
         (Key::Char, true, false) if c == Some('w') => Some(Act::CloseTab(usize::MAX)),
         (Key::Char, true, false) if c == Some('j') => Some(Act::Panel(Panel::Output)),
         (Key::Char, true, true) if c == Some('m') => Some(Act::Panel(Panel::Problems)),
+        (Key::Char, true, true) if c == Some('p') => Some(Act::Palette),
         (Key::Char, true, false) if c == Some('k') => Some(Act::Hover),
         (Key::PageDown, true, _) => Some(Act::CycleTab(true)),
         (Key::PageUp, true, _) => Some(Act::CycleTab(false)),
@@ -426,6 +436,8 @@ pub struct ArtifexView {
     pub bp_chosen: Mutable<Option<(String, usize)>>,
     /// The rename bar's new name.
     pub rename_field: Mutable<TextEdit>,
+    /// What's typed in the command palette.
+    pub palette_field: Mutable<TextEdit>,
     pub doc: Mutable<Option<DocCells>>,
     pub size: Mutable<(f32, f32)>,
     pub queue: Queue,
@@ -1089,6 +1101,36 @@ impl View for ArtifexView {
             ctx.pop();
         }
 
+        // The command palette, over the editor's top.
+        if let Some((_, rows)) = &s.palette {
+            let pw = em(560.0).min(w - em(32.0));
+            let px = (w - pw) / 2.0;
+            let py = bar_h() + em(8.0);
+            let ph = em(56.0) + rows.len().max(1) as f32 * em(32.0);
+            ctx.key(3300);
+            ctx.push(Node::Rect { rect: Rect::new(px, py, pw, ph), fill: t.bg_elevated(), radius: radius::MD });
+            ctx.key(3301);
+            let q3 = q.clone();
+            TextField::new(self.palette_field.clone()).key(3301).at(px + em(8.0), py + em(8.0)).width(pw - em(104.0))
+                .placeholder("Type a command").autofocus(true)
+                .on_submit(move |_| push(&q3, Act::PaletteRun(0))).render(ctx);
+            ctx.key(3302);
+            Button::ghost("Close").at(px + pw - em(88.0), py + em(8.0)).width(em(80.0)).on_click(plain(q, Act::ClosePalette)).render(ctx);
+            if rows.is_empty() {
+                text(ctx, px + em(16.0), py + em(68.0), "No command matches", type_size::SM, Weight::Regular, t.text_tertiary());
+            }
+            for (i, (label, hint)) in rows.iter().enumerate() {
+                let ry = py + em(52.0) + i as f32 * em(32.0);
+                ctx.key(3400 + i as u64);
+                let id = ctx.push(Node::Rect { rect: Rect::new(px + em(4.0), ry, pw - em(8.0), em(30.0)), fill: if i == 0 { t.bg_surface() } else { t.bg_elevated() }, radius: radius::SM });
+                ctx.on_click(id, plain(q, Act::PaletteRun(i)));
+                text(ctx, px + em(16.0), ry + em(15.0), &fit(label, pw - em(200.0), type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
+                text(ctx, px + pw - em(170.0), ry + em(15.0), &fit(hint, em(150.0), type_size::SM), type_size::SM, Weight::Regular, t.text_tertiary());
+                ctx.pop();
+            }
+            ctx.pop();
+        }
+
         // The workspace chooser, over everything.
         if s.choosing || (s.ws.is_none() && s.listed) {
             ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.scrim(), radius: 0.0 });
@@ -1139,6 +1181,7 @@ mod tests {
         assert_eq!(shortcut(Key::Char, m(true, false), "s"), Some(Act::Save));
         assert_eq!(shortcut(Key::Char, m(true, false), "S"), Some(Act::Save));
         assert_eq!(shortcut(Key::Char, m(true, true), "M"), Some(Act::Panel(Panel::Problems)));
+        assert_eq!(shortcut(Key::Char, m(true, true), "P"), Some(Act::Palette));
         assert_eq!(shortcut(Key::F(12), m(false, false), ""), Some(Act::Definition));
         assert_eq!(shortcut(Key::Char, m(false, false), "s"), None);
         assert_eq!(shortcut(Key::Char, m(true, false), " "), Some(Act::Complete));
