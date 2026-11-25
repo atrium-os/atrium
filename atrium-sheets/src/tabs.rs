@@ -15,6 +15,23 @@ const TAB_MIN: f32 = 56.0;
 const TAB_MAX: f32 = 200.0;
 const TAB_PAD: f32 = 24.0;
 
+/// Ctrl+PageDown (`dir` 1) / Ctrl+PageUp (-1): the next shown sheet that
+/// way from `from`, skipping hidden ones; `None` at the end (no wrapping, as
+/// in Excel).
+pub fn step_sheet(wb: &officina_grid::Workbook, from: u16, dir: i8) -> Option<u16> {
+    let n = wb.sheet_count() as i64;
+    let mut i = from as i64;
+    loop {
+        i += dir.signum() as i64;
+        if dir == 0 || i < 0 || i >= n {
+            return None;
+        }
+        if !wb.sheet(i as u16).sheet_hidden {
+            return Some(i as u16);
+        }
+    }
+}
+
 /// A press on the strip or its rename bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabCmd {

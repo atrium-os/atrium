@@ -4891,6 +4891,12 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Ctrl+Shift+*** selects the current region: the rectangle around the cursor, grown while any cell just outside it, diagonals included, holds something. **Ctrl+A** does the same first. Pressed again, or on a cell with nothing around it, Ctrl+A selects everything (`pergola::widgets::grid_view::current_region`). Each side is grown as far as it goes in one pass, and at most 4,000,000 cells are looked at.
 - Tests: `f4_repeats_the_last_command_on_the_new_selection` (Sheets) and `ctrl_a_and_ctrl_shift_star_select_the_data_around_the_cursor` (pergola). Results: Sheets 142 and pergola 232 lib tests pass.
 
+### 16.115 Sheet and comment keys (2026-11-25)
+
+- **Ctrl+PageDown** and **Ctrl+PageUp** show the next or previous sheet. Hidden sheets are skipped, there is no wrap at either end (as in Excel), and the cursor stays where it was (`tabs::step_sheet`).
+- **Shift+F11** adds a sheet and shows it. **Shift+F2** opens the comment bar for the cursor's cell, where Excel opens its note editor. Plain F2 still edits the cell.
+- pergola's grid sends `GridAction::Sheet(-1 | 0 | 1)` and `GridAction::Comment`. Tests: `ctrl_page_keys_step_through_shown_sheets_only` (Sheets) and the grid's region and key test (pergola). Sheets 143 and pergola 237 lib tests pass. pergola's lib tests now build only in debug, since the UI inspector's `Link` is `debug_assertions`-only.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

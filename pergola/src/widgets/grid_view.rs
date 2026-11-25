@@ -553,6 +553,11 @@ pub enum GridAction {
     Redo,
     /// F4 outside the editor: the last command again, on the selection.
     Repeat,
+    /// Ctrl+PageUp (-1) / Ctrl+PageDown (1): the sheet before or after;
+    /// Shift+F11 (0): a new sheet.
+    Sheet(i8),
+    /// Shift+F2: the cursor cell's comment, to write or edit.
+    Comment,
     Copy(CellRange),
     Cut(CellRange),
     /// Paste at the active cell; `sel` the selection (a bigger one may be
@@ -2743,6 +2748,10 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             };
             Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
         }
+        Key::PageUp | Key::PageDown if cmd && !m.shift => {
+            send(GridAction::Sheet(if key == Key::PageUp { -1 } else { 1 }));
+            return true;
+        }
         // Hidden rows and columns are stepped over.
         Key::PageUp => Some(past_hidden(src, g.cursor, step(g.cursor, -page(st), 0), -1, 0)),
         Key::PageDown => Some(past_hidden(src, g.cursor, step(g.cursor, page(st), 0), 1, 0)),
@@ -2758,7 +2767,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             reveal(src, geom, st, to);
             return true;
         }
-        Key::Enter | Key::F(2) => {
+        Key::Enter | Key::F(2) if !(key == Key::F(2) && m.shift && src.fills()) => {
             let mut ed = TextEdit::new(&src.edit_text(g.cursor.0, g.cursor.1));
             ed.set_caret(ed.text().len(), false);
             g.anchor = g.cursor;
@@ -2801,6 +2810,14 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
         Key::F(4) if !cmd && !m.alt && src.fills() => {
             send(GridAction::Repeat);
+            return true;
+        }
+        Key::F(11) if m.shift && !cmd && !m.alt && src.fills() => {
+            send(GridAction::Sheet(0));
+            return true;
+        }
+        Key::F(2) if m.shift && !cmd && !m.alt && src.fills() => {
+            send(GridAction::Comment);
             return true;
         }
         // Ctrl+Shift+*: the data around the cursor (its current region).
@@ -3228,6 +3245,19 @@ mod tests {
         // F4 outside the editor asks to repeat.
         key(&mut app, Key::F(4), "", Modifiers::default());
         assert_eq!(log.borrow().last(), Some(&GridAction::Repeat));
+        // Sheets: Ctrl+PageDown / Ctrl+PageUp step, Shift+F11 adds; Shift+F2 comments.
+        let cursor = state.get_cloned().cursor;
+        key(&mut app, Key::PageDown, "", ctrl);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Sheet(1)));
+        key(&mut app, Key::PageUp, "", ctrl);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Sheet(-1)));
+        assert_eq!(state.get_cloned().cursor, cursor, "the cursor stays");
+        let shift = Modifiers { shift: true, ..Modifiers::default() };
+        key(&mut app, Key::F(11), "", shift);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Sheet(0)));
+        key(&mut app, Key::F(2), "", shift);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Comment));
+        assert!(state.get_cloned().edit.is_none(), "Shift+F2 doesn't open the cell editor");
     }
 
     #[test]
