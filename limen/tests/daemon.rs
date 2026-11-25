@@ -859,6 +859,51 @@ fn only_settings_opens_an_apps_own_pane_and_the_launcher_decides_the_persona() {
 }
 
 #[test]
+fn a_plugin_is_any_app_the_parent_names_that_is_one_for_its_person() {
+    let w = World::new();
+    w.shared.set_plugin_check(Box::new(|person: &str, app: &str| person == "ana" && ["org.example.notes", "org.example.map"].contains(&app)));
+    let mut app = w.parent(APP);
+    // Never from a plain request, and only apps that are plugins, by names
+    // limend can check.
+    assert_eq!(refused(app.request("editor-extension", W_APP)), refusal::NO_PROVIDER);
+    assert_eq!(refused(app.request_plugin(W_APP, "org.example.player")), refusal::NO_PLUGIN);
+    assert_eq!(refused(app.request_plugin(W_APP, "../org.example.notes")), refusal::NO_PLUGIN);
+    assert_eq!(refused(app.request_plugin(W_APP, "")), refusal::NO_PLUGIN);
+
+    // Two plugins side by side, each started as itself.
+    let a = app.request_plugin(W_APP, "org.example.notes").unwrap();
+    let (spawned, mut notes) = w.spawned();
+    assert_eq!(a, spawned);
+    assert_eq!(next_c(&mut notes), ChildEvent::Attach { embed: a, role: "editor-extension".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    let b = app.request_plugin(W_APP, "org.example.map").unwrap();
+    let (spawned, _map) = w.spawned();
+    assert_eq!(b, spawned);
+    assert_ne!(a, b);
+    // But one of each per window.
+    assert_eq!(refused(app.request_plugin(W_APP, "org.example.notes")), refusal::TOO_MANY);
+
+    // LSP travels without a panel; a panel is the plugin's window, bound
+    // in a plain slot.
+    let init = limen::editor_ext::ToChild::Init(limen::editor_ext::Init { languages: vec!["rust".into()], workspace: "hello".into(), read: false });
+    app.send(a, init.encode()).unwrap();
+    assert_eq!(next_c(&mut notes), ChildEvent::Message { embed: a, bytes: init.encode() });
+    for part in limen::editor_ext::split(br#"{"jsonrpc":"2.0","id":1,"result":null}"#, false).unwrap() {
+        notes.emit(a, part.clone()).unwrap();
+        assert_eq!(next_p(&mut app), ParentEvent::Message { embed: a, bytes: part });
+    }
+    notes.ready(a, W_NOTES).unwrap();
+    app.place(a, RECT).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: a });
+    assert!(w.fresco.binds().iter().any(|x| x.0 == W_APP && x.1 == W_NOTES && x.2 == SlotKind::Plain));
+
+    // Once it is gone the same plugin can start again (Restart).
+    app.detach(a).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: a });
+    let c = app.request_plugin(W_APP, "org.example.notes").unwrap();
+    assert_eq!(w.spawned().0, c);
+}
+
+#[test]
 fn a_choice_in_another_persona_goes_to_the_launcher_which_decides() {
     let w = World::new();
     w.shared.set_target_check(Box::new(|person: &str, app: &str| person == "ana" && app == "org.example.notes"));

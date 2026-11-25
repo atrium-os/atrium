@@ -148,7 +148,7 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 | `payment` | user | the user's payment app | `credential` | one payment |
 | `web-island` | fixed worker | a fresh instance of `org.atrium.navigator.engine`, with the embed-only Fresco connection | `island` | as long as the page |
 | `map` | user | default map app | `plain` | as long as the parent wants |
-| `editor-extension` | user | the extension the user installed | `plain` | as long as the parent wants |
+| `editor-extension` | plugin | any app the parent names whose manifest implements it for the parent's person, several at once (`REQUEST_PLUGIN`) | `plain` | as long as the parent wants |
 
 ### 2.1 `doc-viewer`
 
@@ -368,8 +368,26 @@ check as a password fill.
 
 ### 2.7 `editor-extension`
 
-Defined in [artifex.md](artifex.md) §7.2. This spec owns the role's mechanics; artifex.md owns
-what Artifex does with it.
+An Artifex plugin (design in [dev-tools.md](dev-tools.md) §3.8, D26–D30; what Artifex does
+with it in [artifex.md](artifex.md) §7). Built as `limen::editor_ext`.
+
+- **Who starts it.** Never a plain `REQUEST` (`NO_PROVIDER`). The parent sends
+  `REQUEST_PLUGIN { window, z, app }` naming the plugin; limend starts `app` as itself for the
+  parent's instance if its installed manifest implements `editor-extension` for the parent's
+  person (a dev build only for the person whose workspace made it), else `NO_PLUGIN`. The
+  parent's own manifest must name the role in `embeds`. Several plugins run at once, one of
+  each per parent window (`TOO_MANY`).
+- **Manifest.** `[roles.editor-extension]`: `languages` (1–16 Artifex names, or `*`),
+  `commands` (≤64 ids), `panel` (a title, if it draws one), `workspace-read` (D28). portcullisd
+  refuses the section without the role and the role without the section.
+- **Messages.** Parent → child: `Init { languages, workspace, read }`, `Lsp { last, part }`,
+  `Command { id, file, line }`, `PanelShown(bool)`. Child → parent: `Lsp { last, part }`,
+  `RegisterCommand { id, label }`, `Panel(Open { title } | Close)`, `Status(text)`. One LSP
+  JSON-RPC message (no `Content-Length` header) goes as parts of at most 60 KiB, the last with
+  `last: true`, at most 4 MiB in all; both ends refuse more and drop the peer. Files are
+  `artifex:///<path in work>`.
+- **Panel.** Messages flow before the child has a window; a panel is the child's window, given
+  with `READY` and placed by the parent in a `plain` slot like any other.
 
 ### 2.8 `credential`
 

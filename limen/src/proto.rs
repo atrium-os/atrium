@@ -34,6 +34,9 @@ pub mod op {
     /// Curia only: [`AppSettings`], an app's own settings pane in the
     /// persona Curia names (curia.md §15).
     pub const REQUEST_APP_SETTINGS: u16 = 0x0b;
+    /// [`Plugin`]: one of the parent's plugins (`editor-extension`,
+    /// dev-tools.md §3.8), the app it names.
+    pub const REQUEST_PLUGIN: u16 = 0x0c;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;
@@ -79,6 +82,9 @@ pub mod refusal {
     /// `REQUEST_APP_SETTINGS`: the parent isn't Curia, or the app doesn't
     /// implement `app-settings` for the parent's person.
     pub const NO_PANE: u8 = 17;
+    /// `REQUEST_PLUGIN`: the app doesn't implement `editor-extension` for
+    /// the parent's person.
+    pub const NO_PLUGIN: u8 = 18;
 }
 
 pub type EmbedId = u64;
@@ -107,6 +113,15 @@ pub struct AppSettings {
     pub z: u8,
     pub app: String,
     pub persona: String,
+}
+
+/// A plugin, `app`, for the parent's window `window` (its panel, if it
+/// shows one, goes in a slot there).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plugin {
+    pub window: WindowToken,
+    pub z: u8,
+    pub app: String,
 }
 
 /// The slot's rect in the parent window's surface pixels; `None` hides it.

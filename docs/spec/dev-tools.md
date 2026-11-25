@@ -528,7 +528,7 @@ semantic tokens, server commands.
 
 ### 3.8 Plugins for Artifex (proposal, 2026-11-25)
 
-Status: proposal, waiting for Shankar (D26–D30). It makes artifex.md §7
+Status: ACCEPTED by Shankar 2026-11-25 (D26–D30 as recommended); being built. It makes artifex.md §7
 (the `editor-extension` Limen role) concrete now that Limen, the LSP
 features (§3.7) and Pergola slots are built, and changes it in two places
 (D27, D28).
@@ -544,15 +544,15 @@ SDK gives Rust a crate (`atrium-artifex-ext`) and C a header.
 id = "org.example.todo-lens"
 entry = "bin/todo-lens"
 
-[role]
+[roles]
 implements = ["editor-extension"]
 
-[editor-extension]
+[roles.editor-extension]
 languages = ["rust", "c"]          # what it is started for; "*" for all
 commands = ["todo-lens.list"]      # shown in the command palette
 panel = "TODOs"                    # it may draw a panel (a Limen slot)
 workspace-read = false             # D28: off unless asked for and granted
-network = []                       # hosts, shown when it is switched on
+# network: the app's own [capabilities] network, shown when it is switched on
 ```
 
 **What it speaks (D27).** Language Server Protocol, over the role's
@@ -618,6 +618,13 @@ one process and one channel per plugin.
 - P5: the Plugins view, `workspace-read` grants, limits and restart.
 - P6: the SDK crate, two sample plugins (TODO lens with a panel; a
   Markdown link checker as diagnostics), a VM check.
+
+**As built.** P1 (2026-11-25): `limen::editor_ext` (messages, LSP
+parts of ≤60 KiB joined up to 4 MiB, bounds), limend's
+`Provider::Plugin` (`REQUEST_PLUGIN` names the plugin, checked against
+installed manifests for the parent's person, one of each per window;
+limen.md §2.7), `[roles.editor-extension]` in portcullis-toml, and
+`embeds = ["editor-extension"]` in Artifex's manifest.
 
 **Decisions.**
 
@@ -1050,4 +1057,4 @@ decided. T2 and T3 together already give a usable terminal development setup.
 | D18 | Importing SVG from other tools | ACCEPTED: the dock's checker; convert what it can, name what it can't keep |
 | D19–D22 | Artifex's debugger UI (2026-11-25) | BUILT: a panel with a strip entry, one toolbar group, the stopped line and hover values, stack, expanding variables, breakpoints with conditions, an evaluate line (§3.6) |
 | D23–D25 | Inspecting a dev app's UI (2026-11-25) | BUILT: pick, tree and bounds; read-only; dev builds and their own Artifex only (§3.6) |
-| D26–D30 | Plugins for Artifex (2026-11-25) | PROPOSED: jailed apps through Limen speaking LSP plus commands and a panel; no workspace files unless granted; many at once (§3.8) |
+| D26–D30 | Plugins for Artifex (2026-11-25) | ACCEPTED: jailed apps through Limen speaking LSP plus commands and a panel; no workspace files unless granted; many at once (§3.8) |

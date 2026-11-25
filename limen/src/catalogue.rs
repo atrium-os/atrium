@@ -37,6 +37,11 @@ pub enum Provider {
     /// curia.md §15): only Curia, and only an app whose installed manifest
     /// implements the role. Never from a plain `REQUEST`.
     Named,
+    /// The app the parent names among those whose installed manifest
+    /// implements the role for the parent's person: Artifex's plugins
+    /// (dev-tools.md §3.8, D29), several at once. Only through
+    /// `REQUEST_PLUGIN`.
+    Plugin,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,7 +100,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "mail-sign-in", provider: Provider::System("org.atrium.navigator"), slot: SlotKind::Sheet { w: 720, h: 540 }, takes_fd: false, returns_fd: false },
     Role { name: "web-island", provider: Provider::Worker(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },
     Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
-    Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
+    Role { name: "editor-extension", provider: Provider::Plugin, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     // The PDF comes with Print; Save as PDF goes back read-only.
     // An app's own settings, inside Curia's Apps page (curia.md §15).
     Role { name: "app-settings", provider: Provider::Named, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },

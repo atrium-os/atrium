@@ -8,7 +8,7 @@
 //! - [`audio`]: choragusd's attribution tickets for embedded players.
 //! - [`manifests`]: `embeds` and `[roles] implements` from installed manifests.
 //! - [`fdpass`]: the checks on a descriptor a parent passes with a message.
-//! - one module per role's messages: [`credential`], [`doc_viewer`], [`media_player`], [`picker`], [`print`],
+//! - one module per role's messages: [`credential`], [`doc_viewer`], [`editor_ext`] (Artifex plugins), [`media_player`], [`picker`], [`print`],
 //!   [`share`] (the share sheet) and [`share_target`].
 
 pub mod audio;
@@ -17,6 +17,7 @@ pub mod client;
 pub mod credential;
 pub mod daemon;
 pub mod doc_viewer;
+pub mod editor_ext;
 pub mod fdpass;
 pub mod fresco;
 pub mod launch;
