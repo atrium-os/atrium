@@ -349,6 +349,8 @@ impl Live {
     pub fn embed(&mut self, embeds: Rc<RefCell<Embeds>>, window: WindowToken) {
         self.window = Some(window);
         self.embeds = Some(embeds);
+        // A sheet on the old connection is gone; the shell hears it below.
+        self.sharing = None;
     }
 
     /// How many page children are live (not being parked).
@@ -467,7 +469,7 @@ impl Live {
     /// spends `press`; a stale one gets nothing shown.
     fn share(&mut self, s: &mut Shell, url: &str, title: &str, press: navigator_control::Press) {
         use limen::share_target::{Body, Format, Item, MAX_TITLE};
-        let title: String = limen::doc_viewer::cut(&title.chars().filter(|c| !c.is_control()).collect::<String>(), MAX_TITLE);
+        let title = limen::doc_viewer::cut(&crate::shell::plain(title), MAX_TITLE);
         let item = Item { title, formats: vec![
             Format { mime: "text/uri-list".into(), body: Body::Inline(format!("{url}\r\n").into_bytes()) },
             Format { mime: "text/plain".into(), body: Body::Inline(url.as_bytes().to_vec()) },
@@ -1052,6 +1054,12 @@ impl Live {
             }
         }
         s.arca_tick(Instant::now());
+        // A share the shell thinks is up with no sheet here (limend went,
+        // or a new connection replaced it) ends, or Share stays refused.
+        if s.sharing && self.sharing.is_none() && !s.outbox.iter().any(|o| matches!(o, Out::Share { .. })) {
+            s.shared("share: failed: the sheet went away".into());
+            changed = true;
+        }
         // The page children.
         loop {
             let ev = match &self.embeds {
@@ -1063,6 +1071,10 @@ impl Live {
                 Ok(None) => break,
                 Err(e) => {
                     eprintln!("navigator-ui: limend: {e:?}");
+                    if self.sharing.take().is_some() {
+                        s.shared("share: failed: the sheet went away".into());
+                        changed = true;
+                    }
                     break;
                 }
             };
