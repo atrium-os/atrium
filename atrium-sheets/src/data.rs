@@ -100,6 +100,8 @@ pub enum DataCmd {
     TextToColumns,
     /// Text to Columns at a delimiter the user types (a bar asks).
     TextToColumnsAt,
+    /// Remove Duplicates comparing only the columns the user types (a bar asks).
+    RemoveDuplicatesBy,
     /// The table's total row, on or off.
     TotalRow,
     /// The total row cell under the cursor: function `.0` of
@@ -483,6 +485,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Clear Filter in Column {}", officina_grid::addr::col_name(col))).enabled(col_filtered), Some(DataCmd::ClearColumn)),
         (MenuItem::new("Show All Rows").enabled(any_cond), Some(DataCmd::ShowAll)),
         (MenuItem::new("Remove Duplicates").enabled(some).separated(), Some(DataCmd::RemoveDuplicates)),
+        (MenuItem::new("Remove Duplicates by…").enabled(some), Some(DataCmd::RemoveDuplicatesBy)),
         (MenuItem::new("Text to Columns").enabled(sel.c0 == sel.c1), Some(DataCmd::TextToColumns)),
         (MenuItem::new("Text to Columns at…").enabled(sel.c0 == sel.c1), Some(DataCmd::TextToColumnsAt)),
         (MenuItem::new("AutoSum").shortcut("Alt+="), Some(DataCmd::AutoSum)),
@@ -1552,7 +1555,69 @@ pub const MAX_SPLIT_COLS: usize = 256;
 /// The rows of `rect` in order, split into the first of each kind and the
 /// ones the same in every column as a row above (text matched without regard
 /// to case, as Excel does).
-fn duplicate_rows(wb: &Workbook, rect: &Rect) -> (Vec<u32>, Vec<u32>) {
+/// Remove Duplicates: rows of the data at the selection or cursor that
+/// repeat an earlier row in the columns `by` lists (all when None) are
+/// removed and the rest close up, as one step.
+pub fn remove_duplicates(d: &mut Doc, sel: CellRange, cursor: (u32, u32), by: Option<&str>) -> Result<String, String> {
+    let s = d.sheet;
+    let t = target(d, sel, cursor).ok_or_else(|| "Put the cursor in your data (or select it) first.".to_string())?;
+    let mut rect = t.rect;
+    if t.header {
+        rect.r0 += 1;
+    }
+    if rect.r0 > rect.r1 {
+        return Err("There is nothing under the header to look through.".into());
+    }
+    if rect.r1 - rect.r0 >= MAX_DEDUP_ROWS {
+        return Err(format!("Remove Duplicates looks through at most {MAX_DEDUP_ROWS} rows."));
+    }
+    if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= rect.r1 && f.rect.r1 >= rect.r0)
+        || d.wb.sheet(s).table_hidden().iter().any(|&(a, b)| a <= rect.r1 && b >= rect.r0) {
+        return Err("Show all rows first: the filter hides some of them.".into());
+    }
+    if !officina_grid::sort::merges_allow_sort(&d.wb, &rect) {
+        return Err("Every row needs the same merged cells; unmerge them first.".into());
+    }
+    let cols: Vec<u32> = match by {
+        Some(spec) => columns_named(d, &t, rect, spec)?,
+        None => (rect.c0..=rect.c1).collect(),
+    };
+    let (kept, dups) = duplicate_rows(&d.wb, &rect, &cols);
+    if dups.is_empty() {
+        return Ok(format!("No duplicate rows: all {} are different.", kept.len()));
+    }
+    let (n, left) = (dups.len(), kept.len());
+    let tail = Rect { r0: rect.r0 + left as u32, ..rect };
+    let ord: Vec<u32> = kept.into_iter().chain(dups).collect();
+    let mut ops: Vec<GridOp> = officina_grid::sort::reorder_op(&d.wb, rect, &ord).into_iter().collect();
+    ops.push(GridOp::clear(tail));
+    d.run("Remove Duplicates", ops);
+    Ok(format!("{} duplicate {} removed; {left} unique {} left.", n, if n == 1 { "row" } else { "rows" }, if left == 1 { "row" } else { "rows" }))
+}
+
+/// The columns of `rect` that `spec` lists: letters or headers (of table
+/// `t`'s first row), separated by commas.
+fn columns_named(d: &Doc, t: &Target, rect: Rect, spec: &str) -> Result<Vec<u32>, String> {
+    let header = |c: u32| t.header.then(|| d.wb.formatted(CellAddr::new(rect.sheet, t.rect.r0, c)).text.trim().to_lowercase());
+    let mut cols = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let lower = part.to_lowercase();
+        let by_header = (rect.c0..=rect.c1).find(|&c| header(c).is_some_and(|h| !h.is_empty() && h == lower));
+        let by_letter = officina_grid::addr::parse_col(&part.to_uppercase()).filter(|c| (rect.c0..=rect.c1).contains(c));
+        let Some(col) = by_header.or(by_letter) else {
+            return Err(format!("{part:?} isn't a column of the data: use a letter from {} to {} or a header.", officina_grid::addr::col_name(rect.c0), officina_grid::addr::col_name(rect.c1)));
+        };
+        if !cols.contains(&col) {
+            cols.push(col);
+        }
+    }
+    if cols.is_empty() {
+        return Err("Type the columns to compare, such as: Name, City".into());
+    }
+    Ok(cols)
+}
+
+fn duplicate_rows(wb: &Workbook, rect: &Rect, cols: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let key = |v: Value| match v {
         Value::Str(t) => format!("s{}", t.to_lowercase()),
         Value::Num(x) => format!("n{}", if x == 0.0 { 0.0 } else { x }),
@@ -1561,54 +1626,88 @@ fn duplicate_rows(wb: &Workbook, rect: &Rect) -> (Vec<u32>, Vec<u32>) {
     let mut seen = std::collections::HashSet::new();
     let (mut kept, mut dups) = (Vec::new(), Vec::new());
     for r in rect.r0..=rect.r1 {
-        let row: Vec<String> = (rect.c0..=rect.c1).map(|c| key(wb.get(CellAddr::new(rect.sheet, r, c)))).collect();
+        let row: Vec<String> = cols.iter().map(|&c| key(wb.get(CellAddr::new(rect.sheet, r, c)))).collect();
         if seen.insert(row) { kept.push(r) } else { dups.push(r) }
     }
     (kept, dups)
 }
 
-/// Splits the selected column (or the cursor's column of the data around it)
-/// at the delimiter most of its cells use: tab, semicolon, comma, bar, then
-/// space. The pieces go into that column and the ones to its right, which
-/// must be empty; each is typed as it would be (numbers become numbers).
 /// The longest delimiter Text to Columns at… takes, in characters.
 pub const MAX_DELIMITER: usize = 8;
 
-/// What Text to Columns at… was told to split at: a delimiter's name (tab,
-/// space, comma, semicolon, bar) or the characters themselves; None (empty
-/// or auto) to find one.
-fn parse_delimiter(typed: &str) -> Result<Option<(String, String)>, String> {
+/// How Text to Columns at… splits.
+#[derive(Debug, Clone, PartialEq)]
+enum Split {
+    /// At the delimiter most cells use.
+    Auto,
+    /// At `delim` (`name` in messages); `runs`: several in a row count as one.
+    At { delim: String, name: String, runs: bool },
+    /// After these character counts, ascending (Excel's fixed width).
+    Fixed(Vec<usize>),
+}
+
+/// What Text to Columns at… was told: a delimiter's name (tab, space, comma,
+/// semicolon, bar) or the characters themselves, with a `+` after for runs
+/// of it counted as one; `fixed 3, 8` for pieces after the 3rd and 8th
+/// characters; empty or auto to find a delimiter.
+fn parse_split(typed: &str) -> Result<Split, String> {
     let t = typed.trim_matches(|c| c == '\r' || c == '\n');
-    let named = |n: &str| match n.trim().to_ascii_lowercase().trim_end_matches('s') {
-        "tab" => Some("\t"),
-        "space" => Some(" "),
-        "comma" => Some(","),
-        "semicolon" => Some(";"),
-        "bar" | "pipe" => Some("|"),
-        _ => None,
-    };
     if t.is_empty() || t.trim().eq_ignore_ascii_case("auto") {
-        return Ok(None);
+        return Ok(Split::Auto);
     }
     if t.trim().is_empty() {
-        return Ok(Some((" ".into(), "spaces".into())));
+        return Ok(Split::At { delim: " ".into(), name: "spaces".into(), runs: true });
     }
-    if let Some(d) = named(t) {
-        return Ok(Some((d.to_string(), t.trim().to_ascii_lowercase())));
+    let lower = t.trim().to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("fixed") {
+        let mut at = Vec::new();
+        for p in rest.split([',', ' ']).filter(|p| !p.is_empty()) {
+            let n: usize = p.parse().map_err(|_| format!("{p:?} isn't a character count: type fixed 3, 8."))?;
+            if n == 0 || at.last().is_some_and(|&l| n <= l) {
+                return Err("Fixed widths go up from 1: fixed 3, 8.".into());
+            }
+            if at.len() + 1 >= MAX_SPLIT_COLS {
+                return Err(format!("Text to Columns makes at most {MAX_SPLIT_COLS} columns."));
+            }
+            at.push(n);
+        }
+        if at.is_empty() {
+            return Err("Type where the columns break: fixed 3, 8.".into());
+        }
+        return Ok(Split::Fixed(at));
     }
-    if t.chars().count() > MAX_DELIMITER {
+    let (body, runs) = match t.strip_suffix('+') {
+        Some(b) if !b.is_empty() => (b, true),
+        _ => (t, false),
+    };
+    let named = match body.trim().to_ascii_lowercase().trim_end_matches('s') {
+        "tab" => Some(("\t", "tabs")),
+        "space" => Some((" ", "spaces")),
+        "comma" => Some((",", "commas")),
+        "semicolon" => Some((";", "semicolons")),
+        "bar" | "pipe" => Some(("|", "bars")),
+        _ => None,
+    };
+    if let Some((d, n)) = named {
+        return Ok(Split::At { delim: d.into(), name: n.into(), runs: runs || d == " " });
+    }
+    if body.chars().count() > MAX_DELIMITER {
         return Err(format!("Split at up to {MAX_DELIMITER} characters, or a name such as comma or tab."));
     }
-    Ok(Some((t.to_string(), format!("“{t}”"))))
+    Ok(Split::At { delim: body.to_string(), name: format!("“{body}”"), runs: runs || body == " " })
 }
 
 /// Text to Columns at… with what was typed in its bar.
 pub fn text_to_columns_at(d: &mut Doc, sel: CellRange, cursor: (u32, u32), typed: &str) -> Result<String, String> {
-    let at = parse_delimiter(typed)?;
-    text_to_columns(d, sel, cursor, at)
+    let how = parse_split(typed)?;
+    text_to_columns(d, sel, cursor, how)
 }
 
-fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32), at: Option<(String, String)>) -> Result<String, String> {
+/// Splits the selected column (or the cursor's column of the data around it)
+/// as `how` says, or (auto) at the delimiter most of its cells use: tab,
+/// semicolon, comma, bar, then space. The pieces go into that column and the ones to its right, which
+/// must be empty; each is typed as it would be (numbers become numbers).
+fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32), how: Split) -> Result<String, String> {
     use officina_grid::Input;
     let s = d.sheet;
     if sel.c0 != sel.c1 {
@@ -1628,23 +1727,49 @@ fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32), at: Option<(
         _ => None,
     }).collect();
     const DELIMS: [(&str, &str); 5] = [("\t", "tabs"), (";", "semicolons"), (",", "commas"), ("|", "bars"), (" ", "spaces")];
-    let (delim, name) = match at {
-        Some((d, n)) => {
-            if !texts.iter().flatten().any(|t| t.trim().contains(d.as_str())) {
-                return Err(format!("These cells have no {n} to split at."));
-            }
-            (d, n)
+    let (pieces, name): (Vec<Option<Vec<String>>>, String) = match how {
+        Split::Fixed(at) => {
+            let cut = |t: &str| {
+                let chars: Vec<char> = t.chars().collect();
+                let mut v = Vec::new();
+                let mut from = 0;
+                for &k in at.iter().chain(std::iter::once(&usize::MAX)) {
+                    if from >= chars.len() {
+                        break;
+                    }
+                    let to = k.min(chars.len());
+                    v.push(chars[from..to].iter().collect::<String>().trim().to_string());
+                    from = to;
+                }
+                v
+            };
+            let name = format!("character {}", at.iter().map(usize::to_string).collect::<Vec<_>>().join(", "));
+            (texts.iter().map(|t| t.as_ref().filter(|t| t.chars().count() > at[0]).map(|t| cut(t))).collect(), name)
         }
-        None => DELIMS.iter()
-            .map(|&(c, n)| (texts.iter().flatten().filter(|t| t.trim().contains(c)).count(), c, n))
-            .filter(|&(k, ..)| k > 0)
-            .fold(None, |best: Option<(usize, &str, &str)>, x| match best { Some(b) if b.0 >= x.0 => Some(b), _ => Some(x) })
-            .map(|(_, c, n)| (c.to_string(), n.to_string()))
-            .ok_or("These cells have no tabs, semicolons, commas, bars or spaces to split at.")?,
+        how => {
+            let (delim, name, runs) = match how {
+                Split::At { delim, name, runs } => {
+                    if !texts.iter().flatten().any(|t| t.trim().contains(delim.as_str())) {
+                        return Err(format!("These cells have no {name} to split at."));
+                    }
+                    (delim, name, runs)
+                }
+                _ => DELIMS.iter()
+                    .map(|&(c, n)| (texts.iter().flatten().filter(|t| t.trim().contains(c)).count(), c, n))
+                    .filter(|&(k, ..)| k > 0)
+                    .fold(None, |best: Option<(usize, &str, &str)>, x| match best { Some(b) if b.0 >= x.0 => Some(b), _ => Some(x) })
+                    .map(|(_, c, n)| (c.to_string(), n.to_string(), c == " "))
+                    .ok_or("These cells have no tabs, semicolons, commas, bars or spaces to split at.")?,
+            };
+            (texts.iter().map(|t| t.as_ref().filter(|t| t.trim().contains(delim.as_str())).map(|t| {
+                if delim == " " {
+                    t.split_whitespace().map(str::to_string).collect()
+                } else {
+                    t.split(delim.as_str()).map(|p| p.trim().to_string()).filter(|p| !runs || !p.is_empty()).collect()
+                }
+            })).collect(), name)
+        }
     };
-    let pieces: Vec<Option<Vec<String>>> = texts.iter().map(|t| t.as_ref().filter(|t| t.trim().contains(delim.as_str())).map(|t| {
-        if delim == " " { t.split_whitespace().map(str::to_string).collect() } else { t.split(delim.as_str()).map(|p| p.trim().to_string()).collect() }
-    })).collect();
     let wide = pieces.iter().flatten().map(Vec::len).max().unwrap_or(1);
     if wide > MAX_SPLIT_COLS || col as u64 + wide as u64 > officina_grid::addr::MAX_COLS as u64 {
         return Err(format!("That would make {wide} columns; Text to Columns makes at most {MAX_SPLIT_COLS}."));
@@ -2015,10 +2140,86 @@ pub fn cond_fields(c: &Cond) -> Option<(usize, String, String)> {
     }
 }
 
+/// What the filter panel shows for a column's condition: its kind of
+/// [`FILTER_CONDS`] and typed values, and an optional second one joined
+/// by and (or, with `or`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PanelCond {
+    pub kind: usize,
+    pub a: String,
+    pub b: String,
+    /// 0: no second condition.
+    pub kind2: usize,
+    pub c: String,
+    pub or: bool,
+}
+
+/// Whether condition `kind` of [`FILTER_CONDS`] can be one of two joined
+/// by and or or: the comparisons and the text tests.
+pub fn filter_cond_joins(kind: usize) -> bool {
+    matches!(kind, 1..=6 | 12..=15)
+}
+
+/// The panel's two conditions as one, joined by and (or).
+pub fn filter_cond2(p: &PanelCond) -> Result<Cond, String> {
+    use officina_grid::filter::Test;
+    if p.kind2 == 0 {
+        return filter_cond(p.kind, &p.a, &p.b);
+    }
+    if !filter_cond_joins(p.kind) || !filter_cond_joins(p.kind2) {
+        return Err("Only comparisons and text tests join with and or or.".into());
+    }
+    let tests = |c: Cond| -> Vec<Test> {
+        match c {
+            Cond::Compare(v, _) => v.into_iter().map(|(op, x)| Test::Number(op, x)).collect(),
+            Cond::Custom(t, _) => t,
+            _ => Vec::new(),
+        }
+    };
+    let mut all = tests(filter_cond(p.kind, &p.a, "")?);
+    all.extend(tests(filter_cond(p.kind2, &p.c, "")?));
+    Ok(Cond::custom(all, !p.or))
+}
+
+/// One test as the panel shows it: its kind and value.
+fn test_fields(t: &officina_grid::filter::Test) -> Option<(usize, String)> {
+    use officina_grid::filter::{Test, TextOp};
+    const OPS: [&str; 6] = ["=", "<>", ">", ">=", "<", "<="];
+    match t {
+        Test::Number(op, x) => Some((OPS.iter().position(|o| o == op)? + 1, Value::Num(*x).display())),
+        Test::Text(t) if !t.case_sensitive => {
+            let k = match t.op {
+                TextOp::Begins => 12,
+                TextOp::Ends => 13,
+                TextOp::Contains => 14,
+                TextOp::NotContains => 15,
+                op => OPS.iter().position(|o| Some(*o) == op.comparison_symbol())? + 1,
+            };
+            Some((k, t.value.clone()))
+        }
+        Test::Text(_) => None,
+    }
+}
+
+/// A condition as the panel shows it, when it is one the panel makes.
+pub fn panel_cond(c: &Cond) -> Option<PanelCond> {
+    use officina_grid::filter::Test;
+    if let Some((kind, a, b)) = cond_fields(c) {
+        return Some(PanelCond { kind, a, b, ..PanelCond::default() });
+    }
+    let (t1, t2, and) = match c {
+        Cond::Compare(v, and) if v.len() == 2 => (Test::Number(v[0].0.clone(), v[0].1), Test::Number(v[1].0.clone(), v[1].1), *and),
+        Cond::Custom(t, and) if t.len() == 2 => (t[0].clone(), t[1].clone(), *and),
+        _ => return None,
+    };
+    let ((kind, a), (kind2, c)) = (test_fields(&t1)?, test_fields(&t2)?);
+    Some(PanelCond { kind, a, b: String::new(), kind2, c, or: !and })
+}
+
 /// The panel's condition for column `col` of the filter at (`row`, `col`).
-pub fn column_cond(d: &Doc, row: u32, col: u32) -> Option<(usize, String, String)> {
+pub fn column_cond(d: &Doc, row: u32, col: u32) -> Option<PanelCond> {
     let f = filter_scope(d, row, col)?.auto_filter();
-    f.conds.iter().find(|(c, _)| *c == col).and_then(|(_, c)| cond_fields(c))
+    f.conds.iter().find(|(c, _)| *c == col).and_then(|(_, c)| panel_cond(c))
 }
 
 /// Puts `cond` in place of column `col`'s condition in the filter at (`row`, `col`).
@@ -2098,7 +2299,7 @@ fn table_col_ref(t: &officina_grid::tables::Table, k: usize) -> String {
 }
 
 /// Which of [`TOTAL_FUNCTIONS`] the total row cell (`row`, `col`) holds.
-fn total_fn_at(wb: &Workbook, s: u16, row: u32, col: u32) -> Option<usize> {
+pub fn total_fn_at(wb: &Workbook, s: u16, row: u32, col: u32) -> Option<usize> {
     let t = wb.table_at(s, row, col)?;
     let f = wb.formula_text(CellAddr::new(s, row, col));
     let Some(f) = f else { return (wb.get(CellAddr::new(s, row, col)) == Value::Empty).then_some(0) };
@@ -2110,7 +2311,7 @@ fn total_fn_at(wb: &Workbook, s: u16, row: u32, col: u32) -> Option<usize> {
 
 /// Sets the total row cell under the cursor to function `k` of
 /// [`TOTAL_FUNCTIONS`], as one step.
-fn total_fn(d: &mut Doc, row: u32, col: u32, k: usize) -> Result<String, String> {
+pub fn total_fn(d: &mut Doc, row: u32, col: u32, k: usize) -> Result<String, String> {
     use officina_grid::Input;
     let s = d.sheet;
     let t = d.wb.table_at(s, row, col).cloned().ok_or("The cursor isn't in a table.")?;
@@ -2439,38 +2640,8 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             })
         }
         DataCmd::ClearValidation => Ok(if crate::validation::clear(d, Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 }) { "Validation cleared.".into() } else { "No validation there.".into() }),
-        DataCmd::RemoveDuplicates => {
-            let t = target(d, sel, cursor).ok_or_else(need)?;
-            let mut rect = t.rect;
-            if t.header {
-                rect.r0 += 1;
-            }
-            if rect.r0 > rect.r1 {
-                return Err("There is nothing under the header to look through.".into());
-            }
-            if rect.r1 - rect.r0 >= MAX_DEDUP_ROWS {
-                return Err(format!("Remove Duplicates looks through at most {MAX_DEDUP_ROWS} rows."));
-            }
-            if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= rect.r1 && f.rect.r1 >= rect.r0)
-                || d.wb.sheet(s).table_hidden().iter().any(|&(a, b)| a <= rect.r1 && b >= rect.r0) {
-                return Err("Show all rows first: the filter hides some of them.".into());
-            }
-            if !officina_grid::sort::merges_allow_sort(&d.wb, &rect) {
-                return Err("Every row needs the same merged cells; unmerge them first.".into());
-            }
-            let (kept, dups) = duplicate_rows(&d.wb, &rect);
-            if dups.is_empty() {
-                return Ok(format!("No duplicate rows: all {} are different.", kept.len()));
-            }
-            let (n, left) = (dups.len(), kept.len());
-            let tail = Rect { r0: rect.r0 + left as u32, ..rect };
-            let ord: Vec<u32> = kept.into_iter().chain(dups).collect();
-            let mut ops: Vec<GridOp> = officina_grid::sort::reorder_op(&d.wb, rect, &ord).into_iter().collect();
-            ops.push(GridOp::clear(tail));
-            d.run("Remove Duplicates", ops);
-            Ok(format!("{} duplicate {} removed; {left} unique {} left.", n, if n == 1 { "row" } else { "rows" }, if left == 1 { "row" } else { "rows" }))
-        }
-        DataCmd::TextToColumns => text_to_columns(d, sel, cursor, None),
+        DataCmd::RemoveDuplicates => remove_duplicates(d, sel, cursor, None),
+        DataCmd::TextToColumns => text_to_columns(d, sel, cursor, Split::Auto),
         DataCmd::TotalRow => total_row(d, row, col),
         DataCmd::TotalFn(k) => total_fn(d, row, col, usize::from(k)),
         DataCmd::AutoSum => auto_sum(d, sel),
@@ -2636,7 +2807,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

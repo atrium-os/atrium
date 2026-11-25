@@ -361,6 +361,11 @@ fn chart_nodes(prims: Vec<officina_draw::chart::Prim>, theme: &pergola::theme::S
 pub const KEY_FILTER: u64 = 1 << 61;
 const KEY_TABLE: u64 = 1 << 60;
 pub const KEY_LIST: u64 = 1 << 59;
+
+/// Whether `a` is in a table's total row.
+pub fn total_cell(wb: &officina_grid::Workbook, a: CellAddr) -> bool {
+    wb.table_at(a.sheet, a.row, a.col).is_some_and(|t| t.totals && a.row == t.rect.r1)
+}
 /// The fill options button by the area a fill just filled.
 pub const KEY_FILL: u64 = 1 << 57;
 /// Its size, px.
@@ -566,14 +571,15 @@ impl SheetSource {
     }
 
     /// A button at the right of [`Self::note_at`]'s cell when a validation
-    /// rule offers it a list; a press opens the list.
+    /// rule offers it a list, or it is a table's total row cell (a press
+    /// offers the totals); a press opens the list.
     fn list_button(&self, theme: &pergola::theme::Semantic) -> Option<pergola::widgets::GridFloat> {
         let (r, c) = self.note_at.get()?;
         let (r0, r1, c1) = {
             let d = self.doc.borrow();
             let a = CellAddr::new(d.sheet, r, c);
-            let v = d.wb.validation_at(a)?;
-            if v.allow != officina_grid::validation::Allow::List || !v.dropdown {
+            let list = d.wb.validation_at(a).is_some_and(|v| v.allow == officina_grid::validation::Allow::List && v.dropdown);
+            if !list && !total_cell(&d.wb, a) {
                 return None;
             }
             d.wb.merge_at(a).map_or((r, r, c), |m| (m.r0, m.r1, m.c1))
