@@ -360,3 +360,13 @@ fn random_edits_hold_invariants() {
     while b.undo() {}
     assert_eq!(b.to_string(), "fn main() {\n    let x = 1;\n}\n");
 }
+
+#[test]
+fn replace_is_one_step_and_skips_overlaps() {
+    let mut b = CodeBuffer::new("let x = 1;\nx + x\n");
+    b.set_caret(b.len_chars(), false);
+    assert!(b.replace(vec![(15..16, "count".into()), (4..5, "count".into()), (11..12, "count".into()), (4..6, "no".into()), (90..99, "!".into())]));
+    assert_eq!(b.to_string(), "let count = 1;\ncount + count\n!");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "let x = 1;\nx + x\n", "one undo undoes all of it");
+}

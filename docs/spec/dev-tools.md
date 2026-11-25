@@ -467,6 +467,63 @@ A, then B.
   `atrium_window_frame_rect(1, ...)` line (the C SDK in the base must be
   this tree's: `install-c-sdk.sh`).
 
+### 3.7 Language server features in Artifex (Shankar, 2026-11-25)
+
+Shankar picked these after the debugger and inspector: completion first,
+then signature help, references, rename, quick fixes and format on save,
+checked with rust-analyzer and clangd. As built:
+
+- **Protocol** (`artifex/app/src/lsp.rs`): the client asks for completion
+  (snippets off; any snippet that comes anyway is made plain text by
+  `strip_snippet`, nesting at most 8 deep), `signatureHelp`, `references`,
+  `rename`, `codeAction` (with the diagnostics in the range) and
+  `formatting`. A workspace edit is kept only for files in `work`; create,
+  rename and delete operations and command-only code actions are left out
+  (Artifex runs no server commands). A newer completion request cancels
+  the older one (`$/cancelRequest`), and an answer to anything but the
+  newest completion or signature request is dropped. Answers are bounded:
+  1000 completions, 2000 locations or edits, 200 actions, 1 MiB per
+  edit's text, 64 Ki chars per completion's text.
+- **Editor widget** (`pergola::widgets::code_grid`): a `Menu` under the
+  word (above it near the bottom), 8 rows, the selected one kept in view,
+  details right-aligned; a `Tip` above the line with the active parameter
+  bold; `intercept_keys` sees keys before the buffer, and a press on a row
+  calls `on_menu_pick`. `CodeBuffer::replace` applies a list of edits as
+  one undo step (overlaps dropped, ranges clipped).
+- **Artifex** (`assist.rs`, `engine.rs`): typing asks for completions at a
+  word's second letter (once per word, again while the server says its
+  list is incomplete) and after `.`, `::` or `->` when the server lists
+  those triggers; Ctrl+Space asks anywhere. The menu narrows as you type
+  (prefix, then case-insensitive prefix, then letters in order, then the
+  server's sort) and closes when the caret leaves the word. Up, Down,
+  Page Up/Down move in it, Enter or Tab accept, Escape closes it. The
+  server's trigger characters for signatures (`(`, `,`) show the tip; `)`,
+  leaving the line or Escape hide it. Shift+F12 lists references in a
+  References panel (a click goes there); F2 opens a rename bar over the
+  editor (Enter or Rename; only a plain name is sent); Ctrl+. offers quick
+  fixes for the caret's line in the same menu, the server's preferred one
+  first (clangd marks a missing `;` on the next token, so its fix is
+  there). Shift+Alt+F
+  formats; Ctrl+S formats first when the file's folder or one above it in
+  `work` has `rustfmt.toml` / `.rustfmt.toml` (Rust) or `.clang-format` /
+  `_clang-format` (C, C++),
+  and saves as it is if the server hasn't answered in 3 s or the text
+  changed meanwhile. Edits to files not open open them; every changed file
+  is told to the server, and the note says how many changes in how many
+  files.
+- **Checks**: `engine::tests::language_server_features_with_a_scripted_server`
+  drives every feature against `artifex/app/tests/fixtures/fake_lsp.py`
+  (started as the Python server), and
+  `language_server_features_with_clangd_when_there_is_one` does rename, a
+  quick fix, completion, signature help and format on save with a real
+  clangd; `vm-artifex-check.sh` has a section that
+  does references, rename, a quick fix, completion, signature help and
+  format on save with clangd on `names.c`, and completion after `Vec::`
+  with rust-analyzer.
+
+Not built: plugins (no design yet), workspace symbol search, inlay hints,
+semantic tokens, server commands.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today

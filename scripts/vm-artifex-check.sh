@@ -291,6 +291,11 @@ int main(void) {
 }
 C
 printf '# proj\n' > $W/proj/work/README.md
+# For the language server features: a name used three times, and a
+# statement short of its ';' (clangd's quick fix). In a folder of its own:
+# a second C file beside hello.c would take hello.c's Build task away.
+mkdir -p $W/proj/work/lsp
+printf 'int count_up(int n) {\n\treturn n + 1;\n}\n\nint main(void) {\n\tint total = count_up(1);\n\ttotal = count_up(total)\n\treturn total;\n}\n' > $W/proj/work/lsp/names.c
 # A Cargo project for rust-analyzer: a module it can't find is its own
 # diagnostic, and the type error is cargo check's.
 mkdir -p $W/proj/work/rs
@@ -388,8 +393,81 @@ if [ -n "$RUST" ]; then
     # Its first answer indexes std under TCG: minutes.
     waitstate 'lsp=Some("rust-analyzer") diags=[1-9]' 1500 && ok "rust-analyzer answers, with a diagnostic ($(state | sed 's/.*\(lsp=.*diags=[0-9]*\).*/\1/'))" || bad "rust-analyzer: $(state)"
     shot artifex-5-rust
+    # Completion after `::`, from rust-analyzer: a new line under println!.
+    press 700 200
+    i=0; while [ $i -lt 40 ]; do inj "KEY 0x4a 1 1" "KEY 0x4a 0 1"; state | grep -q 'caret=(1,' && break; sleep 1; i=$((i+1)); done
+    inj "KEY 0x51 1" "KEY 0x51 0" "KEY 0x51 1" "KEY 0x51 0" "KEY 0x51 1" "KEY 0x51 0" "KEY 0x51 1" "KEY 0x51 0" "KEY 0x4d 1" "KEY 0x4d 0"; sleep 3
+    waitstate 'caret=(5,' 20 || bad "caret: $(state)"
+    typ "
+let v: Vec<i32> = Vec::ne"
+    waitstate 'menu=Some(([0-9]*, "new' 600 && ok "typing Vec::ne brings rust-analyzer's completions ($(state | grep -o 'menu=Some([^)]*))'))" || bad "rust completion: $(state)"
+    shot artifex-5b-rust-completion
+    inj "KEY 0x28 1" "KEY 0x28 0"; sleep 3
+    waitstate 'menu=None' 20 && ok "Enter accepts it" || bad "accept: $(state)"
 else
     echo "  (RUST not set: skipped)"
+fi
+
+echo "=== language server features (clangd)"
+if V "jexec ws_alice_proj test -x /atrium/toolchains/c-dev/bin/clangd" && want lsp; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    home() { press 700 200; i=0; while [ $i -lt 40 ]; do inj "KEY 0x4a 1 1" "KEY 0x4a 0 1"; state | grep -q 'caret=(1, 1)' && break; sleep 1; i=$((i+1)); done; }
+    down() { keys=""; for n in $(seq 1 $1); do keys="$keys \"KEY 0x51 1\" \"KEY 0x51 0\""; done; eval inj $keys; sleep 3; }
+    ROW=$(rows | grep -n '^lsp$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'rows=\[[^]]*lsp/names.c' 20 || bad "lsp: $(state)"
+    ROW=$(rows | grep -n '^lsp/names.c$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'tabs=\[[^]]*lsp/names.c\]' 20 || bad "names.c: $(state)"
+    waitstate 'diags=[1-9]' 120 || bad "clangd on names.c: $(state)"
+    # References (Shift+F12) of count_up: its definition and two calls.
+    home
+    inj "KEY 0x4f 1" "KEY 0x4f 0" "KEY 0x4f 1" "KEY 0x4f 0" "KEY 0x4f 1" "KEY 0x4f 0" "KEY 0x4f 1" "KEY 0x4f 0" "KEY 0x4f 1" "KEY 0x4f 0"; sleep 3
+    inj "KEY 0xe1 1 2" "KEY 0x45 1 2" "KEY 0x45 0 2" "KEY 0xe1 0 0"
+    waitstate 'refs=3 ' 60 && ok "Shift+F12 lists count_up's 3 references" || bad "references: $(state)"
+    waitstate 'panel=Some(References)' 5 || bad "the References panel: $(state)"
+    shot artifex-lsp-1-references
+    # Rename (F2): the bar starts with the name; Enter renames every use.
+    inj "KEY 0x3b 1" "KEY 0x3b 0"
+    waitstate 'rename=Some("count_up")' 20 && ok "F2 opens the rename bar on count_up" || bad "rename bar: $(state)"
+    shot artifex-lsp-2-rename
+    typ "_by_one"
+    inj "KEY 0x28 1" "KEY 0x28 0"
+    waitstate 'note=Some("Rename: 3 changes in 1 file")' 60 && ok "Enter renames all three" || bad "rename: $(state)"
+    # A quick fix (Ctrl+.) for line 7's missing ';', which clangd marks on
+    # the next token, line 8's `return`.
+    home; down 7
+    waitstate 'caret=(8,' 20 || bad "caret: $(state)"
+    ctrl 0x37
+    waitstate 'menu=Some(([0-9]*, "[^"]*;' 60 && ok "Ctrl+. offers clangd's fix ($(state | grep -o 'menu=Some([^)]*))'))" || bad "quick fix: $(state)"
+    shot artifex-lsp-3-quickfix
+    inj "KEY 0x28 1" "KEY 0x28 0"
+    waitstate 'menu=None .*' 20 && waitstate "note=Some(\"[^\"]*: 1 change in 1 file" 20 && ok "Enter applies it" || bad "fix: $(state)"
+    # Completion as you type (a new line under line 7), then signature help.
+    home; down 6
+    inj "KEY 0x4d 1" "KEY 0x4d 0"; sleep 2
+    typ "
+total = coun"
+    waitstate 'menu=Some(([0-9]*, "count_up_by_one' 60 && ok "typing coun brings count_up_by_one ($(state | grep -o 'menu=Some([^)]*))'))" || bad "completion: $(state)"
+    shot artifex-lsp-4-completion
+    inj "KEY 0x28 1" "KEY 0x28 0"; sleep 3
+    waitstate 'menu=None' 20 || bad "accept: $(state)"
+    typ "("
+    waitstate 'tip=Some("[^"]*count_up_by_one' 60 && ok "( shows its signature ($(state | grep -o 'tip=Some("[^"]*")'))" || bad "signature: $(state)"
+    shot artifex-lsp-5-signature
+    typ "2);"
+    waitstate 'tip=None' 20 && ok ") takes the signature away" || bad "tip: $(state)"
+    # Format on save: the project has a .clang-format, so Ctrl+S formats.
+    V "printf 'BasedOnStyle: LLVM\n' > $W/proj/work/lsp/.clang-format && chown alice:files-alice $W/proj/work/lsp/.clang-format"
+    ctrl 0x16
+    waitstate 'Saved lsp/names.c' 60 && ok "Ctrl+S saves names.c" || bad "save: $(state)"
+    F=$(V "cat $W/proj/work/lsp/names.c")
+    check "formatted by clangd on save (no tabs, two-space indent)" "0 1" "$(printf '%s\n' "$F" | grep -c "$(printf '\t')") $(printf '%s\n' "$F" | grep -c '^  int total = count_up_by_one(1);$')"
+    check "renamed, fixed and completed" "4 1 1" "$(printf '%s\n' "$F" | grep -o 'count_up_by_one' | wc -l | tr -d ' ') $(printf '%s\n' "$F" | grep -c 'total = count_up_by_one(total);') $(printf '%s\n' "$F" | grep -c 'total = count_up_by_one(2);')"
+    V "rm -f $W/proj/work/lsp/.clang-format"
+    inj "KEY 0x29 1" "KEY 0x29 0"; sleep 2
+else
+    echo "  (no clangd in proj, or SKIP has lsp: skipped)"
 fi
 
 echo "=== composition and Run"
@@ -532,7 +610,7 @@ if want inspect && V "test -x $W/proj/work/ui/bin/ui"; then
         || bad "no tree: $(state | sed 's/.*inspect=//')"
     shot artifex-22-inspect-app
     # The strip's Inspect entry: last, 42 apart from Files at 100.
-    I=$(state | sed 's/.*inspect=Some(.*, \([0-9]*\)))$/\1/')
+    I=$(state | sed 's/.*inspect=Some(.*, \([0-9]*\))) menu=.*/\1/')
     case "$I" in ''|*[!0-9]*) I=5;; esac
     press 64 $((100 + 42 * ${I:-5}))
     waitstate 'view=Inspect' 20 && ok "the strip's Inspect shows the tree" || bad "view: $(state)"
@@ -564,8 +642,11 @@ echo "=== Inspect a C dev app (libatrium)"
 # give it the app's line. The C SDK in the base must be this tree's
 # (install-c-sdk.sh); the app was built by the Debug section.
 if want inspect && V "grep -q atrium__site /usr/include/atrium/atrium.h" && V "test -x $W/proj/work/app/app"; then
-    press 614 89               # the app.c tab
-    waitstate 'active=Some(2)' 20 || bad "app.c tab: $(state)"
+    # app.c from the tree (its tab's place depends on what else is open).
+    ROW=$(rows | grep -n '^app/app.c$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    T=$(state | sed 's/.*tabs=\[\([^]]*\)\].*/\1/' | tr ',' '\n' | grep -n '^app/app.c\*\{0,1\}$' | cut -d: -f1)
+    waitstate "active=Some($(( ${T:-3} - 1 )))" 20 || bad "app.c tab: $(state)"
     press 296 52               # Run: make run, which asks to Run app
     waitstate 'ask=Some("app")' 300 && ok "make run asks to Run app" || bad "c ask: $(state)"
     GAP=8 press 980 520
@@ -580,7 +661,7 @@ if want inspect && V "grep -q atrium__site /usr/include/atrium/atrium.h" && V "t
     done
     waitstate "inspect=Some((\"$CDEV\", true, true, [1-9]" 300 && ok "a C dev build answers with its frame ($(state | sed 's/.*inspect=Some(([^,]*, true, true, \([0-9]*\).*/\1/') nodes)" \
         || bad "no C frame: $(state | sed 's/.*inspect=//')"
-    I=$(state | sed 's/.*inspect=Some(.*, \([0-9]*\)))$/\1/')
+    I=$(state | sed 's/.*inspect=Some(.*, \([0-9]*\))) menu=.*/\1/')
     case "$I" in ''|*[!0-9]*) I=5;; esac
     press 64 $((100 + 42 * I))
     waitstate 'view=Inspect' 20 || bad "c view: $(state)"
