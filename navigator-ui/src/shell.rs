@@ -191,6 +191,12 @@ pub fn plain(s: &str) -> String {
     s.chars().filter(|&c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')).collect()
 }
 
+/// Start's column (§15.1): its width, and where its field sits below the
+/// toolbar, and how tall it is.
+pub const START_COL: f32 = 640.0;
+pub const START_FIELD_Y: f32 = 96.0;
+pub const START_FIELD_H: f32 = 44.0;
+
 /// The rail's foot (All history) and its pinned tiles (§15.1).
 pub const RAIL_FOOT: f32 = 40.0;
 /// The longest Find in trails query kept.
@@ -747,7 +753,13 @@ impl Shell {
         let pw = em(if presence_label { PRESENCE_PILL } else { PRESENCE_ICON });
         let presence = Rect::new(tools_x - em(8.0) - pw, em(6.0), pw, em(28.0));
         let right = w - presence.x() + em(12.0) + if media { em(32.0) } else { 0.0 };
-        let where_ = Rect::new(fx, em(6.0), (w - fx - right).max(em(160.0)), em(28.0));
+        let mut where_ = Rect::new(fx, em(6.0), (w - fx - right).max(em(160.0)), em(28.0));
+        // On Start the field is the page's: a wide one under "Where to?"
+        // (§15.1), and the toolbar keeps only its buttons.
+        if self.on_start() {
+            let col = em(START_COL).min(w - x0 - em(64.0)).max(em(200.0));
+            where_ = Rect::new(x0 + (w - x0 - col) / 2.0, bar() + em(START_FIELD_Y), col, em(START_FIELD_H));
+        }
         let keep = Rect::new(where_.x() + where_.w() - em(28.0), where_.y() + em(2.0), em(24.0), em(24.0));
         let mut y = bar() + 1.0;
         let page = self.store.trail().page();
@@ -772,7 +784,7 @@ impl Shell {
         let page = Rect::new(x0, y, w - x0, (bottom - y).max(0.0));
         let drop = self.editing.as_ref().and_then(|_| {
             let v = self.suggestions();
-            (!v.is_empty()).then(|| Rect::new(where_.x(), bar() + 1.0 + 3.0, where_.w(), drop_height(&v)))
+            (!v.is_empty()).then(|| Rect::new(where_.x(), where_.y() + where_.h() + 4.0, where_.w(), drop_height(&v)))
         });
         let popover = (self.popover && self.store.trail().page().is_some())
             .then(|| {
@@ -2359,6 +2371,23 @@ impl Shell {
         }
     }
 
+    /// Whether Start is on screen: a trail with no page, not the history view.
+    pub fn on_start(&self) -> bool {
+        self.store.trail().page().is_none() && self.history.is_none()
+    }
+
+    /// From Start, go to trail `i` (a pinned card): the empty trail on
+    /// Start closes rather than staying in the rail as "New trail".
+    pub fn leave_start_for(&mut self, i: usize) {
+        let Some(id) = self.store.trails.get(i).map(|t| t.id) else { return };
+        if self.store.trail().current.is_none() && i != self.store.current {
+            self.store.put_away(crate::clock::now_s());
+        }
+        if let Some(j) = self.store.trails.iter().position(|t| t.id == id) {
+            self.show_trail(j);
+        }
+    }
+
     /// Show a trail from the rail.
     pub fn show_trail(&mut self, i: usize) {
         self.end_edit();
@@ -3750,5 +3779,32 @@ mod tests {
         assert_eq!(crate::ui::monogram_letters("x.example"), "X");
         assert_eq!(crate::ui::monogram_letters("über.example"), "Üb");
         assert_eq!(crate::ui::monogram_letters(""), "·");
+    }
+
+    #[test]
+    fn start_puts_the_field_in_the_page_and_a_pinned_card_closes_the_empty_trail() {
+        let mut s = shell();
+        let wide = s.geo().where_;
+        assert!(wide.y() < bar(), "on a page the field is the toolbar's");
+        let pin = s.store.current;
+        s.store.toggle_pin(pin);
+        let n = s.store.trails.len();
+        s.apply(Action::NewTrail, 0.0);
+        assert!(s.on_start() && s.editing.is_some());
+        let g = s.geo();
+        assert!(g.where_.y() > bar() && g.where_.h() == em(START_FIELD_H), "on Start it is the page's");
+        assert!(g.where_.x() > g.x0 && g.where_.x() + g.where_.w() < g.w, "centred in the page");
+        if let Some(e) = &mut s.editing {
+            e.edit.set_text("atr");
+        }
+        let g = s.geo();
+        let d = g.drop.expect("suggestions");
+        assert!(d.y() > g.where_.y() + g.where_.h(), "the suggestions hang under the field");
+        assert_eq!(s.store.trails.len(), n + 1);
+        let id = s.store.trails[pin].id;
+        s.leave_start_for(pin);
+        assert_eq!(s.store.trails.len(), n, "the empty trail closed");
+        assert_eq!(s.store.trail().id, id);
+        assert!(!s.on_start());
     }
 }

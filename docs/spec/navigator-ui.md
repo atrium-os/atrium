@@ -1689,3 +1689,18 @@ its own checks (trace lines plus a screenshot at each width the step touches).
 - Host tests: `pinned_trails_are_tiles_and_find_narrows_the_rail`,
   `monograms_are_two_letters_of_the_site`, `a_page_opened_again_right_after_itself_is_one_row`,
   `pinned_trails_stay_pinned_and_only_so_many`. The Main scene pins Mail and the Handbook.
+
+*Step 3, 2026-11-25* (`ui.rs` `start`; `shell.rs` `on_start`, `leave_start_for`):
+- On Start the Where field is the page's. It is a 44 pt field centred in a column of up to
+  640 pt, 96 pt below the toolbar, under "Where to?". The toolbar keeps only its buttons.
+  The suggestions hang under the field, grouped as Open (with "Go to it"), Kept and
+  visited, and the search row "sent when you press Enter". Under the field, while nothing
+  is typed: "Suggestions come from this computer. Nothing leaves it until you press Enter."
+- **Pinned** trails show as cards (monogram, title, host, "· live" while it runs live
+  code). A press goes to the trail and closes the empty one on Start, so the rail doesn't
+  keep a stray "New trail".
+- **Kept** pages are cards that open in this trail. **Put away** rows show the page count
+  and when, with a Bring back button and Forget.
+- The canvas's "Pin the page you're on" is not on Start, where there is no page; pinning
+  is More's.
+- Host test: `start_puts_the_field_in_the_page_and_a_pinned_card_closes_the_empty_trail`.
