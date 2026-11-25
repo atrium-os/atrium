@@ -22,6 +22,10 @@ mod stats;
 mod refs;
 mod special;
 mod textafter;
+mod matrix;
+mod complex;
+mod mathx;
+mod spread;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;

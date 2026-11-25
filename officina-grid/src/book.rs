@@ -766,7 +766,7 @@ impl Workbook {
                 let spec = &funcs::FUNCS[*id as usize];
                 volatile |= spec.volatile;
                 dynamic |= matches!(spec.name, "INDIRECT" | "OFFSET");
-                subtotal |= spec.name == "SUBTOTAL";
+                subtotal |= matches!(spec.name, "SUBTOTAL" | "AGGREGATE");
             }
         });
         let (fps, reads_formula_text) = dependencies(&expr, sheet, col, r0, r1, &|s, row, c, n| self.bound(s, row, c, n).map(Arc::new));

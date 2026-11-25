@@ -205,7 +205,7 @@ pub(super) fn mode_mult(c: &Ctx, a: &[Expr]) -> Ev {
 
 /// The values MAXA, MINA and AVERAGEA count: in ranges and arrays text is 0
 /// and logicals 0 or 1 (blanks are skipped); direct arguments are coerced.
-fn a_values(c: &Ctx, a: &[Expr]) -> Result<Vec<f64>, ErrorKind> {
+pub(super) fn a_values(c: &Ctx, a: &[Expr]) -> Result<Vec<f64>, ErrorKind> {
     let mut out = Vec::new();
     for arg in a {
         match c.eval(arg) {
