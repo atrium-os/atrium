@@ -52,6 +52,10 @@ for l in sys.stdin:
 done
 (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins)
 REL="$ROOT/arca/arcad/target/$TARGET/release"
+# arca-ui's smime_tool test runs the arca-ui binary; in the guest it is
+# found through ARCA_UI_BIN, not the build host's CARGO_BIN_EXE path.
+(cd "$ROOT/arca/arca-ui" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin arca-ui)
+UREL="$ROOT/arca/arca-ui/target/$TARGET/release"
 (cd "$ROOT/arca/arca-courier" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins --examples)
 CREL="$ROOT/arca/arca-courier/target/$TARGET/release"
 (cd "$ROOT/arca/arca-courierd" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins --examples)
@@ -72,7 +76,7 @@ fi
 
 echo "=== deploy"
 g "mkdir -p /root/arca-test && rm -f /root/arca-test/*"
-for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe" "$NREL/examples/cookies-vm-probe" ${NAVBINS:-}; do
+for b in $BINS "$REL/arcad" "$REL/arca-probe" "$UREL/arca-ui" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe" "$NREL/examples/cookies-vm-probe" ${NAVBINS:-}; do
     put "$b" /root/arca-test/
     h=$(sha256sum "$b" | cut -d' ' -f1)
     gh=$(g "sha256 -q /root/arca-test/$(basename "$b")")
@@ -83,14 +87,14 @@ echo "=== 1. test suites"
 if [ "${SKIP_SUITES:-0}" != 1 ]; then
 for b in $BINS; do
     n=$(basename "$b")
-    r=$(g "cd /tmp && /root/arca-test/$n -q 2>&1 | grep -E '^test result' | tail -1")
+    r=$(g "cd /tmp && ARCA_UI_BIN=/root/arca-test/arca-ui /root/arca-test/$n -q 2>&1 | grep -E '^test result' | tail -1")
     case "$r" in *" 0 failed"*) check "root: $n" ok ok ;; *) check "root: $n" ok "$r" ;; esac
 done
 g "pw usershow arcatest >/dev/null 2>&1 || pw useradd arcatest -u 1999 -d /nonexistent -s /usr/sbin/nologin"
 g "mkdir -p /tmp/arcatest && cp /root/arca-test/* /tmp/arcatest/ && chown -R arcatest /tmp/arcatest"
 for b in $BINS; do
     n=$(basename "$b")
-    r=$(g "cd /tmp/arcatest && su -m arcatest -c 'TMPDIR=/tmp/arcatest ./$n -q' 2>&1 | grep -E '^test result' | tail -1")
+    r=$(g "cd /tmp/arcatest && su -m arcatest -c 'TMPDIR=/tmp/arcatest ARCA_UI_BIN=/tmp/arcatest/arca-ui ./$n -q' 2>&1 | grep -E '^test result' | tail -1")
     case "$r" in *" 0 failed"*) check "unprivileged: $n" ok ok ;; *) check "unprivileged: $n" ok "$r" ;; esac
 done
 
@@ -156,7 +160,9 @@ PUB=$(printf 'a%.0s' $(seq 64))
 g "grep -q '^50801 ' /var/run/atrium/app-registry || printf '50801 alice org.example.mail $PUB\n50802 alice org.example.evil $PUB\n' >> /var/run/atrium/app-registry"
 P=/usr/local/bin/arca-probe
 as() { g "su -m $1 -c '$P $S $2'"; }
-check "root is no one" "status=5 body=" "$(g "$P $S list")"
+# Root outside the registry is the print broker (prelumd, label.rs): it may
+# ask for print sign-in grants and nothing else, so a list is DENIED (1).
+check "root lists nothing" "status=1 body=" "$(g "$P $S list")"
 # The machine store (§6.4): a system service's bond key, with no user
 # unlocked (arcad was just restarted, so every user store is locked).
 g "pw usershow arcabt >/dev/null 2>&1 || pw useradd arcabt -u 50804 -d /nonexistent -s /usr/sbin/nologin"
