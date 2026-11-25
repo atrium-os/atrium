@@ -274,6 +274,10 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         let _ = write!(o, r#"<dimension ref="A1:{}"/>"#, a1(rows - 1, cols - 1));
     }
     let (fr, fc) = sh.freeze;
+    let zoom = sh.zoom.clamp(officina_grid::book::ZOOM_MIN, officina_grid::book::ZOOM_MAX);
+    if (fr, fc) == (0, 0) && zoom != 100 {
+        let _ = write!(o, r#"<sheetViews><sheetView zoomScale="{zoom}" workbookViewId="0"/></sheetViews>"#);
+    }
     if (fr, fc) != (0, 0) {
         let fr = fr.min(XLSX_ROWS - 1);
         let fc = fc.min(XLSX_COLS - 1);
@@ -285,7 +289,11 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         // The view starts at the first frozen row and column; the splits
         // count the frozen ones from there.
         let (tr, tc) = (sh.freeze_from.0.min(fr.saturating_sub(1)), sh.freeze_from.1.min(fc.saturating_sub(1)));
-        o.extend_from_slice(br#"<sheetViews><sheetView workbookViewId="0""#);
+        o.extend_from_slice(br#"<sheetViews><sheetView"#);
+        if zoom != 100 {
+            let _ = write!(o, r#" zoomScale="{zoom}""#);
+        }
+        o.extend_from_slice(br#" workbookViewId="0""#);
         if (tr, tc) != (0, 0) {
             let _ = write!(o, r#" topLeftCell="{}""#, a1(tr, tc));
         }
@@ -612,6 +620,10 @@ fn write_filter(
                     Cond::Expression(_) => unreachable!(),
                     Cond::Values(values) => filter_values(o, values, None),
                     Cond::Calendar(selection) => filter_values(o, &selection.values, Some(selection)),
+                    // Excel recomputes the average; the cached val is optional.
+                    Cond::Average { below } => {
+                        let _ = write!(o, r#"<dynamicFilter type="{}"/>"#, if *below { "belowAverage" } else { "aboveAverage" });
+                    }
                     Cond::DynamicDate(rule) => {
                         let _ = write!(o, r#"<dynamicFilter type="{}""#, rule.name());
                                     if let Some(bounds) = rule.cached.or_else(|| rule.bounds(system, system.now())) {

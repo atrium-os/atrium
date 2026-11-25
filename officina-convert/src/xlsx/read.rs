@@ -416,6 +416,8 @@ struct Seg {
     freeze: Option<((u32, u32), (u32, u32))>,
     /// The `<sheetView topLeftCell>`, for a frozen pane after it.
     view_top: (u32, u32),
+    /// The `<sheetView zoomScale>`, when in Excel's 10–400.
+    zoom: Option<u16>,
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
@@ -724,7 +726,10 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                 }
             }
             b"autoFilter" => seg.filter = read_auto_filter(&mut r, &e, empty, system, dxfs, &mut seg.rep)?,
-            b"sheetView" => seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0)),
+            b"sheetView" => {
+                seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0));
+                seg.zoom = attr(&e, b"zoomScale")?.and_then(|v| v.parse::<u16>().ok()).filter(|z| (officina_grid::book::ZOOM_MIN..=officina_grid::book::ZOOM_MAX).contains(z));
+            }
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from
                 // the view's top-left cell.
@@ -880,6 +885,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 }
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
+                }
+                if let Some(z) = seg.zoom {
+                    wb.sheet_mut(s).zoom = z;
                 }
                 if let Some((f, from)) = seg.freeze {
                     wb.sheet_mut(s).freeze = f;
@@ -1138,6 +1146,8 @@ fn read_filter_column(
             b"dynamicFilter" => {
                 match attr(&e, b"type")?.as_deref() {
                     Some("null") => Ok(None),
+                    Some("aboveAverage") => Ok(Some(Cond::Average { below: false })),
+                    Some("belowAverage") => Ok(Some(Cond::Average { below: true })),
                     name => read_dynamic_date(&e, name.unwrap_or_default(), system)?.map(|rule| Some(Cond::DynamicDate(rule)))
                         .ok_or("unsupported dynamic filter (rows stay as the file hid them)"),
                 }

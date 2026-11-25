@@ -1312,7 +1312,7 @@ pub fn supports_filter(cond: &Cond) -> bool {
     }
     match cond {
         Cond::Expression(expr) => supported_expr(expr),
-        _ => !cond.is_excel_date() && !matches!(cond, Cond::Appearance(_)),
+        _ => !cond.is_excel_date() && !matches!(cond, Cond::Appearance(_) | Cond::Average { .. }),
     }
 }
 
@@ -1367,7 +1367,7 @@ fn filter_condition(out: &mut String, cond: &Cond, field: u32, whole_cell: bool,
             if let Some(g) = group { let _ = write!(out, "</table:filter-{g}>"); }
         }
         Cond::Expression(expr) => filter_expr(out, expr, whole_cell, parent),
-        Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) => unreachable!(),
+        Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) | Cond::Average { .. } => unreachable!(),
         Cond::Rank(rank) => {
             let op = match (rank.bottom, rank.percent) {
                 (false, false) => "top values",

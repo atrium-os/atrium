@@ -4983,7 +4983,17 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Ctrl+Shift+Space** selects everything.
 - **Format Painter** is now a toolbar button too, shown pressed while the painter is on. Pressing it again while on keeps it on, as Excel's double-click.
 - Tests: `enter_and_tab_step_through_a_selection_end_mode_and_ctrl_wheel_zoom` (pergola; `keys_move_extend_and_edit` now expects Enter to stay in the selection) and `zoom_scales_rows_columns_and_text_and_keeps_the_top_left_cell` (Sheets). All 156 Sheets and 245 pergola lib tests pass.
-- Not yet: zoom saved per sheet in the workbook, and headers scaling with it.
+- Not yet: headers scaling with the zoom. (Zoom saved per sheet came in §16.128.)
+
+### 16.128 Zoom kept per sheet, editing a name's reference, Above and Below Average, total row functions, Text to Columns at… (2026-11-25)
+
+- **Zoom per sheet, kept in the file.** Each sheet has its own zoom (`Sheet::zoom`, percent, 10–400, 100 as made), as in Excel; switching sheets shows each at its own. It is a view setting, not an undo step, and doesn't mark the workbook changed. `.xlsx` reads and writes `<sheetView zoomScale>` (values outside 10–400 are ignored on read); the native file has a new `ZOOM` chunk (29: count, then each sheet's index and percent; the reader refuses an out-of-range or repeated zoom, or 100). `SheetSource::zoom_factor` reads the sheet on screen. `.ods` doesn't keep it yet (its view settings live in settings.xml).
+- **Name Manager: Edit** under each name opens the name bar with what the name refers to. A place, a constant or a formula is taken, with or without its `=`; formulas using the name follow, as one undo step (`data::edit_name_refers`).
+- **Filter: Above average and Below average** in the filter panel's condition list, with nothing to type. The engine has `Cond::Average { below }` (wire kind 10): it keeps numbers strictly above (below) the average of the column's numbers in the filter range, worked out each time the filter is applied, as Excel does. `.xlsx` reads and writes `<dynamicFilter type="aboveAverage">` and `"belowAverage"`; `.ods` has no such filter and leaves it out.
+- **Total row functions.** With the cursor on a table's total row, the cell menu lists Total: None, Average, Count, Count Numbers, Max, Min, Sum, StdDev and Var, the current one marked. Each writes `SUBTOTAL(code, Table[Column])` with Excel's codes that skip filtered rows (101, 103, 102, 104, 105, 109, 107, 110); None empties the cell (`data::TOTAL_FUNCTIONS`, `total_fn`).
+- **Text to Columns at…** opens a bar that asks what to split at: a name (comma, tab, space, semicolon, bar, singular or plural) or up to 8 characters typed, such as `-` or ` / `. Empty or `auto` finds one as plain Text to Columns does. Cells without the delimiter stay as they are; a delimiter in none of them is refused and the bar stays (`data::text_to_columns_at`).
+- Tests: `zoom_scales_rows_columns_and_text_and_keeps_the_top_left_cell` (now also per sheet), `a_name_s_reference_is_edited_in_the_name_manager`, `a_filter_column_takes_a_condition` (average, and its `.xlsx` round trip), `a_table_total_row_sums_the_shown_rows_and_goes_again` (functions), `text_to_columns_splits_at_the_delimiter_the_cells_use` (the bar) in Sheets; officina-grid `average_filter_keeps_numbers_above_or_below_and_is_saved`; officina-convert `each_sheets_zoom_round_trips_through_xlsx_and_the_native_file`. All 157 Sheets, 123 officina-grid and 65 officina-convert lib tests pass, and the convert ods, roundtrip and freeze tests.
+- Not yet: zoom in `.ods`; consecutive delimiters as one and fixed widths for Text to Columns; a drop-down on the total row cell itself.
 
 ## 17. Decisions (accepted 2026-11-14)
 

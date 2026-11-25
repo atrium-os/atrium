@@ -98,8 +98,13 @@ pub enum DataCmd {
     /// The selection's column split at the delimiter its cells use, into the
     /// empty columns to its right.
     TextToColumns,
+    /// Text to Columns at a delimiter the user types (a bar asks).
+    TextToColumnsAt,
     /// The table's total row, on or off.
     TotalRow,
+    /// The total row cell under the cursor: function `.0` of
+    /// [`TOTAL_FUNCTIONS`] over its column's shown rows.
+    TotalFn(u8),
     /// A SUM of the numbers next to the selection (Alt+=).
     AutoSum,
     /// The selection back to the default format; with its contents, comments
@@ -479,6 +484,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Show All Rows").enabled(any_cond), Some(DataCmd::ShowAll)),
         (MenuItem::new("Remove Duplicates").enabled(some).separated(), Some(DataCmd::RemoveDuplicates)),
         (MenuItem::new("Text to Columns").enabled(sel.c0 == sel.c1), Some(DataCmd::TextToColumns)),
+        (MenuItem::new("Text to Columns at…").enabled(sel.c0 == sel.c1), Some(DataCmd::TextToColumnsAt)),
         (MenuItem::new("AutoSum").shortcut("Alt+="), Some(DataCmd::AutoSum)),
         (MenuItem::new("Clear Formats").separated(), Some(DataCmd::ClearFormats)),
         (MenuItem::new("Clear All"), Some(DataCmd::ClearAll)),
@@ -501,6 +507,13 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         Some(t) => {
             v.push((MenuItem::new(format!("Convert “{}” to Range", short(&t.name))).separated(), Some(DataCmd::RemoveTable)));
             v.push((MenuItem::new("Total Row").checked(t.totals), Some(DataCmd::TotalRow)));
+            if t.totals && row == t.rect.r1 {
+                let now = total_fn_at(wb, s, row, col);
+                for (k, (label, _)) in TOTAL_FUNCTIONS.iter().enumerate() {
+                    let item = MenuItem::new(format!("Total: {label}")).radio(now == Some(k));
+                    v.push((if k == 0 { item.separated() } else { item }, Some(DataCmd::TotalFn(k as u8))));
+                }
+            }
         }
         None => v.push((MenuItem::new("Format as Table").shortcut("Ctrl+T").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
     }
@@ -1340,6 +1353,29 @@ pub fn rename_name(d: &mut Doc, i: usize, new: &str) -> Result<String, String> {
     })
 }
 
+/// Changes what row `i` of the Name Manager refers to (`refers`, with or
+/// without its `=`: a place, a constant or a formula), as one step;
+/// formulas using the name follow.
+pub fn edit_name_refers(d: &mut Doc, i: usize, refers: &str) -> Result<String, String> {
+    let row = name_rows(&d.wb).into_iter().nth(i).ok_or("That name is gone.")?;
+    let t = refers.trim();
+    if t.is_empty() || t == "=" {
+        return Err(format!("Type what {} refers to, such as =Sheet1!$A$1:$B$4 or =0.18.", shown_name(&row.name)));
+    }
+    let text = if t.starts_with('=') { t.to_string() } else { format!("={t}") };
+    let old: Vec<_> = d.wb.names().iter().cloned().collect();
+    d.wb.define_name(&row.name, row.scope, &text).map_err(|e| format!("{} can't refer to {}: {e:?}", shown_name(&row.name), text.trim_start_matches('=')))?;
+    let new: Vec<_> = d.wb.names().iter().cloned().collect();
+    d.wb.replace_names(old);
+    let op = GridOp::names(&d.wb, &new);
+    d.status.clear();
+    d.run("Edit Name", vec![op]);
+    if d.status == crate::sheet_protection::REFUSED {
+        return Err(d.status.clone());
+    }
+    Ok(format!("{} now refers to {}.", shown_name(&row.name), text.trim_start_matches('=')))
+}
+
 /// The Name Manager panel's commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamesCmd {
@@ -1347,6 +1383,8 @@ pub enum NamesCmd {
     Go(usize),
     /// Open the bar that renames row `.0`.
     Rename(usize),
+    /// Open the bar that changes what row `.0` refers to.
+    Edit(usize),
     Delete(usize),
     Close,
 }
@@ -1533,7 +1571,44 @@ fn duplicate_rows(wb: &Workbook, rect: &Rect) -> (Vec<u32>, Vec<u32>) {
 /// at the delimiter most of its cells use: tab, semicolon, comma, bar, then
 /// space. The pieces go into that column and the ones to its right, which
 /// must be empty; each is typed as it would be (numbers become numbers).
-fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32)) -> Result<String, String> {
+/// The longest delimiter Text to Columns at… takes, in characters.
+pub const MAX_DELIMITER: usize = 8;
+
+/// What Text to Columns at… was told to split at: a delimiter's name (tab,
+/// space, comma, semicolon, bar) or the characters themselves; None (empty
+/// or auto) to find one.
+fn parse_delimiter(typed: &str) -> Result<Option<(String, String)>, String> {
+    let t = typed.trim_matches(|c| c == '\r' || c == '\n');
+    let named = |n: &str| match n.trim().to_ascii_lowercase().trim_end_matches('s') {
+        "tab" => Some("\t"),
+        "space" => Some(" "),
+        "comma" => Some(","),
+        "semicolon" => Some(";"),
+        "bar" | "pipe" => Some("|"),
+        _ => None,
+    };
+    if t.is_empty() || t.trim().eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if t.trim().is_empty() {
+        return Ok(Some((" ".into(), "spaces".into())));
+    }
+    if let Some(d) = named(t) {
+        return Ok(Some((d.to_string(), t.trim().to_ascii_lowercase())));
+    }
+    if t.chars().count() > MAX_DELIMITER {
+        return Err(format!("Split at up to {MAX_DELIMITER} characters, or a name such as comma or tab."));
+    }
+    Ok(Some((t.to_string(), format!("“{t}”"))))
+}
+
+/// Text to Columns at… with what was typed in its bar.
+pub fn text_to_columns_at(d: &mut Doc, sel: CellRange, cursor: (u32, u32), typed: &str) -> Result<String, String> {
+    let at = parse_delimiter(typed)?;
+    text_to_columns(d, sel, cursor, at)
+}
+
+fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32), at: Option<(String, String)>) -> Result<String, String> {
     use officina_grid::Input;
     let s = d.sheet;
     if sel.c0 != sel.c1 {
@@ -1552,15 +1627,23 @@ fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32)) -> Result<St
         Input::Value(Value::Str(t)) => Some(t.to_string()),
         _ => None,
     }).collect();
-    const DELIMS: [(char, &str); 5] = [('\t', "tabs"), (';', "semicolons"), (',', "commas"), ('|', "bars"), (' ', "spaces")];
-    let (delim, name) = DELIMS.iter()
-        .map(|&(c, n)| (texts.iter().flatten().filter(|t| t.trim().contains(c)).count(), c, n))
-        .filter(|&(k, ..)| k > 0)
-        .fold(None, |best: Option<(usize, char, &str)>, x| match best { Some(b) if b.0 >= x.0 => Some(b), _ => Some(x) })
-        .map(|(_, c, n)| (c, n))
-        .ok_or("These cells have no tabs, semicolons, commas, bars or spaces to split at.")?;
-    let pieces: Vec<Option<Vec<String>>> = texts.iter().map(|t| t.as_ref().filter(|t| t.trim().contains(delim)).map(|t| {
-        if delim == ' ' { t.split_whitespace().map(str::to_string).collect() } else { t.split(delim).map(|p| p.trim().to_string()).collect() }
+    const DELIMS: [(&str, &str); 5] = [("\t", "tabs"), (";", "semicolons"), (",", "commas"), ("|", "bars"), (" ", "spaces")];
+    let (delim, name) = match at {
+        Some((d, n)) => {
+            if !texts.iter().flatten().any(|t| t.trim().contains(d.as_str())) {
+                return Err(format!("These cells have no {n} to split at."));
+            }
+            (d, n)
+        }
+        None => DELIMS.iter()
+            .map(|&(c, n)| (texts.iter().flatten().filter(|t| t.trim().contains(c)).count(), c, n))
+            .filter(|&(k, ..)| k > 0)
+            .fold(None, |best: Option<(usize, &str, &str)>, x| match best { Some(b) if b.0 >= x.0 => Some(b), _ => Some(x) })
+            .map(|(_, c, n)| (c.to_string(), n.to_string()))
+            .ok_or("These cells have no tabs, semicolons, commas, bars or spaces to split at.")?,
+    };
+    let pieces: Vec<Option<Vec<String>>> = texts.iter().map(|t| t.as_ref().filter(|t| t.trim().contains(delim.as_str())).map(|t| {
+        if delim == " " { t.split_whitespace().map(str::to_string).collect() } else { t.split(delim.as_str()).map(|p| p.trim().to_string()).collect() }
     })).collect();
     let wide = pieces.iter().flatten().map(Vec::len).max().unwrap_or(1);
     if wide > MAX_SPLIT_COLS || col as u64 + wide as u64 > officina_grid::addr::MAX_COLS as u64 {
@@ -1851,16 +1934,25 @@ pub fn keep_values(d: &mut Doc, row: u32, col: u32, keep: Vec<String>, every: bo
 }
 
 /// The conditions a filter column offers besides picking values (index 0).
-pub const FILTER_CONDS: [&str; 16] = [
+pub const FILTER_CONDS: [&str; 18] = [
     "Values", "Equals", "Does not equal", "Greater than", "Greater than or equal to", "Less than", "Less than or equal to", "Between",
     "Top", "Bottom", "Top %", "Bottom %", "Begins with", "Ends with", "Contains", "Does not contain",
+    "Above average", "Below average",
 ];
+
+/// Whether condition `kind` of [`FILTER_CONDS`] takes a typed value.
+pub fn filter_cond_typed(kind: usize) -> bool {
+    !matches!(kind, 0 | 16 | 17)
+}
 
 /// Condition `kind` of [`FILTER_CONDS`] with what was typed for it (`b` only for
 /// Between). Numbers compare as numbers; other text as text, ignoring case.
 pub fn filter_cond(kind: usize, a: &str, b: &str) -> Result<Cond, String> {
     use officina_grid::filter::{Rank, Test, TextOp, TextTest};
     let (a, b) = (a.trim(), b.trim());
+    if !filter_cond_typed(kind) && kind != 0 {
+        return Ok(Cond::Average { below: kind == 17 });
+    }
     if a.is_empty() || (kind == 7 && b.is_empty()) {
         return Err("Type a value for the condition.".into());
     }
@@ -1905,6 +1997,7 @@ pub fn cond_fields(c: &Cond) -> Option<(usize, String, String)> {
             Some((k + 1, n(v[0].1), String::new()))
         }
         Cond::Rank(r) => Some((8 + 2 * usize::from(r.percent) + usize::from(r.bottom), r.limit().to_string(), String::new())),
+        Cond::Average { below } => Some((16 + usize::from(*below), String::new(), String::new())),
         Cond::Custom(t, _) if t.len() == 1 => match &t[0] {
             Test::Text(t) if !t.case_sensitive => {
                 let k = match t.op {
@@ -1979,7 +2072,7 @@ fn total_row(d: &mut Doc, row: u32, col: u32) -> Result<String, String> {
             d.wb.each(&Rect { r0: first, c0: c, c1: c, ..t.rect }, &mut |_, _, v| nums |= matches!(v, Value::Num(_)));
         }
         if nums {
-            Input::Formula(format!("=SUBTOTAL(109,{}[{}])", t.name, t.columns[k].chars().flat_map(|ch| if "[]#'".contains(ch) { vec!['\'', ch] } else { vec![ch] }).collect::<String>()))
+            Input::Formula(format!("=SUBTOTAL(109,{})", table_col_ref(&t, k)))
         } else if k == 0 {
             Input::Value(Value::str("Total"))
         } else {
@@ -1990,6 +2083,45 @@ fn total_row(d: &mut Doc, row: u32, col: u32) -> Result<String, String> {
     all[i].rect.r1 = below;
     d.run("Total Row", vec![GridOp::Tables(all), GridOp::block(s, below, t.rect.c0, vec![cells])]);
     Ok(format!("{} has a total row: column sums of the rows shown.", t.name))
+}
+
+/// The functions a total row cell offers, as Excel's: its label and the
+/// `SUBTOTAL` code that skips filtered rows (0: none, the cell emptied).
+pub const TOTAL_FUNCTIONS: [(&str, u16); 9] = [
+    ("None", 0), ("Average", 101), ("Count", 103), ("Count Numbers", 102), ("Max", 104),
+    ("Min", 105), ("Sum", 109), ("StdDev", 107), ("Var", 110),
+];
+
+/// `[col]` of table `t` as a structured reference names it.
+fn table_col_ref(t: &officina_grid::tables::Table, k: usize) -> String {
+    format!("{}[{}]", t.name, t.columns[k].chars().flat_map(|ch| if "[]#'".contains(ch) { vec!['\'', ch] } else { vec![ch] }).collect::<String>())
+}
+
+/// Which of [`TOTAL_FUNCTIONS`] the total row cell (`row`, `col`) holds.
+fn total_fn_at(wb: &Workbook, s: u16, row: u32, col: u32) -> Option<usize> {
+    let t = wb.table_at(s, row, col)?;
+    let f = wb.formula_text(CellAddr::new(s, row, col));
+    let Some(f) = f else { return (wb.get(CellAddr::new(s, row, col)) == Value::Empty).then_some(0) };
+    let k = (col - t.rect.c0) as usize;
+    let col_ref = table_col_ref(t, k).to_ascii_uppercase();
+    let f = f.trim_start_matches('=').to_ascii_uppercase().replace(' ', "");
+    TOTAL_FUNCTIONS.iter().position(|(_, code)| *code != 0 && f == format!("SUBTOTAL({code},{col_ref})"))
+}
+
+/// Sets the total row cell under the cursor to function `k` of
+/// [`TOTAL_FUNCTIONS`], as one step.
+fn total_fn(d: &mut Doc, row: u32, col: u32, k: usize) -> Result<String, String> {
+    use officina_grid::Input;
+    let s = d.sheet;
+    let t = d.wb.table_at(s, row, col).cloned().ok_or("The cursor isn't in a table.")?;
+    if !t.totals || row != t.rect.r1 {
+        return Err(format!("Put the cursor in {}'s total row first.", t.name));
+    }
+    let (label, code) = *TOTAL_FUNCTIONS.get(k).ok_or("Unknown total.")?;
+    let c = (col - t.rect.c0) as usize;
+    let input = if code == 0 { Input::Empty } else { Input::Formula(format!("=SUBTOTAL({code},{})", table_col_ref(&t, c))) };
+    d.run("Total Row", vec![GridOp::block(s, row, col, vec![vec![input]])]);
+    Ok(if code == 0 { format!("No total for {}.", t.columns[c]) } else { format!("{} of {}'s shown rows.", label, t.columns[c]) })
 }
 
 fn hidden_in(st: &officina_grid::filter::FilterState, r: &Rect) -> u32 {
@@ -2338,8 +2470,9 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.run("Remove Duplicates", ops);
             Ok(format!("{} duplicate {} removed; {left} unique {} left.", n, if n == 1 { "row" } else { "rows" }, if left == 1 { "row" } else { "rows" }))
         }
-        DataCmd::TextToColumns => text_to_columns(d, sel, cursor),
+        DataCmd::TextToColumns => text_to_columns(d, sel, cursor, None),
         DataCmd::TotalRow => total_row(d, row, col),
+        DataCmd::TotalFn(k) => total_fn(d, row, col, usize::from(k)),
         DataCmd::AutoSum => auto_sum(d, sel),
         DataCmd::ClearFormats | DataCmd::ClearAll => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -2503,7 +2636,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
