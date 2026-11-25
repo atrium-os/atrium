@@ -263,8 +263,8 @@ pub trait LocalStorage {
 /// The stores of one jar.
 pub struct JarStores {
     pub stores: Arc<Mutex<crate::live_storage::Stores>>,
+    /// Its IndexedDB and Cache API stores (I6.7), one quota between them.
     pub idb: Arc<Mutex<crate::live_idb::Stores>>,
-    pub cache: Arc<Mutex<crate::live_idb::Stores>>,
     pub jar: Option<u64>,
 }
 
@@ -279,11 +279,11 @@ impl LocalStorage for JarStores {
     }
     fn load_idb(&mut self, page: &str, cache: bool) -> Result<Vec<u8>, String> {
         let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
-        Ok(if cache { &self.cache } else { &self.idb }.lock().unwrap().load(&key))
+        Ok(self.idb.lock().unwrap().load_kind(&key, if cache { crate::live_idb::Kind::Cache } else { crate::live_idb::Kind::Idb }))
     }
     fn apply_idb(&mut self, page: &str, part: &[u8], cache: bool) -> Result<(), String> {
         let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
-        if cache { &self.cache } else { &self.idb }.lock().unwrap().apply(&key, part)
+        self.idb.lock().unwrap().apply_kind(&key, if cache { crate::live_idb::Kind::Cache } else { crate::live_idb::Kind::Idb }, part)
     }
 }
 
@@ -1558,7 +1558,7 @@ mod tests {
         let idb = Arc::new(Mutex::new(crate::live_idb::Stores::new(None)));
         let i2 = idb.clone();
         let server = std::thread::spawn(move || {
-            let mut seen = Seen { local: Some(JarStores { stores: s2, idb: i2, cache: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
+            let mut seen = Seen { local: Some(JarStores { stores: s2, idb: i2, jar: None }), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let storage = limen::web_island::LIVE_STORAGE;
@@ -1588,7 +1588,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let i2 = idb.clone();
         let server = std::thread::spawn(move || {
-            let local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: i2, cache: Arc::new(Mutex::new(Stores::new(None))), jar: None };
+            let local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: i2, jar: None };
             let mut seen = Seen { local: Some(local), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
@@ -1642,7 +1642,7 @@ mod tests {
     fn storage_is_not_asked_for_before_the_page() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), cache: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
+            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();

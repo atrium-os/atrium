@@ -518,6 +518,9 @@ mod live_idb {
         /// The changes of the transaction being committed, and whether one
         /// of them was out of shape (then the commit fails).
         pub static RUN: RefCell<(Vec<Op>, bool)> = const { RefCell::new((Vec::new(), false)) };
+        /// The same for a batch of cache operations: its own, so that an
+        /// IndexedDB commit can never take a cache batch's changes.
+        pub static RUN_CACHE: RefCell<(Vec<Op>, bool)> = const { RefCell::new((Vec::new(), false)) };
     }
     pub static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 }
@@ -577,19 +580,43 @@ pub extern "C" fn navigator_live_idb_begin() {
     live_idb::RUN.with(|r| *r.borrow_mut() = (Vec::new(), false));
 }
 
+/// A batch of cache operations starts committing (I6.7 second part).
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_live_cache_begin() {
+    live_idb::RUN_CACHE.with(|r| *r.borrow_mut() = (Vec::new(), false));
+}
+
+/// One change of the committing cache batch, as [`navigator_live_idb_op`].
+/// # Safety
+/// As [`navigator_live_idb_op`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_cache_op(t: u8, a: *const u8, a_len: usize, b: *const u8, b_len: usize, n: u64) {
+    // SAFETY: as this function's own contract.
+    unsafe { live_idb_op_into(&live_idb::RUN_CACHE, t, a, a_len, b, b_len, n) }
+}
+
 /// One change of the committing transaction, as
 /// `limen::web_island::idb::Op::fields` gives them.
 /// # Safety
 /// `a` and `b` are readable for their lengths (or null with length 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn navigator_live_idb_op(t: u8, a: *const u8, a_len: usize, b: *const u8, b_len: usize, n: u64) {
+    // SAFETY: as this function's own contract.
+    unsafe { live_idb_op_into(&live_idb::RUN, t, a, a_len, b, b_len, n) }
+}
+
+type Run = std::thread::LocalKey<std::cell::RefCell<(Vec<limen::web_island::idb::Op>, bool)>>;
+
+/// # Safety
+/// As [`navigator_live_idb_op`].
+unsafe fn live_idb_op_into(run: &'static Run, t: u8, a: *const u8, a_len: usize, b: *const u8, b_len: usize, n: u64) {
     let bytes = |p: *const u8, len: usize| -> Option<&[u8]> {
         if len == 0 { return Some(&[]); }
         // SAFETY: the caller passes a readable buffer of `len` bytes.
         (!p.is_null()).then(|| unsafe { std::slice::from_raw_parts(p, len) })
     };
     let op = bytes(a, a_len).zip(bytes(b, b_len)).and_then(|(a, b)| limen::web_island::idb::Op::from_fields(t, a, b, n));
-    live_idb::RUN.with(|r| {
+    run.with(|r| {
         let mut r = r.borrow_mut();
         match op {
             Some(op) => r.0.push(op),
@@ -602,19 +629,19 @@ pub unsafe extern "C" fn navigator_live_idb_op(t: u8, a: *const u8, a_len: usize
 /// kept every one; false aborts the transaction (`QuotaExceededError`).
 #[unsafe(no_mangle)]
 pub extern "C" fn navigator_live_idb_commit() -> bool {
-    live_idb_commit_to(limen::web_island::LIVE_IDB)
+    live_idb_commit_to(&live_idb::RUN, limen::web_island::LIVE_IDB)
 }
 
 /// As [`navigator_live_idb_commit`], to the page's Cache API store: the
-/// changes since `navigator_live_idb_begin` are one batch of cache
+/// changes since `navigator_live_cache_begin` are one batch of cache
 /// operations (I6.7 second part).
 #[unsafe(no_mangle)]
 pub extern "C" fn navigator_live_cache_commit() -> bool {
-    live_idb_commit_to(limen::web_island::LIVE_CACHE)
+    live_idb_commit_to(&live_idb::RUN_CACHE, limen::web_island::LIVE_CACHE)
 }
 
-fn live_idb_commit_to(at: &str) -> bool {
-    let (ops, bad) = live_idb::RUN.with(|r| std::mem::take(&mut *r.borrow_mut()));
+fn live_idb_commit_to(run: &'static Run, at: &str) -> bool {
+    let (ops, bad) = run.with(|r| std::mem::take(&mut *r.borrow_mut()));
     if bad {
         eprintln!("island: an IndexedDB change was out of shape; the commit fails");
         return false;

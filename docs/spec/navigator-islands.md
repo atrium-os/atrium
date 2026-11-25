@@ -3691,16 +3691,21 @@ this keeps the third the way D15 keeps the second.
   `addAll`, `put`, `delete`), and its step 9, "if the cache write
   operation ... failed due to exceeding the granted quota limit, throw a
   QuotaExceededError", is a FIXME at the pin: the commit point.
-- **navigatord.** A second `live_idb::Stores`, apart from IndexedDB's:
-  `<NAVIGATORD_STORE>/live-cache/<site>.idb` and `.idb-log` for the
-  persona's jar, memory for an Unrecorded one, forgotten with the site's
-  other stores. The same bounds (50 MiB a site, its own), the same parts
+- **navigatord.** The same `live_idb::Stores` as IndexedDB's, a second
+  kind (`Kind::Cache`) beside it: `<NAVIGATORD_STORE>/live-idb/<site>.cache`
+  and `.cache-log` for the persona's jar, memory for an Unrecorded one,
+  forgotten with the site's other stores. One quota for both kinds, 50 MiB
+  a site, as the Storage standard gives an origin one, and the bounds on
+  what is pending, loaded and in memory are across both. The same parts
   and runs, at `limen::web_island::LIVE_CACHE`
   (`https://live-page.atrium.invalid/cache-storage`), exempt from the
   own-address rate as IndexedDB's commits are.
 - **Engine, Rust** (`fixture_fetch.rs`): `navigator_live_cache_load(ctx,
-  on_op)` and `navigator_live_cache_commit()`, with the same
-  `navigator_live_idb_begin` and `navigator_live_idb_op` between.
+  on_op)`, and `navigator_live_cache_begin`, `navigator_live_cache_op`
+  and `navigator_live_cache_commit()`, with a buffer of their own, so an
+  IndexedDB commit never takes a cache batch's changes. Each batch still
+  goes begin, changes, commit in one call, never across an event-loop
+  turn.
 
 **The LibWeb patch (`patches/ladybird/live-cache.patch`, Mac),** for
 `ATRIUM_I6_PAGE` and the page's own origin only. Each cache is a database
@@ -3712,10 +3717,10 @@ response type, status, status text, URL list, headers and body bytes).
 navigatord never reads it.
 
 1. *Batch.* At the FIXME for step 9 of `batch_cache_operations`, after
-   the operations ran on the list: `navigator_live_idb_begin`,
-   `Database(name)`, `Store("entries")`, a `Delete` for each item taken
-   out and a `Put` for each item added, then
-   `navigator_live_cache_commit`. On false, restore `backupCache` and
+   the operations ran on the list: `navigator_live_cache_begin`, then with
+   `navigator_live_cache_op` `Database(name)`, `Store("entries")`, a
+   `Delete` for each item taken out and a `Put` for each item added, then
+   `navigator_live_cache_commit`, all in this one synchronous step. On false, restore `backupCache` and
    throw `QuotaExceededError`, as step 9 says. The item keys live beside
    the list (a map from item to key) so deletes can name them.
 2. *Open and delete.* `CacheStorage::get_or_create_cache` sends
@@ -3732,9 +3737,11 @@ navigatord never reads it.
 
 1. Run `app.html` live: `cache-api` reads 1 cached. Stop, run live: 2.
    Restart navigatord, run live: 3.
-2. An Unrecorded trail: 1 cached, and no `live-cache` file.
-3. `live-cache/app.example.idb-log` is 0600, the persona's Navigator
-   user's, and `live-idb` holds none of it.
+2. An Unrecorded trail: 1 cached, and no `.cache` file.
+3. `live-idb/app.example.cache-log` is 0600, the persona's Navigator
+   user's, and `app.example.idb-log` holds none of it.
+4. One quota: after the IndexedDB gate's Fill 30 MiB, a 30 MiB
+   `cache.put` fails with `QuotaExceededError`.
 
 #### Costs
 
