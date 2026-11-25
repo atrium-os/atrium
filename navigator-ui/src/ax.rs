@@ -107,6 +107,8 @@ mod id {
     pub const SHARE: u64 = 31;
     pub const MORE_MENU: u64 = 32;
     pub const DOWNLOADS_MENU: u64 = 33;
+    pub const RAIL_FIND: u64 = 34;
+    pub const ALL_HISTORY: u64 = 35;
     pub const HISTORY_CLEAR_SITE: u64 = 5 << 40;
     pub const TRAIL: u64 = 1 << 40;
     pub const PAGE_ROW: u64 = 2 << 40;
@@ -161,7 +163,12 @@ pub fn tree(s: &Shell) -> Node {
     // The rail: each trail an item; the current one expanded to its path,
     // and the path's last page's branches under it.
     let mut trails = vec![Node::new(id::NEW_TRAIL, "button", "New trail (Ctrl-T)")];
-    for i in store.rail_order() {
+    if s.rail_w() > crate::shell::em(crate::shell::RAIL_NARROW) {
+        let q = s.rail_find.as_ref().map_or(String::new(), |e| e.text().to_string());
+        trails.push(Node::new(id::RAIL_FIND, "search-box", "Find in trails").value(q).with(if s.rail_find_focus { state::FOCUSED } else { 0 }));
+    }
+    let q = s.rail_query();
+    for i in store.rail_order().into_iter().filter(|&i| store.trails[i].matches(&q)) {
         let t = &store.trails[i];
         let mut name = t.title().to_string();
         if t.unrecorded {
@@ -169,6 +176,9 @@ pub fn tree(s: &Shell) -> Node {
         }
         if t.muted {
             name.push_str(", muted");
+        }
+        if t.pinned {
+            name.push_str(", pinned");
         }
         let mut item = Node::new(id::TRAIL | t.id, "tree-item", name);
         if i == store.current {
@@ -196,6 +206,9 @@ pub fn tree(s: &Shell) -> Node {
             }
         }
         trails.push(item);
+    }
+    if s.rail_w() > crate::shell::em(crate::shell::RAIL_NARROW) {
+        trails.push(Node::new(id::ALL_HISTORY, "button", "All history (Ctrl-H)"));
     }
     let rail = Node::new(id::RAIL, "tree", "Trails").kids(trails);
     top.push(if s.rail_focus { rail.with(state::FOCUSED) } else { rail });

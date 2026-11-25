@@ -441,6 +441,8 @@ fn event(raw: &fresco_client::Event, main: u32, state: &Mutable<Shell>) {
             } else if !kind.pressed() {
             } else if s.editing.is_some() {
                 s.edit_key(*key, *modifiers, chars, now);
+            } else if s.rail_find_focus {
+                s.rail_find_key(*key, *modifiers, chars);
             } else if s.rail_focus {
                 s.rail_key(*key);
             } else if *key == pergola::Key::Escape {

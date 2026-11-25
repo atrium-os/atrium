@@ -71,7 +71,11 @@ struct TrailRec {
     active: u64,
     #[serde(default)]
     anonymous: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pinned: bool,
 }
+
+fn is_false(b: &bool) -> bool { !*b }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct PageRec {
@@ -145,6 +149,7 @@ fn trail_rec(t: &Trail) -> TrailRec {
         muted: t.muted,
         active: t.active,
         anonymous: t.anonymous,
+        pinned: t.pinned,
     }
 }
 
@@ -196,6 +201,7 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
     t.muted = r.muted;
     t.active = r.active;
     t.anonymous = r.anonymous;
+    t.pinned = r.pinned;
     Ok(t)
 }
 
@@ -243,6 +249,8 @@ pub fn decode(text: &str, facts: &dyn Fn(&str) -> Facts) -> Result<(TrailStore, 
                 t.id = s.next_id;
                 s.next_id += 1;
                 s.clock = s.clock.max(t.active);
+                // Past the tiles' rows, a pinned trail is an ordinary one.
+                t.pinned &= s.trails.iter().filter(|t| t.pinned).count() < crate::trail::PINNED_MAX;
                 s.trails.push(t);
                 if i == f.current {
                     current = Some(s.trails.len() - 1);
@@ -443,5 +451,23 @@ mod tests {
         let (back, _) = load(&p, &facts).unwrap().unwrap();
         assert_eq!(back.trail().page().unwrap().url, "https://a.example/");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn pinned_trails_stay_pinned_and_only_so_many() {
+        let mut s = TrailStore::default();
+        for i in 0..crate::trail::PINNED_MAX + 3 {
+            s.new_trail(false);
+            s.follow(spec(&format!("https://site{i}.example/")));
+            let c = s.current;
+            s.trails[c].pinned = true;
+        }
+        let (back, _) = decode(&encode(&s), &facts).unwrap();
+        let pinned: Vec<bool> = back.trails.iter().map(|t| t.pinned).collect();
+        assert_eq!(pinned.iter().filter(|p| **p).count(), crate::trail::PINNED_MAX, "a file can't pin past the tiles");
+        assert!(pinned.iter().rev().take(3).all(|p| !*p), "the first ones in the file keep their tiles");
+        let mut one = TrailStore::default();
+        one.follow(spec("https://atlas.example/"));
+        assert!(!encode(&one).contains("pinned"), "unpinned trails write nothing");
     }
 }

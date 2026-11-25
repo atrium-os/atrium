@@ -177,6 +177,10 @@ pub struct Shell {
     pub more_open: bool,
     /// The share sheet is up for the page (share-sheet.md §5), one at a time.
     pub sharing: bool,
+    /// Find in trails (§15.1): what is typed, kept while the rail shows
+    /// only the trails it matches; and whether the field has the keys.
+    pub rail_find: Option<TextEdit>,
+    pub rail_find_focus: bool,
 }
 
 /// `s` without control characters and without the invisible marks that
@@ -186,6 +190,13 @@ pub struct Shell {
 pub fn plain(s: &str) -> String {
     s.chars().filter(|&c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')).collect()
 }
+
+/// The rail's foot (All history) and its pinned tiles (§15.1).
+pub const RAIL_FOOT: f32 = 40.0;
+/// The longest Find in trails query kept.
+pub const RAIL_QUERY_MAX: usize = 256;
+pub const TILE: f32 = 36.0;
+pub const TILE_GAP: f32 = 8.0;
 
 /// The most downloads the list keeps.
 pub const DOWNLOADS_KEPT: usize = 16;
@@ -228,6 +239,8 @@ pub enum MoreRow {
     Reading,
     Share,
     OpenWith,
+    Pin,
+    Unpin,
     Find,
     Print,
     History,
@@ -240,6 +253,8 @@ impl MoreRow {
             MoreRow::Reading => "Reading controls",
             MoreRow::Share => "Share\u{2026}",
             MoreRow::OpenWith => "Open with\u{2026}",
+            MoreRow::Pin => "Pin this trail",
+            MoreRow::Unpin => "Unpin this trail",
             MoreRow::Find => "Find in page",
             MoreRow::Print => "Print\u{2026}",
             MoreRow::History => "History",
@@ -536,6 +551,10 @@ pub struct Geo {
     pub more: Rect,
     pub downloads_menu: Option<Rect>,
     pub more_menu: Option<Rect>,
+    /// The rail's Find in trails field and its All history row (§15.1),
+    /// when the rail is wide.
+    pub rail_find: Option<Rect>,
+    pub all_history: Option<Rect>,
 }
 
 /// The network's name when this window is its sign-in window
@@ -579,7 +598,7 @@ pub fn fit_persona(p: &str) -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None, live_remembered: Vec::new(), downloads: Vec::new(), downloads_new: false, downloads_open: false, more_open: false, sharing: false }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None, live_remembered: Vec::new(), downloads: Vec::new(), downloads_new: false, downloads_open: false, more_open: false, sharing: false, rail_find: None, rail_find_focus: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -642,6 +661,12 @@ impl Shell {
         }
         match sc {
             fake::Scene::Main => {
+                // Two pinned trails for the tiles (§15.1): Mail and the Handbook.
+                for site in ["mail.example", "freebsd.example"] {
+                    if let Some(i) = s.store.trails.iter().position(|t| t.page().is_some_and(|p| crate::trail::site(&p.url) == site)) {
+                        s.store.toggle_pin(i);
+                    }
+                }
                 s.status_bar = true;
                 s.hover_hint = Some("https://atlas.example/wiki/Impluvium".into());
             }
@@ -775,7 +800,10 @@ impl Shell {
             let n = self.downloads.len().max(1) as f32;
             Rect::new((downloads.x() + downloads.w() - em(DOWNLOADS_W)).max(x0 + 8.0), bar() + 4.0, em(DOWNLOADS_W), em(40.0) + n * em(DOWNLOAD_ROW))
         });
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button, form, keep, presence_label, downloads, share, more, downloads_menu, more_menu }
+        let wide = rail > em(RAIL_NARROW);
+        let rail_find = wide.then(|| Rect::new(em(12.0), em(42.0), rail - em(24.0), em(28.0)));
+        let all_history = wide.then(|| Rect::new(em(8.0), h - em(RAIL_FOOT) + em(4.0), rail - em(16.0), em(RAIL_FOOT) - em(8.0)));
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button, form, keep, presence_label, downloads, share, more, downloads_menu, more_menu, rail_find, all_history }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -1820,7 +1848,11 @@ impl Shell {
 
     fn more_rows_at(&self, fold: bool) -> Vec<MoreRow> {
         let mut v = if fold { vec![MoreRow::Reading, MoreRow::Share] } else { vec![] };
-        v.extend([MoreRow::OpenWith, MoreRow::Find, MoreRow::Print, MoreRow::History, MoreRow::StatusBar]);
+        v.push(MoreRow::OpenWith);
+        if self.store.trail().page().is_some() {
+            v.push(if self.store.trail().pinned { MoreRow::Unpin } else { MoreRow::Pin });
+        }
+        v.extend([MoreRow::Find, MoreRow::Print, MoreRow::History, MoreRow::StatusBar]);
         v
     }
 
@@ -1838,6 +1870,12 @@ impl Shell {
                     self.last_note = Some("open with: asked Monstrator".into());
                 } else {
                     self.last_note = Some("open with: no page shown".into());
+                }
+            }
+            MoreRow::Pin | MoreRow::Unpin => {
+                let i = self.store.current;
+                if !self.store.toggle_pin(i) {
+                    self.last_note = Some(format!("pin: at most {} trails are pinned", crate::trail::PINNED_MAX));
                 }
             }
             MoreRow::Find => self.apply(Action::Find, now),
@@ -1866,6 +1904,73 @@ impl Shell {
     pub fn shared(&mut self, note: String) {
         self.sharing = false;
         self.last_note = Some(note);
+    }
+
+    // -- Find in trails (§15.1) ---------------------------------------------
+
+    /// The query as the rail filters with it: lowercased, no controls.
+    pub fn rail_query(&self) -> String {
+        self.rail_find.as_ref().map_or(String::new(), |e| plain(e.text()).trim().to_lowercase())
+    }
+
+    /// A press on the field: it takes the keys.
+    pub fn begin_rail_find(&mut self) {
+        self.close_popups();
+        self.end_edit();
+        self.rail_focus = false;
+        self.rail_find.get_or_insert_with(|| TextEdit::new(""));
+        self.rail_find_focus = true;
+    }
+
+    /// The trails the rail shows, in its order, pinned ones apart.
+    pub fn rail_trails(&self) -> (Vec<usize>, Vec<usize>) {
+        let q = self.rail_query();
+        let pinned = self.store.pinned_order().into_iter().filter(|&i| self.store.trails[i].matches(&q)).collect();
+        let today = self.store.rail_order().into_iter().filter(|&i| !self.store.trails[i].pinned && self.store.trails[i].matches(&q)).collect();
+        (pinned, today)
+    }
+
+    /// The trails put away that the rail shows (index into Earlier).
+    pub fn rail_earlier(&self) -> Vec<usize> {
+        let q = self.rail_query();
+        (0..self.store.earlier.len()).filter(|&i| self.store.earlier[i].trail.matches(&q)).collect()
+    }
+
+    /// A key while Find in trails has the keys: typing filters the rail,
+    /// Enter shows the first trail it matches, Escape clears the field.
+    pub fn rail_find_key(&mut self, key: Key, m: Modifiers, chars: &str) -> bool {
+        let Some(e) = &mut self.rail_find else { return false };
+        match key {
+            Key::Escape => {
+                self.rail_find = None;
+                self.rail_find_focus = false;
+                return true;
+            }
+            Key::Enter => {
+                let (pinned, today) = self.rail_trails();
+                if let Some(&i) = today.first().or(pinned.first()) {
+                    self.store.select(i);
+                }
+                self.rail_find_focus = false;
+                return true;
+            }
+            _ => {}
+        }
+        match e.key(key, m, chars) {
+            KeyOutcome::Changed | KeyOutcome::Submit => {
+                // A query past what a person types is cut.
+                if e.text().len() > RAIL_QUERY_MAX {
+                    let t = limen::doc_viewer::cut(e.text(), RAIL_QUERY_MAX);
+                    *e = TextEdit::new(&t);
+                }
+                true
+            }
+            KeyOutcome::Copy(t) => {
+                let _ = pergola::clipboard::copy_text(&t, false);
+                true
+            }
+            KeyOutcome::Paste | KeyOutcome::Ignored => false,
+        }
     }
 
     // -- reading controls (§7) ---------------------------------------------
@@ -2291,6 +2396,12 @@ impl Shell {
         }
         if self.downloads_open && !inside(g.downloads_menu) && !inside(Some(g.downloads)) {
             self.downloads_open = false;
+        }
+        if self.rail_find_focus && !inside(g.rail_find) {
+            self.rail_find_focus = false;
+            if self.rail_query().is_empty() {
+                self.rail_find = None;
+            }
         }
     }
 }
@@ -3578,5 +3689,66 @@ mod tests {
         assert_eq!(s.presence(&site), Presence::SignedIn("ana".into()));
         s.accounts = Some(("other.example".into(), Accounts::Known(vec![navigator_control::Account { kind: navigator_control::AccountKind::Password, name: "ana".into() }])));
         assert_eq!(s.presence(&site), Presence::Remembers, "another site's accounts say nothing here");
+    }
+
+    #[test]
+    fn pinned_trails_are_tiles_and_find_narrows_the_rail() {
+        let mut s = shell();
+        let n = s.store.trails.len();
+        assert!(n >= 3, "the stand-in store has trails");
+        let cur = s.store.current;
+        // Pin from More: the trail leaves Today for the tiles.
+        s.toggle_more();
+        assert!(s.more_rows().contains(&MoreRow::Pin));
+        s.press_more(MoreRow::Pin, None, 0.0);
+        assert!(s.store.trails[cur].pinned);
+        let (pinned, today) = s.rail_trails();
+        assert_eq!(pinned, vec![cur]);
+        assert!(!today.contains(&cur) && today.len() == n - 1);
+        assert!(s.more_rows().contains(&MoreRow::Unpin));
+        // At most PINNED_MAX.
+        for _ in 0..crate::trail::PINNED_MAX + 2 {
+            let i = s.store.new_trail(false);
+            s.store.follow(fake::spec("https://atlas.example/wiki/Impluvium"));
+            s.store.toggle_pin(i);
+        }
+        assert_eq!(s.store.trails.iter().filter(|t| t.pinned).count(), crate::trail::PINNED_MAX);
+        // Find in trails: typing narrows the rail; Enter shows the first;
+        // Escape clears it.
+        let mut s = shell();
+        let title = s.store.trails[s.store.rail_order()[1]].title().to_lowercase();
+        let word: String = title.split_whitespace().next().unwrap().chars().take(4).collect();
+        s.begin_rail_find();
+        assert!(s.rail_find_focus);
+        for c in word.chars() {
+            assert!(s.rail_find_key(Key::Char, Modifiers::default(), &c.to_string()));
+        }
+        let (_, today) = s.rail_trails();
+        assert!(!today.is_empty() && today.iter().all(|&i| s.store.trails[i].matches(&word)));
+        assert!(today.len() < s.store.trails.len(), "it narrows");
+        s.rail_find_key(Key::Enter, Modifiers::default(), "");
+        assert_eq!(s.store.current, today[0]);
+        assert!(!s.rail_find_focus && s.rail_query() == word, "the filter stays after Enter");
+        s.begin_rail_find();
+        s.rail_find_key(Key::Escape, Modifiers::default(), "");
+        assert!(s.rail_find.is_none() && s.rail_trails().1.len() == s.store.trails.len());
+        // A press outside an empty field lets it go.
+        s.begin_rail_find();
+        s.press_at(s.w - 10.0, s.h - 10.0);
+        assert!(!s.rail_find_focus && s.rail_find.is_none());
+        // Nothing matches: nothing shown.
+        s.begin_rail_find();
+        for c in "zzqqxx".chars() {
+            s.rail_find_key(Key::Char, Modifiers::default(), &c.to_string());
+        }
+        assert!(s.rail_trails().1.is_empty() && s.rail_earlier().is_empty());
+    }
+
+    #[test]
+    fn monograms_are_two_letters_of_the_site() {
+        assert_eq!(crate::ui::monogram_letters("atlas.example"), "At");
+        assert_eq!(crate::ui::monogram_letters("x.example"), "X");
+        assert_eq!(crate::ui::monogram_letters("über.example"), "Üb");
+        assert_eq!(crate::ui::monogram_letters(""), "·");
     }
 }
