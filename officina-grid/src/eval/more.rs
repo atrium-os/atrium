@@ -669,7 +669,11 @@ pub(super) fn fixed(c: &Ctx, a: &[Expr]) -> Ev {
     if d > 127.0 {
         return e(ErrorKind::Value);
     }
-    let d = d.max(-128.0) as i32;
+    Ev::V(Value::str(&fixed_text(x, d.max(-128.0) as i32, !no_commas)))
+}
+
+/// `x` rounded to `d` decimals as text, with thousands commas when asked.
+pub(super) fn fixed_text(x: f64, d: i32, commas: bool) -> String {
     let rounded = super::funcs::round_dec(x, d, 0);
     let digits = format!("{:.*}", d.max(0) as usize, rounded.abs());
     let (whole, frac) = digits.split_once('.').map_or((digits.as_str(), None), |(w, f)| (w, Some(f)));
@@ -678,7 +682,7 @@ pub(super) fn fixed(c: &Ctx, a: &[Expr]) -> Ev {
         out.push('-');
     }
     for (i, ch) in whole.chars().enumerate() {
-        if !no_commas && i > 0 && (whole.len() - i) % 3 == 0 {
+        if commas && i > 0 && (whole.len() - i) % 3 == 0 {
             out.push(',');
         }
         out.push(ch);
@@ -687,7 +691,7 @@ pub(super) fn fixed(c: &Ctx, a: &[Expr]) -> Ev {
         out.push('.');
         out.push_str(frac);
     }
-    Ev::V(Value::str(&out))
+    out
 }
 
 /// YEARFRAC(start, end, [basis]): the fraction of a year between two dates
@@ -740,4 +744,23 @@ pub(super) fn yearfrac(c: &Ctx, a: &[Expr]) -> Ev {
         _ => return e(ErrorKind::Num),
     };
     n(r)
+}
+
+pub(super) fn sinh(c: &Ctx, a: &[Expr]) -> Ev {
+    unary(c, a, |x| Some(x.sinh()))
+}
+pub(super) fn cosh(c: &Ctx, a: &[Expr]) -> Ev {
+    unary(c, a, |x| Some(x.cosh()))
+}
+pub(super) fn tanh(c: &Ctx, a: &[Expr]) -> Ev {
+    unary(c, a, |x| Some(x.tanh()))
+}
+pub(super) fn asinh(c: &Ctx, a: &[Expr]) -> Ev {
+    unary(c, a, |x| Some(x.asinh()))
+}
+pub(super) fn acosh(c: &Ctx, a: &[Expr]) -> Ev {
+    unary(c, a, |x| (x >= 1.0).then(|| x.acosh()))
+}
+pub(super) fn atanh(c: &Ctx, a: &[Expr]) -> Ev {
+    unary(c, a, |x| (x.abs() < 1.0).then(|| x.atanh()))
 }

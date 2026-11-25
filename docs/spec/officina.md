@@ -5065,7 +5065,20 @@ Eleven more functions, after §16.133's so function ids stay put:
 - **SLN, SYD, DDB and DB**. DDB never takes the book value below salvage; DB rounds its rate to three places and splits the first year by `month`, with the remainder in period life + 1. Both take closed forms, so a large life costs nothing.
 - Argument tips for all of them. `.xlsx` writes TEXTBEFORE and TEXTSPLIT with `_xlfn.`.
 - Tests: 85 conformance cases with the results on Microsoft's function pages.
-- Not yet: OFFSET and INDIRECT (references made at recalculation time need dependency tracking of their own), MODE.MULT and the rest of the long tail.
+- Not yet: OFFSET and INDIRECT (§16.135), MODE.MULT and the rest of the long tail.
+
+### 16.135 INDIRECT and OFFSET, regression and spread statistics, and number bases (2026-11-26)
+
+Fifty-three more functions, after §16.134's so function ids stay put:
+
+- **INDIRECT(ref_text, [a1])** reads A1 text through the formula parser (sheet names, ranges, defined names and tables) and accepts only a reference; R1C1 text (`R2C3`, `R[-1]C`, ranges, a sheet prefix) is turned into A1 first. Anything else is #REF!. **OFFSET(reference, rows, cols, [height], [width])** moves and resizes a reference; leaving the sheet or a size under one cell is #REF!. Both give references, so `SUM(OFFSET(…))` and `ISREF(INDIRECT(…))` work.
+- **Recalculation.** Both are volatile, as in Excel. A group that calls either is marked `Group::dynamic`, and each pass adds an ordering edge from every dirty group that isn't downstream of a dynamic group to every dynamic one (`Workbook::order_dynamic`): no such edge can close a cycle, and the dynamic groups run after any cell they could read in that pass, with their own readers after them. What's left: an INDIRECT or OFFSET whose target is itself computed from another INDIRECT or OFFSET, or from its own group, may see that cell's value from before this recalculation. `indirect_and_offset_see_this_recalculation` checks the order over a 20-group chain, and fails without the edges.
+- **Statistics**: AVEDEV, DEVSQ, GEOMEAN and HARMEAN (positive numbers only), STANDARDIZE; over pairs of lists (pairs where either side isn't a number are dropped, lists of unequal length are #N/A) CORREL and PEARSON, RSQ, SLOPE, INTERCEPT, FORECAST and FORECAST.LINEAR, STEYX, COVAR, COVARIANCE.P and COVARIANCE.S; MODE.MULT (a column of every most frequent number in first-seen order); MAXA, MINA and AVERAGEA, which count text in ranges as 0 and logicals as 0 or 1. SINH, COSH, TANH and their inverses.
+- **Text and numbers**: REPLACE (by characters), DOLLAR (FIXED with `$`, negatives in parentheses), NUMBERVALUE (any decimal and group separators, spaces ignored, trailing % divides by 100), ROMAN with all five forms (each allows longer subtractions, so 499 is CDXCIX, LDVLIV, XDIX, VDIV or ID) and ARABIC, BASE and DECIMAL (radix 2 to 36, below 2^53), and the twelve BIN/OCT/DEC/HEX conversions with Excel's ten-digit two's complement for negatives and `places` padding.
+- **Information**: TYPE (64 for an array or a range of more than one cell), ERROR.TYPE (Excel's numbers; #N/A for Officina's own #CIRC! and #LIMIT!), SHEET, SHEETS, ISFORMULA (which, like FORMULATEXT, is recalculated when the cell's formula changes) and ISNONTEXT.
+- Argument tips for all of them. `.xlsx` writes the 2010-and-later names (FORECAST.LINEAR, COVARIANCE.P/.S, MODE.MULT, NUMBERVALUE, ARABIC, BASE, DECIMAL, SHEET, SHEETS, ISFORMULA) with `_xlfn.`; `.ods` writes the dotted statistics ones in Microsoft's namespace.
+- Tests: 126 conformance cases with the results on Microsoft's function pages, and the recalculation order test above.
+- Not yet: the rest of the long tail (statistical distributions, LINEST and TREND, bond and security functions, CELL and INFO).
 
 ## 17. Decisions (accepted 2026-11-14)
 

@@ -221,7 +221,7 @@ fn looks_like_cell(s: &str) -> bool {
 /// LibreOffice writes them).
 /// Excel functions OpenFormula has under another meaning, or not at all:
 /// LibreOffice writes them in Microsoft's namespace too.
-const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET", "CEILING", "FLOOR", "CEILING.MATH", "FLOOR.MATH", "MAXIFS", "MINIFS", "RANK.EQ", "RANK.AVG", "PERCENTILE.INC", "PERCENTILE.EXC", "QUARTILE.INC", "QUARTILE.EXC", "MODE.SNGL"];
+const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET", "CEILING", "FLOOR", "CEILING.MATH", "FLOOR.MATH", "MAXIFS", "MINIFS", "RANK.EQ", "RANK.AVG", "PERCENTILE.INC", "PERCENTILE.EXC", "QUARTILE.INC", "QUARTILE.EXC", "MODE.SNGL", "COVARIANCE.P", "COVARIANCE.S", "MODE.MULT", "FORECAST.LINEAR"];
 
 pub fn to_of(a1: &str) -> String {
     let body = a1.strip_prefix('=').unwrap_or(a1);

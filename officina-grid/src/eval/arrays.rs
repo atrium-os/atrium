@@ -140,11 +140,38 @@ const LIFT: &[(&str, u32)] = &[
     ("SYD", ALL),
     ("DDB", ALL),
     ("DB", ALL),
+    ("STANDARDIZE", ALL),
+    ("SINH", ALL),
+    ("COSH", ALL),
+    ("TANH", ALL),
+    ("ASINH", ALL),
+    ("ACOSH", ALL),
+    ("ATANH", ALL),
+    ("REPLACE", ALL),
+    ("DOLLAR", ALL),
+    ("NUMBERVALUE", ALL),
+    ("ROMAN", ALL),
+    ("ARABIC", ALL),
+    ("BASE", ALL),
+    ("DECIMAL", ALL),
+    ("BIN2DEC", ALL),
+    ("BIN2HEX", ALL),
+    ("BIN2OCT", ALL),
+    ("DEC2BIN", ALL),
+    ("DEC2HEX", ALL),
+    ("DEC2OCT", ALL),
+    ("HEX2BIN", ALL),
+    ("HEX2DEC", ALL),
+    ("HEX2OCT", ALL),
+    ("OCT2BIN", ALL),
+    ("OCT2DEC", ALL),
+    ("OCT2HEX", ALL),
+    ("ISNONTEXT", ALL),
 ];
 
 /// Functions whose result may be an array whatever their arguments.
 const ARRAY_RESULT: &[&str] = &[
-    "INDEX", "XLOOKUP", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "FILTER", "SORT", "SORTBY", "UNIQUE", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "MAP", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "TEXTSPLIT",
+    "INDEX", "XLOOKUP", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "FILTER", "SORT", "SORTBY", "UNIQUE", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "MAP", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "TEXTSPLIT", "MODE.MULT",
 ];
 
 /// Functions whose result is an array when an argument is one.

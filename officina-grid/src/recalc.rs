@@ -197,6 +197,11 @@ impl Workbook {
             }
         }
 
+        // INDIRECT and OFFSET read cells no footprint names: run them after
+        // every dirty group that isn't downstream of one (an edge from those
+        // can't close a cycle).
+        self.order_dynamic(&dirty, &mut edges);
+
         // Strongly connected components, in dependency order.
         let nodes: Vec<GroupId> = dirty.keys().copied().collect();
         let mut adj: HashMap<GroupId, Vec<GroupId>> = HashMap::new();
@@ -432,6 +437,31 @@ impl Workbook {
     /// normally. The result does not depend on the order cells are visited in, so an
     /// incremental recalculation agrees with a full one. Past [`MAX_DEMAND_EDGES`] the
     /// whole set is `#LIMIT!` rather than an unbounded walk.
+    fn order_dynamic(&self, dirty: &HashMap<GroupId, RowSet>, edges: &mut HashSet<(GroupId, GroupId)>) {
+        let dynamic: Vec<GroupId> = dirty.keys().copied().filter(|&g| self.group(g).dynamic).collect();
+        if dynamic.is_empty() {
+            return;
+        }
+        let mut adj: HashMap<GroupId, Vec<GroupId>> = HashMap::new();
+        for &(a, b) in edges.iter() {
+            adj.entry(a).or_default().push(b);
+        }
+        let mut downstream: HashSet<GroupId> = dynamic.iter().copied().collect();
+        let mut stack = dynamic.clone();
+        while let Some(g) = stack.pop() {
+            for &h in adj.get(&g).map_or(&[][..], Vec::as_slice) {
+                if downstream.insert(h) {
+                    stack.push(h);
+                }
+            }
+        }
+        for &g in dirty.keys().filter(|g| !downstream.contains(g)) {
+            for &d in &dynamic {
+                edges.insert((g, d));
+            }
+        }
+    }
+
     fn eval_demand(&mut self, set: &HashMap<GroupId, RowSet>, stats: &mut RecalcStats) {
         stats.groups += set.len();
         let mut cells: Vec<(GroupId, u32)> = Vec::new();

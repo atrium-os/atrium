@@ -113,6 +113,9 @@ pub struct Group {
     pub r1: u32,
     pub expr: Arc<Expr>,
     pub volatile: bool,
+    /// Reads cells its formula doesn't name (INDIRECT, OFFSET): volatile, and
+    /// evaluated after the other dirty groups it can't be downstream of.
+    pub dynamic: bool,
     /// Precedents whose values must be calculated before this group.
     pub fps: Vec<Footprint>,
     pub(crate) fast: Option<Arc<Fast>>,
@@ -756,18 +759,20 @@ impl Workbook {
 
     pub(crate) fn add_group(&mut self, sheet: u16, col: u32, r0: u32, r1: u32, expr: Arc<Expr>, dirty: Option<(u32, u32)>) -> GroupId {
         let mut volatile = false;
+        let mut dynamic = false;
         let mut subtotal = false;
         expr.walk(&mut |n| {
             if let Expr::Call(Func::Known(id), _) = n {
                 let spec = &funcs::FUNCS[*id as usize];
                 volatile |= spec.volatile;
+                dynamic |= matches!(spec.name, "INDIRECT" | "OFFSET");
                 subtotal |= spec.name == "SUBTOTAL";
             }
         });
         let (fps, reads_formula_text) = dependencies(&expr, sheet, col, r0, r1, &|s, row, c, n| self.bound(s, row, c, n).map(Arc::new));
         let fast = Fast::compile(&expr, sheet, col).map(Arc::new);
         let values = fps.iter().copied().filter(|fp| !fp.source_only).collect();
-        let g = Group { sheet, col, r0, r1, expr, volatile, fps: values, fast, dep_ids: Vec::new() };
+        let g = Group { sheet, col, r0, r1, expr, volatile, dynamic, fps: values, fast, dep_ids: Vec::new() };
         let id = match self.free_groups.pop() {
             Some(id) => {
                 self.groups[id as usize] = Some(g);

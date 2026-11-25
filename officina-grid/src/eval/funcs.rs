@@ -8,6 +8,9 @@ use super::arrays::*;
 use super::more::*;
 use super::fin::*;
 use super::textafter::textsplit;
+use super::refs::{indirect, offset};
+use super::conv::*;
+use super::stats::*;
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -256,6 +259,60 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("SYD", 4, 4, syd),
     f!("DDB", 4, 5, ddb),
     f!("DB", 4, 5, db),
+    // the fifth batch
+    f!("INDIRECT", 1, 2, indirect, volatile),
+    f!("OFFSET", 3, 5, offset, volatile),
+    f!("AVEDEV", 1, N, avedev),
+    f!("DEVSQ", 1, N, devsq),
+    f!("GEOMEAN", 1, N, geomean),
+    f!("HARMEAN", 1, N, harmean),
+    f!("STANDARDIZE", 3, 3, standardize),
+    f!("CORREL", 2, 2, correl),
+    f!("PEARSON", 2, 2, correl),
+    f!("RSQ", 2, 2, rsq),
+    f!("SLOPE", 2, 2, slope),
+    f!("INTERCEPT", 2, 2, intercept),
+    f!("FORECAST", 3, 3, forecast),
+    f!("FORECAST.LINEAR", 3, 3, forecast),
+    f!("STEYX", 2, 2, steyx),
+    f!("COVAR", 2, 2, covariance_p),
+    f!("COVARIANCE.P", 2, 2, covariance_p),
+    f!("COVARIANCE.S", 2, 2, covariance_s),
+    f!("MODE.MULT", 1, N, mode_mult),
+    f!("MAXA", 1, N, maxa),
+    f!("MINA", 1, N, mina),
+    f!("AVERAGEA", 1, N, averagea),
+    f!("SINH", 1, 1, sinh),
+    f!("COSH", 1, 1, cosh),
+    f!("TANH", 1, 1, tanh),
+    f!("ASINH", 1, 1, asinh),
+    f!("ACOSH", 1, 1, acosh),
+    f!("ATANH", 1, 1, atanh),
+    f!("REPLACE", 4, 4, replace),
+    f!("DOLLAR", 1, 2, dollar),
+    f!("NUMBERVALUE", 1, 3, numbervalue),
+    f!("ROMAN", 1, 2, roman),
+    f!("ARABIC", 1, 1, arabic),
+    f!("BASE", 2, 3, base),
+    f!("DECIMAL", 2, 2, decimal),
+    f!("BIN2DEC", 1, 1, bin2dec),
+    f!("BIN2HEX", 1, 2, bin2hex),
+    f!("BIN2OCT", 1, 2, bin2oct),
+    f!("DEC2BIN", 1, 2, dec2bin),
+    f!("DEC2HEX", 1, 2, dec2hex),
+    f!("DEC2OCT", 1, 2, dec2oct),
+    f!("HEX2BIN", 1, 2, hex2bin),
+    f!("HEX2DEC", 1, 1, hex2dec),
+    f!("HEX2OCT", 1, 2, hex2oct),
+    f!("OCT2BIN", 1, 2, oct2bin),
+    f!("OCT2DEC", 1, 1, oct2dec),
+    f!("OCT2HEX", 1, 2, oct2hex),
+    f!("TYPE", 1, 1, type_fn),
+    f!("ERROR.TYPE", 1, 1, error_type),
+    f!("SHEET", 0, 1, sheet),
+    f!("SHEETS", 0, 1, sheets),
+    f!("ISFORMULA", 1, 1, isformula),
+    f!("ISNONTEXT", 1, 1, isnontext),
 ];
 
 /// The id of a function by its upper-case name.
