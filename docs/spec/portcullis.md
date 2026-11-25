@@ -2858,12 +2858,22 @@ every service reads and mounts) is cleared by a boot, while the
 `atrium-app-<uid>` accounts and anything they own are not, so a fresh
 binding could give one identity's uid to another: its groups (cleared since
 9d989f8b3) and the files the old app left in a person's folders. Every
-binding is now written first to `/var/db/atrium/app-registry` (root's, 0700
-directory, 0600 file, synced), and portcullisd puts that copy back at
-startup, under the registry lock, before anything allocates
-(`portcullis_peer::restore_registry`). A binding that can't be kept is not
+binding is now written first to `/var/db/atrium/app-registry` (root's 0600
+file, synced, in root's 0755 `/var/db/atrium`, which also holds each
+person's policy folder), and portcullisd puts that copy back at startup,
+under the registry lock, before anything allocates
+(`portcullis_peer::restore_registry`). It restores when the live file is
+absent or empty, since `atrium-portcullisd-bootstrap` makes an empty one for
+the services that nullfs-mount it; an empty file is filled in place, so
+those mounts see the bindings. A non-empty live file is left alone. A binding that can't be kept is not
 made, and a kept copy that can't be read stops portcullisd. The file holds
 only account mappings (uid, person, app id, publisher, persona), like
 passwd, not a person's data, so the at-rest rule for personal data doesn't
 apply to it.
 
+Checked 2026-11-25 on an arm64 Tessera guest, after the Mail at-rest gate
+(`scripts/portcullis-registry-reboot-vm-check.sh`, copied into the A5 guest dir,
+11/11): across a reboot the kept file survived unchanged, portcullisd logged
+"launch registry restored" into the empty live file (same inode), a5work's
+personal and Work Mail got their uids again (50005, 50000), and a newly
+installed app got a uid bound to nothing before.

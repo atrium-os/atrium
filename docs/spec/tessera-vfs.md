@@ -478,6 +478,38 @@ A separate tool, `fsck.tessera`, performs deeper checks than mount-time replay:
 
 `fsck.tessera --repair` rebuilds derivable structures (per-pack bloom filters, the pack-registry's reachable-blob counts, the bloom-of-blooms). It cannot recover from data loss; the immutability invariant means a corrupted pack-data block destroys the blobs it held, irrevocably.
 
+### 9.5 A commit over writes that did not land (as built 2026-11-25)
+
+The roots a commit names may sit in delayed-write buffers on the device
+vnode. `tessera_commit_sb` fsyncs the device before the journal record and
+the superblock, and when that fsync fails (EIO, or EACCES from an md over an
+image whose key group locked) it writes neither and returns EIO: the on-disk
+superblock keeps naming the last generation whose sectors are all durable.
+The failed buffers stay dirty and land at the next commit that succeeds.
+
+- The flush and the data-zone GC both latch the cannot-commit state on such
+  a failure (fsync fails EIO, new allocations are refused until a remount or
+  `kern.tessera.commit_failed_clear=1`). The GC used to ignore it and hand
+  out the sectors it had reclaimed while the on-disk superblock still named
+  them.
+- A refused commit has already put its snapshot record in the in-memory
+  snapshots tree, so it closes the metadata epoch: the nodes that record
+  names wait in `meta_pending`, where the drain keeps what a snapshot's walk
+  pins. Without that the epoch sweep recycled them and the next commit
+  carried a destroyed snapshot (found by the check below, sector 76).
+- Unmount retries the device fsync three more times, 100 ms apart, then
+  drops what still can't be written; those buffers hold only a generation
+  no superblock names.
+
+`scripts/tessera-commit-refusal-vm-check.sh` makes every write fail with
+gnop(8) during a GC pass and during a sync, and checks the latch, the
+refused commit, a refused write after the latch, a clean unmount and a clean
+`tessera-fsck` after each, with a control run: 13/13 on an arm64 Tessera
+guest. Seen there and not resolved: "bulk write over DIRTY buffered sector"
+fires when a data publish retries over sectors whose earlier write failed;
+the stale buffer is invalidated, which is right for that case, but the
+warning's comment still calls it a double allocation.
+
 ## 10. Snapshots and versioning
 
 ### 10.1 Snapshot

@@ -129,6 +129,17 @@ fn fits(e: &Entry, p: u8) -> bool {
     }
 }
 
+/// The clipboard chord itself: Ctrl-C or Ctrl-X for a copy, Ctrl-V or
+/// Shift-Insert for a paste.
+fn chord(e: &Entry, p: u8) -> bool {
+    let ctrl = e.mods & MOD_CTRL != 0;
+    e.kind == kind::KEY && match p {
+        purpose::COPY => ctrl && (e.hid == HID_C || e.hid == HID_X),
+        purpose::PASTE => (ctrl && e.hid == HID_V) || (e.mods & MOD_SHIFT != 0 && e.hid == HID_INSERT),
+        _ => false,
+    }
+}
+
 impl Table {
     /// A fresh token for `e` (its `counter` is set here).
     pub fn mint(&mut self, mut e: Entry) -> [u8; 16] {
@@ -172,7 +183,10 @@ impl Table {
         if e.uid != presenter_uid && !(by_parent && matches!(purpose, purpose::COPY | purpose::PASTE)) {
             return refused(refusal::WRONG_UID);
         }
-        if !fits(&e, purpose) {
+        // The parent spends a press the island's engine handed it, and the
+        // engine runs untrusted content: only the copy or paste chord
+        // itself counts, never a click or another key (tabula.md §2.6).
+        if !fits(&e, purpose) || by_parent && !chord(&e, purpose) {
             return refused(refusal::WRONG_KIND);
         }
         // Visibility first: a slot under a cover is OBSCURED whichever
@@ -874,6 +888,21 @@ mod tests {
         let copy = t.mint(island(key(HID_C, MOD_CTRL, 0)));
         assert_eq!(t.consume(1, &copy, 2002, purpose::COPY, |w| w == 7, NOVIS), refused(refusal::NOT_FOCUSED));
         assert!(matches!(t.consume(1, &copy, 2002, purpose::COPY, |w| w == 9, NOVIS), ConsumeResult::Ok { .. }));
+        // A click or another key in the page is no copy or paste for the
+        // parent, though the island's own app could spend a click on one.
+        let click = t.mint(island(button(0)));
+        assert_eq!(t.consume(1, &click, 2002, purpose::PASTE, YES, NOVIS), refused(refusal::WRONG_KIND));
+        let click = t.mint(island(button(0)));
+        assert_eq!(t.consume(1, &click, 2002, purpose::COPY, YES, NOVIS), refused(refusal::WRONG_KIND));
+        let enter = t.mint(island(key(HID_ENTER, 0, 0)));
+        assert_eq!(t.consume(1, &enter, 2002, purpose::COPY, YES, NOVIS), refused(refusal::WRONG_KIND));
+        let ctrl_a = t.mint(island(key(0x04, MOD_CTRL, 0)));
+        assert_eq!(t.consume(1, &ctrl_a, 2002, purpose::COPY, YES, NOVIS), refused(refusal::WRONG_KIND));
+        assert!(matches!(t.consume(1, &ctrl_a, 1001, purpose::COPY, YES, NOVIS), ConsumeResult::Ok { .. }), "its own app still may");
+        let cut = t.mint(island(key(HID_X, MOD_CTRL, 0)));
+        assert!(matches!(t.consume(1, &cut, 2002, purpose::COPY, YES, NOVIS), ConsumeResult::Ok { .. }));
+        let insert = t.mint(island(key(HID_INSERT, MOD_SHIFT, 0)));
+        assert!(matches!(t.consume(1, &insert, 2002, purpose::PASTE, YES, NOVIS), ConsumeResult::Ok { .. }));
         // A press in a window that is no island: only its own app.
         let plain = t.mint(key(HID_V, MOD_CTRL, 0));
         assert_eq!(t.consume(1, &plain, 2002, purpose::PASTE, YES, NOVIS), refused(refusal::WRONG_UID));

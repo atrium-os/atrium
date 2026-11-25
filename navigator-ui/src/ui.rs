@@ -117,6 +117,7 @@ pub fn trace(s: &mut Shell) {
                 Prompt::Handoff { .. } => "handoff",
                 Prompt::OpenApp { .. } => "app",
                 Prompt::Stored { .. } => "stored",
+                Prompt::PasteTooLong => "paste-too-long",
             }),
             s.rail_w(),
             t.page().map_or("-", |p| p.url.as_str()),
@@ -1428,6 +1429,7 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             ("over http: anyone on the network can read it".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
         Prompt::RunLive | Prompt::RunPageLive { .. } | Prompt::Widget { .. } | Prompt::WidgetUnload { .. } | Prompt::WidgetFailed { .. } => (ph::LIGHTNING, vec![(crate::ax::prompt_text(p), body(t.text_primary(), Weight::Regular))]),
+        Prompt::PasteTooLong => (ph::CLIPBOARD, vec![(crate::ax::prompt_text(p), body(t.text_secondary(), Weight::Regular))]),
         Prompt::FetchAgain => (ph::ARROW_CLOCKWISE, vec![("This page could not be restored and will be fetched again".into(), body(t.text_secondary(), Weight::Regular))]),
         Prompt::Stored { at_s } => (ph::CLOCK, vec![
             ("The version you saw".into(), body(t.text_secondary(), Weight::Regular)),

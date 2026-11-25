@@ -9991,17 +9991,29 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			int _ferr, _left;
 
 			vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
-			_ferr = VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
-			BO_LOCK(_bo);
-			_left = _bo->bo_dirty.bv_cnt;
-			BO_UNLOCK(_bo);
 			/* A write that cannot land (the device refuses it: an
 			 * md over an image in a key group that was locked
 			 * under this mount answers EACCES) leaves its buffer
-			 * dirty. Once the consumer is closed, any later sync
-			 * of devvp (md detach, vgone) writes it through
-			 * g_vfs_strategy into freed state and panics. Those
-			 * writes are lost either way: say so and drop them. */
+			 * dirty. A transient failure gets three more tries. */
+			for (int _try = 0;; _try++) {
+				_ferr = VOP_FSYNC(tmp_->devvp, MNT_WAIT,
+				    curthread);
+				BO_LOCK(_bo);
+				_left = _bo->bo_dirty.bv_cnt;
+				BO_UNLOCK(_bo);
+				if (_left == 0 || _try == 3)
+					break;
+				VOP_UNLOCK(tmp_->devvp);
+				pause("tsumfs", hz / 10);
+				vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
+			}
+			/* Still dirty: once the consumer is closed, any later
+			 * sync of devvp (md detach, vgone) writes them through
+			 * g_vfs_strategy into freed state and panics. They
+			 * can't tear the tree: tessera_commit_sb refuses to
+			 * write an SB while a delayed write hasn't landed, so
+			 * the on-disk SB names only durable sectors and these
+			 * buffers hold an uncommitted generation. Drop them. */
 			if (_left != 0) {
 				printf("tessera_fs: unmount of %s: %d metadata "
 				    "buffer(s) could not be written (error %d); "
@@ -13783,9 +13795,40 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * are on stable storage before any committed pointer to them is. */
 	_sbt = TPROF_T0();
 	if (tmp_->devvp != NULL) {
+		int _ferr;
+
 		vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
-		(void)VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
+		_ferr = VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
 		VOP_UNLOCK(tmp_->devvp);
+		/* A delayed write the device refused (EIO, or EACCES from an
+		 * md over an image whose key group locked) stays dirty and
+		 * fsync reports it. The roots this commit names may sit in
+		 * those buffers, so the journal record and the SB must not
+		 * land: the on-disk SB keeps naming the last generation whose
+		 * sectors are all durable. Unmount may then drop the buffers
+		 * (tessera_unmount_impl) without tearing the tree. */
+		if (_ferr != 0) {
+			TPROF_ADD(TPROF_SB_FSYNC, _sbt);
+			/* The snapshot record put above names this
+			 * generation's roots, and it stays in the in-memory
+			 * snapshots tree, so the next commit makes it
+			 * durable. Every node of those trees allocated since
+			 * the last successful commit is still marked in the
+			 * epoch bitmap, and the epoch sweep would hand such a
+			 * node out again the moment a later COW supersedes
+			 * it. Close the epoch: those sectors then wait in
+			 * meta_pending, where the drain keeps whatever a
+			 * snapshot's walk pins. */
+			if (tmp_->meta_epoch_bm != NULL)
+				memset(tmp_->meta_epoch_bm, 0,
+				    tmp_->meta_pin_bitmap_bytes);
+			printf("tessera_fs: %s: delayed writes did not land "
+			    "(error %d); superblock generation %ju not "
+			    "committed\n",
+			    tmp_->dev != NULL ? devtoname(tmp_->dev) : "?",
+			    _ferr, (uintmax_t)tmp_->sb.generation);
+			return (EIO);
+		}
 	}
 	TPROF_ADD(TPROF_SB_FSYNC, _sbt);
 
@@ -17299,7 +17342,10 @@ tessera_fs_dirty_content_append_uio(struct tessera_mount *tmp_,
  * writer of both volumes then sleeps on tessgat. bufwrite() exempts the
  * syncer and bufdaemon (TDP_NORUNNINGBUF) and md-backed vnodes for the
  * same reason; the gate's holder is the one more writer that must
- * finish for those in-flight buffers to.
+ * finish for those in-flight buffers to. This removes only the running-
+ * space wait: the holder can still sleep for a buffer (getnewbuf) or for
+ * pages while the upper volume's md thread waits on the gate, and that
+ * cycle is not closed here.
  */
 static inline void
 tessera_fs_gate_owned(struct tessera_mount *tmp_)
@@ -24069,12 +24115,17 @@ next_p:
 	 * one wedged run. A pass that frees nothing must read as unproductive
 	 * so the caller's exponential backoff engages.
 	 */
+	int _gc_crc = 0;
 	if (gone_n > 0 || retired > 0 || compacted > 0) {
 		if (gone_n > 0 || compacted > 0) {
-			(void)tessera_commit_extent(tmp_);
+			_gc_crc = tessera_commit_extent(tmp_);
 			printf("tessera_fs: gc post commit_extent\n");
 		}
-		(void)tessera_commit_sb(tmp_);
+		{
+			int _src = tessera_commit_sb(tmp_);
+			if (_gc_crc == 0)
+				_gc_crc = _src;
+		}
 		printf("tessera_fs: gc post commit_sb\n");
 	}
 	/* ★ #79: close the apply window. Must be AFTER commit_extent /
@@ -24082,6 +24133,14 @@ next_p:
 	 * allocator deltas are committed, so that is the true end of the
 	 * span a publisher must not have straddled. */
 	mtx_lock(&tmp_->flush_mtx);
+	/* A failed commit here leaves the in-memory allocator counting the
+	 * reclaimed sectors free while the on-disk SB still names them: the
+	 * next write could land on them, and a crash before a later commit
+	 * would mount the old generation over overwritten data. Latch the
+	 * cannot-commit state, which refuses new allocations, so nothing is
+	 * handed out until an operator clears it after a repair. */
+	if (_gc_crc != 0 && !tmp_->flush_unmounting)
+		tessera_fs_commit_failed_latch(tmp_, _gc_crc);
 	atomic_store_rel_64(&tmp_->gc_apply_gen, tmp_->gc_apply_gen + 1);
 	KASSERT((tmp_->gc_apply_gen & 1) == 0,
 	    ("tessera gc_apply_gen %ju is odd after closing the apply "

@@ -186,6 +186,9 @@ pub enum Prompt {
     /// Opened from history (§5.5): this is the version stored when it was
     /// seen (`at_s`), offline; the current one is a press away.
     Stored { at_s: u64 },
+    /// The person's Ctrl-V in a live page found more on the clipboard than
+    /// the page takes at once (I6.4, `COPY_MAX`); nothing was pasted.
+    PasteTooLong,
 }
 
 /// The open-an-app prompt's facts (§6.4), as words: the app's name, who
@@ -218,6 +221,7 @@ impl Prompt {
             Prompt::RunLive => &["Not now", "Run live"],
             Prompt::RunPageLive { .. } => &["Not now", "Run live"],
             Prompt::FetchAgain => &["Fetch now"],
+            Prompt::PasteTooLong => &["Close"],
             Prompt::Play { .. } => &["Not now", "Play"],
             Prompt::Handoff { .. } => &["Not now", "Open"],
             Prompt::OpenApp { .. } => &["Not now", "Open"],
@@ -239,6 +243,7 @@ impl Prompt {
             Prompt::Play { origin } => format!("play {origin}"),
             Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. } => format!("hand {url}"),
             Prompt::Stored { .. } => "stored".into(),
+            Prompt::PasteTooLong => "paste-too-long".into(),
         }
     }
 }

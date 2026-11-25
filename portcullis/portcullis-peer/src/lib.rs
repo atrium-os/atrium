@@ -485,7 +485,7 @@ fn append_line_kept(path: &std::path::Path, line: &str) -> io::Result<()> {
 }
 
 /// After a boot: put the kept registry back at [`DEFAULT_REGISTRY`] when
-/// that is gone, before anything allocates. Call it holding
+/// that is gone or empty, before anything allocates. Call it holding
 /// [`lock_registry`] on [`DEFAULT_REGISTRY`]. A kept copy that can't be
 /// read is an error, not an empty registry: starting empty would reuse
 /// every bound uid.
@@ -505,14 +505,36 @@ pub enum RestoreOutcome {
 }
 
 fn restore_registry_at(kept: &std::path::Path, live: &std::path::Path) -> io::Result<RestoreOutcome> {
-    if std::fs::symlink_metadata(live).is_ok() {
-        return Ok(RestoreOutcome::Present);
-    }
+    // The boot's rc (atrium-portcullisd-bootstrap) makes an empty live file
+    // before services nullfs-mount it, so empty means "cleared by the boot"
+    // as much as absent does. It is filled in place: a rename would leave
+    // those mounts on the old, empty file.
+    let empty = match std::fs::symlink_metadata(live) {
+        Ok(m) if m.file_type().is_file() && m.len() == 0 => true,
+        Ok(_) => return Ok(RestoreOutcome::Present),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
     let bytes = match std::fs::read(kept) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RestoreOutcome::Fresh),
         Err(e) => return Err(e),
     };
+    if empty {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(live)?;
+        // Checked again on the open file: it must still be the empty file.
+        if f.metadata()?.len() != 0 {
+            return Ok(RestoreOutcome::Present);
+        }
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        return Ok(RestoreOutcome::Restored);
+    }
     if let Some(dir) = live.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -872,6 +894,16 @@ mod kept_registry_tests {
         assert_eq!(reg.resolve(50000), Some(("alice", "org.atrium.mail")));
         assert_eq!(reg.resolve(50001).map(|(u, _)| u), Some("bob"));
         // A restart in the same boot leaves it alone.
+        assert_eq!(restore_registry_at(&kept, &live).unwrap(), RestoreOutcome::Present);
+        // The boot's rc leaves an empty live file that services have
+        // already mounted: it is filled in place, the same inode.
+        std::fs::write(&live, b"").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let ino = std::fs::metadata(&live).unwrap().ino();
+        assert_eq!(restore_registry_at(&kept, &live).unwrap(), RestoreOutcome::Restored);
+        assert_eq!(std::fs::metadata(&live).unwrap().ino(), ino);
+        let reg = AppRegistry::load(live.to_str().unwrap()).unwrap();
+        assert_eq!(reg.resolve(50000), Some(("alice", "org.atrium.mail")));
         assert_eq!(restore_registry_at(&kept, &live).unwrap(), RestoreOutcome::Present);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o600);
