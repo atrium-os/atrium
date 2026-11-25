@@ -1547,8 +1547,26 @@ fn resolve_mounts(req: &CreateJailRequest, tmpfs_ceiling: u64) -> Vec<ResolvedMo
 /// Make the destination and mount it. The destination must still lie under
 /// the root once symlinks are resolved: a jail's writable root can hold a
 /// link left by an earlier run, and nmount follows it.
+/// Make sure a mount's destination exists before it is resolved. A nullfs
+/// mount of a single file (a registry file) needs a regular file there: the
+/// jail root provides it, and jaild never creates one. Every other mount gets
+/// a directory.
+fn prepare_dest(m: &ResolvedMount) -> std::io::Result<()> {
+    let file_source = m.kind != MountKind::Tmpfs
+        && std::fs::metadata(&m.source)?.is_file();
+    if !file_source {
+        return std::fs::create_dir_all(&m.dest);
+    }
+    if std::fs::metadata(&m.dest)?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!("{} is a file, so {} must be an existing regular file in the jail root", m.source, m.dest)))
+    }
+}
+
 fn mount_one(m: &ResolvedMount, root: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(&m.dest)?;
+    prepare_dest(m)?;
     let real_root = std::fs::canonicalize(root)?;
     let real_dest = std::fs::canonicalize(&m.dest)?;
     if !real_dest.starts_with(&real_root) {
@@ -2114,6 +2132,60 @@ pub fn bind(socket_path: &Path) -> Result<UnixListener, JaildError> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(socket_path, perms)?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod mount_dest_tests {
+    use super::*;
+
+    fn mount(source: &std::path::Path, dest: &std::path::Path, kind: MountKind) -> ResolvedMount {
+        ResolvedMount {
+            source: source.display().to_string(),
+            dest: dest.display().to_string(),
+            kind,
+            size_mb: 0,
+            owner: None,
+            flags: ffi::MountFlags::default(),
+        }
+    }
+
+    /// A registry file mounted onto the empty file the jail root provides
+    /// (arcad's app-registry): create_dir_all on it failed with EEXIST.
+    #[test]
+    fn a_file_mounts_onto_the_existing_file_without_a_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let (source, dest) = (t.path().join("app-registry"), t.path().join("root-registry"));
+        std::fs::write(&source, b"x").unwrap();
+        std::fs::write(&dest, b"").unwrap();
+        prepare_dest(&mount(&source, &dest, MountKind::RoNullfs)).unwrap();
+        assert!(std::fs::metadata(&dest).unwrap().is_file());
+    }
+
+    /// The refusals beside it: jaild does not invent the file, and a file
+    /// does not mount onto a directory.
+    #[test]
+    fn a_file_source_needs_a_regular_file_destination() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("registry");
+        std::fs::write(&source, b"x").unwrap();
+        let missing = t.path().join("missing");
+        assert!(prepare_dest(&mount(&source, &missing, MountKind::RoNullfs)).is_err());
+        assert!(!missing.exists());
+        let dir = t.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(prepare_dest(&mount(&source, &dir, MountKind::RwNullfs)).is_err());
+    }
+
+    #[test]
+    fn directory_and_tmpfs_mounts_still_get_their_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("a/b");
+        prepare_dest(&mount(t.path(), &dest, MountKind::RoNullfs)).unwrap();
+        assert!(dest.is_dir());
+        let tmp = t.path().join("tmp/x");
+        prepare_dest(&mount(std::path::Path::new(""), &tmp, MountKind::Tmpfs)).unwrap();
+        assert!(tmp.is_dir());
+    }
 }
 
 #[cfg(test)]

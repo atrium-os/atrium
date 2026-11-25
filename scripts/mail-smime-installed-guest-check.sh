@@ -75,7 +75,16 @@ for endpoint in "$arca" "$activation" "$fresco" "$limen" "$portcullis" /var/run/
     fi
     test ! -S "$endpoint" || unlink "$endpoint"
 done
-install -d /var/run/atrium "$s/arca" "$s/sigillum" "$s/portcullis" "$s/fresco" "$s/fresco-activation" "$s/limen"
+# Mail's notify and arca-courier capabilities mount these socket directories.
+install -d /var/run/atrium "$s/arca" "$s/sigillum" "$s/portcullis" "$s/fresco" "$s/fresco-activation" "$s/limen" \
+    "$s/arca-courier" "$s/notify"
+# frescod needs system-sans. A bare guest disk has no fonts, so the staging
+# side copies the repo's fonts/ibm-plex and fonts/phosphor into $d/fonts.
+if test -d "$d/fonts"; then
+    install -d /usr/local/share/fonts/ibm-plex
+    install -m 0444 "$d"/fonts/*.ttf /usr/local/share/fonts/ibm-plex/
+fi
+ls /usr/local/share/fonts/ibm-plex/IBMPlexSans-*.ttf >/dev/null
 touch "$registry" /var/run/atrium/courier-registry
 # Only Scrinium's trusted provider is injected into the registry. Portcullis
 # writes the Work and Personal Mail entries when it launches the signed app.
