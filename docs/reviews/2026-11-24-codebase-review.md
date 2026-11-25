@@ -538,6 +538,13 @@ Proposal:
 3. **A checklist in AGENTS.md**, added 2026-11-24 with Shankar's OK
    (text below).
 
+4. **Gates for a jaild change.** A change to jaild's create or mount path
+   runs a service jail with single-file mounts (`scripts/arca-vm-test.sh`)
+   beside the app gates (personas, console, workspace, artifex). J1 dropped
+   the tolerance for an existing destination file and every app gate passed,
+   while arcad, frescod and limend could not start (fixed d6d0346aa; the
+   link-following mkdir beside it, 483276d7).
+
 The AGENTS.md section:
 
 ```markdown
