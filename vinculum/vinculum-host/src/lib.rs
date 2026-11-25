@@ -879,7 +879,7 @@ impl Host {
                     let a = Peer::from_hci(r.bd_addr, hci::AddressType::PublicDeviceAddress).address;
                     if a != [0; 6] {
                         self.info.address = Some(a);
-                        Some((to_cmd(hci::ReadBufferSize {}), ReadBufferSize))
+                        Some(self.buffer_size_step())
                     } else if self.info.manufacturer == MANUFACTURER_ZEPHYR {
                         // No public address: use the chip's own static one.
                         Some((to_cmd(hci::ZephyrReadStaticAddresses {}), ZephyrStaticAddress))
@@ -904,7 +904,7 @@ impl Host {
                 },
                 Err(_) => return self.fatal(bad("static addresses")),
             },
-            LeSetRandomAddress => Some((to_cmd(hci::ReadBufferSize {}), ReadBufferSize)),
+            LeSetRandomAddress => Some(self.buffer_size_step()),
             ReadBufferSize => match hci::ReadBufferSizeComplete::try_from(cc) {
                 Ok(r) => {
                     self.info.acl_mtu = r.acl_data_packet_length;
@@ -935,7 +935,7 @@ impl Host {
             // BR/EDR: Secure Simple Pairing with Secure Connections. An
             // LE-only controller (LMP feature bit 37, "BR/EDR not
             // supported") skips these.
-            LeSetEventMask if self.info.lmp_features & (1 << 37) == 0 => {
+            LeSetEventMask if !self.le_only() => {
                 Some((to_cmd(hci::WriteSimplePairingMode { simple_pairing_mode: hci::Enable::Enabled }), WriteSimplePairingMode))
             }
             LeSetEventMask => None,
@@ -948,6 +948,23 @@ impl Host {
         match next {
             Some((c, s)) => self.issue(c, Tag::Init(s)),
             None => self.finish_bring_up(),
+        }
+    }
+
+    /// LMP feature bit 37, "BR/EDR not supported" (Core Vol 2 Part C §3.3):
+    /// such a controller refuses every BR/EDR command.
+    fn le_only(&self) -> bool {
+        self.info.lmp_features & (1 << 37) != 0
+    }
+
+    /// The first buffer-size read: the BR/EDR ACL buffers, or straight to
+    /// the LE ones on an LE-only controller (which has only those, so they
+    /// must not be zero: finish_bring_up refuses a controller with none).
+    fn buffer_size_step(&self) -> (Command, Step) {
+        if self.le_only() {
+            (to_cmd(hci::LeReadBufferSizeV2 {}), Step::LeReadBufferSizeV2)
+        } else {
+            (to_cmd(hci::ReadBufferSize {}), Step::ReadBufferSize)
         }
     }
 

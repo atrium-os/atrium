@@ -871,6 +871,12 @@ mod tests {
         assert!(!p.devfs_rulesets.allowed.contains(&"atrium-gpu".to_string()));
         assert!(!p.devfs_rulesets.allowed_ids.contains(&21));
         assert!(p.devfs_rulesets.pin(23).is_some());
+        // Bluetooth controllers: one vinculum-hci jail per controller, shown
+        // only its own ugen node and usb/ endpoint directory.
+        let bt = p.devfs_rulesets.pin(25).expect("pin 25 (atrium_bluetooth) missing");
+        assert_eq!((bt.uid, bt.exec_path.as_str()), (65025, "/usr/local/bin/atrium-vinculum-hci"));
+        assert!(["ugen0.3", "usb/0.3.0"].iter().all(|n| bt.grant_nodes.iter().any(|g| grant_matches(g, n))));
+        assert!(["ugen0.3.1", "usb/0.3.1", "da0", "hidraw0"].iter().all(|n| !bt.grant_nodes.iter().any(|g| grant_matches(g, n))));
         assert!(p.exec_paths.allowed_prefixes.iter()
             .any(|s| s.starts_with("/usr/local/bin/atrium-")));
 

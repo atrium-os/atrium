@@ -87,4 +87,23 @@ mod tests {
         assert!(plan(d, &v(&[("hidraw", "7")]), &[]).is_none(), "nothing to grant");
         assert_eq!(stop_names(d, &v(&[("hidraw", "7")])).unwrap(), ("atrium-sigillum-fido-7".into(), "/var/lib/atrium/jails/sigillum-fido-7".into()));
     }
+
+    /// A Bluetooth controller's jail is the one jaild's pin 25 allows.
+    #[test]
+    fn vinculum_jail_matches_its_pin() {
+        let mut r = Rules::default();
+        r.add_toml("v", include_str!("../../vinculum/etc/devices.d/25-vinculum.toml")).unwrap();
+        let d = &r.drivers["vinculum-hci"];
+        let v: BTreeMap<String, String> =
+            [("usb", "0-3-0"), ("bus", "0"), ("addr", "3"), ("interface", "0")].iter().map(|(k, x)| (k.to_string(), x.to_string())).collect();
+        let p = plan(d, &v, &["ugen0.3".into(), "usb/0.3.0".into()]).unwrap();
+        assert_eq!(p.name, "atrium-vinculum-hci-0-3-0");
+        assert_eq!(p.path, "/var/lib/atrium/jails/vinculum-hci-0-3-0");
+        assert_eq!((p.devfs_ruleset, p.sysfil.as_str(), p.uid, p.gid), (25, "device", 65025, 65025));
+        assert_eq!(p.devfs_grants, ["ugen0.3", "usb/0.3.0"]);
+        assert_eq!(p.exec, "/usr/local/bin/atrium-vinculum-hci");
+        assert_eq!(&p.argv[..3], ["atrium-vinculum-hci", "--controller", "usb"]);
+        assert!(p.argv.windows(2).any(|w| w == ["--host-uid", "65024"]));
+        assert!(p.mounts_ro.iter().all(|m| !m.starts_with("/var") && m != "/"), "no state, no root: {:?}", p.mounts_ro);
+    }
 }

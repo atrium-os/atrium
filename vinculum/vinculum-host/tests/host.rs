@@ -3,7 +3,7 @@
 use vinculum_hci_proto::h4::{Frame, Kind};
 use vinculum_hci_proto::hci::{self, ErrorCode, OpCode};
 use vinculum_hci_proto::Packet;
-use vinculum_host::testing::{complete, event, le_meta, ready_host};
+use vinculum_host::testing::{complete, event, le_meta, ready_host, status};
 use vinculum_host::{Host, HostEvent, MAX_CONNECTIONS};
 
 fn le_conn(handle: u16, addr: u64) -> Frame {
@@ -147,7 +147,9 @@ fn disconnect_returns_credits_and_forgets_queue() {
 
 /// A controller with no public address (BD_ADDR all zero), as Zephyr's
 /// hci_usb on the nRF52840 dongle answers, reporting `manufacturer` and,
-/// to Zephyr's Read Static Addresses, `static_addr`.
+/// to Zephyr's Read Static Addresses, `static_addr`. Like that dongle it is
+/// LE only (LMP feature bit 37) and refuses every BR/EDR command with
+/// Unknown HCI Command.
 fn bring_up_without_public_address(manufacturer: u16, static_addr: u64) -> (Host, Vec<hci::Command>) {
     let ok = ErrorCode::Success;
     let mut h = Host::new();
@@ -177,6 +179,10 @@ fn bring_up_without_public_address(manufacturer: u16, static_addr: u64) -> (Host
             }),
             OpCode::LeSetRandomAddress => complete(hci::LeSetRandomAddressComplete { status: ok, num_hci_command_packets: 1 }),
             OpCode::LeSetScanParameters => complete(hci::LeSetScanParametersComplete { status: ok, num_hci_command_packets: 1 }),
+            OpCode::ReadLocalSupportedFeatures => complete(hci::ReadLocalSupportedFeaturesComplete { status: ok, lmp_features: 1 << 37, num_hci_command_packets: 1 }),
+            OpCode::ReadBufferSize | OpCode::WriteSimplePairingMode | OpCode::WriteSecureConnectionsHostSupport => {
+                status(c.op_code, ErrorCode::UnknownHciCommand)
+            }
             _ => match vinculum_host::testing::answer(&cmd, 4) {
                 Some(a) => a,
                 None => continue,
@@ -195,6 +201,9 @@ fn zephyr_controller_without_public_address_uses_its_static_one() {
     assert!(h.info().address_random);
     let set = sent.iter().find(|c| c.op_code == OpCode::LeSetRandomAddress).expect("LE Set Random Address sent");
     assert_eq!(set.payload, vec![0x9A, 0x78, 0x56, 0x34, 0x12, 0xC6]);
+    // LE only: no BR/EDR command is sent; its LE buffers carry everything.
+    assert!(!sent.iter().any(|c| matches!(c.op_code, OpCode::ReadBufferSize | OpCode::WriteSimplePairingMode)));
+    assert!(h.info().le_buffers > 0);
     // Scans then say "random" for our own address.
     h.le_scan(true, 0);
     let f = h.poll_frame().unwrap();

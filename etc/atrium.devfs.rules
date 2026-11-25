@@ -112,6 +112,16 @@ add path 'bpsm*' mode 0666
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 
+# Vinculum's Bluetooth transport (bluetooth.md §4, §5): one vinculum-hci jail
+# per controller, the basics and nothing else. dispensatord shows each jail
+# its own controller's ugenB.A and usb/B.A.0 through devfs_grants, checked
+# against the pin in jaild.policy.toml (id 25, atrium-vinculum-hci-*,
+# _vinculum-hci), owned by _vinculum-hci, 0600. vinculumd's own jail shows
+# no device: the radio is reached only through vinculum-hci.
+[atrium_bluetooth=25]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+
 # Capsa's removable-storage servers (device-assignment.md §4.6): the basics
 # and nothing else. jaild opens the partition and /dev/fuse for each and
 # passes them as descriptors; no disk node is ever shown in the jail.

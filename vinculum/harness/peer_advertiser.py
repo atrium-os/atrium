@@ -3,7 +3,7 @@ controller and advertises a name, so the host side (vinculum-probe, later
 vinculumd) has a real device to find. Later peers (keyboard, HOGP mouse,
 A2DP sink, hostile devices) follow the same shape (docs/spec/bluetooth.md §14).
 
-usage: python peer_advertiser.py HCI_TRANSPORT NAME SECONDS [IOCAP [PASSKEY_FILE [classic|classic-unnamed]]]
+usage: python peer_advertiser.py HCI_TRANSPORT NAME SECONDS [IOCAP [PASSKEY_FILE [classic|classic-unnamed|le-only]]]
        e.g. tcp-client:127.0.0.1:6402 VinculumPeer 30 display-yes-no
 
 IOCAP is the peer's pairing I/O capability (none, display, display-yes-no,
@@ -13,7 +13,9 @@ With `classic` the peer is a Classic-only keyboard: it does not advertise
 over LE, but answers inquiry (discoverable, its name in the extended
 inquiry response, Class of Device peripheral/keyboard); `classic-unnamed`
 leaves the name out of the inquiry response, so the host must ask for it
-(Remote Name Request).
+(Remote Name Request). With `le-only` the peer never touches BR/EDR, for an
+LE-only controller such as Zephyr's hci_usb on the nRF52840 dongle, which
+refuses every Classic command. PASSKEY_FILE `-` means none.
 """
 import asyncio
 import sys
@@ -68,7 +70,7 @@ async def main(transport: str, name: str, seconds: float, iocap: str, passkey_fi
         device.pairing_config_factory = lambda _c: PairingConfig(sc=True, mitm=True, bonding=True, delegate=delegate)
         # Classic too (page scan, SSP with Secure Connections), so the
         # BR/EDR scenarios can connect to the same peer by address.
-        device.classic_enabled = True
+        device.classic_enabled = mode != "le-only"
         if mode in ("classic", "classic-unnamed"):
             device.class_of_device = 0x002540
         await device.power_on()
@@ -105,4 +107,4 @@ async def main(transport: str, name: str, seconds: float, iocap: str, passkey_fi
 
 if __name__ == "__main__":
     a = sys.argv
-    asyncio.run(main(a[1], a[2], float(a[3]), a[4] if len(a) > 4 else "none", a[5] if len(a) > 5 else None, a[6] if len(a) > 6 else None))
+    asyncio.run(main(a[1], a[2], float(a[3]), a[4] if len(a) > 4 else "none", a[5] if len(a) > 5 and a[5] != "-" else None, a[6] if len(a) > 6 else None))

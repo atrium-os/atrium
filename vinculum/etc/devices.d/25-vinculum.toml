@@ -1,0 +1,45 @@
+# Vinculum's controllers for dispensatord (docs/spec/device-assignment.md §4.2,
+# docs/spec/bluetooth.md §5). Installed to /usr/local/etc/atrium/devices.d/ by
+# scripts/vinculum-service.sh.
+#
+# Every USB interface of class E0/01/01 (a primary Bluetooth controller) goes
+# to a driver jail of its own running vinculum-hci as _vinculum-hci (65025),
+# devfs ruleset 25 (atrium_bluetooth: basics only, plus the two nodes granted
+# here). ng_ubt is detached first if it attached. libusb opens both the ugen
+# node and the usb/B.A.0 control node, so both are granted.
+#
+# The jail mounts are read-only, so vinculum-hci does not listen: it connects
+# to vinculumd's transport socket (vinculumd --transport listen:...), checks
+# the listener is _vinculum (65024), and retries once a second until it is
+# there. Realtek controllers get their patch from the firmware dir at every
+# power-up (vinculum/firmware/README.md); Zephyr and other standard
+# controllers need nothing.
+#
+# `--controller usb` takes the first Bluetooth controller libusb finds: the
+# jail's devfs shows only this device's nodes, so that is this one.
+#
+# sysfil "device" is log-only for now: libusb's USB_FS ioctls on the ugen
+# node still need to be learned before it enforces.
+
+[[rule]]
+name          = "vinculum-controller"
+class         = "usb"
+usb_interface = [0xE0, 0x01, 0x01]
+detach_kernel = true
+nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
+all_nodes     = true
+owner         = "driver:vinculum-hci"
+
+[driver.vinculum-hci]
+exec          = "/usr/local/bin/atrium-vinculum-hci"
+argv          = ["atrium-vinculum-hci", "--controller", "usb",
+                 "--host-connect", "/atrium/sockets/vinculum-hci/transport.sock", "--host-uid", "65024",
+                 "--firmware-dir", "/usr/local/share/atrium/firmware/bluetooth"]
+uid           = 65025
+gid           = 65025
+jail          = "atrium-vinculum-hci-{usb}"
+root          = "/var/lib/atrium/jails/vinculum-hci-{usb}"
+devfs_ruleset = 25
+sysfil        = "device"
+mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin",
+                 "/usr/local/share/atrium/firmware/bluetooth", "/atrium/sockets/vinculum-hci"]

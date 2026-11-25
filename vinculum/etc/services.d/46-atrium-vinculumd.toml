@@ -1,0 +1,98 @@
+# /etc/atrium/services.d/46-atrium-vinculumd.toml
+#
+# vinculumd, Vinculum's Bluetooth host (docs/spec/bluetooth.md §4, §5), as a
+# jailed system service. atrium-portcullisd-bootstrap reads this, asks jaild
+# to create the jail and supervises vinculumd inside it. Numbered after arcad
+# (42): it keeps pairing keys in Arca's machine store (arcad's ARCA_SERVICES
+# names vinculumd=65024).
+#
+# vinculumd runs NON-ROOT as _vinculum (65024) with no devices (ruleset 4) and
+# no network. It never opens a controller: vinculum-hci does, one driver jail
+# per controller that dispensatord starts (25-vinculum.toml), and connects to
+# the transport socket here; vinculumd accepts only _vinculum-hci (65025).
+# Everything from the air up to the profile boundary is parsed here.
+#
+# Sockets, each checked by peer uid on every connection:
+#   /atrium/sockets/vinculum-hci/transport.sock      the controller (_vinculum-hci only)
+#   /atrium/sockets/bluetooth-control/control.sock   apps holding bluetooth-control (Curia, the bar)
+#   /atrium/sockets/bluetooth-hid/hid.sock           tactusd (65018) only
+#
+# One controller at a time: the transport socket is removed once a controller
+# is taken, and vinculumd exits when it goes, so the supervisor restarts it
+# listening again for the next one.
+#
+# REQUIRES (scripts/vinculum-service.sh does all of it):
+#   1. The _vinculum (65024) and _vinculum-hci (65025) system users (in
+#      jaild.policy's allowed_system_uids).
+#   2. The socket directories above (vinculum-hci owned _vinculum:_vinculum-hci
+#      0750; bluetooth-hid _vinculum:_tactus 0750; bluetooth-control _vinculum 0755).
+#   3. /var/db/vinculum owned _vinculum 0700 (the power switch's state only;
+#      keys are in Arca).
+#   4. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
+#      var/lib/atrium/apps,var/db/vinculum,var/run/atrium,atrium/sockets/{arca,
+#      vinculum-hci,bluetooth-control,bluetooth-hid}} and an empty file
+#      <path>/var/run/atrium/app-registry (nullfs file mount point).
+
+enabled       = true
+name          = "atrium-vinculumd"
+path          = "/var/lib/atrium/jails/vinculumd"
+children_max  = 0
+devfs_ruleset = 4                                # devfsrules_jail: no devices
+# network: none (the manifest default, `disable`).
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/vinculum-hci"           # rw: the controller transport
+dest   = "atrium/sockets/vinculum-hci"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/bluetooth-control"      # rw: the trusted UI's socket
+dest   = "atrium/sockets/bluetooth-control"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/bluetooth-hid"          # rw: HID devices to tactusd
+dest   = "atrium/sockets/bluetooth-hid"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/arca"                   # ro: connect to arcad for the machine store
+dest   = "atrium/sockets/arca"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/lib/atrium/apps"                   # ro: installed manifests (bluetooth-control)
+dest   = "var/lib/atrium/apps"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/db/vinculum"                       # rw: the power switch across restarts
+dest   = "var/db/vinculum"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-vinculumd"
+argv = ["atrium-vinculumd",
+        "--transport", "listen:/atrium/sockets/vinculum-hci/transport.sock", "--transport-uid", "65025",
+        "--arca", "/atrium/sockets/arca/arcad.sock",
+        "--control", "/atrium/sockets/bluetooth-control/control.sock",
+        "--control-apps", "/var/run/atrium/app-registry", "/var/lib/atrium/apps",
+        "--hid", "/atrium/sockets/bluetooth-hid/hid.sock", "--hid-uid", "65018",
+        "--power-file", "/var/db/vinculum/power"]
+uid  = 65024   # _vinculum
+gid  = 65024

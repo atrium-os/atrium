@@ -581,6 +581,7 @@ mod tests {
         r.add_toml("t", include_str!("../../tactus/etc/devices.d/30-tactus.toml")).unwrap();
         r.add_toml("s", include_str!("../../sigillum/etc/devices.d/40-sigillum.toml")).unwrap();
         r.add_toml("c", include_str!("../../capsa/etc/devices.d/50-capsa.toml")).unwrap();
+        r.add_toml("v", include_str!("../../vinculum/etc/devices.d/25-vinculum.toml")).unwrap();
         r.finish().unwrap()
     }
 
