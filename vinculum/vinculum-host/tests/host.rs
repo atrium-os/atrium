@@ -144,3 +144,81 @@ fn disconnect_returns_credits_and_forgets_queue() {
     h.send_l2cap(4, 4, &[1], 0).unwrap();
     assert!(h.poll_frame().is_some(), "credit came back with the disconnect");
 }
+
+/// A controller with no public address (BD_ADDR all zero), as Zephyr's
+/// hci_usb on the nRF52840 dongle answers, reporting `manufacturer` and,
+/// to Zephyr's Read Static Addresses, `static_addr`.
+fn bring_up_without_public_address(manufacturer: u16, static_addr: u64) -> (Host, Vec<hci::Command>) {
+    let ok = ErrorCode::Success;
+    let mut h = Host::new();
+    h.start(0);
+    let mut sent = Vec::new();
+    for _ in 0..40 {
+        let Some(cmd) = h.poll_frame() else { break };
+        let c = hci::Command::decode_full(&cmd.packet).unwrap();
+        sent.push(c.clone());
+        let a = match c.op_code {
+            OpCode::ReadLocalVersionInformation => complete(hci::ReadLocalVersionInformationComplete {
+                status: ok,
+                local_version_information: hci::LocalVersionInformation {
+                    hci_version: hci::HciVersion::V54,
+                    hci_revision: 0,
+                    lmp_version: hci::LmpVersion::V54,
+                    manufacturer_name: manufacturer,
+                    lmp_subversion: 0xFFFF,
+                },
+                num_hci_command_packets: 1,
+            }),
+            OpCode::ReadBdAddr => complete(hci::ReadBdAddrComplete { status: ok, bd_addr: hci::Address::try_from(0u64).unwrap(), num_hci_command_packets: 1 }),
+            OpCode::ZephyrReadStaticAddresses => complete(hci::ZephyrReadStaticAddressesComplete {
+                status: ok,
+                addresses: vec![hci::ZephyrStaticAddress { address: hci::Address::try_from(static_addr).unwrap(), identity_root: [7; 16] }],
+                num_hci_command_packets: 1,
+            }),
+            OpCode::LeSetRandomAddress => complete(hci::LeSetRandomAddressComplete { status: ok, num_hci_command_packets: 1 }),
+            OpCode::LeSetScanParameters => complete(hci::LeSetScanParametersComplete { status: ok, num_hci_command_packets: 1 }),
+            _ => match vinculum_host::testing::answer(&cmd, 4) {
+                Some(a) => a,
+                None => continue,
+            },
+        };
+        h.on_frame(a, 0);
+    }
+    (h, sent)
+}
+
+#[test]
+fn zephyr_controller_without_public_address_uses_its_static_one() {
+    let (mut h, sent) = bring_up_without_public_address(0x05F1, 0xC6_12_34_56_78_9A);
+    assert!(h.is_ready());
+    assert_eq!(h.info().address, Some([0xC6, 0x12, 0x34, 0x56, 0x78, 0x9A]));
+    assert!(h.info().address_random);
+    let set = sent.iter().find(|c| c.op_code == OpCode::LeSetRandomAddress).expect("LE Set Random Address sent");
+    assert_eq!(set.payload, vec![0x9A, 0x78, 0x56, 0x34, 0x12, 0xC6]);
+    // Scans then say "random" for our own address.
+    h.le_scan(true, 0);
+    let f = h.poll_frame().unwrap();
+    let c = hci::Command::decode_full(&f.packet).unwrap();
+    let p = hci::LeSetScanParameters::try_from(c).unwrap();
+    assert_eq!(p.own_address_type, hci::OwnAddressType::RandomDeviceAddress);
+}
+
+#[test]
+fn no_address_and_no_way_to_get_one_is_fatal() {
+    // Not Zephyr: nothing to ask.
+    let (h, sent) = bring_up_without_public_address(0x005D, 0xC6_12_34_56_78_9A);
+    assert!(!h.is_ready());
+    assert!(!sent.iter().any(|c| c.op_code == OpCode::ZephyrReadStaticAddresses));
+    // Zephyr, but the answer is not a static random address (top bits 01).
+    let (h, _) = bring_up_without_public_address(0x05F1, 0x46_12_34_56_78_9A);
+    assert!(!h.is_ready());
+}
+
+#[test]
+fn public_address_controller_keeps_public_own_address() {
+    let mut h = ready_host(4);
+    assert!(!h.info().address_random);
+    h.le_scan(true, 0);
+    let c = hci::Command::decode_full(&h.poll_frame().unwrap().packet).unwrap();
+    assert_eq!(hci::LeSetScanParameters::try_from(c).unwrap().own_address_type, hci::OwnAddressType::PublicDeviceAddress);
+}

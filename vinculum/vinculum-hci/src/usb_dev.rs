@@ -118,6 +118,9 @@ extern "C" {
     fn libusb_free_device_list(list: *mut *mut Device, unref: c_int);
     fn libusb_get_device_descriptor(dev: *mut Device, desc: *mut DeviceDescriptor) -> c_int;
     fn libusb_get_active_config_descriptor(dev: *mut Device, config: *mut *mut ConfigDescriptor) -> c_int;
+    fn libusb_get_config_descriptor(dev: *mut Device, index: u8, config: *mut *mut ConfigDescriptor) -> c_int;
+    fn libusb_get_configuration(handle: *mut Handle, config: *mut c_int) -> c_int;
+    fn libusb_set_configuration(handle: *mut Handle, config: c_int) -> c_int;
     fn libusb_free_config_descriptor(config: *mut ConfigDescriptor);
     fn libusb_get_bus_number(dev: *mut Device) -> u8;
     fn libusb_get_device_address(dev: *mut Device) -> u8;
@@ -153,6 +156,8 @@ fn io_err(what: &str, code: c_int) -> std::io::Error {
 struct Usb {
     handle: *mut Handle,
     iface: u8,
+    /// bConfigurationValue of the configuration holding `iface`.
+    config: u8,
     eps: HciEndpoints,
     vendor: u16,
     product: u16,
@@ -330,7 +335,7 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
                 continue;
             }
         }
-        if let Some((iface, eps)) = hci_interface(dev) {
+        if let Some((iface, eps, config)) = hci_interface(dev) {
             // SAFETY: `dev` is from the live list.
             let (bus, addr) = unsafe { (libusb_get_bus_number(dev), libusb_get_device_address(dev)) };
             let name = format!("{:04x}:{:04x} on bus {bus} address {addr}", dd.id_vendor, dd.id_product);
@@ -344,7 +349,7 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
                 unsafe { libusb_free_device_list(list, 1) };
                 return Err(io_err(&format!("open {name}"), r));
             }
-            found = Some((Usb { handle: h, iface, eps, vendor: dd.id_vendor, product: dd.id_product }, name));
+            found = Some((Usb { handle: h, iface, config, eps, vendor: dd.id_vendor, product: dd.id_product }, name));
             break;
         }
     }
@@ -361,6 +366,24 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
     if r < 0 && r != LIBUSB_ERROR_NOT_SUPPORTED {
         return Err(io_err("auto-detach", r));
     }
+    // A controller whose device descriptor says class 0xE0 (the UB500) is
+    // left unconfigured by macOS, which configures only composite (class 0)
+    // devices itself; FreeBSD's usb stack always sets one, so there this
+    // finds it set and does nothing.
+    let mut cur: c_int = 0;
+    // SAFETY: the handle was just opened; `cur` is a live out-int.
+    let r = unsafe { libusb_get_configuration(usb.handle, &mut cur) };
+    if r < 0 {
+        return Err(io_err(&format!("get configuration of {name}"), r));
+    }
+    if cur != usb.config as c_int {
+        // SAFETY: the handle was just opened; no interface is claimed yet.
+        let r = unsafe { libusb_set_configuration(usb.handle, usb.config as c_int) };
+        if r < 0 {
+            return Err(io_err(&format!("set configuration {} of {name} (was {cur})", usb.config), r));
+        }
+        eprintln!("vinculum-hci: {name}: set configuration {} (was {cur})", usb.config);
+    }
     // SAFETY: the handle was just opened.
     let r = unsafe { libusb_claim_interface(usb.handle, usb.iface as c_int) };
     if r < 0 {
@@ -369,14 +392,19 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
     Ok((usb, name))
 }
 
-/// The HCI interface of `dev`'s active configuration: alternate setting 0
-/// of the first interface whose class is Bluetooth, and its endpoints.
-fn hci_interface(dev: *mut Device) -> Option<(u8, HciEndpoints)> {
+/// The HCI interface of `dev`'s active configuration (or, for a device not
+/// configured yet, its first): alternate setting 0 of the first interface
+/// whose class is Bluetooth, its endpoints, and the configuration's value.
+fn hci_interface(dev: *mut Device) -> Option<(u8, HciEndpoints, u8)> {
     let mut cfg: *mut ConfigDescriptor = std::ptr::null_mut();
     // SAFETY: `dev` is a valid device from the caller's live list; `cfg` is
     // a live out-pointer.
     if unsafe { libusb_get_active_config_descriptor(dev, &mut cfg) } < 0 || cfg.is_null() {
-        return None;
+        cfg = std::ptr::null_mut();
+        // SAFETY: as above; index 0 is the first configuration descriptor.
+        if unsafe { libusb_get_config_descriptor(dev, 0, &mut cfg) } < 0 || cfg.is_null() {
+            return None;
+        }
     }
     let mut result = None;
     // SAFETY: libusb filled `cfg` with `b_num_interfaces` interfaces, each
@@ -400,7 +428,7 @@ fn hci_interface(dev: *mut Device) -> Option<(u8, HciEndpoints)> {
                 .map(|e| Endpoint { address: e.b_endpoint_address, attributes: e.bm_attributes, max_packet: e.w_max_packet_size })
                 .collect();
             if let Some(e) = usb::pick_endpoints(&eps) {
-                result = Some((alt.b_interface_number, e));
+                result = Some((alt.b_interface_number, e, c.b_configuration_value));
                 break;
             }
         }

@@ -410,6 +410,12 @@ enum OpCode : 16 {
   // controller for test purposes.
   ROOTCANAL_OPCODE = 0xFC01,
 
+  // Zephyr's HCI controllers (company 0x05F1): Read Static Addresses, a
+  // read-only vendor command answering the chip's factory-random static
+  // address, for controllers that have no public address (Vinculum change,
+  // see CHANGES.md).
+  ZEPHYR_READ_STATIC_ADDRESSES = 0xFC09,
+
   // MSFT_OPCODE_xxxx below is needed for the tests.
   MSFT_OPCODE_INTEL = 0xFC1E,
   INTEL_DDC_CONFIG_READ = 0xFC8C,
@@ -7034,4 +7040,19 @@ packet ControllerDebugInfoEvent : VendorSpecificEvent (subevent_code = CONTROLLE
   last_block : 8,
   _size_(debug_data) : 16,
   debug_data : 8[],
+}
+
+// Vinculum: Zephyr vendor command (see CHANGES.md).
+struct ZephyrStaticAddress {
+  address : Address,
+  identity_root : 8[16],
+}
+
+packet ZephyrReadStaticAddresses : Command (op_code = ZEPHYR_READ_STATIC_ADDRESSES) {
+}
+
+packet ZephyrReadStaticAddressesComplete : CommandComplete (command_op_code = ZEPHYR_READ_STATIC_ADDRESSES) {
+  status : ErrorCode,
+  _count_(addresses) : 8,
+  addresses : ZephyrStaticAddress[],
 }

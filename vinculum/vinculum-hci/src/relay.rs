@@ -26,6 +26,9 @@ pub struct Relay {
     /// from the controller up to that Reset's completion is the old
     /// session's and is dropped, and no new host is accepted until then.
     pub resetting: bool,
+    /// The manufacturer the controller reported in Read Local Version
+    /// (picks which vendor commands the allowlist passes).
+    pub manufacturer: Option<u16>,
 }
 
 /// HCI_Reset as H4 bytes.
@@ -71,6 +74,13 @@ impl Relay {
                 self.dropped += 1;
                 continue;
             }
+            // Command Complete for Read Local Version (0x1001), success:
+            // code, len, credits, opcode(2), status, hci_ver, hci_rev(2),
+            // lmp_ver, manufacturer(2).
+            let p = &f.packet;
+            if f.kind == Kind::Event && p.len() >= 13 && p[0] == 0x0E && p[3..5] == [0x01, 0x10] && p[5] == 0 {
+                self.manufacturer = Some(u16::from_le_bytes([p[10], p[11]]));
+            }
             out.push(Out::ToHost(f.to_bytes()));
         }
         Ok(())
@@ -83,7 +93,7 @@ impl Relay {
             match f.kind {
                 Kind::Command => {
                     let opcode = u16::from_le_bytes([f.packet[0], f.packet[1]]);
-                    if allow::allowed(opcode) {
+                    if allow::allowed(opcode, self.manufacturer) {
                         out.push(Out::ToController(f.to_bytes()));
                     } else {
                         self.refused += 1;

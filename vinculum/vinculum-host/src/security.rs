@@ -68,9 +68,10 @@ impl Host {
             return Ok(());
         }
         // SMP addresses: 6 bytes little-endian, then the type (§2.2.7).
-        let a = smp_addr(own, false);
+        let a = smp_addr(own, self.info.address_random);
         let b = smp_addr(conn.peer.address, conn.peer.random);
-        let local_identity = (0u8, a[..6].try_into().expect("6"));
+        // Our identity: the public address, or the static random one (type 1).
+        let local_identity = (self.info.address_random as u8, a[..6].try_into().expect("6"));
         let (init, actions) = Initiator::start(Config { io_cap: cfg.io_cap, local_irk: cfg.irk, local_identity }, a, b, now_ms);
         self.conns.get_mut(&handle).expect("present").smp = Some(init);
         self.smp_actions(handle, actions);
