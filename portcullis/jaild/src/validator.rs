@@ -42,7 +42,9 @@ pub fn validate_create(
     validate_mlock(req, policy)?;
     validate_tessera_keys(req, policy)?;
     for m in &req.mounts {
-        if !is_app_socket_mount(req, m, policy) && !is_class_mount(req, m, policy) {
+        if is_owned_mount(m, policy) {
+            validate_owned_mount(m, req.exec.as_ref())?;
+        } else if !is_app_socket_mount(req, m, policy) && !is_class_mount(req, m, policy) {
             validate_mount(m, policy)?;
         }
         validate_tmpfs_owner(m, req.exec.as_ref())?;
@@ -722,6 +724,27 @@ fn validate_children_max(n: u32, policy: &Policy) -> Result<(), JaildError> {
 /// else: a manifest must not hand a scratch directory to some other account.
 /// The mode is permission bits only (no setuid/setgid), and a world-writable
 /// one must be sticky, as /tmp is.
+/// A read-write mount of a folder only its own app may have
+/// (`rw_owned_patterns`).
+fn is_owned_mount(m: &MountSpec, policy: &Policy) -> bool {
+    m.kind == MountKind::RwNullfs && !m.source.contains("..")
+        && policy.mount_sources.rw_owned_patterns.iter().any(|pat| matches_glob(pat, &m.source))
+}
+
+/// The folder is a directory of the jail's own exec uid: one app's data
+/// never lands in a jail that runs as anyone else.
+fn validate_owned_mount(m: &MountSpec, exec: Option<&ExecSpec>) -> Result<(), JaildError> {
+    use std::os::unix::fs::MetadataExt;
+    let bad = |detail: String| Err(JaildError::PolicyViolation { rule: "mount.source.not_owned", detail });
+    let Some(e) = exec else { return bad(format!("{:?}: an owned folder goes only to a jail with an exec uid", m.source)) };
+    match std::fs::symlink_metadata(&m.source) {
+        Ok(md) if md.is_dir() && md.uid() == e.uid && e.uid != 0 => Ok(()),
+        Ok(md) => bad(format!("{:?} is uid {}'s {}, not the jail's uid {}'s folder", m.source, md.uid(),
+                              if md.file_type().is_symlink() { "link" } else if md.is_dir() { "folder" } else { "file" }, e.uid)),
+        Err(err) => bad(format!("{:?}: {err}", m.source)),
+    }
+}
+
 fn validate_tmpfs_owner(m: &MountSpec, exec: Option<&ExecSpec>) -> Result<(), JaildError> {
     let Some(o) = m.owner else { return Ok(()) };
     let bad = |rule: &'static str, detail: String| Err(JaildError::PolicyViolation { rule, detail });
@@ -1282,18 +1305,33 @@ mod tests {
     }
 
     #[test]
-    fn a_settings_pane_mounts_one_apps_data_and_nothing_wider() {
+    fn an_apps_pane_data_goes_only_to_a_jail_of_its_own_uid() {
+        use std::os::unix::fs::MetadataExt;
         let p = load_sample_policy();
-        let rw = |source: &str| validate_mount(&MountSpec { noexec: true, source: source.into(), dest: "/app-data".into(),
-            kind: MountKind::RwNullfs, size_mb: None, owner: None }, &p);
-        for ok in ["/usr/home/ana/.atrium/apps/org.atrium.navigator", "/home/ana/.atrium/persona-apps/work/org.atrium.navigator"] {
-            rw(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        let m = |source: &str| MountSpec { noexec: true, source: source.into(), dest: "/app-data".into(),
+            kind: MountKind::RwNullfs, size_mb: None, owner: None };
+        assert!(is_owned_mount(&m("/usr/home/ana/.atrium/apps/.pane-data/org.atrium.navigator"), &p));
+        assert!(is_owned_mount(&m("/home/ana/.atrium/persona-apps/work/.pane-data/org.atrium.navigator"), &p));
+        for no in ["/usr/home/ana/.atrium/apps/org.atrium.navigator", "/usr/home/ana/.atrium/apps/.pane-data",
+                   "/usr/home/ana/.atrium/apps/.pane-data/x/y", "/usr/home/ana/.atrium/apps/.pane-data/.."] {
+            assert!(!is_owned_mount(&m(no), &p), "{no}");
+            assert!(validate_mount(&m(no), &p).is_err(), "{no}: not an ordinary rw source either");
         }
-        for no in ["/usr/home/ana/.atrium/apps", "/usr/home/ana/.atrium/persona-apps/work",
-                   "/usr/home/ana/.atrium/apps/org.atrium.navigator/var", "/usr/home/ana/.atrium/apps/..",
-                   "/usr/home/ana/.atrium/keys"] {
-            assert!(rw(no).is_err(), "{no}");
-        }
+        let d = std::env::temp_dir().join(format!("jaild-owned-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let me = std::fs::metadata(&d).unwrap().uid();
+        let exec = |uid| ExecSpec { cwd: None, groups: vec![], path: "/x".into(), argv: vec![], env: vec![], uid, gid: uid,
+                                    stdio: false, listen: Vec::new(), ready: false };
+        let src = m(d.to_str().unwrap());
+        if me != 0 { assert!(validate_owned_mount(&src, Some(&exec(me))).is_ok()); }
+        assert!(validate_owned_mount(&src, Some(&exec(me + 1))).is_err(), "another uid's folder");
+        assert!(validate_owned_mount(&src, None).is_err());
+        let link = d.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&d, &link).unwrap();
+        assert!(validate_owned_mount(&m(link.to_str().unwrap()), Some(&exec(me))).is_err(), "a link");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

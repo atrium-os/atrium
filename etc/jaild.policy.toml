@@ -161,15 +161,6 @@ rw_patterns = [
     "/root/.atrium/persona-apps/*/.fasti/*",
     "/var/run/atrium/fasti/*",
 
-    # An app's own data in one persona (its overlay), read-write at
-    # /app-data in that app's settings pane, which runs as the app's own
-    # uid (curia.md §15; portcullisd's ExecSettingsPane).
-    "/usr/home/*/.atrium/apps/*",
-    "/usr/home/*/.atrium/persona-apps/*/*",
-    "/home/*/.atrium/apps/*",
-    "/home/*/.atrium/persona-apps/*/*",
-    "/root/.atrium/apps/*",
-    "/root/.atrium/persona-apps/*/*",
 
     # A folder of a USB stick granted into an app's jail: dispensatord's
     # FUSE mount of the stick's own server (device-assignment.md §4.8).
@@ -192,6 +183,17 @@ rw_patterns = [
 
     # Per-user persistent state under Atrium control (db, prefs).
     "/var/db/atrium/users/*",
+]
+
+# One app's settings-pane data (curia.md §15), mounted only into a jail
+# that runs as the folder's own uid: that app's, or its pane's.
+rw_owned_patterns = [
+    "/usr/home/*/.atrium/apps/.pane-data/*",
+    "/usr/home/*/.atrium/persona-apps/*/.pane-data/*",
+    "/home/*/.atrium/apps/.pane-data/*",
+    "/home/*/.atrium/persona-apps/*/.pane-data/*",
+    "/root/.atrium/apps/.pane-data/*",
+    "/root/.atrium/persona-apps/*/.pane-data/*",
 ]
 
 # Prefix-match subtrees for atrium-volumes-managed allocation

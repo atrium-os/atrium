@@ -5,8 +5,9 @@
 //!
 //! limend starts it for Settings (`REQUEST_APP_SETTINGS`), and portcullisd
 //! runs it as the Navigator's own uid in the persona Settings named, with
-//! that persona's Navigator data at `ATRIUM_PANE_DATA` and nothing else of
-//! the Navigator's. It reads the store directory from the bundle's
+//! that persona's Navigator pane data (its `[roles.app-settings] data`,
+//! which the Navigator has at `ATRIUM_PANE_DATA_FOR`) at `ATRIUM_PANE_DATA`
+//! and nothing else of the Navigator's. It reads the store directory from the bundle's
 //! `etc/navigatord.conf` (`NAVIGATORD_STORE`), as navigatord does, and
 //! changes the list through the same crate, so a revoke here reaches every
 //! Navigator window of the persona at once. A revoke takes something away,
@@ -39,11 +40,11 @@ const PER_PAGE: usize = 6;
 const REREAD: Duration = Duration::from_secs(2);
 
 /// The list's file: `NAVIGATORD_STORE` from navigatord's settings (later
-/// lines win; blank is unset), an absolute path in the Navigator's jail,
-/// found under `data`, where the pane sees that jail's own files. `None`
-/// for no store (navigatord keeps the list in memory) or a path that
-/// would leave `data`.
-fn list_file(conf: &str, data: &Path) -> Option<PathBuf> {
+/// lines win; blank is unset), an absolute path in the Navigator's jail
+/// under `data_for`, the pane data folder as the Navigator has it, found
+/// under `data`, where the pane has it. `None` for no store (navigatord
+/// keeps the list in memory) or one outside the pane data.
+fn list_file(conf: &str, data: &Path, data_for: &Path) -> Option<PathBuf> {
     let store = conf.lines().map(str::trim).filter(|l| !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .filter(|(k, _)| k.trim() == "NAVIGATORD_STORE")
@@ -53,7 +54,7 @@ fn list_file(conf: &str, data: &Path) -> Option<PathBuf> {
     if parts.next() != Some(Component::RootDir) || !parts.all(|c| matches!(c, Component::Normal(_))) {
         return None;
     }
-    Some(data.join(store.strip_prefix("/").ok()?).join("live-origins"))
+    Some(data.join(store.strip_prefix(data_for).ok()?).join("live-origins"))
 }
 
 /// What the pane shows: an origin without its `https://`.
@@ -158,7 +159,7 @@ fn die(why: impl std::fmt::Display) -> ! {
 fn read(list: &Option<Remembered>) -> Result<Vec<String>, String> {
     match list {
         Some(r) => Ok(r.list()),
-        None => Err("Navigator keeps this list only while it runs.".into()),
+        None => Err("Navigator keeps this list only while it runs, so there is none here.".into()),
     }
 }
 
@@ -173,10 +174,11 @@ fn main() {
         }
     };
     let data = std::env::var_os("ATRIUM_PANE_DATA").map(PathBuf::from).unwrap_or_else(|| die("no ATRIUM_PANE_DATA"));
+    let data_for = std::env::var_os("ATRIUM_PANE_DATA_FOR").map(PathBuf::from).unwrap_or_else(|| die("no ATRIUM_PANE_DATA_FOR"));
     // The bundle is the jail's root: navigatord.conf is beside bin/.
     let conf = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.join("etc/navigatord.conf")))
         .and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    let mut list = list_file(&conf, &data).map(|f| Remembered::new(Some(f)));
+    let mut list = list_file(&conf, &data, &data_for).map(|f| Remembered::new(Some(f)));
     let conn = fresco_client::Connection::wrap(fresco).unwrap_or_else(|e| die(format_args!("frescod: {e}")));
     let desc = WindowDesc {
         hints: fresco_protocol::WindowHints { embed_pending: true, server_decorations: Some(false), ..Default::default() },
@@ -248,14 +250,16 @@ mod tests {
     #[test]
     fn the_list_is_where_navigatord_keeps_it_under_the_apps_data() {
         let data = Path::new("/app-data");
-        let at = |conf: &str| list_file(conf, data);
-        assert_eq!(at("NAVIGATORD_STORE=/var/db/navigatord/store\n"), Some(PathBuf::from("/app-data/var/db/navigatord/store/live-origins")));
-        assert_eq!(at("# c\nNAVIGATORD_STORE = /a\nNAVIGATORD_STORE=/b\n"), Some(PathBuf::from("/app-data/b/live-origins")), "the later line");
+        let at = |conf: &str| list_file(conf, data, Path::new("/var/db/navigatord"));
+        assert_eq!(at("NAVIGATORD_STORE=/var/db/navigatord/store\n"), Some(PathBuf::from("/app-data/store/live-origins")));
+        assert_eq!(at("# c\nNAVIGATORD_STORE = /a\nNAVIGATORD_STORE=/var/db/navigatord/b\n"), Some(PathBuf::from("/app-data/b/live-origins")), "the later line");
+        assert_eq!(at("NAVIGATORD_STORE=/var/db/other/store\n"), None, "outside the pane data");
+        assert_eq!(at("NAVIGATORD_STORE=/var/db/navigatord-x/store\n"), None, "a name that only starts the same");
         assert_eq!(at("NAVIGATORD_STORE=\n"), None, "blank is unset: kept in memory");
         assert_eq!(at("NAVIGATORD_PRERENDER=/x\n"), None);
         assert_eq!(at("NAVIGATORD_STORE=relative/store\n"), None);
         assert_eq!(at("NAVIGATORD_STORE=/var/../../etc\n"), None, "nothing outside the app's data");
-        assert_eq!(at("NAVIGATORD_STORE=/var/./db\n").is_some(), true, "a `.` std drops is harmless");
+        assert_eq!(at("NAVIGATORD_STORE=/var/db/./navigatord/s\n").is_some(), true, "a `.` std drops is harmless");
     }
 
     #[test]

@@ -498,13 +498,13 @@ list in Navigator only or the chip alone. Build order:
 ### 15.1 As built (2026-11-25)
 
 Steps 1 to 5 are on main. The VM check is
-`scripts/navigator-settings-pane-check.sh PERSON [PERSONA]` (18 checks). It
+`scripts/navigator-settings-pane-check.sh PERSON [PERSONA]` (19 checks). It
 runs while someone opens the pane in Settings and presses Ask again, and
 has not been run yet.
 
 - **The list's crate.** `navigator-live-origins` holds the parser and the
-  lock for navigatord and the pane. The pane sees the Navigator's data
-  through a nullfs mount of its own. A rename made through the app's
+  lock for navigatord and the pane. The pane sees the Navigator's pane data
+  through a nullfs mount of its own, and navigatord through another. A rename made through the app's
   unionfs may not reach a name the other view has already looked up, so
   the file is changed in place, never replaced. A change holds an
   exclusive flock on the file itself, and a read holds a shared one. A
@@ -523,9 +523,27 @@ has not been run yet.
   - `Launcher::launch_settings` sends portcullisd `ExecSettingsPane`.
   - Covered by the daemon test
     `only_settings_opens_an_apps_own_pane_and_the_launcher_decides_the_persona`.
-- **The manifest.** `[roles.app-settings] entry = "bin/..."` must come
-  with `"app-settings"` in `implements`. The entry is checked like a
-  worker's and may not be the app's own entry.
+- **The manifest.** `[roles.app-settings] entry = "bin/..."` and `data =
+  "var/db/..."` must come with `"app-settings"` in `implements`. The entry
+  is checked like a worker's and may not be the app's own entry. `data` is
+  1 to 8 plain names, not under `dev/` or `atrium/`, and the bundle may
+  have nothing at that path.
+- **Pane data, never the overlay (review, 2026-11-25).** The overlay's
+  upper layer is the app uid's from its root, and the next launch unions
+  it over the signed bundle. A pane given the upper could write `bin/...`
+  or a whiteout and replace or hide the app's own code. So the folder a
+  pane works on lives in the persona's key group at
+  `~/.atrium/apps/.pane-data/<app>` (or `persona-apps/<p>/...`): the
+  parents are root's 0700, the folder is the app uid's 0700
+  (`portcullisd::pane`).
+  - The app's own launch mounts the folder rw, nosuid and noexec at
+    `data` in its jail, over the overlay, and refuses a link on the way.
+  - On a machine that ran the app before, what the overlay held at that
+    path is hidden from then on. The Navigator's store restarts empty,
+    which only matters on dev VMs.
+  - jaild allows these sources only under `rw_owned_patterns`, and only
+    into a jail whose exec uid owns the folder (a directory, not a link).
+    One app's data never lands in another's jail.
 - **portcullisd's `ExecSettingsPane { app_id, instance, serves, persona }`.**
   - It is refused unless all of these hold:
     - the caller is `_limen`;
@@ -538,15 +556,15 @@ has not been run yet.
   - The one-shot lane's `Spec::pane` then runs it this way:
     - `as_pane` swaps in the pane's entry and clears every capability,
       the workers and the setup;
-    - the overlay is mounted read-write and noexec at `/app-data`
-      (`ATRIUM_PANE_DATA`);
+    - the pane data folder is mounted read-write and noexec at
+      `/app-data` (`ATRIUM_PANE_DATA`), and the pane is told where the app
+      has it (`ATRIUM_PANE_DATA_FOR`, `/` + `data`);
     - memory is 256 MiB;
     - the answer is `ReadyForFdsAs` with the app's uid.
-  - jaild's policy allows exactly one app's overlay as an rw source:
-    `~/.atrium/apps/*` and `~/.atrium/persona-apps/*/*`.
-- **The Navigator's pane.** `navigator-settings` reads `NAVIGATORD_STORE`
-  from the bundle's `etc/navigatord.conf`. The path must be absolute,
-  with nothing but plain components, and is found under
+- **The Navigator's pane.** Its `data` is `var/db/navigatord`.
+  `navigator-settings` reads `NAVIGATORD_STORE` from the bundle's
+  `etc/navigatord.conf`. The path must be absolute, with nothing but plain
+  components, and under `ATRIUM_PANE_DATA_FOR`; it is found under
   `ATRIUM_PANE_DATA`. The pane shows the list newest first, six to a
   page, re-read every 2 s. Each row has "Ask again", and there is "Ask
   again for every site". With no store, it says the list lives only
@@ -561,3 +579,9 @@ has not been run yet.
   - Leaving the page closes the pane. If the child is lost or limend
     goes, the pane returns to the list with a note under the row.
   - Curia's manifest `embeds` gains `app-settings`.
+- **Which persona's pane Settings opens.** Settings runs once per person,
+  and the person may open an app's pane for any of their own personas, as
+  the Apps and Personas pages already span them. So a Settings window can
+  show Work's remembered sites while Personal is in front. That is the
+  decision: settings are the person's to manage across their personas.
+  Nothing crosses into an app: the pane runs in the persona it shows.

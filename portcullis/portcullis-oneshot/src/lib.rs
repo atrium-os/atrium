@@ -96,9 +96,9 @@ pub struct Spec {
     pub worker: Option<String>,
     /// ★ The app's settings pane (curia.md §15): run `[roles.app-settings]
     /// entry` in place of the app's, with NO capability of the app's, and
-    /// this folder (the app's data in one persona, its overlay) mounted
-    /// read-write at [`PANE_DATA`]. Set only by portcullisd, for limend,
-    /// for the settings app.
+    /// this folder (the app's pane data in one persona, never its overlay)
+    /// mounted read-write at [`PANE_DATA`]. Set only by portcullisd, for
+    /// limend, for the settings app.
     pub pane: Option<PathBuf>,
     /// The caller's persona's route domain (vpn.md §5.4, V2): a networked
     /// worker's epair goes in this routing table, as its caller's does, so a
@@ -264,8 +264,10 @@ pub const PANE_DATA: &str = "/app-data";
 /// capability, the app's `[resources]` but its storage, and no workers or
 /// setup. What the jail is built from, after the signature check of the
 /// whole bundle (the entry is in the same signed tree).
-pub fn as_pane(m: &mut portcullis_toml::Manifest) -> Result<(), String> {
-    let Some(entry) = m.roles.as_ref().and_then(|r| r.app_settings.as_ref()).map(|s| s.entry.clone()) else {
+/// Returns where the app itself has the pane's data (`data`, made
+/// absolute), which the pane is told as `ATRIUM_PANE_DATA_FOR`.
+pub fn as_pane(m: &mut portcullis_toml::Manifest) -> Result<String, String> {
+    let Some((entry, data)) = m.roles.as_ref().and_then(|r| r.app_settings.as_ref()).map(|s| (s.entry.clone(), s.data.clone())) else {
         return Err(format!("{} has no [roles.app-settings]", m.app.id));
     };
     m.app.entry = entry;
@@ -275,7 +277,7 @@ pub fn as_pane(m: &mut portcullis_toml::Manifest) -> Result<(), String> {
     m.setup = None;
     m.supervision = None;
     m.workers.clear();
-    Ok(())
+    Ok(format!("/{data}"))
 }
 
 pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
@@ -351,9 +353,13 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     if let Some(name) = &spec.worker {
         if let Err(e) = as_worker(&mut manifest, name) { return OneShot::Refused(e) }
     }
+    let mut pane_for = None;
     if spec.pane.is_some() {
         if spec.worker.is_some() { return OneShot::Refused("a worker or a pane, not both".into()) }
-        if let Err(e) = as_pane(&mut manifest) { return OneShot::Refused(e) }
+        match as_pane(&mut manifest) {
+            Ok(at) => pane_for = Some(at),
+            Err(e) => return OneShot::Refused(e),
+        }
     }
 
     // ★ The jaild-lane name: jaild-valid by construction, and the last
@@ -526,6 +532,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
             env:   clean_env(&pw).into_iter().chain(spec.extra_env.iter()
                        .map(|(k, v)| jaild::protocol::EnvPair { key: k.clone(), value: v.clone() }))
                        .chain(spec.pane.as_ref().map(|_| jaild::protocol::EnvPair { key: "ATRIUM_PANE_DATA".into(), value: PANE_DATA.into() }))
+                       .chain(pane_for.map(|at| jaild::protocol::EnvPair { key: "ATRIUM_PANE_DATA_FOR".into(), value: at }))
                        .collect(),
             uid:   pw.uid,
             gid:   pw.gid,
@@ -1071,14 +1078,14 @@ mod pane_tests {
                     [bundle]\nentry = \"bin/web\"\n\
                     [capabilities]\nnetwork = \"full\"\ngraphics = \"window\"\n\
                     [resources]\nmemory = \"1G\"\nstorage = \"2G\"\n\
-                    [roles]\nimplements = [\"app-settings\"]\n[roles.app-settings]\nentry = \"bin/web-settings\"\n";
+                    [roles]\nimplements = [\"app-settings\"]\n[roles.app-settings]\nentry = \"bin/web-settings\"\ndata = \"var/db/web\"\n";
         let mut m = portcullis_toml::Manifest::from_str(text).unwrap();
-        super::as_pane(&mut m).unwrap();
+        assert_eq!(super::as_pane(&mut m).unwrap(), "/var/db/web");
         assert_eq!(m.entry(), "bin/web-settings");
         assert!(m.capabilities.network.is_none() && m.capabilities.graphics.is_none());
         let r = m.resources.as_ref().unwrap();
         assert_eq!((r.memory.as_deref(), r.storage.as_deref()), (Some("1G"), None));
-        let mut none = portcullis_toml::Manifest::from_str(&text.replace("\"app-settings\"", "").replace("[roles.app-settings]\nentry = \"bin/web-settings\"\n", "")).unwrap();
+        let mut none = portcullis_toml::Manifest::from_str(&text.replace("\"app-settings\"", "").replace("[roles.app-settings]\nentry = \"bin/web-settings\"\ndata = \"var/db/web\"\n", "")).unwrap();
         assert!(super::as_pane(&mut none).is_err(), "no pane, nothing run");
     }
 }

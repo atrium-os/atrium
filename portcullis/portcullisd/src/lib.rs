@@ -25,6 +25,7 @@ pub mod crossing;
 pub mod links;
 pub mod listeners;
 pub mod opens;
+pub mod pane;
 pub mod persona_colours;
 pub mod persona_last;
 pub mod portal;

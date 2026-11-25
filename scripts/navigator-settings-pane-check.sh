@@ -26,27 +26,35 @@ app=org.atrium.navigator
 bundle=/var/lib/atrium/apps/$app
 registry=/var/run/atrium/app-registry
 wait_s=${WAIT:-180}
-gate_begin navigator-settings-pane 18
+gate_begin navigator-settings-pane 19
 
 home=$(pw usershow -n "$person" 2>/dev/null | cut -d: -f9)
 [ -n "$home" ] || gate_abort "no user $person"
 if [ "$persona" = personal ]; then
-    overlay=$home/.atrium/apps/$app
+    apps=$home/.atrium/apps
     uid=$(awk -v p="$person" -v a="$app" '$2 == p && $3 == a && $0 !~ / persona=/ && $0 !~ / document=/ { u = $1 } END { print u }' "$registry")
 else
-    overlay=$home/.atrium/persona-apps/$persona/$app
+    apps=$home/.atrium/persona-apps/$persona
     uid=$(awk -v p="$person" -v a="$app" -v s=" persona=$persona" '$2 == p && $3 == a && index($0, s) && $0 !~ / document=/ { u = $1 } END { print u }' "$registry")
 fi
 [ -n "$uid" ] || gate_abort "the Navigator has no uid for $person in $persona: launch it there once"
+overlay=$apps/$app
+paned=$apps/.pane-data/$app
+data_for=/$(sed -n 's/^data *= *"\(.*\)"$/\1/p' "$bundle/atrium.toml" | head -n 1)
 store=$(sed -n 's/^NAVIGATORD_STORE *= *//p' "$bundle/etc/navigatord.conf" | tail -n 1)
 [ -n "$store" ] || gate_abort "no NAVIGATORD_STORE in $bundle/etc/navigatord.conf: the list lives in memory"
+case "$store" in "$data_for"/*) ;; *) gate_abort "NAVIGATORD_STORE $store is not under the pane data $data_for" ;; esac
 [ -x "$bundle/bin/navigator-settings" ] || gate_abort "the bundle has no bin/navigator-settings"
-list=$overlay$store/live-origins
+[ -d "$paned" ] || gate_abort "no $paned: launch the Navigator in $persona once with this bundle"
+list=$paned${store#"$data_for"}/live-origins
 echo "the list: $list (uid $uid)"
 
 if [ ! -s "$list" ]; then
-    su -m "$(id -nu "$uid")" -c "umask 077; mkdir -p '$(dirname "$list")' && printf 'https://a.example\nhttps://b.example\nhttps://c.example:8443\n' > '$list'" \
-        || gate_abort "couldn't write the list as uid $uid"
+    # As root, then the Navigator's: .pane-data is root's alone.
+    d=$(dirname "$list")
+    (mkdir -p "$d" && chown -R "$uid:$uid" "$paned" && chmod 700 "$d" \
+        && printf 'https://a.example\nhttps://b.example\nhttps://c.example:8443\n' > "$list" \
+        && chown "$uid:$uid" "$list" && chmod 600 "$list") || gate_abort "couldn't write the list for uid $uid"
 fi
 lines() { n=$(grep -c . "$list" 2>/dev/null); echo "${n:-0}"; }
 inode=$(stat -f %i "$list")
@@ -84,11 +92,12 @@ check "no IPv4 or IPv6" "ip4=disable ip6=disable" "$(jls -j "$jid" -n ip4 ip6 | 
 check "ATRIUM_PANE_DATA is /app-data" 1 "$(procstat -e "$pid" | tr ' ' '\n' | grep -cx 'ATRIUM_PANE_DATA=/app-data')"
 mounts=$(mount -p | awk -v r="$path/" 'index($2, r) == 1 { print $1, $2, $3, $4 }')
 echo "$mounts" | sed 's/^/    /'
-check "the Navigator's data at /app-data, read-write" 1 \
-    "$(echo "$mounts" | awk -v s="$overlay" -v d="$path/app-data" '$1 == s && $2 == d && $3 == "nullfs" && $4 !~ /(^|,)ro(,|$)/' | grep -c .)"
+check "the Navigator's pane data at /app-data, read-write" 1 \
+    "$(echo "$mounts" | awk -v s="$paned" -v d="$path/app-data" '$1 == s && $2 == d && $3 == "nullfs" && $4 !~ /(^|,)ro(,|$)/' | grep -c .)"
+check "its overlay in no mount of the pane's" 0 "$(echo "$mounts" | awk -v o="$overlay" 'index($1, o) == 1' | grep -c .)"
 check "/app-data is noexec" 1 "$(echo "$mounts" | awk -v d="$path/app-data" '$2 == d && $4 ~ /noexec/' | grep -c .)"
 check "no service socket in its jail" 0 "$(echo "$mounts" | grep -c '/atrium/sockets\|/var/run')"
-check "nothing else of the person's in its jail" 0 "$(echo "$mounts" | awk -v h="$home" -v s="$overlay" 'index($1, h) == 1 && $1 != s' | grep -c .)"
+check "nothing else of the person's in its jail" 0 "$(echo "$mounts" | awk -v h="$home" -v s="$paned" 'index($1, h) == 1 && $1 != s' | grep -c .)"
 check "memoryuse at 256 MiB" 1 "$(rctl "jail:$name" | grep -c ':memoryuse:sigkill=268435456$')"
 
 echo ">>> Press Ask again on one site"
