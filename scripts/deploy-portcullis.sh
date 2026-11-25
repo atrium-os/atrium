@@ -164,9 +164,25 @@ g 'id _volumes-vk >/dev/null 2>&1 || pw useradd _volumes-vk -u 65053 -d /nonexis
 # (portcullis.md §6.5.2e′ snags). ALLOW_RCTL=true|false sets it explicitly.
 tmpd=$(mktemp -d "${TMPDIR:-/tmp}/deploy-portcullis.XXXXXX")
 if g 'cat /etc/atrium/jaild.policy.toml' > "$tmpd/live.toml" 2>/dev/null; then live="$tmpd/live.toml"; else live=-; fi
+# ★ plain_app_data (mail.md §6.4a A1): portcullisd refuses every app launch
+# whose data the kernel doesn't report in an open key group, unless this is
+# true. This script deploys to dev VMs, so it defaults to true; the target's
+# own value survives a deploy, and PLAIN_APP_DATA=true|false sets it. It is
+# ignored wherever the kernel reports key groups, so it never unseals a
+# machine that has them.
+case "${PLAIN_APP_DATA:-}" in
+    true|false) plain=$PLAIN_APP_DATA ;;
+    '') plain=$(g 'sed -nE "s/^[[:space:]]*plain_app_data[[:space:]]*=[[:space:]]*(true|false).*/\\1/p" /etc/atrium/volumes.policy.toml' 2>/dev/null | head -1)
+        [ -n "$plain" ] || plain=true ;;
+    *) echo "PLAIN_APP_DATA must be true or false, not '$PLAIN_APP_DATA'" >&2; exit 2 ;;
+esac
+# A top-level key goes before the first table.
+awk -v plain="$plain" '!done && /^\[/ { print "plain_app_data = " plain "\n"; done = 1 } { print }' \
+    "$BSD/etc/volumes.policy.toml" > "$tmpd/volumes.policy.toml"
+echo "  plain_app_data = $plain"
 if sh "$BSD/scripts/jaild-policy-merge.sh" "$BSD/etc/jaild.policy.toml" "$live" \
         > "$tmpd/jaild.policy.toml" 2> "$tmpd/merge.log" \
-   && scp $SSHOPT -P 2222 "$tmpd/jaild.policy.toml" "$BSD/etc/volumes.policy.toml" \
+   && scp $SSHOPT -P 2222 "$tmpd/jaild.policy.toml" "$tmpd/volumes.policy.toml" \
         root@localhost:/etc/atrium/ >/dev/null 2>&1; then
     echo "  policies ok ($(sed 's/^jaild-policy-merge: //' "$tmpd/merge.log"))"
 else

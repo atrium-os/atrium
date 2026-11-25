@@ -599,6 +599,7 @@ fn launch_inner(
         owner: user.to_string(), app_id: app_id.to_string(), debug: debug.is_some(),
         uid: app_uid, user: run_as_user.clone(), home: user_home.clone(), args: Vec::new(),
         syscall_class: portcullis_jail::sysfil_class(&manifest.capabilities),
+        app_data: None,
     };
     let debug_tree = match &debug {
         Some(_) => Some(debug_tree().map_err(|e| LaunchError::Failed("debug", e))?),
@@ -657,8 +658,8 @@ fn launch_inner(
             .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
         // The person's app data in their key group (E6), before it mounts.
         if portcullis_overlay::home_of(user).is_some() {
-            portcullisd::home::ensure_app_data(user, persona)
-                .map_err(|m| LaunchError::Failed("app data", m))?;
+            app_run.app_data = Some(portcullisd::home::ensure_app_data(user, persona)
+                .map_err(|m| LaunchError::Failed("app data", m))?);
         }
         // The person's own overlay, in their home (homes.md §3).
         let place = match persona {
@@ -1240,10 +1241,14 @@ pub struct AppRun {
     pub args:   Vec<String>,
     /// The manifest's system call class; jaild resolves it again.
     pub syscall_class: String,
+    /// What the kernel said about the app's data folder (mail.md §6.4a
+    /// A2), passed on as `ATRIUM_APP_DATA`; `None` for a jail with no
+    /// persistent app data (a workbook's tmpfs layer).
+    pub app_data: Option<portcullisd::home::AppData>,
 }
 
 /// The entry's whole environment: the account's HOME, SHELL and USER, a
-/// PATH, and the caller's TERM.
+/// PATH, the caller's TERM, and ATRIUM_APP_DATA (`sealed` or `plain`).
 fn clean_env(run: &AppRun) -> Vec<jaild::protocol::EnvPair> {
     let pair = |k: &str, v: String| jaild::protocol::EnvPair { key: k.into(), value: v };
     let shell = account_shell(&run.user).unwrap_or_else(|| "/bin/sh".into());
@@ -1255,6 +1260,9 @@ fn clean_env(run: &AppRun) -> Vec<jaild::protocol::EnvPair> {
     ];
     if let Ok(t) = std::env::var("TERM") {
         env.push(pair("TERM", t));
+    }
+    if let Some(d) = run.app_data {
+        env.push(pair("ATRIUM_APP_DATA", d.env_value().into()));
     }
     env
 }

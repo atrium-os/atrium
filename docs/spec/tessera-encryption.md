@@ -1036,10 +1036,23 @@ A part of `~/.atrium` is asked for each time something is about to use
 it, which also loads the key after a login. A part with an overlay still
 mounted (a system upgraded without a reboot) waits, plain, and moves in at
 the first ask after it is unmounted, at the latest after the next logout.
-Any other trouble (no atrium-volumes, an Arca that is locked before the
-group was ever made) leaves the data plain and the launch goes on, as
-before E6; a part that should be encrypted and isn't is refused and the
-launch fails. A removed persona's `persona-apps/<persona>` goes with its
+Every other outcome refuses the launch (mail.md §6.4a A1, accepted
+2026-11-25): no atrium-volumes, an error or unexpected answer, or
+`encrypted: false`. After atrium-volumes answers, portcullisd asks the
+kernel (`TESSERA_IOC_GROUP_INFO`, opened `O_DIRECTORY | O_NOFOLLOW`) about
+each app data folder, and the launch goes on sealed only if every one is
+in a key group that is open and not bad. Plain is allowed in two cases
+only: `plain_app_data = true` in `/etc/atrium/volumes.policy.toml` on a
+machine where the kernel reports no key group on any of the person's app
+data folders (dev VMs; ignored, and logged, otherwise), and Personal's one
+login while atrium-volumes reports folders `waiting` (spent at logout,
+recorded in `/var/db/atrium/plain-app-data/<person>`). A named persona
+never runs plain under the migration allowance. portcullisd tells the app
+which it was (`ATRIUM_APP_DATA`, portcullis.md "App data fails closed").
+The folder is checked by descriptor and mounted by path. The checked
+folders are root-owned and outside the app's jail, so the app can't swap
+one between the two; the person's own uid could, which is not the threat
+this check is for. A removed persona's `persona-apps/<persona>` goes with its
 group (E5).
 
 Not covered: the machine-wide overlays of apps launched with no person

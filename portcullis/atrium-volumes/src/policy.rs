@@ -16,6 +16,12 @@ pub struct Policy {
     pub schema_version: u32,
     #[serde(default, rename = "backend")]
     pub backends: Vec<BackendConfig>,
+    /// Let apps start with plain app data on a machine without Tessera key
+    /// groups (a UFS dev VM, a plain test image). portcullisd ignores it
+    /// when the kernel reports a key group on the person's app data
+    /// (mail.md §6.4a A1). A product image ships without it.
+    #[serde(default)]
+    pub plain_app_data: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -309,6 +309,7 @@ dependencies = [
  "arcad",
  "atrium-links",
  "atrium-open",
+ "atrium-storage",
  "atrium-types",
  "atrium-worker",
  "fresco-client",
@@ -359,6 +360,10 @@ version = "0.1.0"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "atrium-storage"
+version = "0.1.0"
 
 [[package]]
 name = "atrium-types"

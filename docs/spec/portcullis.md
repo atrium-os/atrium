@@ -2815,3 +2815,25 @@ from the `arca` vault capability. Portcullis shows the connection grant in
 consent, then mounts `/atrium/sockets/arca-courier` into the app jail.
 The app calls `connect(2)` on the launcher socket. Portcullis owns the
 mount operation. Each launched courier has its own endpoint-limited jail.
+
+### App data fails closed
+
+Accepted in mail.md §6.4a (A1, A2), built 2026-11-25 (host and FreeBSD
+cross checks; no VM run yet). `home::ensure_app_data` returns
+`AppData::Sealed` or `AppData::Plain`, or refuses the launch; every
+caller (launch, dev launch, workspaces, consoles) fails closed. What
+counts as sealed is the kernel's answer, not atrium-volumes' reply
+(tessera-encryption.md §13.2). The visible home folders (`encrypt_folders`)
+keep the older rule: atrium-volumes unreachable is logged and the login
+goes on.
+
+The launch passes `ATRIUM_APP_DATA=sealed|plain` to the app (`clean_env`).
+The SDK reads it with `atrium_storage::app_data()`, which is `Unknown` when
+unset. It is for what the app shows and keeps; the enforcement is here.
+Mail uses it to refuse a named persona's accounts on plain storage.
+
+The opt-out is `plain_app_data = true` in `/etc/atrium/volumes.policy.toml`
+(root-owned; a parse error means no opt-out). `scripts/deploy-portcullis.sh`
+deploys to dev VMs, so it writes `true` on a first deploy, keeps the
+target's value after that, and takes `PLAIN_APP_DATA=true|false`. A product
+image ships without it.

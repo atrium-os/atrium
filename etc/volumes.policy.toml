@@ -5,6 +5,16 @@
 
 schema_version = 1
 
+# Apps' data on a machine without Tessera key groups (mail.md §6.4a A1).
+# portcullisd refuses to launch an app whose data folder the kernel does
+# not report in an open key group. `true` lets such launches go on, plain,
+# logged on every launch and told to the app (Mail then shows "Mail on this
+# device is not encrypted" and keeps no named persona's account). It is
+# ignored wherever the kernel reports key groups. For dev VMs only;
+# deploy-portcullis.sh keeps the target's value, writes true on a first
+# deploy, and takes PLAIN_APP_DATA=true|false. A product image ships without.
+# plain_app_data = false
+
 # Default backend used when a manifest's [[volumes]] entry doesn't
 # name one. Most deployments make this `tessera` (Atrium-native;
 # CAS dedup; POSIX-compliant). For testing on a non-Tessera host,

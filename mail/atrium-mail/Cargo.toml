@@ -63,6 +63,8 @@ monstrator = { path = "../../monstrator" }
 mail-sync = { path = "../mail-sync" }
 arca-courier = { path = "../../arca/arca-courier" }
 atrium-worker = { path = "../../sdk/atrium-worker" }
+# Whether the store is encrypted at rest (mail.md §6.4a A2), from portcullisd.
+atrium-storage = { path = "../../sdk/atrium-storage" }
 arca-courierd = { path = "../../arca/arca-courierd" }
 arca-store = { path = "../../arca/arca-store" }
 arcad = { path = "../../arca/arcad" }

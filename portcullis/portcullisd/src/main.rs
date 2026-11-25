@@ -4043,6 +4043,7 @@ fn session_ended(user: &str) -> Response {
         return Response::Ok;
     }
     launch::stop_files_for_logout(user);
+    portcullisd::home::app_data_session_ended(user);
     let uids = launch::user_uids(user);
     launch::end_processes(&uids);
     calendar::stop(user, None);

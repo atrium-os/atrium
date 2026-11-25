@@ -390,7 +390,8 @@ fn main() {
     });
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
-    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
+    let at_rest = atrium_mail::at_rest::app_data();
+    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }), at_rest);
     invitation::start_updates(store.clone(), Parser { program: jail.clone() });
     let mut thumbnails = thumbnails::Thumbnails::start(store.clone(), Parser { program: jail.clone() });
     let mut engine = Engine::new(store, Parser { program: jail });
@@ -507,6 +508,7 @@ fn main() {
         });
     }
     let mut persona_known: Option<Option<String>> = None;
+    let mut refused_told = false;
     // Replies from a notification's press, raised once their window is up.
     let mut raise: Vec<u64> = Vec::new();
     let mut ticked = Instant::now();
@@ -597,6 +599,7 @@ fn main() {
                 *mail.persona.borrow_mut() = p.clone();
                 if let Some(sw) = &settings {
                     *sw.s.persona.borrow_mut() = p.clone();
+                    sw.s.persona_known.set(true);
                 }
                 for cw in &composes {
                     cw.c.ui.set(atrium_mail::compose::ComposeUi { persona: p.clone(), ..cw.c.ui.get_cloned() });
@@ -707,6 +710,7 @@ fn main() {
                 None => match settings_window(&engine, embeds.as_ref()) {
                     Ok(w) => {
                         *w.s.persona.borrow_mut() = mail.persona.borrow().clone();
+                        w.s.persona_known.set(persona_known.is_some());
                         settings = Some(w)
                     }
                     Err(e) => eprintln!("atrium-mail: the settings window: {e}"),
@@ -1408,6 +1412,16 @@ fn main() {
                     }
                 }
             }
+        }
+        // A plain store says so under the account list; a refused
+        // persona says why once (§6.4a A2).
+        if !at_rest.sealed() {
+            let refused = *syncer.refused.lock().unwrap();
+            if refused.is_some() && !refused_told {
+                refused_told = true;
+                mail.file_note(refused.unwrap_or_default().into());
+            }
+            mail.set_at_rest(Some((atrium_mail::at_rest::PLAIN_LINE, refused.is_some())));
         }
         // A server search's result first: it counts what it added.
         if let Some(r) = syncer.searched.lock().unwrap().take() {

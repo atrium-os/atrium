@@ -252,6 +252,17 @@ pub fn tessera_group_info(path: &Path) -> io::Result<GroupInfo> {
     Ok(gi)
 }
 
+/// What the directory `path` itself is, asked on its own descriptor
+/// (opened `O_DIRECTORY | O_NOFOLLOW`), never through its parent: the
+/// answer is about the very folder that is opened, so a link planted in
+/// its place cannot redirect it. A locked group's folder can't be opened,
+/// so this errors for one (use [`tessera_group_info`] to ask about it).
+pub fn tessera_group_info_here(path: &Path) -> io::Result<GroupInfo> {
+    let mut gi = GroupInfo::default();
+    dir_ioctl(path, TESSERA_IOC_GROUP_INFO, &mut gi)?;
+    Ok(gi)
+}
+
 /// Make key group `group_id` on the volume under the loaded key `key_id`.
 pub fn tessera_group_create(path: &Path, key_id: &[u8; 16], group_id: u64) -> io::Result<()> {
     let mut g = IocGroup { key_id: *key_id, group_id, suite: 0, pad: 0 };

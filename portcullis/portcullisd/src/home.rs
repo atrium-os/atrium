@@ -8,7 +8,7 @@
 //! the group), and the one app given `home-files` (Scrinium) runs as its own
 //! per-app uid with that group added at launch.
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -69,14 +69,41 @@ fn volumes() -> Option<crate::volumes_client::Client> {
 /// and so is a locked Arca: the folders aren't handed out. Without Tessera
 /// or Arca keys on this machine the folders stay as they were.
 fn encrypt_folders(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u32) -> Result<(), String> {
-    encrypt_dirs(person, persona, dirs, uid, gid, 0o2770).map_err(|(_, e)| e)
+    // The visible folders keep their earlier rule: atrium-volumes out of
+    // reach leaves them as they are. App data (below) fails closed.
+    match encrypt_dirs(person, persona, dirs, uid, gid, 0o2770) {
+        Ok(_) => Ok(()),
+        Err((Fail::Unreachable, e)) => {
+            eprintln!("portcullisd: {person}'s {persona} folders are not encrypted now: {e}");
+            Ok(())
+        }
+        Err((_, e)) => Err(e),
+    }
 }
 
-/// The error says whether a folder was refused (`true`: it should be
-/// encrypted and isn't, or is in the wrong group).
-fn encrypt_dirs(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u32, mode: u32) -> Result<(), (bool, String)> {
+/// What atrium-volumes said about the folders it was asked to encrypt.
+struct Ready {
+    encrypted: bool,
+    /// Some folders are in use and move in at the next login.
+    waiting: bool,
+}
+
+/// Why atrium-volumes gave no `FoldersReady`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fail {
+    /// A folder should be encrypted and isn't, or is in the wrong group.
+    Refused,
+    /// atrium-volumes answered an error or something unexpected.
+    Error,
+    /// atrium-volumes was not reached, or the exchange failed.
+    Unreachable,
+}
+
+/// Every trouble is an error: the caller decides whether plain data is
+/// allowed.
+fn encrypt_dirs(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u32, mode: u32) -> Result<Ready, (Fail, String)> {
     use atrium_volumes::protocol::{PersonaFoldersRequest, Request, Response};
-    let Some(mut c) = volumes() else { return Ok(()) };
+    let Some(mut c) = volumes() else { return Err((Fail::Unreachable, "atrium-volumes not reached".into())) };
     let req = Request::PersonaFolders(PersonaFoldersRequest {
         person: person.into(),
         persona: persona.into(),
@@ -90,21 +117,18 @@ fn encrypt_dirs(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u3
             for m in moved {
                 eprintln!("portcullisd: {person}'s {m}: old files moved into the encrypted folder");
             }
-            for w in waiting {
+            for w in &waiting {
                 eprintln!("portcullisd: {person}'s {w} is in use: it is encrypted once it is free (next login)");
             }
             if !encrypted {
                 eprintln!("portcullisd: {person}'s {persona} folders are not encrypted (no Tessera keys here)");
             }
-            Ok(())
+            Ok(Ready { encrypted, waiting: !waiting.is_empty() })
         }
-        Ok(Response::FoldersRefused { folder, detail }) => Err((true, format!("{folder} refused: {detail}"))),
-        Ok(Response::Error { detail }) => Err((false, detail)),
-        Ok(other) => Err((false, format!("atrium-volumes: unexpected {other:?}"))),
-        Err(e) => {
-            eprintln!("portcullisd: atrium-volumes: {e}: {person}'s {persona} folders are not encrypted now");
-            Ok(())
-        }
+        Ok(Response::FoldersRefused { folder, detail }) => Err((Fail::Refused, format!("{folder} refused: {detail}"))),
+        Ok(Response::Error { detail }) => Err((Fail::Error, detail)),
+        Ok(other) => Err((Fail::Error, format!("atrium-volumes: unexpected {other:?}"))),
+        Err(e) => Err((Fail::Unreachable, format!("atrium-volumes: {e}"))),
     }
 }
 
@@ -161,27 +185,112 @@ pub fn ensure_person(person: &str) -> Result<(PathBuf, u32), String> {
 pub const APP_DATA_ROOT: &[&str] = &["apps", "state"];
 pub const APP_DATA_FILES: &[&str] = &["workspaces", "cache"];
 
+/// What a launch's app data is (mail.md §6.4a A1, A2): the kernel's answer,
+/// handed to the app as `ATRIUM_APP_DATA`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppData {
+    /// In the expected key group, with the group open.
+    Sealed,
+    /// Plain, allowed: the root-owned `plain_app_data` opt-out on a machine
+    /// whose kernel reports no key groups here, or Personal's one login
+    /// while its folders wait to be moved in.
+    Plain,
+}
+
+impl AppData {
+    pub fn env_value(self) -> &'static str {
+        match self { AppData::Sealed => "sealed", AppData::Plain => "plain" }
+    }
+}
+
+/// The policy that may opt a machine out of encrypted app data.
+const VOLUMES_POLICY: &str = "/etc/atrium/volumes.policy.toml";
+/// Root-only record of a person whose one plain login (migration) is spent.
+const ALLOWANCE_DIR: &str = "/var/db/atrium/plain-app-data";
+
+/// People using their one plain login (Personal folders still `waiting`) in
+/// the session now running; spent when that session ends.
+static ALLOWANCE_IN_USE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn allowance_spent_path(person: &str) -> PathBuf { Path::new(ALLOWANCE_DIR).join(person) }
+
+/// The session of `person` ended: a plain login they used is spent.
+pub fn app_data_session_ended(person: &str) {
+    let mut used = ALLOWANCE_IN_USE.lock().unwrap_or_else(|p| p.into_inner());
+    if !used.iter().any(|p| p == person) {
+        return;
+    }
+    used.retain(|p| p != person);
+    let spent = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(ALLOWANCE_DIR)
+        .and_then(|()| std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(allowance_spent_path(person)))
+        .and_then(|f| f.sync_all());
+    if let Err(e) = spent {
+        // Refusing later depends on this record; say so loudly.
+        eprintln!("portcullisd: {person}'s plain login could not be recorded as spent: {e}");
+    }
+}
+
+/// The kernel's answer for one directory, asked on its own descriptor.
+fn group_info(dir: &Path) -> Result<atrium_volumes::ffi::GroupInfo, String> {
+    atrium_volumes::ffi::tessera_group_info_here(dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+fn sealed_open(info: &atrium_volumes::ffi::GroupInfo) -> bool {
+    use atrium_volumes::ffi::GroupInfo;
+    info.group_id != 0 && info.has(GroupInfo::OPEN) && !info.has(GroupInfo::BAD)
+}
+
+/// True when the kernel reports a key group on any of the person's app
+/// data folders: then this machine encrypts, whatever the config says.
+fn kernel_has_groups(at: &Path) -> bool {
+    let mut dirs: Vec<PathBuf> = APP_DATA_ROOT.iter().chain(APP_DATA_FILES).map(|d| at.join(d)).collect();
+    if let Ok(rd) = std::fs::read_dir(at.join(portcullis_overlay::PERSONA_APPS)) {
+        dirs.extend(rd.flatten().map(|e| e.path()));
+    }
+    dirs.iter().any(|d| atrium_volumes::ffi::tessera_group_info(d).is_ok_and(|g| g.group_id != 0))
+}
+
+fn plain_opt_out() -> bool {
+    match atrium_volumes::policy::Policy::load(Path::new(VOLUMES_POLICY)) {
+        Ok(p) => p.plain_app_data,
+        Err(e) => {
+            eprintln!("portcullisd: {VOLUMES_POLICY}: {e}: no plain_app_data opt-out");
+            false
+        }
+    }
+}
+
 /// The person's app data in their key groups before anything mounts or
 /// uses it (E6): Personal's parts of `~/.atrium`, or a named persona's
 /// overlays folder `~/.atrium/persona-apps/<persona>` (root's, 0700). A
 /// persona overlay from before E6 (`apps/<id>@<persona>`) is moved to its
 /// persona's folder first, so it never enters Personal's group.
 ///
-/// A part that should be encrypted and isn't (an offline edit) fails the
-/// launch. Any other trouble (no atrium-volumes, the person's Arca locked
-/// before their group was ever made) leaves the data as it was, plain, and
-/// is logged: a launch that worked before E6 still works. Data already in
-/// a locked group can't be read anyway: its overlay doesn't mount.
-pub fn ensure_app_data(person: &str, persona: Option<&str>) -> Result<(), String> {
+/// It fails closed (mail.md §6.4a A1): the launch goes ahead only when the
+/// kernel, asked on the folder's own descriptor, reports it in a key group
+/// that is open. Plain data is allowed in two cases only: the root-owned
+/// `plain_app_data` opt-out on a machine whose kernel reports no key groups
+/// for this person, and Personal's one login while atrium-volumes reports
+/// its folders `waiting` (in use, moved in at the next login).
+pub fn ensure_app_data(person: &str, persona: Option<&str>) -> Result<AppData, String> {
     let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
     portcullis_overlay::apps_root(&home)?;
     let at = home.join(".atrium");
-    let r = match persona.filter(|p| *p != "personal") {
+    let named = persona.filter(|p| *p != "personal");
+    let (asked, checked) = match named {
         None => {
             portcullis_overlay::relocate_persona_overlays(person, None);
             let gid = ensure_group(&files_group(person))?;
-            encrypt_dirs(person, "personal", &APP_DATA_ROOT.iter().map(|d| at.join(d)).collect::<Vec<_>>(), 0, 0, 0o755)
-                .and_then(|_| encrypt_dirs(person, "personal", &APP_DATA_FILES.iter().map(|d| at.join(d)).collect::<Vec<_>>(), 0, gid, 0o750))
+            let root: Vec<PathBuf> = APP_DATA_ROOT.iter().map(|d| at.join(d)).collect();
+            let files: Vec<PathBuf> = APP_DATA_FILES.iter().map(|d| at.join(d)).collect();
+            let a = encrypt_dirs(person, "personal", &root, 0, 0, 0o755);
+            let b = a.as_ref().ok().map(|_| encrypt_dirs(person, "personal", &files, 0, gid, 0o750));
+            let asked = match (a, b) {
+                (Ok(x), Some(Ok(y))) => Ok(Ready { encrypted: x.encrypted && y.encrypted, waiting: x.waiting || y.waiting }),
+                (Err(e), _) | (_, Some(Err(e))) => Err(e),
+                (Ok(_), None) => unreachable!("b is computed whenever a is Ok"),
+            };
+            (asked, root.into_iter().chain(files).collect::<Vec<_>>())
         }
         Some(p) => {
             if !plain(p) {
@@ -189,16 +298,117 @@ pub fn ensure_app_data(person: &str, persona: Option<&str>) -> Result<(), String
             }
             ensure_root_dir(&at.join(portcullis_overlay::PERSONA_APPS))?;
             portcullis_overlay::relocate_persona_overlays(person, Some(p));
-            encrypt_dirs(person, p, &[portcullis_overlay::persona_apps_dir(&home, p)], 0, 0, 0o700)
+            let dir = portcullis_overlay::persona_apps_dir(&home, p);
+            (encrypt_dirs(person, p, std::slice::from_ref(&dir), 0, 0, 0o700), vec![dir])
         }
     };
-    match r {
-        Err((true, e)) => Err(e),
-        Err((false, e)) => {
-            eprintln!("portcullisd: {person}'s app data ({}) stays as it is for now: {e}", persona.unwrap_or("personal"));
-            Ok(())
+    let which = named.unwrap_or("personal");
+    // A refusal (a folder in the wrong group) always stops the launch.
+    let asked = match asked {
+        Err((Fail::Refused, e)) => return Err(e),
+        other => other,
+    };
+    // Ask the kernel, not atrium-volumes' reply.
+    let kernel: Result<(), String> = checked.iter().try_for_each(|d| match group_info(d) {
+        Ok(g) if sealed_open(&g) => Ok(()),
+        Ok(_) => Err(format!("{} is not in an open key group", d.display())),
+        Err(e) => Err(e),
+    });
+    let why = match (&asked, &kernel) {
+        (_, Ok(())) => String::new(),
+        (Err((_, e)), _) => e.clone(),
+        (Ok(_), Err(k)) => k.clone(),
+    };
+    let facts = Facts {
+        sealed: kernel.is_ok(),
+        kernel_has_groups: kernel.is_err() && kernel_has_groups(&at),
+        opt_out: kernel.is_err() && plain_opt_out(),
+        personal: named.is_none(),
+        waiting: asked.as_ref().is_ok_and(|r| r.waiting),
+        spent: allowance_spent_path(person).exists(),
+    };
+    match decide(&facts) {
+        Some(Why::Sealed) => Ok(AppData::Sealed),
+        Some(Why::OptOut) => {
+            eprintln!("portcullisd: {person}'s {which} app data is PLAIN under plain_app_data in {VOLUMES_POLICY} ({why})");
+            Ok(AppData::Plain)
         }
-        Ok(()) => Ok(()),
+        Some(Why::Migrating) => {
+            let mut used = ALLOWANCE_IN_USE.lock().unwrap_or_else(|p| p.into_inner());
+            if !used.iter().any(|p| p == person) {
+                used.push(person.into());
+            }
+            eprintln!("portcullisd: {person}'s Personal app data is PLAIN for this one login, while its folders wait to be moved in ({why})");
+            Ok(AppData::Plain)
+        }
+        None => {
+            if facts.opt_out && facts.kernel_has_groups {
+                eprintln!("portcullisd: plain_app_data in {VOLUMES_POLICY} is IGNORED: the kernel reports key groups on {person}'s app data");
+            }
+            Err(format!("{person}'s {which} app data is not encrypted, so the app does not start: {why}"))
+        }
+    }
+}
+
+/// What the launch knows about the app data.
+#[derive(Clone, Copy, Debug, Default)]
+struct Facts {
+    /// The kernel reports every checked folder in an open key group.
+    sealed: bool,
+    /// The kernel reports a key group on some app data folder of the person.
+    kernel_has_groups: bool,
+    /// `plain_app_data` in the volumes policy.
+    opt_out: bool,
+    /// The Personal instance (not a named persona).
+    personal: bool,
+    /// atrium-volumes reported folders in use, moved in at the next login.
+    waiting: bool,
+    /// The person's one plain login was used in an earlier session.
+    spent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why { Sealed, OptOut, Migrating }
+
+/// Whether a launch may go ahead, and why; `None` refuses.
+fn decide(f: &Facts) -> Option<Why> {
+    if f.sealed {
+        Some(Why::Sealed)
+    } else if f.opt_out && !f.kernel_has_groups {
+        Some(Why::OptOut)
+    } else if f.personal && f.waiting && !f.spent {
+        Some(Why::Migrating)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod app_data_tests {
+    use super::{decide, Facts, Why};
+
+    #[test]
+    fn plain_app_data_is_refused_unless_allowed() {
+        // atrium-volumes unreachable, errors, or says not encrypted: the
+        // kernel does not report the folder sealed, so the launch stops.
+        assert_eq!(decide(&Facts::default()), None);
+        assert_eq!(decide(&Facts { personal: true, ..Facts::default() }), None);
+        assert_eq!(decide(&Facts { sealed: true, ..Facts::default() }), Some(Why::Sealed));
+    }
+
+    #[test]
+    fn the_opt_out_counts_only_where_the_kernel_reports_no_groups() {
+        let opt = Facts { opt_out: true, ..Facts::default() };
+        assert_eq!(decide(&opt), Some(Why::OptOut));
+        assert_eq!(decide(&Facts { kernel_has_groups: true, ..opt }), None);
+    }
+
+    #[test]
+    fn personal_gets_one_plain_login_while_its_folders_wait() {
+        let first = Facts { personal: true, waiting: true, ..Facts::default() };
+        assert_eq!(decide(&first), Some(Why::Migrating));
+        assert_eq!(decide(&Facts { spent: true, ..first }), None, "a second login refuses");
+        assert_eq!(decide(&Facts { personal: false, ..first }), None, "a named persona never gets it");
     }
 }
 
