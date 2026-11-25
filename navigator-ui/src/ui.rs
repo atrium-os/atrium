@@ -227,6 +227,27 @@ fn icon_button(ctx: &mut Ctx, x: f32, y: f32, g: char, enabled: bool, color: Col
 }
 
 /// Texts in one row on a shared baseline, laid out by Pergola.
+/// `runs` cut to fit `max` px with `gap` between them: the run that would
+/// cross the edge ends in an ellipsis, and the ones after it go.
+fn fit_runs(runs: &[(String, TextStyle)], gap: f32, max: f32) -> Vec<(String, TextStyle)> {
+    let mut out = Vec::new();
+    let mut used = 0.0;
+    for (s, st) in runs {
+        let left = max - used - if out.is_empty() { 0.0 } else { gap };
+        let w = width(s, st);
+        if w <= left {
+            used += w + if out.is_empty() { 0.0 } else { gap };
+            out.push((s.clone(), st.clone()));
+            continue;
+        }
+        let cut = fit(s, st, left);
+        // An ellipsis alone may still be too wide: then nothing more.
+        if !cut.is_empty() && width(&cut, st) <= left { out.push((cut, st.clone())); }
+        break;
+    }
+    out
+}
+
 fn inline(ctx: &mut Ctx, x: f32, cy: f32, gap: f32, runs: &[(String, TextStyle)]) {
     let y = cy - 0.5 * em(runs.first().map(|r| r.1.size).unwrap_or(13.0));
     let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(x, y, 0.0, 0.0), gap));
@@ -1446,9 +1467,13 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
         ]),
     };
     icon(ctx, r.x() + em(16.0), r.y() + em(12.0), g, 20.0, t.text_secondary());
-    inline(ctx, r.x() + em(46.0), r.y() + em(22.0), em(6.0), &runs);
     let answers = p.answers();
     let bs = sans(type_size::SM, Weight::Semibold, t.text_primary());
+    // The words stop short of the answers: cut with an ellipsis, never
+    // under a button (the whole text is the accessibility tree's).
+    let buttons: f32 = answers.iter().map(|a| width(a, &bs) + em(24.0) + em(8.0)).sum();
+    let room = r.w() - em(46.0) - em(16.0) - buttons - em(8.0);
+    inline(ctx, r.x() + em(46.0), r.y() + em(22.0), em(6.0), &fit_runs(&runs, em(6.0), room));
     let mut x = r.x() + r.w() - em(16.0);
     for (i, a) in answers.iter().enumerate().rev() {
         let w = width(a, &bs) + em(24.0);
@@ -1708,4 +1733,25 @@ fn status_bar(ctx: &mut Ctx, s: &Shell, r: Rect, link: Option<String>) {
     let fx = r.x() + em(32.0) + addr_w.max(em(260.0)) + em(24.0);
     let fs = st(c, Weight::Medium);
     text(ctx, fx, cy, &fit(&facts, &fs, r.x() + r.w() - fx - em(12.0)), type_size::XS, Weight::Medium, c);
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn a_prompts_words_are_cut_short_of_its_answers() {
+        let st = sans(type_size::SM, Weight::Regular, Color::TRANSPARENT);
+        let runs = vec![("Run this page live?".to_string(), st.clone()), ("Its scripts run on this computer, in a jail".to_string(), st.clone()),
+                        ("and can send what you type".to_string(), st.clone())];
+        let total = |v: &[(String, TextStyle)]| v.iter().map(|(s, st)| width(s, st)).sum::<f32>() + 6.0 * v.len().saturating_sub(1) as f32;
+        let all = total(&runs);
+        assert_eq!(fit_runs(&runs, 6.0, all + 1.0).len(), 3, "room for all of it: unchanged");
+        for max in [all * 0.8, all * 0.5, all * 0.2, 1.0] {
+            let cut = fit_runs(&runs, 6.0, max);
+            assert!(total(&cut) <= max + 0.5, "{max}: {cut:?}");
+            assert!(cut.last().is_none_or(|(s, _)| s.ends_with('…') || runs.iter().any(|(r, _)| r == s)));
+        }
+        assert!(fit_runs(&runs, 6.0, 0.0).is_empty());
+    }
 }

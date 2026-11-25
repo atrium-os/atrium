@@ -63,7 +63,11 @@ fn serve(p: &Pki, name: &str, handler: Handler) -> (SocketAddr, Arc<Mutex<Vec<Ve
                 loop {
                     let Some(req) = read_req(&mut t) else { return };
                     seen.lock().unwrap().push(req.clone());
-                    if t.write_all(&h(&req)).and_then(|_| t.flush()).is_err() {
+                    // An empty answer: the server goes away without one
+                    // (a restart), closing the kept-alive connection.
+                    let answer = h(&req);
+                    if answer.is_empty() { return; }
+                    if t.write_all(&answer).and_then(|_| t.flush()).is_err() {
                         return;
                     }
                 }
@@ -494,4 +498,37 @@ fn an_origin_is_sent_only_as_a_plain_https_origin() {
         req.headers.push((Header::Origin, good.to_vec()));
         assert!(Request::decode(&req.encode()).is_ok(), "{}", String::from_utf8_lossy(good));
     }
+}
+
+#[test]
+fn a_get_on_a_kept_alive_connection_the_server_dropped_is_sent_once_more_fresh() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let p = pki(&["api.example"]);
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    // The second request the server reads, the first on a kept-alive
+    // connection, is never answered: the server went away.
+    let h: Handler = Arc::new(move |_: &[u8]| if n2.fetch_add(1, Ordering::SeqCst) % 2 == 1 { Vec::new() } else { http("200 OK", &[], b"ok") });
+    let (at, seen) = serve(&p, "api.example", h);
+    let net = Net { map: HashMap::from([("api.example".into(), at)]), lookups: Default::default() };
+    let mut c = Courier::new(ep("api.example"), &net, tls(&p), LOOPBACK);
+    let mut v = vault();
+    assert!(matches!(c.handle(&get_with_bearer("/one").encode(), &mut v), Response::Http { status: 200, .. }));
+    let asked = v.asked.len();
+    let r = c.handle(&get_with_bearer("/two").encode(), &mut v);
+    assert!(matches!(r, Response::Http { status: 200, .. }), "{r:?}");
+    assert_eq!(c.connects, 2, "a fresh connection for the second try");
+    assert_eq!(v.asked.len(), asked + 1, "Arca is asked once for the request, not per try");
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[1], sent[2], "the same bytes, sent again");
+
+    // A POST is never sent twice: the server may have kept it.
+    let mut post = get_with_bearer("/three");
+    post.method = Method::Post;
+    post.headers.push((Header::ContentType, b"application/json".to_vec()));
+    post.body = vec![Segment::Literal(b"{}".to_vec())];
+    let r = c.handle(&post.encode(), &mut v);
+    assert_eq!(r, Response::Refused(Refusal::Http));
+    assert_eq!(seen.lock().unwrap().len(), 4, "sent once");
 }

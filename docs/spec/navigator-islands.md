@@ -3350,6 +3350,30 @@ no WARNs. memfed was not running on this base.
   on `/app.html` it passes. The first run after a fixture-server restart
   stopped with `CourierRefused("Http")`, and the retry ran.
 
+Follow-up (cloud, 2026-11-25). What became of the rough edges:
+
+- **`CourierRefused("Http")` after a fixture-server restart.** The courier
+  wrote into a kept-alive connection that the restarted server had
+  closed, and then the read failed. It now sends a GET or HEAD once more
+  on a fresh connection, with the same bytes; Arca is asked once, and a
+  POST is never resent. The new courier test,
+  `a_get_on_a_kept_alive_connection_the_server_dropped_is_sent_once_more_fresh`,
+  fails without the fix.
+- **The prompt's words ran under "Not now"** once the prompt had three
+  answers. The row now cuts its words with an ellipsis short of the
+  buttons (`fit_runs`, tested). The whole text stays in the
+  accessibility tree.
+- **No selection highlight after Ctrl+A.** The selection is made, since
+  typing replaces it, but it isn't drawn. This needs an engine-side look
+  on the Mac: check whether LibWeb's display list carries the selection
+  rects for a text control.
+- **`same-site-api` failed on `/route/1`** but passed on `/app.html`. Open:
+  the fixture server's log line (its `origin` field) and navigatord's log
+  for that request are needed.
+- **The frame's box is black in the document lane.** This is the D14
+  island box: a document-lane `<iframe>` becomes a press-to-start box.
+  Left as it is.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
