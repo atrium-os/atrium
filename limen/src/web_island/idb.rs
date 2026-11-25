@@ -11,6 +11,11 @@ pub const QUOTA: usize = 50 * 1024 * 1024;
 pub const PART_MAX: usize = 32 * 1024;
 /// The most bytes of changes one run carries, all parts together.
 pub const RUN_MAX: usize = QUOTA + 4 * 1024 * 1024;
+/// The most changes one run carries.
+pub const RUN_OPS_MAX: usize = 1 << 20;
+/// The most changes a loaded store is: each record or index record costs
+/// navigatord at least 16 bytes of the quota, so a full store is fewer.
+pub const LOAD_OPS_MAX: usize = 4 << 20;
 /// The longest store the engine loads, or a file read back.
 pub const LOAD_MAX: usize = 2 * QUOTA;
 /// The longest name, or description of a store or an index.
@@ -134,12 +139,16 @@ pub fn encode_ops(ops: &[Op]) -> Vec<u8> {
     out
 }
 
-/// The changes in `bytes`, if every one is in shape and within its bounds.
+/// The changes in `bytes`, if every one is in shape and within its bounds:
+/// at most `max` bytes, and [`LOAD_OPS_MAX`] changes for a store as loaded
+/// (`max` of [`LOAD_MAX`]) or [`RUN_OPS_MAX`] for anything else.
 pub fn decode_ops(bytes: &[u8], max: usize) -> Option<Vec<Op>> {
     if bytes.len() > max { return None; }
+    let ops_max = if max >= LOAD_MAX { LOAD_OPS_MAX } else { RUN_OPS_MAX };
     let mut r = Reader(bytes);
     let mut ops = vec![];
     while !r.done() {
+        if ops.len() >= ops_max { return None; }
         ops.push(match r.byte()? {
             tag::DATABASE => Op::Database(r.name()?),
             tag::VERSION => Op::Version(r.name()?, r.u64()?),
@@ -261,6 +270,9 @@ mod tests {
         }
         assert_eq!(decode_ops(&encode_ops(&all), RUN_MAX), Some(all));
         assert_eq!(Op::from_fields(0, b"", b"", 0), None);
+        let clears = vec![tag::CLEAR; RUN_OPS_MAX + 1];
+        assert_eq!(decode_ops(&clears, RUN_MAX), None, "a run of more changes than its bound");
+        assert_eq!(decode_ops(&clears[1..], RUN_MAX).map(|o| o.len()), Some(RUN_OPS_MAX));
         assert_eq!(Op::from_fields(tag::DATABASE, &vec![0; NAME_MAX + 1], b"", 0), None);
     }
 

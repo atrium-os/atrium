@@ -3481,10 +3481,17 @@ is the Mac step.
   starts the site empty, logged. Unrecorded stores are memory only, 200
   MiB for all of them together, and go with their jar; file-backed stores
   past 150 MiB loaded are dropped and reread on demand. Forgetting a site
-  removes its IndexedDB with its `localStorage`.
+  removes its IndexedDB with its `localStorage`. After the review: a
+  rename or clear is undone by moving things back, never by a copy; runs
+  being received hold at most 108 MiB across every site; a commit in the
+  log that is out of shape ends the replay there, keeping the image and
+  the commits before it, and the next commit writes the next generation
+  whole rather than append after it. A commit whose log write fails is
+  cut back off the log; only if that cut fails too can a crash before the
+  next commit bring it back.
 - **Bounds.** 50 MiB a site (each database, store and index costs 64
   bytes more than its bytes, each record and index record 16), names and
-  descriptions 4 KiB, keys 16 KiB, a run 54 MiB, a load 100 MiB (the
+  descriptions 4 KiB, keys 16 KiB, a run 54 MiB and 1,048,576 changes, a load 100 MiB and 4,194,304 changes (the
   engine sizes its buffer from the answer's length, not up front).
 - **Engine, Rust** (`fixture_fetch.rs`): `navigator_live_idb_load(ctx,
   on_op)` gives each change of the store from empty as `(tag, a, b, n)`
