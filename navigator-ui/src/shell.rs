@@ -36,6 +36,11 @@ pub const DROP_LABEL: f32 = 22.0;
 pub const POPOVER_W: f32 = 380.0;
 /// The find bar's height (§7), under the toolbar.
 pub const FIND: f32 = 40.0;
+/// Room above a live page for frescod's "live code" tag (a 20 pt pill
+/// just outside the island's 1 pt frame, navigator-ui.md §6.3), so it
+/// covers none of the window's own rows. In points: frescod draws the
+/// tag at the display scale, not the text scale.
+pub const TAG_BAND: f32 = 22.0;
 /// The Aa pop-up (§7).
 pub const READING_W: f32 = 300.0;
 pub const READING_H: f32 = 236.0;
@@ -820,6 +825,7 @@ impl Shell {
             y += em(PROMPT);
             r
         });
+        if self.shows_live() { y += TAG_BAND; }
         let status = (self.status_bar && page.is_some()).then(|| Rect::new(x0, h - em(STATUS), w - x0, em(STATUS)));
         let bottom = status.map_or(h, |s| s.y());
         let page = Rect::new(x0, y, w - x0, (bottom - y).max(0.0));
@@ -1142,6 +1148,11 @@ impl Shell {
             if !run.entries.contains(&key) { run.entries.push(key); }
         }
         true
+    }
+
+    /// Whether the page on screen is the one running live, in its island.
+    pub fn shows_live(&self) -> bool {
+        self.history.is_none() && self.live_run.as_ref().is_some_and(|r| r.origin.is_some() && Some(r.key) == self.shown_key())
     }
 
     /// The page the live engine shows (I6.2: an entry it made by changing
@@ -3402,6 +3413,11 @@ mod tests {
         assert!(s.live_file(url, dl(1 << 31), 10_000.0));
         let asked = s.store.page_by_key_mut(key.0, key.1).and_then(|p| p.asked.as_ref()).map(|a| a.prompt.clone());
         assert_eq!(asked, Some(dl(1 << 31)), "on the live page's own entry");
+        // frescod's tag above the island lands in a band of its own, not on
+        // the prompt row's file name.
+        let g = s.geo();
+        let row = g.prompt.expect("the prompt row");
+        assert_eq!(g.page.y(), row.y() + row.h() + TAG_BAND, "a band for the tag");
         assert!(s.live_run.is_some(), "the page keeps running");
         // Save on it sends the held file's id.
         assert!(s.answer_pressed(2, 20_000.0, Some([3; 16])));
