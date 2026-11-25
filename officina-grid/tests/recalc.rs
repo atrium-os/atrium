@@ -290,3 +290,37 @@ fn conditional_totals_track_the_used_value_rectangle() {
     let reopened = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();
     assert_eq!((0..5).map(|r| reopened.value(0, r, 0)).collect::<Vec<_>>(), before);
 }
+
+/// INDIRECT and OFFSET read cells their formulas don't name, so they must run
+/// after every changed group they can read, and what reads them after them.
+#[test]
+fn indirect_and_offset_see_this_recalculation() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("S").unwrap();
+    let at = |a: &str| {
+        let (r, c) = officina_grid::addr::parse_a1(a).unwrap();
+        CellAddr::new(0, r, c)
+    };
+    // A chain across 20 columns, each its own group: B1 = A1+1, C1 = B1+1, ...
+    wb.set_input(at("A1"), "1").unwrap();
+    for k in 1..=20u32 {
+        wb.set_input(CellAddr::new(0, 0, k), &format!("={}1+1", col_name(k - 1))).unwrap();
+    }
+    let last = col_name(20);
+    for row in 2..=6u32 {
+        wb.set_input(at(&format!("A{row}")), &format!("=INDIRECT(\"{last}1\")*{row}")).unwrap();
+        wb.set_input(at(&format!("B{row}")), &format!("=SUM(OFFSET(A1,0,{},1,1))", 20)).unwrap();
+        wb.set_input(at(&format!("C{row}")), &format!("=A{row}+B{row}")).unwrap();
+    }
+    wb.recalc();
+    for step in [5.0, 50.0, -3.0] {
+        wb.set_input(at("A1"), &step.to_string()).unwrap();
+        wb.recalc();
+        let end = step + 20.0;
+        for row in 2..=6u32 {
+            assert_eq!(wb.get(at(&format!("A{row}"))), Value::Num(end * f64::from(row)), "A{row} after {step}");
+            assert_eq!(wb.get(at(&format!("B{row}"))), Value::Num(end), "B{row} after {step}");
+            assert_eq!(wb.get(at(&format!("C{row}"))), Value::Num(end * f64::from(row) + end), "C{row} after {step}");
+        }
+    }
+}

@@ -187,7 +187,7 @@ fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn
                     out.push(Footprint { source_only: false, sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
                 }
             }
-            Expr::Call(Func::Known(id), args) if crate::eval::funcs::FUNCS[*id as usize].name == "FORMULATEXT" => {
+            Expr::Call(Func::Known(id), args) if matches!(crate::eval::funcs::FUNCS[*id as usize].name, "FORMULATEXT" | "ISFORMULA") => {
                 *reads_formula_text = true;
                 let mut sources = Vec::new();
                 formula_sources(&args[0], &resolve, &mut sources);

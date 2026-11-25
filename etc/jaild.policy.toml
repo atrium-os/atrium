@@ -87,6 +87,11 @@ ro_paths = [
     # aura-keys connects to arcad's for Wi-Fi credentials.
     "/atrium/sockets/aura-keys",
     "/atrium/sockets/arca",
+    # Vinculum (bluetooth.md §5): each controller's vinculum-hci jail
+    # connects through vinculumd's transport dir and reads the controller
+    # firmware it loads at power-up (Realtek's, unmodified, with its licence).
+    "/atrium/sockets/vinculum-hci",
+    "/usr/local/share/atrium/firmware/bluetooth",
     "/var/lib/atrium/apps",          # limend: installed manifests (embeds, roles); the share sheet: share-targets and icons
     "/etc/pwd.db",                   # limend: a worker rule's run_as -> uid (no hashes)
 ]
@@ -138,6 +143,15 @@ rw_paths = [
     "/atrium/sockets/opifex-sheet",
     "/atrium/sockets/limen",
     "/atrium/sockets/audio-attribution",
+
+    # vinculumd's sockets (bluetooth.md §5, §10, §13): the controller
+    # transport, the trusted UI's control socket and HID devices for tactusd,
+    # each peer-uid checked; and its power switch across restarts (machine
+    # state only: pairing keys are in Arca's machine store).
+    "/atrium/sockets/vinculum-hci",
+    "/atrium/sockets/bluetooth-control",
+    "/atrium/sockets/bluetooth-hid",
+    "/var/db/vinculum",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",
@@ -239,6 +253,7 @@ allowed = [
     "atrium-wifi-keys",  # baseline + aura/key*; pinned to aura-keys
     "atrium-arca",       # baseline + tesserakeys; pinned to arcad
     "atrium-driver",     # baseline (+ one device per jail); catalog drivers
+    "atrium-bluetooth",  # baseline (+ one USB controller per jail); pinned to vinculum-hci
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
 # themselves live in etc/atrium.devfs.rules (installed and loaded at boot by
@@ -262,6 +277,8 @@ allowed = [
 #      with each capability's unhide rules applied to that jail's own mount.
 # 23 = atrium_display  — atrium_gpu + display0: frescod's alone (pinned below).
 # 24 = atrium_audio    — dsp*, mixer*, laminar: lyrad's alone (pinned below).
+# 25 = atrium_bluetooth — basics only: one vinculum-hci jail per Bluetooth
+#      controller, shown its own ugen nodes through devfs_grants (pinned below).
 # 26 = atrium_input    — atkbd*, bpsm*: tactusd's alone (pinned below). HID
 #      nodes are NOT in it: portcullisd shows tactusd each hidraw node the
 #      kernel classified as input, in that jail's mount (sigillum.md §5.1).
@@ -272,7 +289,7 @@ allowed = [
 # 32 = atrium_arca     — basics + tesserakeys: arcad's alone (pinned below).
 # 33 = atrium_driver   — basics only: the catalog's drivers, one jail per
 #      device, each shown its own device through devfs_grant (pinned below).
-allowed_ids = [4, 20, 22, 23, 24, 26, 27, 28, 29, 31, 32, 33]
+allowed_ids = [4, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -314,6 +331,19 @@ name_prefix = true
 exec_path   = "/usr/local/bin/atrium-sigillum-fido"
 uid         = 65029
 grant_nodes = ["hidraw#", "u2f/#"]   # u2f/N: keys u2f(4) drives (FreeBSD 15+)
+
+# Bluetooth controllers (bluetooth.md §4, §5.3): one jail per controller,
+# named atrium-vinculum-hci-<B-A-I>, running the transport as _vinculum-hci,
+# shown only that controller's ugen node and its usb/ endpoint directory, so
+# vinculumd never touches the radio and cannot send vendor commands that are
+# not on the transport's allowlist.
+[[devfs_rulesets.pinned]]
+id          = 25
+jail_name   = "atrium-vinculum-hci-"
+name_prefix = true
+exec_path   = "/usr/local/bin/atrium-vinculum-hci"
+uid         = 65025
+grant_nodes = ["ugen#.#", "usb/#.#.0"]
 
 # Removable storage (device-assignment.md §4.6): one Capsa FAT/exFAT server
 # jail per USB-disk partition, as _capsa. jaild opens the partition (da#p#
@@ -545,9 +575,11 @@ allowed_system_uids = [
              # knows it by this uid (--limen-uid) for embedded players' audio tickets
     65023,   # _nuntius: the system fetcher, started per app by portcullisd
              # (OpenFetcher) under the system worker rule (nuntius-bundle.sh)
-    # 65024 = _vinculum        (reserved: Bluetooth host, docs/spec/bluetooth.md §4)
-    # 65025 = _vinculum-hci    (reserved: Bluetooth transport, one per controller)
-    # 65026 = _vinculum-audio  (reserved: Bluetooth audio profiles)
+    65024,   # _vinculum: the Bluetooth host, vinculumd (docs/spec/bluetooth.md §4;
+             # vinculum-service.sh creates it)
+    65025,   # _vinculum-hci: the Bluetooth transport, one jail per controller,
+             # started by dispensatord (vinculum/etc/devices.d/25-vinculum.toml)
+    # 65026 = _vinculum-audio  (reserved: Bluetooth audio profiles, B5)
     65027,   # _hospes-cdm: content decryption module hosts, started per app by
              # portcullisd (OpenCdm) under the system worker rule (hospes-cdm-bundle.sh)
     65028,   # _sigillum: Sigillum's broker, sigillumd (docs/spec/sigillum.md §4)
@@ -602,6 +634,8 @@ allowed_system_gids = [
     65020,   # _arca
     65022,   # _limen
     65023,   # _nuntius
+    65024,   # _vinculum
+    65025,   # _vinculum-hci
     65027,   # _hospes-cdm
     65028,   # _sigillum
     65029,   # _sigillum-dev

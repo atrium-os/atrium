@@ -200,3 +200,68 @@ pub(super) fn irr(c: &Ctx, a: &[Expr]) -> Ev {
         None => Ev::err(ErrorKind::Num),
     }
 }
+
+// Depreciation (§16.134).
+
+/// SLN(cost, salvage, life): straight-line depreciation for one period.
+pub(super) fn sln(c: &Ctx, a: &[Expr]) -> Ev {
+    let (cost, salvage, life) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)));
+    if life == 0.0 {
+        return Ev::err(ErrorKind::Div0);
+    }
+    n((cost - salvage) / life)
+}
+
+/// SYD(cost, salvage, life, per): sum-of-years'-digits depreciation.
+pub(super) fn syd(c: &Ctx, a: &[Expr]) -> Ev {
+    let (cost, salvage, life, per) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)), tri!(arg(c, a, 3, 0.0)));
+    if life <= 0.0 || per <= 0.0 || per > life {
+        return Ev::err(ErrorKind::Num);
+    }
+    n((cost - salvage) * (life - per + 1.0) * 2.0 / (life * (life + 1.0)))
+}
+
+/// DDB(cost, salvage, life, period, [factor]): declining-balance
+/// depreciation at `factor` / `life` a period (double by default), never
+/// taking the book value below `salvage`.
+pub(super) fn ddb(c: &Ctx, a: &[Expr]) -> Ev {
+    let (cost, salvage, life, period) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)), tri!(arg(c, a, 3, 0.0)));
+    let factor = tri!(arg(c, a, 4, 2.0));
+    if cost < 0.0 || salvage < 0.0 || life <= 0.0 || period <= 0.0 || factor <= 0.0 || period > life {
+        return Ev::err(ErrorKind::Num);
+    }
+    let rate = (factor / life).min(1.0);
+    // The book value at the start of the period.
+    let book = if rate == 1.0 {
+        if period <= 1.0 { cost } else { 0.0 }
+    } else {
+        cost * (1.0 - rate).powf(period - 1.0)
+    };
+    n((book * rate).min(book - salvage).max(0.0))
+}
+
+/// DB(cost, salvage, life, period, [month]): fixed-declining-balance
+/// depreciation at a rate rounded to three places, with `month` months in
+/// the first year and the rest in period life + 1.
+pub(super) fn db(c: &Ctx, a: &[Expr]) -> Ev {
+    let (cost, salvage, life, period) = (tri!(arg(c, a, 0, 0.0)), tri!(arg(c, a, 1, 0.0)), tri!(arg(c, a, 2, 0.0)), tri!(arg(c, a, 3, 0.0)));
+    let month = tri!(arg(c, a, 4, 12.0)).trunc();
+    let period = period.trunc();
+    if cost < 0.0 || salvage < 0.0 || life <= 0.0 || period < 1.0 || !(1.0..=12.0).contains(&month) || period > life + 1.0 {
+        return Ev::err(ErrorKind::Num);
+    }
+    if cost == 0.0 {
+        return n(0.0);
+    }
+    let rate = super::funcs::round_dec(1.0 - (salvage / cost).powf(1.0 / life), 3, 0);
+    let first = cost * rate * month / 12.0;
+    if period == 1.0 {
+        return n(first);
+    }
+    // The book value at the start of the period.
+    let book = (cost - first) * (1.0 - rate).powf(period - 2.0);
+    if period > life {
+        return n(book * rate * (12.0 - month) / 12.0);
+    }
+    n(book * rate)
+}

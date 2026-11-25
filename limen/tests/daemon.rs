@@ -1125,6 +1125,27 @@ fn delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine() {
     ui.detach(doc).unwrap();
     let broker = w.parent(4101).request_island(W_APP, 1).unwrap();
     assert_ne!(doc, broker);
+    // A picker only to say "Show in Files" (scrinium.md §4.5): never an
+    // Open, so no file comes back to the UI.
+    let mut files = provider(w.connect(SCRINIUM_UID), "picker").unwrap();
+    let p = ui.request("picker", W_APP).unwrap();
+    assert!(matches!(next_c(&mut files), ChildEvent::Attach { .. }));
+    let open = limen::picker::ToChild::Open(limen::picker::Filter::file());
+    assert_eq!(refused(ui.send(p, open.encode())), refusal::NOT_PROVIDER);
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    {
+        let staged = limen::fdpass::sealed_file("x", b"x").unwrap();
+        assert_eq!(refused(ui.send_fd(p, open.encode(), std::os::fd::AsFd::as_fd(&staged))), refusal::NOT_PROVIDER);
+    }
+    let show = limen::picker::ToChild::Show { folder: limen::picker::Folder::Downloads, name: "a.pdf".into(), press: [5; 16] };
+    ui.send(p, show.encode()).unwrap();
+    let got = loop {
+        match next_c(&mut files) {
+            ChildEvent::Message { bytes, .. } => break bytes,
+            _ => continue,
+        }
+    };
+    assert_eq!(limen::picker::ToChild::decode(&got), Some(show));
 }
 
 #[test]

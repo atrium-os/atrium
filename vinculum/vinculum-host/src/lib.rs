@@ -61,6 +61,14 @@ impl Peer {
     }
 }
 
+/// A random static address (MSB first): top two bits 11, and the other 46
+/// bits neither all zero nor all one.
+pub fn is_static_random(a: [u8; 6]) -> bool {
+    let rest_zero = a[0] & 0x3F == 0 && a[1..].iter().all(|&b| b == 0);
+    let rest_ones = a[0] & 0x3F == 0x3F && a[1..].iter().all(|&b| b == 0xFF);
+    a[0] & 0xC0 == 0xC0 && !rest_zero && !rest_ones
+}
+
 impl std::fmt::Display for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let a = self.address;
@@ -82,6 +90,9 @@ pub enum Transport {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControllerInfo {
     pub address: Option<[u8; 6]>,
+    /// `address` is a random static address set with LE Set Random Address
+    /// (the controller has no public one), not the controller's BD_ADDR.
+    pub address_random: bool,
     pub hci_version: u8,
     pub manufacturer: u16,
     pub lmp_features: u64,
@@ -95,6 +106,12 @@ pub struct ControllerInfo {
 }
 
 impl ControllerInfo {
+    /// LMP feature bit 37, "BR/EDR not supported" (Core Vol 2 Part C §3.3):
+    /// such a controller refuses every BR/EDR command.
+    pub fn le_only(&self) -> bool {
+        self.lmp_features & (1 << 37) != 0
+    }
+
     /// Whether the controller lists a command (Core Vol 4 Part E §6.27).
     pub fn supports(&self, octet: usize, bit: u8) -> bool {
         self.supported_commands.get(octet).is_some_and(|o| o & (1 << bit) != 0)
@@ -156,6 +173,8 @@ enum Step {
     ReadCommands,
     ReadFeatures,
     ReadBdAddr,
+    ZephyrStaticAddress,
+    LeSetRandomAddress,
     ReadBufferSize,
     LeReadBufferSizeV2,
     LeReadBufferSizeV1,
@@ -234,6 +253,9 @@ const EVENT_MASK: u64 = 0x0000_1FFF_FFFF_FFFF | (1 << 46) | (1 << 47) | (0x3F <<
 /// data length change, enhanced connection complete, extended advertising
 /// report.
 const LE_EVENT_MASK: u64 = 0x7F | (1 << 9) | (1 << 12);
+
+/// Company identifier of Zephyr's controllers (Linux Foundation).
+pub const MANUFACTURER_ZEPHYR: u16 = 0x05F1;
 
 fn to_cmd<C>(c: C) -> Command
 where
@@ -350,7 +372,7 @@ impl Host {
                     le_scan_type: hci::LeScanType::Active,
                     le_scan_interval: 0x0060, // 60 ms
                     le_scan_window: 0x0030,   // 30 ms
-                    own_address_type: hci::OwnAddressType::PublicDeviceAddress,
+                    own_address_type: self.own_address_type(),
                     scanning_filter_policy: hci::LeScanningFilterPolicy::AcceptAll,
                 }),
                 Tag::User,
@@ -371,7 +393,11 @@ impl Host {
     /// pairing mode), for about 10 s, or stop looking. Results arrive as
     /// `InquiryResult`, the end as `InquiryDone`. We stay undiscoverable
     /// ourselves: this only asks.
+    /// An LE-only controller has no inquiry: nothing is sent.
     pub fn inquiry(&mut self, on: bool, now_ms: u64) {
+        if self.le_only() {
+            return;
+        }
         if on {
             // Extended results carry the name and the signal.
             self.issue(to_cmd(hci::WriteInquiryMode { inquiry_mode: hci::InquiryMode::RssiOrExtended }), Tag::Policy);
@@ -418,7 +444,7 @@ impl Host {
                 initiator_filter_policy: hci::InitiatorFilterPolicy::UsePeerAddress,
                 peer_address_type,
                 peer_address: address,
-                own_address_type: hci::OwnAddressType::PublicDeviceAddress,
+                own_address_type: self.own_address_type(),
                 connection_interval_min: 0x0018, // 30 ms
                 connection_interval_max: 0x0028, // 50 ms
                 max_latency: 0,
@@ -860,11 +886,35 @@ impl Host {
             },
             ReadBdAddr => match hci::ReadBdAddrComplete::try_from(cc) {
                 Ok(r) => {
-                    self.info.address = Some(Peer::from_hci(r.bd_addr, hci::AddressType::PublicDeviceAddress).address);
-                    Some((to_cmd(hci::ReadBufferSize {}), ReadBufferSize))
+                    let a = Peer::from_hci(r.bd_addr, hci::AddressType::PublicDeviceAddress).address;
+                    if a != [0; 6] {
+                        self.info.address = Some(a);
+                        Some(self.buffer_size_step())
+                    } else if self.info.manufacturer == MANUFACTURER_ZEPHYR {
+                        // No public address: use the chip's own static one.
+                        Some((to_cmd(hci::ZephyrReadStaticAddresses {}), ZephyrStaticAddress))
+                    } else {
+                        return self.fatal("controller has no public address and no known way to read a static one".into());
+                    }
                 }
                 Err(_) => return self.fatal(bad("address")),
             },
+            ZephyrStaticAddress => match hci::ZephyrReadStaticAddressesComplete::try_from(cc) {
+                Ok(r) => match r.addresses.first().map(|z| Peer::from_hci(z.address, hci::AddressType::RandomDeviceAddress)) {
+                    // A static address has its two top bits set (Core Vol 6
+                    // Part B §1.3.2.1) and is not all ones in the rest.
+                    Some(p) if is_static_random(p.address) => {
+                        self.info.address = Some(p.address);
+                        self.info.address_random = true;
+                        let (random_address, _) = p.to_hci();
+                        Some((to_cmd(hci::LeSetRandomAddress { random_address }), LeSetRandomAddress))
+                    }
+                    Some(p) => return self.fatal(format!("controller's static address {p} is not a static random address")),
+                    None => return self.fatal("controller has no static address".into()),
+                },
+                Err(_) => return self.fatal(bad("static addresses")),
+            },
+            LeSetRandomAddress => Some(self.buffer_size_step()),
             ReadBufferSize => match hci::ReadBufferSizeComplete::try_from(cc) {
                 Ok(r) => {
                     self.info.acl_mtu = r.acl_data_packet_length;
@@ -895,7 +945,7 @@ impl Host {
             // BR/EDR: Secure Simple Pairing with Secure Connections. An
             // LE-only controller (LMP feature bit 37, "BR/EDR not
             // supported") skips these.
-            LeSetEventMask if self.info.lmp_features & (1 << 37) == 0 => {
+            LeSetEventMask if !self.le_only() => {
                 Some((to_cmd(hci::WriteSimplePairingMode { simple_pairing_mode: hci::Enable::Enabled }), WriteSimplePairingMode))
             }
             LeSetEventMask => None,
@@ -908,6 +958,31 @@ impl Host {
         match next {
             Some((c, s)) => self.issue(c, Tag::Init(s)),
             None => self.finish_bring_up(),
+        }
+    }
+
+    fn le_only(&self) -> bool {
+        self.info.le_only()
+    }
+
+    /// The first buffer-size read: the BR/EDR ACL buffers, or straight to
+    /// the LE ones on an LE-only controller (which has only those, so they
+    /// must not be zero: finish_bring_up refuses a controller with none).
+    fn buffer_size_step(&self) -> (Command, Step) {
+        if self.le_only() {
+            (to_cmd(hci::LeReadBufferSizeV2 {}), Step::LeReadBufferSizeV2)
+        } else {
+            (to_cmd(hci::ReadBufferSize {}), Step::ReadBufferSize)
+        }
+    }
+
+    /// The address type our scans and connections use: the random static
+    /// address when the controller has no public one.
+    fn own_address_type(&self) -> hci::OwnAddressType {
+        if self.info.address_random {
+            hci::OwnAddressType::RandomDeviceAddress
+        } else {
+            hci::OwnAddressType::PublicDeviceAddress
         }
     }
 

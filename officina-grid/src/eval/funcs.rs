@@ -7,6 +7,10 @@ use super::ifcache;
 use super::arrays::*;
 use super::more::*;
 use super::fin::*;
+use super::textafter::textsplit;
+use super::refs::{indirect, offset};
+use super::conv::*;
+use super::stats::*;
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -243,6 +247,72 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("RATE", 3, 6, rate),
     f!("NPV", 2, N, npv),
     f!("IRR", 1, 2, irr),
+    // the fourth batch
+    f!("TEXTBEFORE", 2, 6, textbefore),
+    f!("TEXTSPLIT", 2, 6, textsplit),
+    f!("FIXED", 1, 3, fixed),
+    f!("LOOKUP", 2, 3, lookup_fn),
+    f!("ADDRESS", 2, 5, address),
+    f!("ISREF", 1, 1, isref),
+    f!("YEARFRAC", 2, 3, yearfrac),
+    f!("SLN", 3, 3, sln),
+    f!("SYD", 4, 4, syd),
+    f!("DDB", 4, 5, ddb),
+    f!("DB", 4, 5, db),
+    // the fifth batch
+    f!("INDIRECT", 1, 2, indirect, volatile),
+    f!("OFFSET", 3, 5, offset, volatile),
+    f!("AVEDEV", 1, N, avedev),
+    f!("DEVSQ", 1, N, devsq),
+    f!("GEOMEAN", 1, N, geomean),
+    f!("HARMEAN", 1, N, harmean),
+    f!("STANDARDIZE", 3, 3, standardize),
+    f!("CORREL", 2, 2, correl),
+    f!("PEARSON", 2, 2, correl),
+    f!("RSQ", 2, 2, rsq),
+    f!("SLOPE", 2, 2, slope),
+    f!("INTERCEPT", 2, 2, intercept),
+    f!("FORECAST", 3, 3, forecast),
+    f!("FORECAST.LINEAR", 3, 3, forecast),
+    f!("STEYX", 2, 2, steyx),
+    f!("COVAR", 2, 2, covariance_p),
+    f!("COVARIANCE.P", 2, 2, covariance_p),
+    f!("COVARIANCE.S", 2, 2, covariance_s),
+    f!("MODE.MULT", 1, N, mode_mult),
+    f!("MAXA", 1, N, maxa),
+    f!("MINA", 1, N, mina),
+    f!("AVERAGEA", 1, N, averagea),
+    f!("SINH", 1, 1, sinh),
+    f!("COSH", 1, 1, cosh),
+    f!("TANH", 1, 1, tanh),
+    f!("ASINH", 1, 1, asinh),
+    f!("ACOSH", 1, 1, acosh),
+    f!("ATANH", 1, 1, atanh),
+    f!("REPLACE", 4, 4, replace),
+    f!("DOLLAR", 1, 2, dollar),
+    f!("NUMBERVALUE", 1, 3, numbervalue),
+    f!("ROMAN", 1, 2, roman),
+    f!("ARABIC", 1, 1, arabic),
+    f!("BASE", 2, 3, base),
+    f!("DECIMAL", 2, 2, decimal),
+    f!("BIN2DEC", 1, 1, bin2dec),
+    f!("BIN2HEX", 1, 2, bin2hex),
+    f!("BIN2OCT", 1, 2, bin2oct),
+    f!("DEC2BIN", 1, 2, dec2bin),
+    f!("DEC2HEX", 1, 2, dec2hex),
+    f!("DEC2OCT", 1, 2, dec2oct),
+    f!("HEX2BIN", 1, 2, hex2bin),
+    f!("HEX2DEC", 1, 1, hex2dec),
+    f!("HEX2OCT", 1, 2, hex2oct),
+    f!("OCT2BIN", 1, 2, oct2bin),
+    f!("OCT2DEC", 1, 1, oct2dec),
+    f!("OCT2HEX", 1, 2, oct2hex),
+    f!("TYPE", 1, 1, type_fn),
+    f!("ERROR.TYPE", 1, 1, error_type),
+    f!("SHEET", 0, 1, sheet),
+    f!("SHEETS", 0, 1, sheets),
+    f!("ISFORMULA", 1, 1, isformula),
+    f!("ISNONTEXT", 1, 1, isnontext),
 ];
 
 /// The id of a function by its upper-case name.
@@ -1405,13 +1475,20 @@ fn substitute(c: &Ctx, a: &[Expr]) -> Ev {
     s(out)
 }
 fn textafter(c: &Ctx, a: &[Expr]) -> Ev {
+    text_around(c, a, false)
+}
+fn textbefore(c: &Ctx, a: &[Expr]) -> Ev {
+    text_around(c, a, true)
+}
+fn text_around(c: &Ctx, a: &[Expr], before: bool) -> Ev {
     let haystack = tri!(text(c, &a[0]));
     let delim = tri!(super::textafter::delimiters(c, c.eval(&a[1])));
     let instance = tri!(opt_num(c, a, 2, 1.0)).floor();
     let mode = tri!(opt_num(c, a, 3, 0.0));
     let match_end = tri!(opt_num(c, a, 4, 0.0));
     let explicit_instance = a.get(2).is_some_and(|arg| !missing(arg));
-    match super::textafter::after(&haystack, &delim, instance, mode, match_end, explicit_instance) {
+    let find = if before { super::textafter::before } else { super::textafter::after };
+    match find(&haystack, &delim, instance, mode, match_end, explicit_instance) {
         Ok(Some(suffix)) => v(Value::str(suffix)),
         Ok(None) => match a.get(5).filter(|arg| !missing(arg)) {
             Some(fallback) => match c.scalar(fallback) {
@@ -1513,6 +1590,7 @@ fn index(c: &Ctx, a: &[Expr]) -> Ev {
 }
 
 /// A vector to search: a single row or column of a range, or a 1-D array.
+#[derive(Clone)]
 enum Vector {
     Col { sheet: u16, col: u32, r0: u32, len: u32 },
     Row { sheet: u16, row: u32, c0: u32, len: u32 },
@@ -1848,4 +1926,130 @@ pub fn text_key(s: &str) -> String {
 #[allow(dead_code)]
 fn _unused(a: &str, b: &str) -> Ordering {
     cmp_text(a, b)
+}
+
+/// LOOKUP(value, lookup_vector, [result_vector]), or LOOKUP(value, array):
+/// the last place whose value of the same type is at most `value` (on sorted
+/// data, where Excel's binary search lands). The array form searches the
+/// first row of a wide array, else the first column, and answers from the
+/// last row or column.
+fn lookup_fn(c: &Ctx, a: &[Expr]) -> Ev {
+    let key = c.scalar(&a[0]);
+    if let Value::Err(k) = key {
+        return e(k);
+    }
+    let (look, result) = if a.len() == 3 {
+        let look = tri!(Vector::from(c, c.eval(&a[1])));
+        let result = tri!(Vector::from(c, c.eval(&a[2])));
+        (look, result)
+    } else {
+        tri!(lookup_array_form(c, c.eval(&a[1])))
+    };
+    let mut hit = None;
+    for i in 0..look.len() {
+        let x = look.get(c, i);
+        if x.is_empty() || std::mem::discriminant(&x) != std::mem::discriminant(&key) {
+            continue;
+        }
+        if compare(&x, &key) != Ordering::Greater {
+            hit = Some(i);
+        }
+    }
+    let Some(i) = hit else { return e(ErrorKind::NA) };
+    match &result {
+        // A short result array has nothing at that place.
+        Vector::Arr(arr) if i as usize >= arr.vals.len() => e(ErrorKind::NA),
+        _ => v(result.get(c, i)),
+    }
+}
+
+/// LOOKUP's array form: the vector to search and the one to answer from.
+fn lookup_array_form(c: &Ctx, ev: Ev) -> Result<(Vector, Vector), ErrorKind> {
+    match ev {
+        Ev::R(r) if r.rows() > 1 && r.cols() > 1 => {
+            let r = c.clip(&r).unwrap_or(r);
+            let wide = r.cols() > r.rows();
+            let (look, last) = if wide {
+                (Rect { r1: r.r0, ..r }, Rect { r0: r.r1, ..r })
+            } else {
+                (Rect { c1: r.c0, ..r }, Rect { c0: r.c1, ..r })
+            };
+            Ok((Vector::from(c, Ev::R(look))?, Vector::from(c, Ev::R(last))?))
+        }
+        Ev::R(_) => {
+            let vector = Vector::from(c, ev)?;
+            Ok((vector.clone(), vector))
+        }
+        Ev::V(Value::Err(k)) => Err(k),
+        other => {
+            let arr = c.to_array(other)?;
+            let (rows, cols) = (arr.rows, arr.cols);
+            let wide = cols > rows;
+            let pick = |fixed_row: Option<usize>, fixed_col: Option<usize>| {
+                let vals: Vec<Value> = if let Some(row) = fixed_row {
+                    (0..cols).map(|col| arr.vals[row * cols + col].clone()).collect()
+                } else {
+                    let col = fixed_col.unwrap_or(0);
+                    (0..rows).map(|row| arr.vals[row * cols + col].clone()).collect()
+                };
+                let (r, k) = if fixed_row.is_some() { (1, vals.len()) } else { (vals.len(), 1) };
+                Vector::Arr(Arc::new(Array { rows: r, cols: k, vals }))
+            };
+            if rows == 0 || cols == 0 {
+                return Err(ErrorKind::NA);
+            }
+            Ok(if wide {
+                (pick(Some(0), None), pick(Some(rows - 1), None))
+            } else {
+                (pick(None, Some(0)), pick(None, Some(cols - 1)))
+            })
+        }
+    }
+}
+
+/// ADDRESS(row, column, [abs_num], [a1], [sheet_text]): a cell's address as
+/// text, in A1 or R1C1 style.
+fn address(c: &Ctx, a: &[Expr]) -> Ev {
+    let row = tri!(num(c, &a[0])).trunc();
+    let col = tri!(num(c, &a[1])).trunc();
+    let abs = tri!(opt_num(c, a, 2, 1.0)).trunc();
+    let a1 = match a.get(3).filter(|x| !missing(x)) {
+        Some(x) => tri!(to_bool(&c.scalar(x))),
+        None => true,
+    };
+    if !(1.0..=f64::from(crate::addr::MAX_ROWS)).contains(&row)
+        || !(1.0..=f64::from(crate::addr::MAX_COLS)).contains(&col)
+        || !matches!(abs as i32, 1..=4)
+        || abs.fract() != 0.0
+    {
+        return e(ErrorKind::Value);
+    }
+    let (row, col, abs) = (row as u32, col as u32, abs as i32);
+    let mut out = String::new();
+    if let Some(sheet) = a.get(4).filter(|x| !missing(x)) {
+        let name = tri!(text(c, sheet));
+        crate::formula::print::push_sheet_name(&name, &mut out);
+        out.push('!');
+    }
+    let (row_abs, col_abs) = (matches!(abs, 1 | 2), matches!(abs, 1 | 3));
+    if a1 {
+        if col_abs {
+            out.push('$');
+        }
+        out.push_str(&crate::addr::col_name(col - 1));
+        if row_abs {
+            out.push('$');
+        }
+        out.push_str(&row.to_string());
+    } else {
+        let part = |letter: char, n: u32, absolute: bool| if absolute { format!("{letter}{n}") } else { format!("{letter}[{n}]") };
+        out.push_str(&part('R', row, row_abs));
+        out.push_str(&part('C', col, col_abs));
+    }
+    s(out)
+}
+
+/// ISREF(value): whether the argument is a reference.
+fn isref(c: &Ctx, a: &[Expr]) -> Ev {
+    v(Value::Bool(matches!(c.eval(&a[0]), Ev::R(_))))
 }

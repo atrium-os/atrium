@@ -140,11 +140,15 @@ enum State {
     Failed,
 }
 
-/// Reassembles H4 frames from a byte stream (UART, TCP).
+/// Reassembles H4 frames from a byte stream (UART, TCP), or HCI packets of
+/// one kind from a stream with no type bytes (a USB endpoint: events on the
+/// interrupt pipe, ACL on bulk), see [`Decoder::typed`].
 #[derive(Debug, Default)]
 pub struct Decoder {
     state: State,
     buf: Vec<u8>,
+    /// Every packet in the stream is of this kind and has no type byte.
+    typed: Option<Kind>,
 }
 
 impl Decoder {
@@ -152,8 +156,27 @@ impl Decoder {
         Decoder::default()
     }
 
+    /// A decoder for a stream that carries only `kind` packets, back to back,
+    /// without H4 type bytes. Frames come out as for an H4 stream, with the
+    /// same length bounds.
+    pub fn typed(kind: Kind) -> Decoder {
+        Decoder { state: State::Header(kind), buf: Vec::new(), typed: Some(kind) }
+    }
+
     pub fn reset(&mut self) {
-        *self = Decoder::default();
+        *self = match self.typed {
+            Some(k) => Decoder::typed(k),
+            None => Decoder::default(),
+        };
+    }
+
+    /// True between packets: nothing of a partial packet is buffered.
+    pub fn idle(&self) -> bool {
+        match self.state {
+            State::Type => true,
+            State::Header(_) => self.buf.is_empty(),
+            _ => false,
+        }
     }
 
     /// Feeds bytes; calls `out` for each complete frame. Stops at the first
@@ -200,7 +223,10 @@ impl Decoder {
             if let State::Payload(k, total) = self.state {
                 if self.buf.len() == total {
                     out(Frame { kind: k, packet: std::mem::take(&mut self.buf) });
-                    self.state = State::Type;
+                    self.state = match self.typed {
+                        Some(k) => State::Header(k),
+                        None => State::Type,
+                    };
                 }
             }
         }
@@ -221,6 +247,41 @@ mod tests {
     // HCI_Reset command and its Command Complete.
     const RESET: [u8; 4] = [0x01, 0x03, 0x0c, 0x00];
     const RESET_DONE: [u8; 7] = [0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00];
+
+    #[test]
+    fn typed_stream_split_across_usb_packets() {
+        // Two events back to back with no type bytes, as on the interrupt
+        // endpoint, delivered in 3-byte USB packets.
+        let mut stream = RESET_DONE[1..].to_vec();
+        stream.extend_from_slice(&[0x0f, 0x04, 0x00, 0x01, 0x03, 0x0c]);
+        let mut d = Decoder::typed(Kind::Event);
+        assert!(d.idle());
+        let mut got = Vec::new();
+        for c in stream.chunks(3) {
+            d.push(c, |f| got.push(f)).unwrap();
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].to_bytes(), RESET_DONE);
+        assert_eq!(got[1].kind, Kind::Event);
+        assert_eq!(got[1].packet[0], 0x0f);
+        assert!(d.idle());
+        d.push(&[0x0e], |_| {}).unwrap();
+        assert!(!d.idle());
+        d.reset();
+        assert!(d.idle());
+        // After a reset the decoder is still typed: no type byte expected.
+        let mut again = Vec::new();
+        d.push(&RESET_DONE[1..], |f| again.push(f)).unwrap();
+        assert_eq!(again.len(), 1);
+    }
+
+    #[test]
+    fn typed_acl_over_bound_fails() {
+        let mut d = Decoder::typed(Kind::Acl);
+        let len = (MAX_ACL_PAYLOAD as u16 + 1).to_le_bytes();
+        let r = d.push(&[0x01, 0x20, len[0], len[1]], |_| {});
+        assert_eq!(r, Err(Error::TooLong { kind: Kind::Acl, len: MAX_ACL_PAYLOAD + 1 }));
+    }
 
     #[test]
     fn whole_and_byte_by_byte_agree() {
