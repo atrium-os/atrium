@@ -67,6 +67,12 @@ kind   = "ro_nullfs"
 path = "/usr/local/bin/atrium-memfed"
 argv = ["atrium-memfed", "--arm", "--broker", "/atrium/sockets/portcullis.sock",
         "--budget-pct", "70", "--interval", "10",
+        # The Navigator's engines (widgets, a live page, its frames) as ONE
+        # pool: frames and windows divide its share, never add to it
+        # (navigator-islands.md I6.6). Named here rather than read with
+        # --pools-from, so memfed's jail needs no view of the apps
+        # directory; the engine manifest declares the same weight and floor.
+        "--pool", "app-org-atrium-navigator-engine--:1:256",
         # operator-tuned jail list (name:weight:floor MiB):
         "app-org-atrium-vestibulum:5:128"]
 uid  = 50091   # _memfed

@@ -8,7 +8,9 @@
 #
 # PAGE_MIB is the installed engine manifest's [resources].memory (1024 for
 # the 1G manifest). Every frame engine must have a part's limit, 256 MiB
-# (limen::web_island::PART_MEMORY_MB). For each engine it checks:
+# (limen::web_island::PART_MEMORY_MB). Stop memfed first: it may tighten
+# the engine pool's caps, and the limits are compared exactly. For each
+# engine it checks:
 #   - its jail is a navigator-engine one-shot jail of its own, with no IP;
 #   - it is in Capsicum capability mode and not root;
 #   - its jail's RCTL rules: memoryuse sigkill at its role's limit, pcpu;
