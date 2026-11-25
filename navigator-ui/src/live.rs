@@ -123,6 +123,9 @@ pub struct Live {
     embeds: Option<Rc<RefCell<Embeds>>>,
     window: Option<WindowToken>,
     widget: Option<ActiveWidget>,
+    /// Tabula over the connection navigatord opened (`Hello { clipboard }`),
+    /// for a live page's copy and paste (navigator-islands.md I6.4).
+    clipboard: Option<pergola::clipboard::Tabula>,
     /// The page running live (I6.1) and where its island was last placed.
     live_placed: Option<(String, [u32; 4])>,
     children: Vec<Child>,
@@ -230,7 +233,7 @@ impl Live {
     /// started us on). With `trails`, navigatord keeps the trail store
     /// and sends it back here (navigator-ui.md §2.3a J3).
     pub fn on(mut s: UnixStream, chrome: bool, trails: bool) -> io::Result<(Live, Hello)> {
-        ctl::write_frame(&mut s, &Request::Hello { chrome, limen: true, measure: true, trails })?;
+        ctl::write_frame(&mut s, &Request::Hello { chrome, limen: true, measure: true, clipboard: true, trails })?;
         let fd = match ctl::read_frame::<Event>(&mut s)? {
             Some(Event::Chrome { fd: true }) => Some(ctl::recv_fd(&s)?),
             Some(Event::Chrome { fd: false }) => None,
@@ -244,6 +247,17 @@ impl Live {
         let measure = match ctl::read_frame::<Event>(&mut s)? {
             Some(Event::Measure { fd: true }) => Some(ctl::recv_fd(&s)?),
             Some(Event::Measure { fd: false }) => None,
+            other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
+        };
+        // The Tabula connection navigatord opened: the presenter frescod
+        // lets spend a live page's chord is the owner of our windows.
+        let clipboard = match ctl::read_frame::<Event>(&mut s)? {
+            Some(Event::Clipboard { fd: true }) => {
+                let fd = ctl::recv_fd(&s)?;
+                pergola::clipboard::Tabula::on(std::os::unix::net::UnixStream::from(fd))
+                    .map_err(|e| eprintln!("navigator-ui: Tabula: {e:?}")).ok()
+            }
+            Some(Event::Clipboard { fd: false }) => None,
             other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
         };
         let mut kept: Option<String> = None;
@@ -298,6 +312,7 @@ impl Live {
                 window: None,
                 widget: None,
                 live_placed: None,
+                clipboard,
                 children: vec![],
                 shown: None,
                 started: false,
@@ -934,13 +949,16 @@ impl Live {
                 Event::LiveCopy { from, text, token } => {
                     if !s.live_on_screen(&from) {
                         eprintln!("navigator-ui: a live page's copy not taken");
-                    } else if let Err(e) = pergola::clipboard::copy_text_with(token, &text) {
+                    } else if let Err(e) = self.clipboard.as_mut().ok_or(pergola::clipboard::Error::Unavailable("no Tabula connection".into()))
+                        .and_then(|t| pergola::clipboard::copy_text_on(t, token, &text)) {
                         eprintln!("navigator-ui: the live page's copy: {e:?}");
                     }
                 }
                 Event::LivePaste { from, token } => {
                     if s.live_on_screen(&from) {
-                        match pergola::clipboard::paste_text_with(token) {
+                        let pasted = self.clipboard.as_mut().ok_or(pergola::clipboard::Error::Unavailable("no Tabula connection".into()))
+                            .and_then(|t| pergola::clipboard::paste_text_on(t, token));
+                        match pasted {
                             Ok(Some(text)) if !text.is_empty() && text.len() <= limen::web_island::COPY_MAX => {
                                 send(&mut self.w, &Request::LivePasted { url: from, text });
                             }
@@ -984,7 +1002,7 @@ impl Live {
                     eprintln!("navigator-ui: Arca holds {} accounts for {}{}", accounts.len(), crate::trail::site(&url), why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default());
                     s.accounts_answer(&url, accounts, why);
                 }
-                Event::Chrome { .. } | Event::Limen { .. } | Event::Measure { .. } | Event::Trails { .. } | Event::Settings { .. } => {}
+                Event::Chrome { .. } | Event::Limen { .. } | Event::Measure { .. } | Event::Clipboard { .. } | Event::Trails { .. } | Event::Settings { .. } => {}
                 Event::TrailsNotSaved { why } => eprintln!("navigator-ui: trail store not kept: {why}"),
             }
         }

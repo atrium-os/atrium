@@ -103,7 +103,10 @@ pub enum Request {
     /// `measure`: a second frescod connection, for measuring text, answered
     /// by `Measure`; `trails`: the trail store navigatord keeps for the UI,
     /// answered by `Trails` parts (navigator-ui.md §2.3a J3).
-    Hello { chrome: bool, limen: bool, measure: bool, trails: bool },
+    /// `clipboard`: a Tabula connection navigatord opened, answered by
+    /// `Clipboard` after `Measure`, so the presenter Tabula sees is the owner
+    /// of the UI's windows, as frescod's island tokens name it (I6.4).
+    Hello { chrome: bool, limen: bool, measure: bool, clipboard: bool, trails: bool },
     /// The UI's trail store, to keep: in [`parts`], the last with `last`;
     /// at most [`TRAILS_MAX`] in all.
     SaveTrails { part: String, last: bool },
@@ -349,6 +352,9 @@ pub enum Event {
     /// After `Limen`, when `Hello` asked. With `fd`, a descriptor follows: a
     /// second frescod connection, for measuring text.
     Measure { fd: bool },
+    /// After `Measure`, when `Hello` asked. With `fd`, a descriptor follows:
+    /// a Tabula connection navigatord opened.
+    Clipboard { fd: bool },
     /// After `Measure`, when `Hello` asked: the kept trail store in parts,
     /// the last with `last`; `None` in every part when there is none.
     Trails { part: Option<String>, last: bool },

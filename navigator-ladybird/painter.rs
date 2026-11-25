@@ -1560,7 +1560,7 @@ pub mod host {
         let Some((child, embed, surface)) = &mut state.embed else { return -1 };
         if state.interactive_island {
             match child.borrow_mut().poll(std::time::Duration::ZERO) {
-                Ok(Some(limen::proto::ChildEvent::Detaching { embed: id })) if id == *embed => return -1,
+                Ok(Some(limen::proto::ChildEvent::Detaching { embed: id })) if id == *embed => { eprintln!("island: Limen detached the island"); return -1 }
                 Ok(Some(limen::proto::ChildEvent::Message { embed: id, bytes })) if id == *embed => {
                     if let Some(seek) = limen::web_island::ChapterSeek::decode(&bytes) {
                         state.chapter_seconds = Some(seek.seconds());
@@ -1579,7 +1579,7 @@ pub mod host {
                         return 8;
                     }
                 }
-                Err(_) => return -1,
+                Err(e) => { eprintln!("island: the Limen channel failed: {e:?}"); return -1 }
                 _ => {}
             }
         }
@@ -1609,7 +1609,8 @@ pub mod host {
                 state.key = Some((special, code_point, modifiers, pressed, activation));
                 7
             }
-            Err(_) | Ok(Some(fresco_client::Event::CloseRequested {..})) => -1,
+            Err(e) => { eprintln!("island: the frescod connection failed: {e:?}"); -1 }
+            Ok(Some(fresco_client::Event::CloseRequested {..})) => { eprintln!("island: frescod asked the island to close"); -1 }
             _ => 0,
         }
     }

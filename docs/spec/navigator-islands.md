@@ -2950,10 +2950,10 @@ LibWeb's `handle_keydown` and `handle_keyup`, except Ctrl-C and Ctrl-V.
 - **Copy.** On Ctrl-C the engine reads the focused navigable's selected text and sends
   `Report::Copy { text, token }` (limen `web_island.rs`; text at most `COPY_MAX`, 16 KiB,
   token non-zero). navigatord turns it into `Event::LiveCopy`, and the UI writes it through
-  Tabula with `pergola::clipboard::copy_text_with`, but only when that live page is the one
+  Tabula with `pergola::clipboard::copy_text_on`, but only when that live page is the one
   on screen (`Shell::live_on_screen`).
 - **Paste.** On Ctrl-V the engine sends `Report::Paste { token }`. The UI reads Tabula with
-  `paste_text_with`, then sends `Request::LivePasted { url, text }` if the text is at most
+  `paste_text_on`, then sends `Request::LivePasted { url, text }` if the text is at most
   `COPY_MAX`, or else says in the prompt row that nothing was pasted
   (`Prompt::PasteTooLong`). navigatord passes it to the engine as `Pasted` ('V' plus the text), and the
   engine types it into the page as key presses.
@@ -2962,10 +2962,46 @@ LibWeb's `handle_keydown` and `handle_keyup`, except Ctrl-C and Ctrl-V.
   press was the chord itself (tabula.md §2.6): never a click or Enter. The page never reads
   the clipboard on its own: the reporter still refuses `navigator.clipboard.read` and
   `readText`.
+- **The presenter.** frescod names the parent by the owner of the UI's window, and
+  navigatord opens that connection (§2.3a of navigator-ui.md), so the owner is the
+  Navigator app's uid, not the UI's per-instance one. Tabula passes its peer's uid as the
+  presenter, so navigatord opens the UI's Tabula connection too (`Hello { clipboard }`,
+  answered by `Event::Clipboard` with the descriptor) and the UI keeps it
+  (`pergola::clipboard::Tabula::on`, never reconnected as the UI). The Navigator app's
+  manifest has `clipboard = true`; the UI's has no capabilities.
 
 Not built: a page's own `copy` and `paste` events with clipboardData, and rich (HTML) copy.
-The Mac gate types into the fixture, then runs Ctrl-C and Ctrl-V with a frescod rebuilt
-for §2.6.
+
+#### I6.4 gate results on arm64 Tessera, 2026-11-25
+
+All four parts ran on one disposable arm64 Tessera guest under J2, with frescod and the
+engine built from e008f640e (engine sha256 `9dd07bef…94b5` at the end, JIT audit
+passed), then arcad, the courier and navigatord from ac5ba59b9. Evidence is in
+`~/atrium-vm/evidence/navigator-i6-4-20261125/` on the Mac. jaild logged no `rctl` WARNs.
+
+- **Downloads and refusals, 4/4.** `report.csv` was asked in the prompt row while the page
+  ran; Save wrote `~/Downloads/report.csv` with `user.atrium.origin` set to its address. A
+  script's `blob:` file (`notes.txt`, 17 bytes) was asked, and Cancel discarded it. The
+  refusals settled at once (notifications denied, geolocation denied, service worker and
+  `window.open` refused), and the popover named the third-party host and all four. The form
+  sign-in made one POST (303) and one GET through the jar.
+- **File input, 3/3.** The picker sheet read "Choose a file for app.example", and the pick
+  reached the page (`pick-me.txt`, 33 bytes). Cancel added nothing and the engine ran on;
+  the input still shows the earlier pick, since LibWeb keeps it. A second press within 2 s
+  was refused and named in the popover.
+- **Printing, 1/1.** Ctrl-P in the live page opened Prelum's sheet with the entry's
+  document-lane rendering; Ctrl-P twice gave one sheet and a logged refusal.
+- **Keys and the clipboard.** Typing reached the page's fields, and Shift+Home selected.
+  Ctrl-C then Ctrl-V copied "anaxy" from one field into the other. Ctrl+A does not select
+  all yet.
+
+Fixed on the way: navigatord ended the run when a finished picker detached (only the
+island's own embed ends it now); the engine stopped after 15,000 input polls, about five
+minutes (now a 12-hour bound); a few engine compile fixes against the pinned LibWeb
+(`SelectedFile` and `FileFilter` live in LibWebCommon, the selection is read from
+`hosted_focused_navigable()`); and the clipboard's presenter above, which Tabula refused as
+`WRONG_UID` until navigatord opened the UI's connection. The guest also needed Prelum's
+render worker installed, Scrinium run `--no-window` as its app uid, and `_tabula`'s user.
 
 #### I6.5 as built (2026-11-25, first part: the page's own site answers its scripts)
 
@@ -3061,6 +3097,14 @@ Tests: `live_frames` (address, placement, the mailbox),
 reporter's parse checks (navigatord), and the frames half of
 `scripts/navigator-live-reporter-check.js`. The fixture's `frame` line is
 the Mac check.
+
+**Mac check, 2026-11-25 (arm64 Tessera, ac5ba59b9).** The fixture's
+`same-site-api` line passed ("api.app.example answered") and its `frame`
+line passed ("pay.example running; parent DOM unreachable"), with the
+frame in a second engine. **Open bug:** once the frame runs, the main page
+takes no clicks or keys. Clicks on its links and fields do nothing, and
+keys go only to the frame, while the main engine sits idle in `sbwait`.
+The same page with the iframe removed takes input normally.
 
 #### Costs
 
@@ -4010,4 +4054,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4's first part](#i64-as-built-2026-11-25-first-part-downloads-and-refusals) (downloads from links, forms and scripts; refused APIs answered at once and named in the popover) [second part](#i64-as-built-2026-11-25-second-part-file-input) (file input through Scrinium's picker) and [third part](#i64-as-built-2026-11-25-third-part-printing) (printing) are host-tested and wait for their gates; the [clipboard](#the-clipboard-i64-still-to-build) waits on a Fresco change.
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4](#i64-gate-results-on-arm64-tessera-2026-11-25) (downloads and refusals, file input through Scrinium, printing, keys and the clipboard) passed its gates on arm64 Tessera after four fixes. I6.5 is built; its fixture lines pass on the Mac, but a page with a running cross-origin frame takes no input ([open bug](#i65-as-built-2026-11-25-second-part-cross-origin-frames)).

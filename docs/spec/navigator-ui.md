@@ -195,7 +195,9 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   as the Navigator's per-app uid (50000+) that the launch registry names (navtest,
   `org.atrium.navigator`), with its store in its own jail. navigatord now also opens the UI's
   limend connection (`Hello { limen }`, `NAVIGATORD_LIMEN`), so limend's parent is the owner of
-  the UI's windows whoever runs the UI, and spends prompt presses as that owner. Left for later:
+  the UI's windows whoever runs the UI, and spends prompt presses as that owner. It opens the UI's Tabula connection too (`Hello { clipboard }`, when the Navigator app has
+  `clipboard`), since frescod lets only that owner spend a live page's copy or paste chord
+  (navigator-islands.md I6.4). Left for later:
   portcullisd making a served socket's directory the app's own (the script opens `navigator/`
   and `navigator-page/` 1777). Downloads reach the person's folder through portcullisd's
   `SaveDownload` (2026-11-18).

@@ -93,14 +93,24 @@ pub fn paste_text() -> Result<Option<String>, Error> {
 /// one it is dispatching: an island's parent copying for the page in it
 /// (navigator-islands.md I6.4; frescod lets the parent spend it).
 pub fn copy_text_with(token: Token, text: &str) -> Result<(), Error> {
+    with_backend(|b| copy_text_on(b, token, text))
+}
+
+/// [`copy_text_with`] on a backend the caller holds.
+pub fn copy_text_on(b: &mut dyn Backend, token: Token, text: &str) -> Result<(), Error> {
     if token == fresco_protocol::activation::NONE { return Err(Error::NoGesture); }
-    with_backend(|b| b.set(token, &[("text/plain", text.as_bytes())], false))
+    b.set(token, &[("text/plain", text.as_bytes())], false)
 }
 
 /// Paste as text spending `token`, as [`copy_text_with`].
 pub fn paste_text_with(token: Token) -> Result<Option<String>, Error> {
+    with_backend(|b| paste_text_on(b, token))
+}
+
+/// [`paste_text_with`] on a backend the caller holds.
+pub fn paste_text_on(b: &mut dyn Backend, token: Token) -> Result<Option<String>, Error> {
     if token == fresco_protocol::activation::NONE { return Err(Error::NoGesture); }
-    Ok(with_backend(|b| b.get(token, &["text/plain"]))?.map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(b.get(token, &["text/plain"])?.map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// Inside a drop handler: the dropped content as text, if it offers
@@ -115,16 +125,29 @@ pub fn drop_text() -> Result<Option<String>, Error> {
 #[derive(Default)]
 pub struct Tabula {
     conn: Option<aqueduct::Connection>,
+    /// Handed over ([`Tabula::on`]): never reconnected as this process.
+    handed: bool,
 }
 
 impl Tabula {
     /// A Tabula at `path` (default: `TABULA_SOCKET`, then the jail path).
     pub fn at(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
         let c = aqueduct::Connection::connect(path).map_err(|e| Error::Unavailable(e.to_string()))?;
-        Ok(Self { conn: Some(c) })
+        Ok(Self { conn: Some(c), handed: false })
+    }
+
+    /// A Tabula over a connection someone else opened: its presenter is
+    /// whoever connected, as for a UI whose broker opens it (navigator-ui.md
+    /// §2.3a).
+    pub fn on(s: std::os::unix::net::UnixStream) -> Result<Self, Error> {
+        let c = aqueduct::Connection::wrap(s).map_err(|e| Error::Unavailable(e.to_string()))?;
+        Ok(Self { conn: Some(c), handed: true })
     }
 
     fn conn(&mut self) -> Result<&mut aqueduct::Connection, Error> {
+        if self.conn.is_none() && self.handed {
+            return Err(Error::Unavailable("the Tabula connection handed over has closed".into()));
+        }
         if self.conn.is_none() {
             let path = std::env::var("TABULA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/clipboard/clipboard.sock".into());
             let c = aqueduct::Connection::connect(&path).map_err(|e| Error::Unavailable(e.to_string()))?;

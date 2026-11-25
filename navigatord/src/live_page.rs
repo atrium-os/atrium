@@ -1247,6 +1247,10 @@ impl Live {
                         let file = pick.end();
                         finish_pick(connection, embed, file, &picked);
                     }
+                    // Only the island's own end ends the run: a picker this
+                    // run already finished (and detached) reports its detach
+                    // too, after `pick.embed` is cleared.
+                    Ok(Some(ParentEvent::ChildLost { embed: id } | ParentEvent::Detached { embed: id })) if id != embed => {}
                     Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_) => {
                         let why = match fetched.recv_timeout(Duration::from_millis(100)) {
                             Ok(Err(e)) => e,

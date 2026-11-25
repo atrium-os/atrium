@@ -1212,7 +1212,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
         let wants_tier = matches!(req, Request::OpenWithRecordingTier { .. });
         let wants_islands = wants_tier || matches!(req, Request::OpenWithIslands { .. });
         match req {
-            Request::Hello { chrome, limen, measure, trails } => {
+            Request::Hello { chrome, limen, measure, clipboard, trails } => {
                 let opened = match (&cfg.chrome, chrome) {
                     (Some(p), true) => match open_chrome(p) {
                         Ok(o) => Some(o),
@@ -1266,6 +1266,27 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                             }
                         }
                         None => send(&w, &Event::Measure { fd: false }),
+                    }
+                }
+                // Tabula, on the UI's behalf: frescod lets the owner of the
+                // UI's windows (us) spend a live page's copy or paste chord
+                // (navigator-islands.md I6.4), so the presenter Tabula names
+                // must be us, whoever runs the UI.
+                if clipboard {
+                    let path = settings::get("NAVIGATORD_TABULA").unwrap_or_else(|| "/atrium/sockets/clipboard/clipboard.sock".into());
+                    match std::os::unix::net::UnixStream::connect(&path) {
+                        Ok(t) => {
+                            let s = w.lock().unwrap();
+                            let ok = ctl::write_frame(&mut &*s, &Event::Clipboard { fd: true }).and_then(|_| ctl::send_fd(&s, t.as_raw_fd()));
+                            if let Err(e) = ok {
+                                eprintln!("navigatord: UI: {e}");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("navigatord: Tabula {path}: {e}");
+                            send(&w, &Event::Clipboard { fd: false });
+                        }
                     }
                 }
                 if trails {
