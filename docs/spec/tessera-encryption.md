@@ -929,7 +929,13 @@ apps, then locks Arca, which drops their group keys (the kernel flushes as
 each goes). portcullisd unmounts the person's overlays before that
 (SessionEnded); one that something outside their uids still holds after
 five seconds is unmounted with `umount -f` while the key is still loaded,
-so its flush lands (`scripts/vm-logout-check.sh` 7). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
+so its flush lands, and its md is detached (`-o force`); one still attached
+after that is logged and named in SessionEnded's answer, and the key goes
+anyway. So a process of another uid that has a person's overlay open (a
+root shell, or a system service such as an indexer or a backup) gets EBADF
+at their logout instead of holding it up: logout ending on time with the
+key gone outranks that process's open files (`scripts/vm-logout-check.sh` 7,
+20 rounds with a writer). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
 atrium-volumes only, key-group keys only, no second verification since
 portcullisd had Sigillum verify the removal) deletes the item and drops
 the key, then `GROUP_ERASE`; if a folder is still in use the erase waits

@@ -4207,6 +4207,10 @@ fn session_ended(user: &str) -> Response {
     if !busy.is_empty() {
         eprintln!("portcullisd: {user} logging out: forcing unmount of: {}", busy.join("; "));
         busy = portcullis_overlay::teardown_person_forced(user);
+        if !busy.is_empty() {
+            eprintln!("portcullisd: ★ {user} logging out: still attached after the forced unmount, \
+                       its key goes anyway: {}", busy.join("; "));
+        }
     }
     if busy.is_empty() {
         eprintln!("portcullisd: {user} logging out: {} app uid(s) stopped, overlays unmounted", uids.len());
