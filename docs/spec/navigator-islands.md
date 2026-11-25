@@ -2967,6 +2967,40 @@ Not built: a page's own `copy` and `paste` events with clipboardData, and rich (
 The Mac gate types into the fixture, then runs Ctrl-C and Ctrl-V with a frescod rebuilt
 for §2.6.
 
+#### I6.5 as built (2026-11-25, first part: the page's own site answers its scripts)
+
+D12 lets a page's scripts reach its sibling hosts, but until now their
+answers failed LibWeb's CORS check: the request carried no `Origin`, and
+the answer reached the engine with only its content type.
+
+- **`Origin`.** Arca's courier takes a new client header, `Origin`
+  (`Header::Origin` = 8 in `arca-courier/src/schema.rs`), only in the shape
+  `https://host[:port]` (`origin_value`); anything else refuses the whole
+  request. The client states it as it already states the ticket's
+  initiator, which Arca's same-site rule trusts. `navigator_cookies::Fetch`
+  carries it (`from_origin`), only from a live view, on the first hop only.
+  navigatord's `LiveJar` sends the page's origin with a request to another
+  host of the site, with every script POST and with a form.
+- **The answer.** navigatord reads the server's one
+  `Access-Control-Allow-Origin` (`*`, `null` or one origin) and
+  `Access-Control-Allow-Credentials: true`, and sends them to the engine
+  as a new Nuntius event, `Event::Cors`, after the head and before the
+  body. Two such headers, a list, or a value out of shape pass nothing on.
+  The engine's `navigator_live_cors` hands them to LibWeb's response
+  headers (`live-page.patch`), and LibWeb's own check decides.
+- **Not yet.** A preflighted request (a POST with a JSON body to a sibling
+  host, or any custom header) needs `OPTIONS`, which neither the engine's
+  loader nor the courier sends; it fails closed. The jar adds the site's
+  cookies whatever the script's `credentials` mode, because the engine
+  does not pass the mode.
+
+Tests: `an_origin_is_sent_only_as_a_plain_https_origin` (arca-courier),
+the live jar's origin checks in navigator-cookies' broker test,
+`a_cors_answer_is_one_origin_or_none` (nuntius wire),
+`a_servers_cors_answer_is_passed_on_only_in_its_one_shape` and the serve
+test's sibling-host answer (navigatord). The fixture's `same-site-api`
+line is the Mac check.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

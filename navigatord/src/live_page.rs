@@ -57,23 +57,51 @@ pub fn scope(page: &str, url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A resource's answer for the engine: its status, content type token
+/// (`-` for none), body, and the server's CORS answer when the request
+/// carried the page's origin (I6.5).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Got {
+    pub status: u16,
+    pub kind: String,
+    pub body: Vec<u8>,
+    /// `Access-Control-Allow-Origin` (in [`nuntius::cors_origin`]'s
+    /// shape) and whether credentials are allowed.
+    pub cors: Option<(String, bool)>,
+}
+
+impl Got {
+    pub fn new(status: u16, kind: impl Into<String>, body: Vec<u8>) -> Got {
+        Got { status, kind: kind.into(), body, cors: None }
+    }
+}
+
+/// The server's CORS answer, if it gave one in the shape passed on: one
+/// `Access-Control-Allow-Origin` header, and `Access-Control-Allow-
+/// Credentials: true` read case-sensitively, as browsers do.
+fn cors(headers: &[(String, String)]) -> Option<(String, bool)> {
+    let named = |n: &'static str| headers.iter().filter(move |(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim());
+    let mut origins = named("access-control-allow-origin");
+    let origin = origins.next().filter(|_| origins.next().is_none()).filter(|v| nuntius::cors_origin(v))?;
+    Some((origin.to_string(), named("access-control-allow-credentials").next() == Some("true")))
+}
+
 /// Where a live page's resources come from: the page's jar through Arca
 /// ([`LiveJar`], D9), the plain fetcher (`L`) where there is no Arca, or a
 /// test's stand-in.
 pub trait Resources {
-    /// One GET (`first`: the page itself): status, content type token
-    /// (`-` for none), body.
-    fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String>;
+    /// One GET (`first`: the page itself).
+    fn get(&mut self, url: &str, first: bool) -> Result<Got, String>;
     /// A script's POST (I6.3) of `body` as `content_type`.
-    fn post(&mut self, _url: &str, _content_type: &str, _body: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+    fn post(&mut self, _url: &str, _content_type: &str, _body: &[u8]) -> Result<Got, String> {
         Err("a POST needs the page's jar".into())
     }
 }
 
 impl Resources for crate::Upstream {
-    fn get(&mut self, url: &str, _first: bool) -> Result<(u16, String, Vec<u8>), String> {
+    fn get(&mut self, url: &str, _first: bool) -> Result<Got, String> {
         match self {
-            crate::Upstream::Fetchd(f, _) => f.live_resource(url),
+            crate::Upstream::Fetchd(f, _) => f.live_resource(url).map(|(status, kind, body)| Got::new(status, kind, body)),
             _ => Err("a live page needs the plain fetcher".into()),
         }
     }
@@ -100,11 +128,14 @@ pub struct LiveJar {
     pub view: u64,
     /// The page's host, the initiator of its requests.
     pub host: String,
+    /// The page's origin, sent with its scripts' requests to its sibling
+    /// hosts and with its POSTs (I6.5).
+    origin: String,
     /// The trail's jar (`None`: the persona's own).
     pub jar: Option<u64>,
     /// The page itself, already fetched when this run's navigation was
     /// looked at ([`LiveJar::peek`]), so it is not asked for twice.
-    first: Option<(u16, String, Vec<u8>)>,
+    first: Option<Got>,
 }
 
 /// What a live page's navigation or form led to (I6.4).
@@ -126,18 +157,18 @@ pub struct Offered {
 }
 
 /// A page a run looked at, kept briefly for the run that shows it.
-struct Stashed { jar: Option<u64>, url: String, at: Instant, answer: (u16, String, Vec<u8>) }
+struct Stashed { jar: Option<u64>, url: String, at: Instant, answer: Got }
 static STASH: Mutex<Option<Stashed>> = Mutex::new(None);
 /// How long a looked-at page waits for its run.
 const STASH_LIFE: Duration = Duration::from_secs(30);
 
-fn stash(jar: Option<u64>, url: &str, answer: (u16, String, Vec<u8>)) {
-    if answer.2.len() <= navigator_prerender::fetch::LIVE_RESOURCE_MAX {
+fn stash(jar: Option<u64>, url: &str, answer: Got) {
+    if answer.body.len() <= navigator_prerender::fetch::LIVE_RESOURCE_MAX {
         *STASH.lock().unwrap() = Some(Stashed { jar, url: url.to_string(), at: Instant::now(), answer });
     }
 }
 
-fn unstash(jar: Option<u64>, url: &str) -> Option<(u16, String, Vec<u8>)> {
+fn unstash(jar: Option<u64>, url: &str) -> Option<Got> {
     let mut slot = STASH.lock().unwrap();
     let fresh = slot.as_ref().is_some_and(|s| s.jar == jar && s.url == url && s.at.elapsed() < STASH_LIFE);
     if fresh { slot.take().map(|s| s.answer) } else { None }
@@ -151,7 +182,7 @@ fn answered(r: navigator_cookies::Fetched, jar: Option<u64>) -> Result<Answer, S
     match crate::files::live_file(&r.url, &r.headers, &r.body) {
         Some((name, kind)) => Ok(Answer::File(Offered { url: r.url, name, kind, bytes: r.body })),
         None => {
-            stash(jar, &r.url, (r.status, type_token(&r.headers), r.body));
+            stash(jar, &r.url, Got::new(r.status, type_token(&r.headers), r.body));
             Ok(Answer::Page(r.url))
         }
     }
@@ -161,23 +192,25 @@ impl LiveJar {
     /// A new view for the page at `url` in the jar `jar` (`None`: the
     /// persona's own).
     pub fn open(cookies: crate::Cookies, url: &str, jar: Option<u64>) -> Result<Self, String> {
-        let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).ok_or("no host")?;
+        let parsed = url::Url::parse(url).map_err(|_| "no address")?;
+        let host = parsed.host_str().map(str::to_ascii_lowercase).ok_or("no host")?;
+        let origin = parsed.origin().ascii_serialization();
         let view = crate::VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cookies.lock().unwrap().show_live(view, url, jar).map_err(|e| format!("the page's jar: {e:?}"))?;
-        Ok(LiveJar { cookies, view, host, jar, first: unstash(jar, url) })
+        Ok(LiveJar { cookies, view, host, origin, jar, first: unstash(jar, url) })
     }
 
-    fn answer(got: Result<navigator_cookies::Fetched, navigator_cookies::Refused>) -> Result<(u16, String, Vec<u8>), String> {
+    fn answer(got: Result<navigator_cookies::Fetched, navigator_cookies::Refused>) -> Result<Got, String> {
         let r = got.map_err(|e| format!("through Arca: {e:?}"))?;
         if r.body.len() > navigator_prerender::fetch::LIVE_RESOURCE_MAX { return Err("the answer is too big".into()); }
-        Ok((r.status, type_token(&r.headers), r.body))
+        Ok(Got { status: r.status, kind: type_token(&r.headers), cors: cors(&r.headers), body: r.body })
     }
 
     /// A form the page submitted (I6.3): sent through the jar, its answer's
     /// redirects followed. The page that answered is kept for the next
     /// run, so an answer that is not a redirect is not lost (I6.4).
     pub fn submit(&self, url: &str, body: &[u8]) -> Result<Answer, String> {
-        let f = navigator_cookies::Fetch::live_form(url, &self.host, body.to_vec());
+        let f = navigator_cookies::Fetch::live_form(url, &self.host, body.to_vec()).from_origin(&self.origin);
         let r = self.cookies.lock().unwrap().fetch(self.view, &f).map_err(|e| format!("through Arca: {e:?}"))?;
         answered(r, self.jar)
     }
@@ -193,14 +226,18 @@ impl LiveJar {
 }
 
 impl Resources for LiveJar {
-    fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String> {
+    fn get(&mut self, url: &str, first: bool) -> Result<Got, String> {
         if first { if let Some(a) = self.first.take() { return Ok(a); } }
         let f = if first { navigator_cookies::Fetch::navigation(url, None, true) } else { navigator_cookies::Fetch::subresource(url, &self.host) };
+        // Another host on the page's site: the page's origin goes with it,
+        // so the server's CORS answer is its own (I6.5).
+        let other_host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).is_none_or(|h| h != self.host);
+        let f = if !first && other_host { f.from_origin(&self.origin) } else { f };
         Self::answer(self.cookies.lock().unwrap().fetch_once(self.view, &f))
     }
 
-    fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
-        let f = navigator_cookies::Fetch::script_post(url, &self.host, content_type, body.to_vec());
+    fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<Got, String> {
+        let f = navigator_cookies::Fetch::script_post(url, &self.host, content_type, body.to_vec()).from_origin(&self.origin);
         Self::answer(self.cookies.lock().unwrap().fetch_once(self.view, &f))
     }
 }
@@ -402,7 +439,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
             Some(b) => upstream.post(&url, &b.content_type, &b.bytes),
             None => upstream.get(&url, !delivered),
         };
-        let (status, kind, body) = match got {
+        let Got { status, kind, body, cors } = match got {
             Ok(r) => r,
             Err(why) if delivered => {
                 eprintln!("navigatord: a live page's resource failed: {why}");
@@ -431,6 +468,9 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
             accept_ranges: false,
             validator: None,
         }).map_err(|e| e.to_string())?;
+        if let Some((allow_origin, allow_credentials)) = cors.filter(|_| delivered) {
+            output.send(Event::Cors { id, allow_origin, allow_credentials }).map_err(|e| e.to_string())?;
+        }
         for (i, bytes) in body.chunks(nuntius::DATA_MAX).enumerate() {
             output.send(Event::Data { id, offset: (i * nuntius::DATA_MAX) as u64, bytes: bytes.to_vec() }).map_err(|e| e.to_string())?;
         }
@@ -993,17 +1033,17 @@ mod tests {
 
     struct Fake(Vec<String>);
     impl Resources for Fake {
-        fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+        fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<Got, String> {
             self.0.push(format!("POST {url} {content_type} {}", String::from_utf8_lossy(body)));
-            Ok((201, "application/json".into(), b"{\"count\":1}".to_vec()))
+            Ok(Got::new(201, "application/json", b"{\"count\":1}".to_vec()))
         }
-        fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String> {
+        fn get(&mut self, url: &str, first: bool) -> Result<Got, String> {
             assert_eq!(first, self.0.is_empty(), "only the page is the first");
             self.0.push(url.to_string());
             match url {
-                "https://app.example/app.html" => Ok((200, "text/html".into(), b"<p>hi".to_vec())),
-                "https://app.example/app.js" => Ok((200, "text/javascript".into(), b"x=1".to_vec())),
-                "https://api.app.example/status" => Ok((404, "-".into(), vec![])),
+                "https://app.example/app.html" => Ok(Got::new(200, "text/html", b"<p>hi".to_vec())),
+                "https://app.example/app.js" => Ok(Got::new(200, "text/javascript", b"x=1".to_vec())),
+                "https://api.app.example/status" => Ok(Got { cors: Some(("https://app.example".into(), true)), ..Got::new(200, "application/json", b"{}".to_vec()) }),
                 _ => Err("not here".into()),
             }
         }
@@ -1027,13 +1067,23 @@ mod tests {
     }
 
     fn body(client: &mut nuntius::client::Client) -> (Option<(u16, String, Option<String>)>, Vec<u8>, Option<ErrorCode>) {
-        let (mut head, mut bytes) = (None, vec![]);
+        let (head, bytes, error, _) = body_and_cors(client);
+        (head, bytes, error)
+    }
+
+    type Cors = Option<(String, bool)>;
+    fn body_and_cors(client: &mut nuntius::client::Client) -> (Option<(u16, String, Option<String>)>, Vec<u8>, Option<ErrorCode>, Cors) {
+        let (mut head, mut bytes, mut cors) = (None, vec![], None);
         loop {
             match client.recv().unwrap() {
                 Event::Head { status, final_url, content_type, .. } => head = Some((status, final_url, content_type)),
+                Event::Cors { allow_origin, allow_credentials, .. } => {
+                    assert!(head.is_some() && bytes.is_empty(), "after the head, before the body");
+                    cors = Some((allow_origin, allow_credentials));
+                }
                 Event::Data { bytes: b, .. } => bytes.extend(b),
-                Event::Done { .. } => return (head, bytes, None),
-                Event::Error { code, .. } => return (head, bytes, Some(code)),
+                Event::Done { .. } => return (head, bytes, None, cors),
+                Event::Error { code, .. } => return (head, bytes, Some(code), cors),
                 _ => {}
             }
         }
@@ -1058,7 +1108,9 @@ mod tests {
         c.open(Open::get(2, "https://app.example/app.js")).unwrap();
         assert_eq!(body(&mut c).1, b"x=1");
         c.open(Open::get(3, "https://api.app.example/status")).unwrap();
-        assert_eq!(body(&mut c).0.map(|h| h.0), Some(404), "the site's own answer, whatever it is");
+        let (head, _, _, cors) = body_and_cors(&mut c);
+        assert_eq!(head.map(|h| h.0), Some(200), "the site's own answer");
+        assert_eq!(cors, Some(("https://app.example".into(), true)), "with its CORS answer for the engine to check (I6.5)");
         c.open(Open::get(4, "https://cdn.thirdparty.example/lib.js")).unwrap();
         assert_eq!(body(&mut c).2, Some(ErrorCode::Policy));
         let mut post = Open::get(5, "https://app.example/api/items");
@@ -1228,10 +1280,10 @@ mod tests {
     #[test]
     fn a_page_the_jar_looked_at_waits_briefly_for_its_own_jar_and_address() {
         let _one = STASH_TESTS.lock().unwrap();
-        stash(Some(7), "https://app.example/answer", (200, "text/html".into(), b"<p>ok".to_vec()));
+        stash(Some(7), "https://app.example/answer", Got::new(200, "text/html", b"<p>ok".to_vec()));
         assert_eq!(unstash(None, "https://app.example/answer"), None, "another jar");
         assert_eq!(unstash(Some(7), "https://app.example/other"), None, "another address");
-        assert_eq!(unstash(Some(7), "https://app.example/answer").map(|a| a.2), Some(b"<p>ok".to_vec()));
+        assert_eq!(unstash(Some(7), "https://app.example/answer").map(|a| a.body), Some(b"<p>ok".to_vec()));
         assert_eq!(unstash(Some(7), "https://app.example/answer"), None, "taken once");
     }
 
@@ -1244,7 +1296,7 @@ mod tests {
         };
         let page = answered(fetched("https://app.example/second.html", "text/html", None, b"<p>2"), Some(9)).unwrap();
         assert_eq!(page, Answer::Page("https://app.example/second.html".into()));
-        assert_eq!(unstash(Some(9), "https://app.example/second.html").map(|a| a.2), Some(b"<p>2".to_vec()), "kept for the run that shows it");
+        assert_eq!(unstash(Some(9), "https://app.example/second.html").map(|a| a.body), Some(b"<p>2".to_vec()), "kept for the run that shows it");
         let file = answered(fetched("https://app.example/report.csv", "text/csv", Some(("Content-Disposition", "attachment; filename=\"report.csv\"")), b"a,b\n"), Some(9)).unwrap();
         assert_eq!(file, Answer::File(Offered { url: "https://app.example/report.csv".into(), name: "report.csv".into(), kind: "CSV file".into(), bytes: b"a,b\n".to_vec() }));
         assert_eq!(unstash(Some(9), "https://app.example/report.csv"), None, "a file is not a page to run");
@@ -1314,5 +1366,25 @@ mod tests {
         assert_eq!(refused_host("host cdn.thirdparty.example, site thirdparty.example"), "cdn.thirdparty.example");
         assert_eq!(refused_host("host unreadable"), "unreadable");
         assert_eq!(refused_host("garbage"), "an unreadable address");
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+
+    #[test]
+    fn a_servers_cors_answer_is_passed_on_only_in_its_one_shape() {
+        assert_eq!(cors(&h(&[("access-control-allow-origin", "https://app.example"), ("access-control-allow-credentials", "true")])),
+                   Some(("https://app.example".into(), true)));
+        assert_eq!(cors(&h(&[("Access-Control-Allow-Origin", " * ")])), Some(("*".into(), false)));
+        assert_eq!(cors(&h(&[("access-control-allow-origin", "https://app.example"), ("access-control-allow-credentials", "TRUE")])),
+                   Some(("https://app.example".into(), false)), "credentials only on a literal true");
+        assert_eq!(cors(&h(&[])), None);
+        assert_eq!(cors(&h(&[("access-control-allow-origin", "https://a.example"), ("access-control-allow-origin", "https://b.example")])), None,
+                   "two answers are none");
+        assert_eq!(cors(&h(&[("access-control-allow-origin", "https://a.example, https://b.example")])), None);
     }
 }

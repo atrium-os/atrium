@@ -27,6 +27,7 @@ pub enum WireEvent {
     Error { id: u32, code: ErrorCode },
     Records { id: u32, records: Vec<Record>, secure: bool },
     RecordsWithTtl { id: u32, records: Vec<Record>, secure: bool, ttl: u32 },
+    Cors { id: u32, allow_origin: String, allow_credentials: bool },
 }
 
 fn text_ok(s: &str, max: usize) -> bool { s.len() <= max && !s.chars().any(|c| c.is_control()) }
@@ -70,6 +71,7 @@ impl WireEvent {
                 text_ok(final_url, URL_MAX) && content_type.as_deref().is_none_or(|c| text_ok(c, TEXT_MAX)) && validator_ok(validator),
             WireEvent::Data { bytes, .. } => bytes.len() <= DATA_MAX,
             WireEvent::Retrying { reason, .. } => text_ok(reason, TEXT_MAX),
+            WireEvent::Cors { allow_origin, .. } => allow_origin.is_empty() || cors_origin(allow_origin),
             WireEvent::Records { records, .. } | WireEvent::RecordsWithTtl { records, .. } => records.len() <= RECORDS_MAX && records.iter().all(Record::valid),
             _ => true,
         };
@@ -110,6 +112,11 @@ impl WireEvent {
                 };
                 (wire, None)
             }
+            // A value out of shape is no allowance: the engine's own check fails.
+            Event::Cors { id, allow_origin, allow_credentials } => {
+                let allow_origin = if cors_origin(&allow_origin) { allow_origin } else { String::new() };
+                (WireEvent::Cors { id, allow_origin, allow_credentials }, None)
+            }
         }
     }
 
@@ -126,6 +133,7 @@ impl WireEvent {
             WireEvent::Error { id, code } => Event::Error { id, code },
             WireEvent::Records { id, records, secure } => Event::Records { id, records, secure, ttl: 0 },
             WireEvent::RecordsWithTtl { id, records, secure, ttl } => Event::Records { id, records, secure, ttl },
+            WireEvent::Cors { id, allow_origin, allow_credentials } => Event::Cors { id, allow_origin, allow_credentials },
         })
     }
 }

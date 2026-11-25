@@ -198,12 +198,31 @@ pub enum Event {
     Error { id: u32, code: ErrorCode },
     /// A lookup's answer. `secure`: the resolver validated it with DNSSEC.
     Records { id: u32, records: Vec<Record>, secure: bool, ttl: u32 },
+    /// After `Head`: the server's CORS answer to a request that carried an
+    /// `Origin` (navigator-islands.md I6.5), for an engine that checks it
+    /// itself. `allow_origin` is `*`, `null` or one origin ([`cors_origin`]);
+    /// empty, no allowance.
+    Cors { id: u32, allow_origin: String, allow_credentials: bool },
+}
+
+/// The longest `Access-Control-Allow-Origin` passed on.
+pub const CORS_ORIGIN_MAX: usize = 300;
+
+/// An `Access-Control-Allow-Origin` value passed on: `*`, `null`, or
+/// `http(s)://host[:port]` in visible ASCII without spaces, commas or a
+/// path. Anything else is no allowance at all.
+pub fn cors_origin(v: &str) -> bool {
+    if v == "*" || v == "null" { return true }
+    let Some(rest) = v.strip_prefix("https://").or_else(|| v.strip_prefix("http://")) else { return false };
+    v.len() <= CORS_ORIGIN_MAX && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:[]".contains(&b))
 }
 
 impl Event {
     pub fn id(&self) -> u32 {
         match self { Event::Head { id, .. } | Event::Data { id, .. } | Event::Fd { id, .. } | Event::Progress { id, .. }
-                   | Event::Retrying { id, .. } | Event::Done { id, .. } | Event::Error { id, .. } | Event::Records { id, .. } => *id }
+                   | Event::Retrying { id, .. } | Event::Done { id, .. } | Event::Error { id, .. } | Event::Records { id, .. }
+                   | Event::Cors { id, .. } => *id }
     }
     /// The request's last event.
     pub fn is_last(&self) -> bool { matches!(self, Event::Done { .. } | Event::Error { .. } | Event::Records { .. }) }
