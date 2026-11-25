@@ -325,11 +325,26 @@ const LOG_MAGIC: &[u8; 8] = b"AIDBlog1";
 /// than this.
 const LOG_FOLD: usize = 1024 * 1024;
 
-/// Every live page's IndexedDB store, for this navigatord (one persona).
+/// Which of a site's stores: its IndexedDB, or its Cache API's (I6.7
+/// second part), kept alike and held to one quota between them, as the
+/// Storage standard gives an origin one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind { Idb, Cache }
+
+impl Kind {
+    fn other(self) -> Kind { match self { Kind::Idb => Kind::Cache, Kind::Cache => Kind::Idb } }
+    fn ext(self) -> &'static str { match self { Kind::Idb => "idb", Kind::Cache => "cache" } }
+}
+
+type Slot = (Key, Kind);
+
+/// Every live page's IndexedDB and Cache API stores, for this navigatord
+/// (one persona): the bounds on what is loaded, pending and in memory are
+/// across both.
 pub struct Stores {
     /// `<store dir>/live-idb`, for the persona's own jar.
     dir: Option<PathBuf>,
-    open: HashMap<Key, Site>,
+    open: HashMap<Slot, Site>,
 }
 
 impl Stores {
@@ -337,9 +352,9 @@ impl Stores {
         Stores { dir, open: HashMap::new() }
     }
 
-    fn files(&self, key: &Key) -> Option<(PathBuf, PathBuf)> {
+    fn files(&self, (key, kind): &Slot) -> Option<(PathBuf, PathBuf)> {
         match key.jar {
-            None => self.dir.as_ref().map(|d| (d.join(format!("{}.idb", key.site)), d.join(format!("{}.idb-log", key.site)))),
+            None => self.dir.as_ref().map(|d| (d.join(format!("{}.{}", key.site, kind.ext())), d.join(format!("{}.{}-log", key.site, kind.ext())))),
             Some(_) => None,
         }
     }
@@ -348,9 +363,10 @@ impl Stores {
     /// generation. A log cut short at its end loses only the commit that
     /// was never answered; anything else out of shape starts the site
     /// empty, logged.
-    fn read(&self, key: &Key) -> Site {
+    fn read(&self, slot: &Slot) -> Site {
+        let key = &slot.0;
         let empty = || Site { dbs: Databases::new(), size: 0, generation: 0, log_len: 0, image_len: 0, pending: None };
-        let Some((image, log)) = self.files(key) else { return empty() };
+        let Some((image, log)) = self.files(slot) else { return empty() };
         let read = |f: &PathBuf| match std::fs::File::open(f) {
             Ok(file) => {
                 use std::io::Read;
@@ -410,54 +426,64 @@ impl Stores {
         match loaded {
             Ok(site) => site,
             Err(why) => {
-                eprintln!("navigatord: {}'s IndexedDB: {why}; the site starts empty", key.site);
+                eprintln!("navigatord: {}'s {:?} store: {why}; the site starts empty", key.site, slot.1);
                 empty()
             }
         }
     }
 
-    fn site(&mut self, key: &Key) -> &mut Site {
-        if !self.open.contains_key(key) {
-            let site = self.read(key);
-            self.open.insert(key.clone(), site);
+    fn site(&mut self, slot: &Slot) -> &mut Site {
+        if !self.open.contains_key(slot) {
+            let site = self.read(slot);
+            self.open.insert(slot.clone(), site);
         }
-        self.open.get_mut(key).expect("inserted above")
+        self.open.get_mut(slot).expect("inserted above")
     }
 
     /// Drop file-backed sites other than `key` while those loaded hold more
     /// than [`LOADED_MAX`]; they are read again when next asked for.
-    fn trim(&mut self, key: &Key) {
-        let mut loaded: usize = self.open.iter().filter(|(k, _)| k.jar.is_none()).map(|(_, s)| s.size).sum();
+    fn trim(&mut self, slot: &Slot) {
+        let mut loaded: usize = self.open.iter().filter(|(k, _)| k.0.jar.is_none()).map(|(_, s)| s.size).sum();
         if loaded <= LOADED_MAX { return; }
-        let others: Vec<Key> = self.open.iter().filter(|(k, s)| k.jar.is_none() && *k != key && s.pending.is_none()).map(|(k, _)| k.clone()).collect();
+        let others: Vec<Slot> = self.open.iter().filter(|(k, s)| k.0.jar.is_none() && *k != slot && s.pending.is_none()).map(|(k, _)| k.clone()).collect();
         for k in others {
             if loaded <= LOADED_MAX { break; }
             if let Some(s) = self.open.remove(&k) { loaded -= s.size; }
         }
     }
 
-    /// The site's store, as the engine loads it.
-    pub fn load(&mut self, key: &Key) -> Vec<u8> {
-        let out = encode(&self.site(key).dbs);
-        self.trim(key);
+    /// The site's IndexedDB, as the engine loads it.
+    pub fn load(&mut self, key: &Key) -> Vec<u8> { self.load_kind(key, Kind::Idb) }
+
+    /// The site's store of `kind`, as the engine loads it.
+    pub fn load_kind(&mut self, key: &Key, kind: Kind) -> Vec<u8> {
+        let slot = (key.clone(), kind);
+        let out = encode(&self.site(&slot).dbs);
+        self.trim(&slot);
         out
     }
+
+    /// One part of a commit to the site's IndexedDB.
+    pub fn apply(&mut self, key: &Key, part: &[u8]) -> Result<(), String> { self.apply_kind(key, Kind::Idb, part) }
 
     /// One part of a commit's run. A part 0 starts a run (and drops any
     /// run not finished); each later part must be the next of that run.
     /// The last part applies the whole run, or none of it, and a recorded
     /// site's commit is on disk before this returns.
-    pub fn apply(&mut self, key: &Key, part: &[u8]) -> Result<(), String> {
+    pub fn apply_kind(&mut self, key: &Key, kind: Kind, part: &[u8]) -> Result<(), String> {
+        let slot = (key.clone(), kind);
         if part.len() > PART_MAX { return Err("a part over its bound".into()); }
         let (head, body) = part.split_at_checked(HEADER).ok_or("a part with no header")?;
         let run = u64::from_le_bytes(head[0..8].try_into().map_err(|_| "no run")?);
         let n = u32::from_le_bytes(head[8..12].try_into().map_err(|_| "no part")?);
         let last = match head[12] { 0 => false, 1 => true, _ => return Err("a part out of shape".into()) };
-        let memory_used: usize = self.open.iter().filter(|(k, _)| k.jar.is_some() && *k != key).map(|(_, s)| s.size).sum();
-        let pending_elsewhere: usize = self.open.iter().filter(|(k, _)| *k != key)
+        let memory_used: usize = self.open.iter().filter(|(k, _)| k.0.jar.is_some() && *k != &slot).map(|(_, s)| s.size).sum();
+        let pending_elsewhere: usize = self.open.iter().filter(|(k, _)| *k != &slot)
             .filter_map(|(_, s)| s.pending.as_ref()).map(|p| p.ops.len()).sum();
-        let files = self.files(key);
-        let site = self.site(key);
+        let files = self.files(&slot);
+        // The site's other store counts against the same quota.
+        let beside = if last { self.site(&(key.clone(), kind.other())).size } else { 0 };
+        let site = self.site(&slot);
         let mut pending = match site.pending.take() {
             _ if n == 0 => Pending { run, next: 0, ops: vec![] },
             Some(p) if p.run == run && p.next == n => p,
@@ -475,7 +501,7 @@ impl Stores {
         let mut undo = vec![];
         let applied = apply_ops(&mut site.dbs, ops, &mut undo).and_then(|()| {
             let next = size(&site.dbs);
-            if next > QUOTA { return Err("over the site's IndexedDB quota".to_string()); }
+            if next + beside > QUOTA { return Err("over the site's storage quota".to_string()); }
             if files.is_none() && memory_used + next > MEMORY_MAX { return Err("over what Unrecorded trails may keep".to_string()); }
             if let Some((image, log)) = &files {
                 append(site, image, log, &pending.ops)?;
@@ -485,17 +511,20 @@ impl Stores {
         });
         if applied.is_err() { revert(&mut site.dbs, undo); }
         applied?;
-        self.trim(key);
+        self.trim(&slot);
         Ok(())
     }
 
-    /// The person forgot the site in that jar: its store goes too.
+    /// The person forgot the site in that jar: both its stores go too.
     pub fn forget(&mut self, key: &Key) {
-        self.open.remove(key);
-        if let Some((image, log)) = self.files(key) {
-            for f in [image, log] {
-                if let Err(e) = std::fs::remove_file(&f) {
-                    if e.kind() != std::io::ErrorKind::NotFound { eprintln!("navigatord: {}: {e}", f.display()); }
+        for kind in [Kind::Idb, Kind::Cache] {
+            let slot = (key.clone(), kind);
+            self.open.remove(&slot);
+            if let Some((image, log)) = self.files(&slot) {
+                for f in [image, log] {
+                    if let Err(e) = std::fs::remove_file(&f) {
+                        if e.kind() != std::io::ErrorKind::NotFound { eprintln!("navigatord: {}: {e}", f.display()); }
+                    }
                 }
             }
         }
@@ -503,7 +532,7 @@ impl Stores {
 
     /// An Unrecorded jar ended: every store in it goes.
     pub fn forget_jar(&mut self, jar: u64) {
-        self.open.retain(|k, _| k.jar != Some(jar));
+        self.open.retain(|k, _| k.0.jar != Some(jar));
     }
 }
 
@@ -728,6 +757,27 @@ mod tests {
     }
 
     #[test]
+    fn a_sites_cache_api_store_is_apart_but_shares_its_quota_and_its_forgetting() {
+        let d = Dir::new("kinds");
+        let k = key(None);
+        let mut s = Stores::new(Some(d.0.clone()));
+        let fill = |name: &str| parts(0, &[Op::Version(b(name), 0), Op::CreateStore(b("entries"), vec![]), Op::Put(b("1"), vec![7; 30 * 1024 * 1024])]);
+        for p in fill("idb") { s.apply_kind(&k, Kind::Idb, &p).unwrap(); }
+        assert_eq!(s.load_kind(&k, Kind::Cache), b"", "apart");
+        // 30 MiB of IndexedDB and 30 of cache would be past the site's 50.
+        let mut refused = false;
+        for p in fill("cache") { if s.apply_kind(&k, Kind::Cache, &p).is_err() { refused = true; break; } }
+        assert!(refused, "one quota for both");
+        assert_eq!(s.load_kind(&k, Kind::Cache), b"");
+        for p in parts(1, &[Op::Version(b("small"), 0)]) { s.apply_kind(&k, Kind::Cache, &p).unwrap(); }
+        assert!(d.0.join("app.example.idb-log").exists() && d.0.join("app.example.cache-log").exists());
+        s.forget(&k);
+        assert!(!d.0.join("app.example.idb-log").exists() && !d.0.join("app.example.cache-log").exists());
+        let mut again = Stores::new(Some(d.0.clone()));
+        assert_eq!((again.load_kind(&k, Kind::Idb), again.load_kind(&k, Kind::Cache)), (vec![], vec![]));
+    }
+
+    #[test]
     fn a_part_is_what_nuntius_carries_in_one_post() {
         assert_eq!(PART_MAX, nuntius::BODY_MAX);
     }
@@ -827,6 +877,6 @@ mod tests {
         assert_eq!(st.records[&b("k2")], b("v2"));
         assert_eq!(st.indexes[&b("j")].records.iter().cloned().collect::<Vec<_>>(), vec![(b("v2"), b("k2"))]);
         assert!(dbs[&b("d")].stores[&b("u")].records.is_empty());
-        assert_eq!(size(&dbs), s.open[&k].size);
+        assert_eq!(size(&dbs), s.open[&(k.clone(), Kind::Idb)].size);
     }
 }
