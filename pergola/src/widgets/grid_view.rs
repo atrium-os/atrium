@@ -58,6 +58,17 @@ pub const TILE_COLS: u32 = 4;
 pub const REBASE: f64 = 8192.0;
 /// The column header's height.
 pub const HEADER_H: f32 = 24.0;
+
+/// How much the headers scale at `zoom`: with it, but kept to half to twice
+/// their size so their labels stay readable and don't crowd the cells.
+pub fn header_scale(zoom: f32) -> f32 {
+    if zoom.is_finite() { zoom.clamp(0.5, 2.0) } else { 1.0 }
+}
+
+/// The column header's height at `zoom`.
+pub fn header_height(zoom: f32) -> f32 {
+    (HEADER_H * header_scale(zoom)).round()
+}
 /// A press this close to a column's right edge in the header resizes it.
 pub const RESIZE_GRIP: f32 = 4.0;
 /// The narrowest a column can be dragged.
@@ -131,6 +142,8 @@ pub struct CellView {
     pub marks: u8,
     /// Text size, px, when not the grid's own.
     pub size: Option<f32>,
+    /// Drawn in the monospace face (`font::MONO`) rather than the sans one.
+    pub mono: bool,
     /// A number format's `*` fill: the byte offset in `text` of the character
     /// repeated to the cell's width. What comes before it sits at the left
     /// edge, what comes after at the right (Accounting's sign and number).
@@ -296,7 +309,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, fill_at: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -972,8 +985,13 @@ impl GridView {
 
     /// The row header's width for rows up to `last`.
     pub fn header_width(last: u32) -> f32 {
+        Self::header_width_at(last, 1.0)
+    }
+
+    /// The row header's width for rows up to `last` at `zoom`.
+    pub fn header_width_at(last: u32, zoom: f32) -> f32 {
         let digits = (last as u64 + 1).to_string().len().max(2) as f32;
-        (digits * TEXT_SIZE * 0.62 + 2.0 * PAD + 6.0).ceil()
+        ((digits * TEXT_SIZE * 0.62 + 2.0 * PAD + 6.0) * header_scale(zoom)).ceil()
     }
 
     /// The tiles to send for a view at (`x`, `y`) of `w` × `h` px: those
@@ -1005,8 +1023,11 @@ impl GridView {
 
         // Headers' size; the body is what is left.
         let (tiles_r, _) = Self::tiles(&*src, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
-        let header_w = Self::header_width((tiles_r.1 + 1) * TILE_ROWS);
-        let body = Rect::new(r.x() + header_w, r.y() + HEADER_H, (r.w() - header_w).max(0.0), (r.h() - HEADER_H).max(0.0));
+        // Headers scale with the zoom, within half to twice their size.
+        let hs = header_scale(src.zoom());
+        let header_w = Self::header_width_at((tiles_r.1 + 1) * TILE_ROWS, src.zoom());
+        let header_h = header_height(src.zoom());
+        let body = Rect::new(r.x() + header_w, r.y() + header_h, (r.w() - header_w).max(0.0), (r.h() - header_h).max(0.0));
         let frozen = src.frozen();
         let frozen = (frozen.0.min(rows), frozen.1.min(cols));
         let from = src.frozen_from();
@@ -1433,14 +1454,14 @@ impl GridView {
         }
 
         // ---- column headers: a viewport that moves across only ----
-        let hstyle = text(type_size::XS, Weight::Medium, t.text_secondary());
-        let hstyle_on = text(type_size::XS, Weight::Semibold, t.accent_fg());
+        let hstyle = text(type_size::XS * hs, Weight::Medium, t.text_secondary());
+        let hstyle_on = text(type_size::XS * hs, Weight::Semibold, t.accent_fg());
         ctx.key(self.key + 1);
-        let ch_rect = Rect::new(body.x(), r.y(), body.w(), HEADER_H);
+        let ch_rect = Rect::new(body.x(), r.y(), body.w(), header_h);
         let colh = ctx.push(Node::Scroll { rect: ch_rect, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: (x - bx) as f32, content_w: 0.0 });
         {
             ctx.key(1);
-            let page = ctx.push(Node::vstack(Rect::new(ch_rect.x(), ch_rect.y(), ((ext[0] - bx).clamp(0.0, 3.0 * REBASE)) as f32, HEADER_H), 0.0));
+            let page = ctx.push(Node::vstack(Rect::new(ch_rect.x(), ch_rect.y(), ((ext[0] - bx).clamp(0.0, 3.0 * REBASE)) as f32, header_h), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             if cols > 0 && tiles_c.0 <= tiles_c.1 {
               for tc in tiles_c.0..=tiles_c.1 {
@@ -1449,7 +1470,7 @@ impl GridView {
                 let (c0, c1) = (tc * TILE_COLS, ((tc + 1) * TILE_COLS).min(cols) - 1);
                 let gx = q(ch_rect.x() as f64 + (src.col_left(c0) - bx));
                 ctx.key(1 << 40 | tc as u64);
-                let grp = ctx.push(Node::vstack(Rect::new(gx, ch_rect.y(), (src.col_left(c1 + 1) - src.col_left(c0)) as f32, HEADER_H), 0.0));
+                let grp = ctx.push(Node::vstack(Rect::new(gx, ch_rect.y(), (src.col_left(c1 + 1) - src.col_left(c0)) as f32, header_h), 0.0));
                 ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
                 for c in c0..=c1 {
                     let (xl, xr) = (src.col_left(c), src.col_left(c + 1));
@@ -1457,25 +1478,25 @@ impl GridView {
                     let w = (xr - xl) as f32;
                     ctx.key(c as u64 + 1);
                     let on = c >= sel.c0 && c <= sel.c1;
-                    let cell = ctx.push(Node::vstack(Rect::new(cx, ch_rect.y(), w, HEADER_H), 0.0));
+                    let cell = ctx.push(Node::vstack(Rect::new(cx, ch_rect.y(), w, header_h), 0.0));
                     ctx.set_flex(cell, FlexStyle { free: true, ..FlexStyle::default() });
                     if on {
-                        ctx.add(Node::Rect { rect: Rect::new(cx, ch_rect.y(), w, HEADER_H), fill: t.accent_bg(), radius: 0.0 });
+                        ctx.add(Node::Rect { rect: Rect::new(cx, ch_rect.y(), w, header_h), fill: t.accent_bg(), radius: 0.0 });
                     }
                     let label = src.col_label(c);
                     let st = if on { hstyle_on.clone() } else { hstyle.clone() };
                     let lw = crate::text::measure_chars(&label, &st);
                     if lw <= w {
-                        ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), ch_rect.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
+                        ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), ch_rect.y() + (header_h - 15.0 * hs) / 2.0, lw, 15.0 * hs), content: label, style: st });
                     }
-                    ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, HEADER_H), fill: line, radius: 0.0 });
+                    ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, header_h), fill: line, radius: 0.0 });
                     if w >= 30.0 {
                         outline_mark(ctx, &*src, false, c, cx + 2.0, ch_rect.y() + 4.0, &hstyle, t.accent_bg());
                     }
                     // Hidden columns after this one: a double line, as Excel marks them.
                     if w > 0.0 && c + 1 < cols && src.col_left(c + 2) <= xr {
-                        ctx.add(Node::Rect { rect: Rect::new(cx + w - 4.0, ch_rect.y(), 1.0, HEADER_H), fill: t.text_secondary(), radius: 0.0 });
-                        ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, HEADER_H), fill: t.text_secondary(), radius: 0.0 });
+                        ctx.add(Node::Rect { rect: Rect::new(cx + w - 4.0, ch_rect.y(), 1.0, header_h), fill: t.text_secondary(), radius: 0.0 });
+                        ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, header_h), fill: t.text_secondary(), radius: 0.0 });
                     }
                     ctx.pop();
                 }
@@ -1607,7 +1628,7 @@ impl GridView {
                     let st = if on { hstyle_on.clone() } else { hstyle.clone() };
                     // By character widths: every row number is a new string.
                     let lw = crate::text::measure_chars(&label, &st);
-                    ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
+                    ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0 * hs) / 2.0).max(0.0) as f64), lw, 15.0 * hs), content: label, style: st });
                     ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
                     if h >= 14.0 {
                         outline_mark(ctx, &*src, true, row, rh_rect.x() + 2.0, cy + 1.0, &hstyle, t.accent_bg());
@@ -1720,22 +1741,22 @@ impl GridView {
         // ---- the frozen columns' and rows' labels, kept in view ----
         if fz[0] > 0.0 && frozen.1 > 0 {
             ctx.key(self.key + 6);
-            let fr = Rect::new(body.x(), r.y(), fz[0] as f32, HEADER_H);
+            let fr = Rect::new(body.x(), r.y(), fz[0] as f32, header_h);
             let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
             for c in from.1..frozen.1 {
                 let (xl, xr) = (src.col_left(c), src.col_left(c + 1));
                 let (cx, w) = (q(body.x() as f64 + xl - skip[0]), (xr - xl) as f32);
                 let on = c >= sel.c0 && c <= sel.c1;
                 if on {
-                    ctx.add(Node::Rect { rect: Rect::new(cx, r.y(), w, HEADER_H), fill: t.accent_bg(), radius: 0.0 });
+                    ctx.add(Node::Rect { rect: Rect::new(cx, r.y(), w, header_h), fill: t.accent_bg(), radius: 0.0 });
                 }
                 let label = src.col_label(c);
                 let st = if on { hstyle_on.clone() } else { hstyle.clone() };
                 let lw = crate::text::measure_chars(&label, &st);
                 if lw <= w {
-                    ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), r.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
+                    ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), r.y() + (header_h - 15.0 * hs) / 2.0, lw, 15.0 * hs), content: label, style: st });
                 }
-                ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, r.y(), 1.0, HEADER_H), fill: line, radius: 0.0 });
+                ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, r.y(), 1.0, header_h), fill: line, radius: 0.0 });
             }
             ctx.pop();
             let d = col_drag.clone();
@@ -1758,7 +1779,7 @@ impl GridView {
                 let label = src.row_label(row);
                 let st = if on { hstyle_on.clone() } else { hstyle.clone() };
                 let lw = crate::text::measure_chars(&label, &st);
-                ctx.add(Node::Text { rect: Rect::new(r.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
+                ctx.add(Node::Text { rect: Rect::new(r.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0 * hs) / 2.0).max(0.0) as f64), lw, 15.0 * hs), content: label, style: st });
                 ctx.add(Node::Rect { rect: Rect::new(r.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
             }
             ctx.pop();
@@ -1767,7 +1788,7 @@ impl GridView {
         }
 
         // ---- the corner and the header edges ----
-        let corner = ctx.add(Node::Rect { rect: Rect::new(r.x(), r.y(), header_w, HEADER_H), fill: t.bg_surface(), radius: 0.0 });
+        let corner = ctx.add(Node::Rect { rect: Rect::new(r.x(), r.y(), header_w, header_h), fill: t.bg_surface(), radius: 0.0 });
         {
             let gst = self.state.clone();
             ctx.on_click(corner, move || {
@@ -2052,7 +2073,7 @@ pub fn needed_width(cv: &CellView) -> f64 {
 }
 
 fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
-    let st = TextStyle { family: font::SANS.into(), size: cv.size.unwrap_or(TEXT_SIZE), weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
+    let st = TextStyle { family: if cv.mono { font::MONO } else { font::SANS }.into(), size: cv.size.unwrap_or(TEXT_SIZE), weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
     crate::inline::style(&st, cv.marks & crate::inline::Emphasis::Italic as u8)
 }
 
@@ -4070,6 +4091,14 @@ mod tests {
         let zooms: Vec<f32> = log.borrow().iter().filter_map(|a| if let GridAction::Zoom(f) = a { Some(*f) } else { None }).collect();
         assert_eq!(zooms.len(), 2, "{:?}", log.borrow());
         assert!(zooms[0] > 1.0 && zooms[1] < 1.0, "{zooms:?}");
+    }
+
+    #[test]
+    fn headers_scale_with_the_zoom_within_half_to_twice() {
+        assert_eq!((header_height(1.0), header_height(2.0), header_height(1.5), header_height(0.1), header_height(4.0)), (HEADER_H, 48.0, 36.0, 12.0, 48.0));
+        assert_eq!(GridView::header_width_at(99, 1.0), GridView::header_width(99));
+        assert!(GridView::header_width_at(99, 2.0) >= 2.0 * GridView::header_width(99) - 1.0);
+        assert_eq!(header_scale(f32::NAN), 1.0);
     }
 
     #[test]

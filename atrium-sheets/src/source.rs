@@ -127,6 +127,15 @@ pub fn font_marks(f: &officina_grid::style::Font) -> u8 {
     (if f.italic { Emphasis::Italic as u8 } else { 0 }) | (if f.underline { Emphasis::Underline as u8 } else { 0 }) | (if f.strike { Emphasis::Strike as u8 } else { 0 })
 }
 
+/// Whether a font named `name` is a monospace one, drawn in the monospace
+/// face (the others in the sans face): Courier, Consolas, Menlo and the
+/// like, and any name saying Mono or Code.
+pub fn is_mono_font(name: &str) -> bool {
+    const MONO: [&str; 9] = ["courier", "consolas", "menlo", "monaco", "lucida console", "inconsolata", "mono", "code", "fixedsys"];
+    let n = name.to_ascii_lowercase();
+    MONO.iter().any(|m| n.contains(m))
+}
+
 /// The text size `f` asks for, px, when not the default 11 pt (the grid's
 /// own size); 6 to 72 pt.
 pub fn font_px(f: &officina_grid::style::Font) -> Option<f32> {
@@ -160,6 +169,7 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
     cv.bold = st.font.bold;
     cv.marks = font_marks(&st.font);
     cv.size = font_px(&st.font);
+    cv.mono = st.font.name.as_deref().is_some_and(is_mono_font);
     if st.indent > 0 && matches!(st.h_align, officina_grid::style::HAlign::Left | officina_grid::style::HAlign::General) {
         cv.indent = st.indent;
     }

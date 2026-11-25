@@ -5003,7 +5003,17 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Zoom in `.ods`**: `settings.xml` writes `ZoomType` 0 and `ZoomValue` for each sheet not at 100 % and reads `ZoomValue` back (10–400), next to the frozen panes it already kept.
 - **The total row cell's own list.** A table's total row cell under the cursor shows a drop button at its right, as a list validation does; a press (or Alt+Down, or Choose from List) opens the list of totals, and a pick sets the function (`ListKind::Total`, `source::total_cell`).
 - Tests: `remove_duplicates_keeps_the_first_of_each_row_and_undoes` (by columns), `a_filter_column_takes_a_condition` (two conditions), `text_to_columns_splits_at_the_delimiter_the_cells_use` (runs, fixed widths), `a_table_total_row_sums_the_shown_rows_and_goes_again` (the list) in Sheets; officina-convert `each_sheets_zoom_round_trips_through_xlsx_ods_and_the_native_file`. All 157 Sheets and 65 officina-convert lib tests pass, and its ods, roundtrip and freeze tests. The Sheets timing test `a_slow_edit_hands_the_window_back_and_greys_what_is_not_done` can miss its 5-slice bound when four test threads share four cores; it passes alone and with `--test-threads=2`.
-- Not yet: headers scaling with the zoom; more than two conditions per column in the panel.
+- Not yet: more than two conditions per column in the panel. (Headers scaling with the zoom came in §16.130.)
+
+### 16.130 Date filters, Font: Mono, dates from Text to Columns, headers with the zoom (2026-11-25)
+
+- **Date is** in the filter panel's conditions, as Excel's Date Filters: a menu of Today, Yesterday, Tomorrow, this, last and next week, month, quarter and year, Year to date, Quarter 1 to 4 and January to December. It makes the engine's `Cond::DynamicDate` (already read from and written to `.xlsx` as `<dynamicFilter>`); relative ones are worked out each time the filter is applied. Only cells in a date format count. Opening the panel again shows the choice (`data::DATE_COND`, `DATE_RULES`).
+- **Font: Sans and Font: Mono** in the Format menu. Mono gives the cells the font Courier New, which files keep; Sans takes the name off (the workbook's own font). pergola's `CellView::mono` draws a cell in the monospace face (`font::MONO`), and a file's monospace fonts (Courier, Consolas, Menlo, names with Mono or Code: `source::is_mono_font`) draw mono too; other names draw in the sans face as before. Printing still draws sans (officina-pdf, the printing thread's).
+- **Text to Columns: dates.** A piece that reads as a date the way typing it would (ISO, or the persona's day order) becomes a date, and a cell still in General gets the date format typing gives, in one restyle per run down a column (`Doc::typed_date`).
+- **Headers scale with the zoom**, kept to half to twice their size (`grid_view::header_scale`, `header_height`, `GridView::header_width_at`). Sheets places the fill options button and Zoom to Selection with the scaled headers.
+- Rows growing for larger text (the §16.84 "Not yet") was already built: Larger and Smaller Text refit rows nobody sized, in the same step.
+- Tests: `font_mono_draws_in_the_monospace_face_and_files_keep_the_name`, `a_filter_column_takes_a_condition` (Date is) and `text_to_columns_splits_at_the_delimiter_the_cells_use` (dates) in Sheets; pergola `headers_scale_with_the_zoom_within_half_to_twice`. All 158 Sheets (with `--test-threads=2`, see §16.129) and 246 pergola lib tests pass.
+- Not yet: font families beyond sans and mono (the shell ships those two); a CSV's ISO dates read as text, so date filters need dates typed or from `.xlsx`/`.ods`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

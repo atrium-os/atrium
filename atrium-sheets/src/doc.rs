@@ -980,6 +980,13 @@ impl Doc {
         self.run_validated(if area.cells() == 1 { "Typing" } else { "Fill Selection" }, ops)
     }
 
+    /// `text` read as a date the way typing it would be (the persona's day
+    /// order, this year when it has none): its serial and the format typing
+    /// gives the cell.
+    pub fn typed_date(&self, text: &str) -> Option<(f64, String)> {
+        typed_date_in(text, day_first(), crate::source::local_now().map(|n| n.0), self.wb.date_system())
+    }
+
     pub fn type_into(&mut self, row: u32, col: u32, text: &str) -> bool {
         self.type_all(Rect::cell(CellAddr::new(self.sheet, row, col)), text)
     }
