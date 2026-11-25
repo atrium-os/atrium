@@ -609,6 +609,32 @@ stored uncompressed. If Tessera compresses or packs blobs, a short marker could 
 missed even in plain text. The plain-store control proves the grep finds it in this
 layout, and the gate fails if that control does not find it.
 
+**A5 as built (2026-11-25): `scripts/mail-at-rest-vm-check.sh`, 46/46 on an arm64
+Tessera guest** (runs 7–10; evidence `~/atrium-vm/evidence/mail/at-rest-2026-11-25/`, run 10
+the final one, with main's tessera_fs.ko built with the C decoders against the guest's
+9f2eed03a kernel). `build`
+cross-builds the guest half's binaries; `run` copies them to a disposable guest and runs
+`guest`. People's homes are a Tessera volume on an md (`/home`, key groups) and a fresh
+one that never gets a group (`/home/a5plain`). What differs from the plan above:
+- The message comes in through Mail's own JMAP sync and engine, with real parse jails, from
+  an in-process JMAP server (`mail-engine/examples/at_rest_seed.rs`), run as root against
+  the Work overlay while Mail is stopped (the overlay's folders above it are root's 0700).
+  The marker is a 34-character search term: subject, body, a 7bit text attachment and its
+  name, and a saved search.
+- Controls: the marker is on Mail's own (decrypted) overlay volume (C3), and the same marker
+  in a plain file on the same volume is found on both raw devices under it (C7, C8).
+- The opt-out run is on `/home/a5plain` with atrium-volumes down; on `/home` the same
+  opt-out is refused and logged IGNORED.
+- Swap: a probe holds the marker in 64 MiB of incompressible pages, so they reach zram's
+  backing store raw, and is pushed out with Mail open on the message. Through
+  `vtbd2.eli` (one-time) the raw disk holds none; the same run on the plain disk finds
+  16384. Mail's own pages are zstd-compressed in the backing store, so only the probe can
+  show the layer works.
+- Cores: the ATRIUM kernel at 9f2eed03a writes no core at all ("other error", on Tessera and
+  tmpfs), so the control is the kernel's reason: root's process was refused for "other
+  error", Mail's for "coredumpsize limit is 0".
+- Logout and a second device grep are not in it.
+
 **Not proposed:** evicting the whole store at screen lock (a while-unlocked class). That
 would stop background sync, which writes new mail while the screen is locked. If it is
 wanted later, the right shape is a Tessera "complete unless open" class: writes allowed
