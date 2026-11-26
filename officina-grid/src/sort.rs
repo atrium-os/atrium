@@ -275,6 +275,111 @@ pub fn reorder_op(wb: &Workbook, rect: Rect, ord: &[u32]) -> Option<GridOp> {
     Some(if ops.len() == 1 { ops.pop().unwrap() } else { GridOp::Batch(ops) })
 }
 
+/// The most columns a left-to-right sort moves.
+pub const MAX_SORT_COLS: u32 = 16_384;
+
+/// Sort Left to Right: the new order of the columns `rect.c0..=rect.c1` by
+/// the values in `keys`' rows (each `SortKey::col` names a row here):
+/// `order[i]` is the column that goes to column `rect.c0 + i`. Stable.
+pub fn order_cols(wb: &Workbook, rect: &Rect, keys: &[SortKey]) -> Vec<u32> {
+    let cols: Vec<u32> = (rect.c0..=rect.c1).collect();
+    let rows: Vec<Vec<K>> = keys.iter().map(|k| cols.iter().map(|&c| K::of(&wb.get(CellAddr::new(rect.sheet, k.col, c)))).collect()).collect();
+    let mut idx: Vec<usize> = (0..cols.len()).collect();
+    idx.sort_by(|&a, &b| {
+        for (k, key) in keys.iter().enumerate() {
+            let o = cmp(&rows[k][a], &rows[k][b], key.descending);
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    });
+    idx.into_iter().map(|i| cols[i]).collect()
+}
+
+/// The edit that puts the columns of `rect` in the order `ord` (`ord[i]`
+/// goes to column `rect.c0 + i`): values, formulas (copied, their relative
+/// references moving with them), styles, comments and links. Column widths
+/// stay, as in Excel. `None` when that is the order they are in, or `ord`
+/// isn't each column once.
+pub fn reorder_cols_op(wb: &Workbook, rect: Rect, ord: &[u32]) -> Option<GridOp> {
+    let n = (rect.c1 - rect.c0) as u64 + 1;
+    if ord.len() as u64 != n || n > MAX_SORT_COLS as u64 || ord.iter().enumerate().all(|(i, &c)| c == rect.c0 + i as u32) {
+        return None;
+    }
+    let mut seen = vec![false; n as usize];
+    for &c in ord {
+        match c.checked_sub(rect.c0).and_then(|k| seen.get_mut(k as usize)) {
+            Some(x) if !*x => *x = true,
+            _ => return None,
+        }
+    }
+    let s = rect.sheet;
+    let mut values = Vec::new();
+    let mut fills: Vec<Fill> = Vec::new();
+    for (i, &src) in ord.iter().enumerate() {
+        let dest = rect.c0 + i as u32;
+        // The last fill in this column and the expression it came from.
+        let mut last: Option<(usize, Arc<Expr>)> = None;
+        for r in rect.r0..=rect.r1 {
+            if let Some(g) = wb.group_at(s, r, src) {
+                let e = wb.group(g).expr.clone();
+                if let Some((k, pe)) = &last {
+                    if fills[*k].r1 + 1 == r && (Arc::ptr_eq(pe, &e) || **pe == *e) {
+                        fills[*k].r1 = r;
+                        continue;
+                    }
+                }
+                let text = formula::to_a1(&e, r, dest, &|id| wb.sheet_name(id));
+                fills.push(Fill { col: dest, r0: r, r1: r, src: text });
+                last = Some((fills.len() - 1, e));
+            } else {
+                last = None;
+                let v = wb.value(s, r, src);
+                if !v.is_empty() {
+                    values.push((r, dest, v));
+                }
+            }
+        }
+    }
+    let mut ops = vec![GridOp::Replace(Region { rect, values, fills })];
+    let snap = wb.style_snapshot(&rect);
+    if !snap.spans.is_empty() {
+        let sh = wb.sheet(s);
+        let mut spans = Vec::new();
+        for (i, &src) in ord.iter().enumerate() {
+            let dest = rect.c0 + i as u32;
+            let mut r = rect.r0;
+            while r <= rect.r1 {
+                let id: StyleId = sh.style_id(r, src);
+                let mut e = r;
+                while e < rect.r1 && sh.style_id(e + 1, src) == id {
+                    e += 1;
+                }
+                if id != 0 {
+                    spans.push((dest, r, e, wb.styles.get(id).clone()));
+                }
+                r = e + 1;
+            }
+        }
+        ops.push(GridOp::Restyle(StyleRegion { rect, spans }));
+    }
+    let mut dest_of = std::collections::HashMap::with_capacity(ord.len());
+    for (i, &src) in ord.iter().enumerate() {
+        dest_of.insert(src, rect.c0 + i as u32);
+    }
+    let to = |r: u32, c: u32| Some(if (rect.r0..=rect.r1).contains(&r) && (rect.c0..=rect.c1).contains(&c) { (r, dest_of.get(&c).copied().unwrap_or(c)) } else { (r, c) });
+    let set = crate::links::moved(wb.comments(s), to);
+    if !set.is_empty() {
+        ops.push(GridOp::Comments { sheet: s, set });
+    }
+    let set = crate::links::moved(wb.links(s), to);
+    if !set.is_empty() {
+        ops.push(GridOp::Links { sheet: s, set });
+    }
+    Some(if ops.len() == 1 { ops.pop().unwrap_or(GridOp::Batch(Vec::new())) } else { GridOp::Batch(ops) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +508,36 @@ mod tests {
         assert!(!merges_allow_sort(&wb, &all));
         wb.set_merges(0, (0..4).map(|k| r(k, 3, k, 4)).collect());
         assert!(!merges_allow_sort(&wb, &all));
+    }
+
+    #[test]
+    fn left_to_right_moves_whole_columns() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        // Row 1 the key; row 2 numbers; row 3 a formula reading row 2 of its column.
+        for (c, k) in ["c", "a", "b"].iter().enumerate() {
+            let c = c as u32;
+            wb.set_input(CellAddr::new(0, 0, c), k).unwrap();
+            wb.set_value(CellAddr::new(0, 1, c), Value::Num(c as f64 + 1.0));
+            wb.set_formula(CellAddr::new(0, 2, c), &format!("={}2*10", crate::addr::col_name(c))).unwrap();
+        }
+        wb.set_style(&Rect { sheet: 0, r0: 1, c0: 0, r1: 1, c1: 0 }, Style::default().with_num_fmt("0.00"));
+        wb.recalc();
+        let rect = Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 2 };
+        let ord = order_cols(&wb, &rect, &[SortKey { col: 0, descending: false }]);
+        assert_eq!(ord, vec![1, 2, 0]);
+        let undo = reorder_cols_op(&wb, rect, &ord).unwrap().apply(&mut wb);
+        wb.recalc();
+        let row = |wb: &Workbook, r: u32| (0..3).map(|c| wb.get(CellAddr::new(0, r, c)).display()).collect::<Vec<_>>();
+        assert_eq!(row(&wb, 0), ["a", "b", "c"]);
+        assert_eq!(row(&wb, 1), ["2", "3", "1"]);
+        assert_eq!(row(&wb, 2), ["20", "30", "10"], "formulas moved and still read their own column");
+        assert_eq!(wb.formula_text(CellAddr::new(0, 2, 0)).unwrap(), "=A2*10");
+        assert_eq!(wb.style(CellAddr::new(0, 1, 2)).num_fmt.as_ref(), "0.00");
+        undo.apply(&mut wb);
+        wb.recalc();
+        assert_eq!(row(&wb, 0), ["c", "a", "b"]);
+        assert!(reorder_cols_op(&wb, rect, &[0, 0, 1]).is_none());
+        assert!(reorder_cols_op(&wb, rect, &[0, 1, 2]).is_none());
     }
 }

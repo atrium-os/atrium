@@ -1229,6 +1229,10 @@ impl GridSource for SheetSource {
             }
         }
     }
+    fn tab_target(&self, from: (u32, u32), back: bool) -> Option<(u32, u32)> {
+        let d = self.doc.borrow();
+        d.wb.next_unlocked(d.sheet, from, back)
+    }
     fn last_used(&self) -> (u32, u32) {
         let (r, c) = self.used();
         (r.saturating_sub(1), c.saturating_sub(1))

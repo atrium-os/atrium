@@ -503,6 +503,12 @@ pub trait GridSource {
     fn frozen_from(&self) -> (u32, u32) {
         (0, 0)
     }
+    /// Where Tab (Shift+Tab: `back`) goes from `from` when it doesn't step
+    /// to the next column: a protected sheet's next unlocked cell, as in
+    /// Excel. `None` steps as usual.
+    fn tab_target(&self, _from: (u32, u32), _back: bool) -> Option<(u32, u32)> {
+        None
+    }
     /// The last used cell (Ctrl + End).
     fn last_used(&self) -> (u32, u32) {
         (self.rows().saturating_sub(1), self.cols().saturating_sub(1))
@@ -3041,8 +3047,11 @@ fn on_key_inner(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut S
             }
             Key::Tab => {
                 let from = g.cursor.1;
+                let jump = src.tab_target(g.cursor, m.shift);
                 finish(g, st, 0, if m.shift { -1 } else { 1 });
-                if !m.shift {
+                if let Some(to) = jump.filter(|_| g.edit.is_none()) {
+                    g.select(to.0, to.1);
+                } else if !m.shift {
                     g.tab_from = Some(tab_run.unwrap_or(from));
                 }
                 return true;
@@ -3127,6 +3136,12 @@ fn on_key_inner(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut S
         // Enter and Tab in a selection of several cells: the next cell in it.
         Key::Enter | Key::Tab if !cmd && !m.alt && g.step_in_selection(key == Key::Enter, m.shift) => {
             reveal(src, geom, st, g.cursor);
+            return true;
+        }
+        Key::Tab if src.tab_target(g.cursor, m.shift).is_some() => {
+            let to = src.tab_target(g.cursor, m.shift).unwrap_or(g.cursor);
+            g.select(to.0, to.1);
+            reveal(src, geom, st, to);
             return true;
         }
         Key::Tab => {

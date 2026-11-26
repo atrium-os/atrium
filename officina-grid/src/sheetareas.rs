@@ -23,8 +23,9 @@ pub struct EditRange {
     pub title: String,
     /// (r0, c0, r1, c1), each on the sheet.
     pub areas: Vec<(u32, u32, u32, u32)>,
-    /// A password from another app (its verifier, kept as is): the range
-    /// stays locked here, since the verifier isn't checked.
+    /// Its password's verifier, as Excel's attributes (`algorithmName=…`
+    /// lines, or the old `password=` hash): the range opens only once
+    /// unlocked by the password ([`crate::Workbook::unlock_ranges`]).
     pub password: Option<String>,
 }
 

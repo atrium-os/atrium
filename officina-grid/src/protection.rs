@@ -182,10 +182,10 @@ impl Workbook {
             return true;
         }
         let sheet = self.sheet(rect.sheet);
-        // Rows of `col` opened by Allow Edit Ranges (one with a foreign
-        // password stays shut), sorted.
+        // Rows of `col` opened by Allow Edit Ranges (one with a password
+        // only once unlocked by it), sorted.
         let open = |col: u32| -> Vec<(u32, u32)> {
-            let mut v: Vec<(u32, u32)> = sheet.edit_ranges.iter().filter(|e| e.password.is_none())
+            let mut v: Vec<(u32, u32)> = sheet.edit_ranges.iter().filter(|e| e.password.as_ref().is_none_or(|p| self.unlocked_ranges.contains(p)))
                 .flat_map(|e| e.areas.iter().filter(|a| (a.1..=a.3).contains(&col)).map(|a| (a.0, a.2)))
                 .collect();
             v.sort_unstable();
@@ -218,6 +218,69 @@ impl Workbook {
                     .all(|&(a, b, id)| self.styles.get(id).unlocked || covered(&open, a.max(rect.r0), b.min(rect.r1)))
             })
         })
+    }
+
+    /// The cell Tab moves to on a protected sheet: the next unlocked one
+    /// after `from` in reading order (the previous one with `back`),
+    /// wrapping round; `None` when the sheet isn't protected or no cell is
+    /// unlocked. Works on runs and ranges, never cell by cell.
+    pub fn next_unlocked(&self, sheet: u16, from: (u32, u32), back: bool) -> Option<(u32, u32)> {
+        if !self.sheet_protected(sheet) {
+            return None;
+        }
+        let s = self.sheet(sheet);
+        let last = crate::addr::MAX_ROWS - 1;
+        // Unlocked areas as (r0, c0, r1, c1).
+        let mut areas: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for (c, runs) in s.styles.iter().enumerate() {
+            let c = c as u32;
+            for (a, b, id) in runs.spans(0, last) {
+                if id != 0 && self.styles.get(id).unlocked {
+                    areas.push((a, c, b, c));
+                }
+            }
+        }
+        for e in s.edit_ranges.iter().filter(|e| e.password.as_ref().is_none_or(|p| self.unlocked_ranges.contains(p))) {
+            areas.extend(e.areas.iter().copied());
+        }
+        let (r, c) = from;
+        let step = |a: &(u32, u32, u32, u32)| -> Option<(u32, u32)> {
+            let &(r0, c0, r1, c1) = a;
+            if back {
+                if (r0..=r1).contains(&r) && c > c0 {
+                    return Some((r, (c - 1).min(c1)));
+                }
+                let rr = if r > r1 { r1 } else { r.checked_sub(1)? };
+                (rr >= r0).then_some((rr, c1))
+            } else {
+                if (r0..=r1).contains(&r) && c < c1 {
+                    return Some((r, (c + 1).max(c0)));
+                }
+                let rr = if r < r0 { r0 } else { r.checked_add(1)? };
+                (rr <= r1).then_some((rr, c0))
+            }
+        };
+        if back {
+            areas.iter().filter_map(step).max().or_else(|| areas.iter().map(|a| (a.2, a.3)).max())
+        } else {
+            areas.iter().filter_map(step).min().or_else(|| areas.iter().map(|a| (a.0, a.1)).min())
+        }
+    }
+
+    /// The most ranges' verifiers one session unlocks.
+    pub const MAX_UNLOCKED: usize = 1024;
+
+    /// Opens every Allow Edit Range guarded by `verifier` (one the password
+    /// typed was checked against) until the workbook is closed.
+    pub fn unlock_ranges(&mut self, verifier: &str) {
+        if !self.unlocked_ranges.iter().any(|v| v == verifier) && self.unlocked_ranges.len() < Self::MAX_UNLOCKED {
+            self.unlocked_ranges.push(verifier.to_string());
+        }
+    }
+
+    /// Whether ranges guarded by `verifier` were unlocked.
+    pub fn range_unlocked(&self, verifier: &str) -> bool {
+        self.unlocked_ranges.iter().any(|v| v == verifier)
     }
 
     pub fn hides_value(&self, cell: CellAddr) -> bool {

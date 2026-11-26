@@ -109,6 +109,87 @@ pub fn unprotect(d: &mut Doc, password: &str) -> Result<String, String> {
     Ok("Sheet unprotected.".into())
 }
 
+/// A fresh salt: a v4 UUID's 122 random bits.
+fn salt() -> [u8; 16] {
+    uuid::Uuid::new_v4().into_bytes()
+}
+
+fn too_long(password: &str) -> Result<(), String> {
+    let max = officina_convert::protect::MAX_PASSWORD;
+    if password.chars().count() > max { Err(format!("A password is at most {max} characters.")) } else { Ok(()) }
+}
+
+/// Whether unprotecting the workbook's structure needs a password.
+pub fn workbook_needs_password(d: &Doc) -> bool {
+    d.wb.structure_protection().is_some_and(officina_convert::protect::has_password)
+}
+
+/// Protect Workbook with `password` (may be empty), or, when the structure
+/// is protected already, unprotect it with that password. One step.
+pub fn protect_workbook(d: &mut Doc, password: &str) -> Result<String, String> {
+    too_long(password)?;
+    if let Some(p) = d.wb.structure_protection().cloned() {
+        if !officina_convert::protect::check(&p, password)? {
+            return Err("That password doesn't unprotect the workbook.".into());
+        }
+        d.run("Unprotect Workbook", vec![GridOp::Structure(None)]);
+        return Ok("Workbook structure unlocked: sheets can be added, deleted, renamed and moved.".into());
+    }
+    let mut p = SheetProtection::new(ProtectionFormat::ExcelWorkbook);
+    if !password.is_empty() {
+        for (k, v) in officina_convert::protect::workbook_verifier(password, &salt()) {
+            p.keep(k, &v);
+        }
+    }
+    d.run("Protect Workbook", vec![GridOp::Structure(Some(p))]);
+    Ok(if password.is_empty() { "Workbook structure protected: sheets can't be added, deleted, renamed, moved or hidden.".into() } else { "Workbook structure protected with a password: sheets can't be added, deleted, renamed, moved or hidden.".into() })
+}
+
+/// Range Password: `TITLE: password` gives an Allow Edit Range a password
+/// (`TITLE:` alone takes it away). Refused while the sheet is protected,
+/// as every change to the ranges is. One step.
+pub fn range_password(d: &mut Doc, typed: &str) -> Result<String, String> {
+    let s = d.sheet;
+    if d.wb.sheet_protected(s) {
+        return Err("Unprotect the sheet to change its edit ranges' passwords.".into());
+    }
+    let (title, password) = typed.split_once(':').ok_or("Type the range's title, a colon and its password, such as: Inputs: secret")?;
+    let (title, password) = (title.trim(), password.trim());
+    too_long(password)?;
+    let mut list = d.wb.sheet(s).edit_ranges().to_vec();
+    let e = list.iter_mut().find(|e| e.title.eq_ignore_ascii_case(title)).ok_or_else(|| format!("No edit range is called {title:?}."))?;
+    e.password = (!password.is_empty()).then(|| officina_convert::protect::range_verifier(password, &salt()));
+    let msg = if password.is_empty() { format!("{} opens without a password.", e.title) } else { format!("{} opens only with its password.", e.title) };
+    d.status.clear();
+    d.run("Range Password", vec![GridOp::EditRanges { sheet: s, list }]);
+    if crate::sheet_protection::refused(&d.status) {
+        return Err(d.status.clone());
+    }
+    Ok(msg)
+}
+
+/// Unlock Range: opens, until the workbook is closed, every edit range on
+/// the sheet that `password` is the password of. Not a step: nothing in
+/// the file changes.
+pub fn unlock_range(d: &mut Doc, password: &str) -> Result<String, String> {
+    too_long(password)?;
+    let guarded: Vec<(String, String)> = d.wb.sheet(d.sheet).edit_ranges().iter().filter_map(|e| Some((e.title.clone(), e.password.clone()?))).collect();
+    if guarded.is_empty() {
+        return Err("No edit range on this sheet has a password.".into());
+    }
+    let mut opened = Vec::new();
+    for (title, v) in guarded {
+        if officina_convert::protect::check_range(&v, password)? {
+            d.wb.unlock_ranges(&v);
+            opened.push(title);
+        }
+    }
+    if opened.is_empty() {
+        return Err("That password doesn't open any edit range on this sheet.".into());
+    }
+    Ok(format!("Unlocked until the workbook closes: {}.", opened.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +249,96 @@ mod tests {
         protect(&mut d, "").unwrap();
         crate::data::run(&mut d, sel, (0, 0), crate::data::DataCmd::WrapText);
         assert!(d.wb.style(CellAddr::new(0, 0, 0)).wrap, "unchanged by the refusal");
+    }
+
+    #[test]
+    fn workbook_password_guards_the_structure() {
+        let mut d = doc();
+        assert!(protect_workbook(&mut d, "tiles").unwrap().contains("with a password"));
+        assert!(d.wb.structure_protected() && workbook_needs_password(&d));
+        let p = d.wb.structure_protection().unwrap().clone();
+        assert!(p.settings().any(|(k, v)| k == "workbookAlgorithmName" && v == "SHA-512"));
+        // A sheet can't be added; the plain toggle won't take it off.
+        d.run("Add Sheet", vec![GridOp::add_sheet("Two".into())]);
+        assert_eq!(d.wb.sheet_count(), 1);
+        assert!(crate::data::protect_workbook(&mut d).is_err());
+        assert_eq!(protect_workbook(&mut d, "Tiles").unwrap_err(), "That password doesn't unprotect the workbook.");
+        assert!(d.wb.structure_protected());
+        protect_workbook(&mut d, "tiles").unwrap();
+        assert!(!d.wb.structure_protected());
+        // Without a password, none is asked for.
+        protect_workbook(&mut d, "").unwrap();
+        assert!(!workbook_needs_password(&d));
+        protect_workbook(&mut d, "").unwrap();
+        assert!(!d.wb.structure_protected());
+    }
+
+    #[test]
+    fn a_range_password_opens_its_range_only_once_typed() {
+        let mut d = doc();
+        crate::checks::edit_ranges(&mut d, "add Inputs: B1:B2").unwrap();
+        crate::checks::edit_ranges(&mut d, "add Notes: A2").unwrap();
+        assert!(range_password(&mut d, "Nope: x").unwrap_err().contains("No edit range"));
+        assert!(range_password(&mut d, "inputs: key one").unwrap().contains("only with its password"));
+        let v = d.wb.sheet(0).edit_ranges()[0].password.clone().unwrap();
+        assert!(v.contains("algorithmName=SHA-512"), "{v}");
+        protect(&mut d, "").unwrap();
+        assert!(range_password(&mut d, "Inputs:").is_err(), "fixed while protected");
+        // Notes has no password: it opens; Inputs waits for its own.
+        assert!(d.type_into(1, 0, "x"));
+        d.type_into(0, 1, "7");
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 1)), Value::Num(1.0));
+        assert!(unlock_range(&mut d, "key two").unwrap_err().contains("doesn't open"));
+        assert_eq!(unlock_range(&mut d, "key one").unwrap(), "Unlocked until the workbook closes: Inputs.");
+        d.type_into(0, 1, "7");
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 1)), Value::Num(7.0));
+        // Taken away again: no password left to unlock with.
+        unprotect(&mut d, "").unwrap();
+        range_password(&mut d, "Inputs:").unwrap();
+        assert!(d.wb.sheet(0).edit_ranges()[0].password.is_none());
+        assert!(unlock_range(&mut d, "key one").is_err());
+    }
+
+    #[test]
+    fn tab_steps_through_unlocked_cells_on_a_protected_sheet() {
+        let mut d = doc();
+        assert_eq!(d.wb.next_unlocked(0, (0, 0), false), None, "not protected");
+        let sel = CellRange { r0: 0, c0: 1, r1: 1, c1: 1 };
+        crate::special::toggle_protection(&mut d, sel, true).unwrap();
+        assert!(d.wb.style(CellAddr::new(0, 0, 1)).unlocked, "B1 unlocked");
+        crate::checks::edit_ranges(&mut d, "add Far: D5").unwrap();
+        protect(&mut d, "").unwrap();
+        let next = |d: &Doc, at, back| d.wb.next_unlocked(0, at, back);
+        assert_eq!(next(&d, (0, 0), false), Some((0, 1)));
+        assert_eq!(next(&d, (0, 1), false), Some((1, 1)));
+        assert_eq!(next(&d, (1, 1), false), Some((4, 3)));
+        assert_eq!(next(&d, (4, 3), false), Some((0, 1)), "wraps round");
+        assert_eq!(next(&d, (0, 1), true), Some((4, 3)), "and back");
+        assert_eq!(next(&d, (4, 3), true), Some((1, 1)));
+        assert_eq!(next(&d, (3, 0), true), Some((1, 1)));
+        // The grid asks the sheet through its source.
+        use pergola::widgets::GridSource;
+        let d = std::rc::Rc::new(std::cell::RefCell::new(d));
+        let src = crate::source::SheetSource::new(d.clone());
+        assert_eq!(src.tab_target((0, 1), false), Some((1, 1)));
+        unprotect(&mut d.borrow_mut(), "").unwrap();
+        assert_eq!(src.tab_target((0, 1), false), None, "plain Tab once unprotected");
+    }
+
+    #[test]
+    fn sort_left_to_right_reorders_columns_by_a_row() {
+        let mut d = Doc::from_csv("s.csv", b"c,a,b\n3,1,2\nx,y,z\n").unwrap().0;
+        let sel = CellRange { r0: 0, c0: 0, r1: 1, c1: 2 };
+        assert!(crate::data::sort_left_to_right(&mut d, sel, (0, 0), "9").unwrap_err().contains("isn't a row"));
+        assert_eq!(crate::data::sort_left_to_right(&mut d, sel, (0, 0), "1").unwrap(), "Sorted 3 columns by row 1.");
+        let row = |d: &Doc, r| (0..3).map(|c| d.wb.formatted(CellAddr::new(0, r, c)).text.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(row(&d, 0), "a,b,c");
+        assert_eq!(row(&d, 1), "1,2,3");
+        assert_eq!(row(&d, 2), "x,y,z", "row 3 outside the selection is left alone");
+        crate::data::sort_left_to_right(&mut d, sel, (0, 0), "2 desc").unwrap();
+        assert_eq!(row(&d, 1), "3,2,1");
+        assert!(d.undo());
+        assert_eq!(row(&d, 0), "a,b,c");
     }
 
     #[test]

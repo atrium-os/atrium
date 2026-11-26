@@ -42,3 +42,24 @@ fn zero_values_round_trip_in_ods() {
     let (back, _) = ods::read(&file).unwrap();
     assert!(back.sheet(0).show_zeros && !back.sheet(1).show_zeros);
 }
+
+#[test]
+fn workbook_and_range_passwords_round_trip_in_xlsx() {
+    use officina_grid::sheetareas::EditRange;
+    let mut wb = book();
+    let mut p = SheetProtection::new(ProtectionFormat::ExcelWorkbook);
+    for (k, v) in protect::workbook_verifier("books", &[3; 16]) {
+        assert!(p.keep(k, &v));
+    }
+    wb.set_structure_protection(Some(p));
+    let er = EditRange { title: "Inputs".into(), areas: vec![(1, 1, 4, 1)], password: Some(protect::range_verifier("in", &[5; 16])) };
+    assert!(wb.set_edit_ranges(0, vec![er]));
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, rep) = xlsx::read(&file).unwrap();
+    let s = back.structure_protection().cloned().expect("structure still protected");
+    assert_eq!(protect::check(&s, "books"), Ok(true), "{rep:?}");
+    assert_eq!(protect::check(&s, "Books"), Ok(false));
+    let v = back.sheet(0).edit_ranges()[0].password.clone().expect("range keeps its password");
+    assert_eq!(protect::check_range(&v, "in"), Ok(true));
+    assert_eq!(protect::check_range(&v, "out"), Ok(false));
+}

@@ -250,6 +250,9 @@ pub struct Workbook {
     pub(crate) manual: bool,
     /// Protect Workbook: the structure locked, with any foreign verifier.
     pub(crate) structure: Option<crate::protection::SheetProtection>,
+    /// Allow Edit Ranges unlocked by their password for this session: their
+    /// verifiers. Never saved, as in Excel (until the workbook closes).
+    pub(crate) unlocked_ranges: Vec<String>,
     pub(crate) sheets: Vec<Sheet>,
     pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
@@ -312,6 +315,7 @@ impl Workbook {
             iteration: None,
             manual: false,
             structure: None,
+            unlocked_ranges: Vec::new(),
             sheets: Vec::new(),
             tracked_cells: None,
             strings: StringPool::new(),

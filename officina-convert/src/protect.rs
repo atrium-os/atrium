@@ -68,6 +68,35 @@ pub fn verifier(password: &str, salt: &[u8; 16]) -> Vec<(&'static str, String)> 
     ]
 }
 
+/// The same for Protect Workbook (`workbookAlgorithmName` and so on).
+pub fn workbook_verifier(password: &str, salt: &[u8; 16]) -> Vec<(&'static str, String)> {
+    let names = ["workbookAlgorithmName", "workbookHashValue", "workbookSaltValue", "workbookSpinCount"];
+    verifier(password, salt).into_iter().zip(names).map(|((_, v), k)| (k, v)).collect()
+}
+
+/// An Allow Edit Range's verifier as it is kept with the range: `key=value`
+/// lines of Excel's `<protectedRange>` attributes.
+pub fn range_verifier(password: &str, salt: &[u8; 16]) -> String {
+    verifier(password, salt).into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether `password` opens a range guarded by `verifier` (as
+/// [`range_verifier`] writes it, or as a file had it).
+pub fn check_range(verifier: &str, password: &str) -> Result<bool, String> {
+    let mut p = SheetProtection::new(ProtectionFormat::Excel);
+    for line in verifier.split('\n') {
+        if let Some((k, v)) = line.split_once('=') {
+            if !p.keep(k, v) {
+                return Err("The range's password record is damaged.".into());
+            }
+        }
+    }
+    if !has_password(&p) {
+        return Err("The range's password record is damaged.".into());
+    }
+    check(&p, password)
+}
+
 /// Whether `p` asks for a password at all.
 pub fn has_password(p: &SheetProtection) -> bool {
     p.settings().any(|(k, v)| matches!(k, "hashValue" | "password" | "workbookHashValue" | "workbookPassword" | "table:protection-key") && !v.is_empty())
@@ -156,5 +185,22 @@ mod tests {
         assert!(ods.keep("table:protection-key-digest-algorithm", "http://www.w3.org/2000/09/xmldsig#sha256"));
         assert_eq!(check(&ods, "odf"), Ok(true));
         assert_eq!(check(&ods, "ODF"), Ok(false));
+    }
+
+    #[test]
+    fn workbook_and_range_verifiers() {
+        let mut wb = SheetProtection::new(ProtectionFormat::ExcelWorkbook);
+        for (k, v) in workbook_verifier("book", &[3; 16]) {
+            assert!(wb.keep(k, &v));
+        }
+        assert!(has_password(&wb));
+        assert_eq!(check(&wb, "book"), Ok(true));
+        assert_eq!(check(&wb, "Book"), Ok(false));
+        let v = range_verifier("rng", &[4; 16]);
+        assert!(v.starts_with("algorithmName=SHA-512\nhashValue="), "{v}");
+        assert_eq!(check_range(&v, "rng"), Ok(true));
+        assert_eq!(check_range(&v, "rnG"), Ok(false));
+        assert_eq!(check_range(&format!("password={}", legacy_hash("old")), "old"), Ok(true));
+        assert!(check_range("nothing", "x").is_err());
     }
 }

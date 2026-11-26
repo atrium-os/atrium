@@ -248,6 +248,15 @@ pub enum DataCmd {
     ProtectSheet,
     UnprotectSheet,
     ProtectionOptions,
+    /// Protect Workbook… with a password, or unprotect a passworded one (a
+    /// secret bar); [`crate::lock::protect_workbook`].
+    WorkbookPassword,
+    /// An edit range's password, and unlocking ranges by theirs (secret
+    /// bars); [`crate::lock`].
+    RangePassword,
+    UnlockRange,
+    /// Sort Left to Right: columns by rows' values (a bar).
+    SortLeftToRight,
     /// Zero values shown or left blank on this sheet (a view setting).
     ZeroValues,
     /// Shrink to Fit on the selection.
@@ -607,6 +616,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         },
         (MenuItem::new("Protection Options…").enabled(!wb.sheet_protected(s)), Some(DataCmd::ProtectionOptions)),
         (MenuItem::new("Protect Workbook Structure").checked(wb.structure_protected()), Some(DataCmd::ProtectWorkbook)),
+        (MenuItem::new(if wb.structure_protected() { "Unprotect Workbook…" } else { "Protect Workbook…" }), Some(DataCmd::WorkbookPassword)),
+        (MenuItem::new("Range Password…").enabled(!wb.sheet_protected(s) && !wb.sheet(s).edit_ranges().is_empty()), Some(DataCmd::RangePassword)),
+        (MenuItem::new("Unlock Range…").enabled(wb.sheet(s).edit_ranges().iter().any(|e| e.password.is_some())), Some(DataCmd::UnlockRange)),
+        (MenuItem::new("Sort Left to Right…"), Some(DataCmd::SortLeftToRight)),
         (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
         (MenuItem::new("Data Form…"), Some(DataCmd::DataForm)),
         (MenuItem::new("Forecast Sheet…"), Some(DataCmd::ForecastSheet)),
@@ -793,6 +806,59 @@ fn sort_rect(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Result<(Rect, Targe
         return Err("To sort, every row needs the same merged cells; unmerge them first.".into());
     }
     Ok((rect, t))
+}
+
+/// Sort Left to Right: the columns of the selection (or the data at the
+/// cursor) reordered by the values in the rows `spec` lists, first to last,
+/// as one step: sheet row numbers, each optionally followed by `desc` or
+/// `asc`, separated by commas or `then` (`1, 3 desc`).
+pub fn sort_left_to_right(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) -> Result<String, String> {
+    let t = target(d, sel, cursor).ok_or("Select the data to sort, or put the cursor in it.")?;
+    let rect = t.rect;
+    if rect.c1 - rect.c0 >= officina_grid::sort::MAX_SORT_COLS {
+        return Err(format!("Sort Left to Right sorts at most {} columns.", officina_grid::sort::MAX_SORT_COLS));
+    }
+    if rect.c0 == rect.c1 {
+        return Err("Select two columns or more to sort left to right.".into());
+    }
+    if d.wb.merges_in(&rect).next().is_some() {
+        return Err("To sort left to right, unmerge the cells in the data first.".into());
+    }
+    let spec = spec.replace(" then ", ",").replace(" THEN ", ",").replace(" Then ", ",");
+    let mut keys: Vec<SortKey> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if keys.len() == MAX_SORT_KEYS {
+            return Err(format!("Sort Left to Right sorts by at most {MAX_SORT_KEYS} rows."));
+        }
+        let lower = part.to_lowercase();
+        let (what, descending) = match lower.split_once(char::is_whitespace) {
+            Some((n, dir)) if matches!(dir.trim(), "desc" | "descending" | "z-a") => (n.to_string(), true),
+            Some((n, dir)) if matches!(dir.trim(), "asc" | "ascending" | "a-z") => (n.to_string(), false),
+            None => (lower.clone(), false),
+            _ => return Err(format!("{part:?}: type a row number, then desc or asc if you like.")),
+        };
+        let row = what.parse::<u32>().ok().and_then(|n| n.checked_sub(1)).filter(|r| (rect.r0..=rect.r1).contains(r)).ok_or_else(|| format!("{part:?} isn't a row of the data: use a number from {} to {}.", rect.r0 + 1, rect.r1 + 1))?;
+        if keys.iter().any(|k| k.col == row) {
+            return Err(format!("Row {} is listed twice.", row + 1));
+        }
+        keys.push(SortKey { col: row, descending });
+    }
+    if keys.is_empty() {
+        return Err("Type the rows to sort by, such as: 1, 3 desc".into());
+    }
+    let ord = officina_grid::sort::order_cols(&d.wb, &rect, &keys);
+    match officina_grid::sort::reorder_cols_op(&d.wb, rect, &ord) {
+        Some(op) => {
+            d.status.clear();
+            d.run("Sort Left to Right", vec![op]);
+            if crate::sheet_protection::refused(&d.status) {
+                return Err(d.status.clone());
+            }
+            let names: Vec<String> = keys.iter().map(|k| format!("row {}{}", k.col + 1, if k.descending { " (Z to A)" } else { "" })).collect();
+            Ok(format!("Sorted {} columns by {}.", rect.c1 - rect.c0 + 1, names.join(", then ")))
+        }
+        None => Ok("Already in that order.".into()),
+    }
 }
 
 /// The most columns a Custom Sort sorts by (Excel allows 64 levels).
@@ -1074,7 +1140,7 @@ pub fn goal_seek(d: &mut Doc, cursor: (u32, u32), spec: &str) -> Result<String, 
 /// with a password, from a file, can't be taken off here), or unlocks it.
 pub fn protect_workbook(d: &mut Doc) -> Result<String, String> {
     match d.wb.structure_protection() {
-        Some(p) if p.has_password() => Err("The structure is locked with a password from another app: unlock it there.".into()),
+        Some(p) if p.has_password() => Err("The structure is locked with a password: use Unprotect Workbook… and type it.".into()),
         Some(_) => {
             d.run("Unprotect Workbook", vec![GridOp::Structure(None)]);
             Ok("Workbook structure unlocked: sheets can be added, deleted, renamed and moved.".into())
@@ -3034,7 +3100,8 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if on { "Text shrinks to fit its cells.".into() } else { "Text keeps its size.".into() })
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions => Ok(String::new()),
+        DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
