@@ -61,6 +61,8 @@ Same wire format. Same kmod logic with a small swap: instead of the ivshmem PCI 
 
 ## Network transport — TCP / QUIC (D6+)
 
+> Superseded for remote display by [fenestra.md](../spec/fenestra.md) (2026-11-26): apps do not connect to a remote frescod; the host's renderer jails stream the validated scene to a viewer through `fenestrad`.
+
 Same wire format over a socket. Per-client one TCP connection (or QUIC stream); cmd/comp interleaved; input multiplexed.
 
 ```

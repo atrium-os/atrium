@@ -1,0 +1,897 @@
+# Fenestra: a remote compositor that receives the scene, not the pixels
+
+Status: **proposed 2026-11-26, nothing built.** Shankar asked for "a remote compositor, which
+can display the same scenegraph coming through the network", with research into what goes
+wrong with RDP, VNC and the rest, and whether we can get low latency and high quality remote
+viewing. Decisions are in §17. Owner: a new Fenestra thread (spec), the Fresco thread
+(frescod and renderer changes), Forum (the viewer's window and the host's indicator).
+
+*Fenestra* is Latin for a window, the opening in a wall you look through into another room.
+Names: `fenestrad` (the host's exporter), `fenestra-net` (the viewer's network jail),
+`fenestra` (the CLI and the viewer app).
+
+Builds on: [fresco-f4-split.md](fresco-f4-split.md) (broker and per-client renderer jails),
+[atrium-scenegraph-hardening.md](atrium-scenegraph-hardening.md) (H1 to H10, H9 in
+particular), [aqueduct-remote.md](aqueduct-remote.md) (SSH handoff, session capabilities),
+[aqueduct.md](aqueduct.md) §6.6 and §7.2 (possession ledgers, tunnel do not embed),
+[resolution-independence.md](resolution-independence.md) (points and per-monitor scale),
+[fresco-video.md](fresco-video.md) (video layers), [fresco-surfaces.md](fresco-surfaces.md)
+(external GPU surfaces), [fresco-scene-groups.md](fresco-scene-groups.md) (groups, SCROLL),
+[fresco-recovery.md](fresco-recovery.md) (client replay), [stoa.md](stoa.md) §3 (state sync,
+predictive echo), [tabula.md](tabula.md) (clipboard and activation tokens),
+[concursus.md](concursus.md) (NAT traversal), [background-apps.md](background-apps.md)
+(`listen` grant). It replaces the remote-desktop sketch in
+[../subsystems/transport.md](../subsystems/transport.md), which predates the split and had
+apps talk to a remote frescod directly (§3.1 says why that shape is wrong now).
+
+## 0. The idea in one paragraph
+
+Every remote desktop protocol in wide use today renders on the machine where the apps run and
+ships pictures of the result: compressed bitmaps (VNC, RDP's older paths) or a video stream
+(RDP's AVC modes, Parsec, Moonlight, Chrome Remote Desktop). Fresco already has what those
+protocols lack: a retained, validated, content-addressed description of every window. Fenestra
+sends that description to the viewer and the viewer draws it with the same renderer the host
+uses, at the viewer's own resolution and refresh rate. Text is never compressed, a still screen
+costs nothing, scrolling and animation run on the viewer's clock, and the host needs no GPU.
+Where there is no scene to send (decoded video, a game's GPU surface, a window that asked for
+raw pixels), Fenestra falls back to a video or lossless codec **for that region only**, and it
+knows exactly which regions those are because the scene says so, instead of guessing from
+pixels the way RDP and VNC must.
+
+## 1. What people mean by "remote", and what v1 covers
+
+| Shape | Example | In v1 |
+|---|---|---|
+| **Whole desktop** | Sit at the laptop, use the workstation's whole session (its bar, dock, windows) in one window or full screen. | Yes |
+| **App or window** ("rootless") | Run Artifex on the build box; its windows sit among the laptop's own windows. | Yes, after whole desktop (R4) |
+| **Shared view** | Show one window into a meeting, or let a colleague watch; view only. | Yes, as a restricted mint (aqueduct-remote.md §4) |
+| **Headless host** | A server or cloud VM with no monitor and no GPU runs a session that only remote viewers see. | Yes, and it is the cheapest case (§4.4) |
+| **Atrium viewing a foreign desktop** (Windows, Linux, macOS) | | No. That is an RDP or VNC client app, a separate project. |
+| **A foreign viewer** (macOS, Windows, a browser) viewing an Atrium host | | Later (§14). The viewer is portable Rust; nothing in the protocol assumes FreeBSD. |
+
+## 2. What goes wrong with existing remote viewers
+
+This is the research Shankar asked for. Each row is a known, documented failure; §16 maps each
+one to the part of this design that avoids it.
+
+### 2.1 Pixel protocols: VNC (RFB)
+
+- **Everything is pixels, found by diffing.** The server compares framebuffers to find what
+  changed, then picks an encoding (Raw, Hextile, ZRLE, Tight with JPEG). It cannot know that a
+  region is text, so it either sends text losslessly (expensive) or through JPEG (smeared
+  edges, coloured fringes around glyphs).
+- **Pull model, one frame in flight.** The client asks for an update and the server answers
+  with the current state. On a long link the screen updates at best once per round trip, so a
+  100 ms link caps smooth motion near 10 updates a second.
+- **Video and fast motion** are re-detected and re-encoded every frame; Tight's JPEG costs CPU
+  on the server and still looks poor.
+- **Security.** The classic VNC authentication is a DES challenge with an 8-character password
+  limit and no transport encryption; encryption is bolted on (TLS or SSH tunnels, vendor
+  extensions) and varies by implementation. Kaspersky's 2019 audit of LibVNC, UltraVNC, TightVNC
+  and TurboVNC found 37 CVEs, many memory corruption, several reachable from a **malicious
+  server against the client**: the viewer parses hostile bytes in an unconfined process.
+
+### 2.2 RDP
+
+- **Started as drawing orders, ended as video.** RDP's early "GDI orders" remoted drawing
+  commands (this is the idea Fenestra returns to). They died because Windows apps moved to
+  DirectX, WPF and browsers that draw into bitmaps the remoting layer cannot see into. Modern
+  RDP's graphics pipeline (MS-RDPEGFX) sends surfaces with codecs: ClearCodec and a "text
+  optimised" codec for text-like regions, the RemoteFX progressive codec, and H.264 in AVC420
+  and AVC444 modes. AVC444 exists because 4:2:0 chroma subsampling blurs coloured text and
+  sub-pixel anti-aliasing; it sends a second stream to recover the chroma.
+- **Content classification is heuristic.** The server guesses which screen regions are text,
+  which are images and which are video. Wrong guesses show as text smearing for a moment after
+  scrolling (it was classed as motion), or as blocky refinement of images (progressive codec).
+- **Latency stacks up:** capture, classify, encode, send, decode, compose. Hardware encoders
+  help, but a WAN-quality encode still adds frames of delay; SPICE's developers measured at
+  least 100 ms added by streaming at WAN bandwidth in their remote Virgl work.
+- **Resolution and DPI** are the session's, not the viewer's. A 4K laptop viewing a 1080p
+  session scales a bitmap; a session resized to the viewer re-lays out the whole desktop, and
+  per-monitor DPI across a multi-monitor client is a long-standing pain.
+- **Security.** RDP is a large pre-authentication attack surface: BlueKeep (CVE-2019-0708)
+  was a wormable, pre-authentication use-after-free in a virtual channel. Check Point's
+  "Reverse RDP" work found 25 flaws in mstsc, FreeRDP and rdesktop where a **malicious server
+  attacks the client**, including a clipboard path traversal (CVE-2019-0887). The lesson
+  matches VNC's: the viewer is attacked through every channel the server can write to
+  (graphics, clipboard, file transfer, device redirection), and those parsers ran unconfined.
+
+### 2.3 SPICE (QEMU/KVM)
+
+- SPICE was designed to remote drawing commands (QXL) and let the client render, the same bet
+  as Fenestra. It suffered from the RDP problem: guests stopped drawing through 2D commands, so
+  QXL saw ever more bitmaps and switched to streaming them as video. Red Hat closed a bug about
+  lagging cursor and text over high-latency WAN links as WONTFIX, planning to move to Virgl
+  instead; remote Virgl then needed video streaming and its latency cost.
+- Lesson: **a command protocol only works if the apps actually speak it.** On Atrium they do:
+  Pergola, the Navigator, Officina and Forum emit Fresco scenes, and frescod refuses unknown
+  vocabularies (H3).
+
+### 2.4 X11 forwarding and NX
+
+- X11 was network transparent at the protocol level, and that was its strength. It was killed
+  by **round trips**: many requests wait for replies, and modern toolkits draw client-side into
+  images (Cairo, Skia) and push them as pixmaps, so over a WAN an X app is both chatty and
+  bitmap-heavy. NX recovered usability with caching and round-trip suppression in a proxy; LBX
+  tried the same and was abandoned.
+- Lessons: **no request on the drawing path may wait for the server**, and the protocol must
+  carry the app's real content (glyphs, paths), not its rasterised output.
+
+### 2.5 Wayland remoting: Waypipe
+
+- Waypipe proxies the Wayland protocol and copies buffer contents (shm diffs, or video-encoded
+  DMA-BUFs). Wayland has few round trips, so it beats X11 forwarding, but it is still **pixel
+  shipping per window**: every client renders locally into buffers. Its video mode only works
+  for some buffer formats, keeps one stream per buffer (so windows flicker as surfaces rotate
+  between buffers), and hardware encode is described in its own man page as finicky.
+- Lesson: per-window forwarding (rootless) is the nicer experience, but forwarding buffers
+  inherits all of the pixel problems.
+
+### 2.6 Game streaming: Parsec, NVIDIA GameStream / Moonlight / Sunshine, Steam Remote Play
+
+- These get the lowest latency of anything pixel-based: hardware capture and encode on the GPU,
+  UDP with custom congestion control and forward error correction, **no playout buffer** (show
+  a frame the moment it decodes), low-delay encoder settings (no B-frames, intra refresh instead
+  of keyframes), and the cursor drawn on the client. Parsec built its own UDP protocol (BUD)
+  after finding nothing else gave TCP's reliability at UDP's latency.
+- Costs: a GPU with a hardware encoder on the host, steady high bitrate (tens of Mbit/s for
+  1080p60), text that is only as sharp as the bitrate allows, and Wi-Fi or mobile jitter that
+  becomes visible stutter because there is no buffer.
+- Lesson for Fenestra's **fallback** path: when we must send pixels, do it the way these
+  products do (low-delay encoder, no playout buffer, region-limited, UDP datagrams), not the
+  way VNC does.
+
+### 2.7 Terminal-shaped lessons: mosh
+
+- mosh (USENIX ATC 2012) synchronises **state, not a byte stream**: the server sends the
+  difference between the state the client acknowledged and the current one, so a backlog never
+  builds up and old frames are never replayed. It also predicts the effect of keystrokes and
+  shows them immediately (70% of keystrokes, median under 5 ms versus 503 ms for SSH on a 3G
+  link), correcting a wrong guess within one round trip. Stoa already does both (stoa.md §3.3,
+  §3.4).
+- Lesson: **sync state with acks and skip stale intermediate states**, and hide round trips with
+  local prediction where a wrong guess is cheap to undo.
+
+### 2.8 The common failures, summarised
+
+1. Text is degraded because the protocol only knows pixels (VNC, RDP, game streams).
+2. Latency is the sum of capture, encode, network, decode and compose, plus queues.
+3. Bandwidth scales with screen area times frame rate, not with what changed.
+4. The viewer re-scales pictures rendered for a different screen (DPI, HDR, refresh rate).
+5. Command protocols died because apps stopped speaking them (RDP orders, SPICE QXL, X11).
+6. Round trips on the drawing path (X11).
+7. Queues of stale frames under congestion (TCP-based protocols).
+8. Viewers parse hostile streams in unconfined processes, through many side channels
+   (clipboard, files, devices), and authentication is weak or bolted on.
+
+## 3. Architecture
+
+### 3.1 Where the scene is taken from
+
+transport.md's sketch had each app connect to a remote frescod. That no longer fits:
+
+- Apps are jailed and most have **no network**; giving every app a socket to a remote host
+  would break the network model and multiply the attack surface.
+- frescod's split (F4b) means a client's scene lives in its **renderer jail**, already parsed
+  and validated, and the broker only sees packed frames. The validated, canonical scene is the
+  thing worth sending, and it exists in exactly one place per client.
+- A remote session must survive the viewer going away. Apps keep running on the host; only
+  the view is remote.
+
+So Fenestra adds **remote outputs** to the host's frescod. A viewer that connects appears to
+the host as one or more monitors (with the viewer's sizes, scales, refresh rates and HDR
+capabilities). Forum lays windows out on them as on any monitor. Instead of rastering windows
+on those outputs into scanout, each renderer jail emits its window's scene as a canonical
+**scene stream**, and `fenestrad` carries it to the viewer.
+
+```
+ HOST (apps run here)                                          VIEWER (person sits here)
+ ┌──────────────┐  fresco.sock  ┌─────────────────────┐
+ │ app (jailed) ├──────────────►│ fresco-renderer      │ validates (H1–H6), holds the scene
+ └──────────────┘               │ (jail, no net, no fs)│
+                                │  emits canonical     │
+                                │  scene stream ───────┼──┐ memfd ring, fixed records
+                                └─────────────────────┘  │
+ ┌─────────────────────────────┐ records                  ▼
+ │ frescod broker (no network) │◄────────────────┐ ┌──────────────────┐ QUIC over UDP   ┌────────────────────┐
+ │ windows, z, focus, outputs, │  input, acks,   └─┤ fenestrad (jail, ├────────────────►│ fenestra-net (jail,│
+ │ input routing, chrome       │  output changes   │ own uid, one     │◄────────────────┤ own uid, connect   │
+ └─────────────────────────────┘                   │ listen port)     │  input, acks    │ only)              │
+                                                   └──────────────────┘                 └─────────┬──────────┘
+                                                                                                  │ per window
+                                                                                                  ▼
+                                                                                ┌──────────────────────────┐
+                                                                                │ fresco-renderer (jail,   │
+                                                                                │ same bundle as the host's│
+                                                                                │ validates again, H9)     │
+                                                                                └─────────┬────────────────┘
+                                                                                          │ packed frames (slots)
+                                                                                          ▼
+                                                                                ┌──────────────────────────┐
+                                                                                │ viewer's frescod broker  │
+                                                                                │ composes with local      │
+                                                                                │ windows and chrome       │
+                                                                                └──────────────────────────┘
+```
+
+### 3.2 The host side
+
+- **frescod (broker)** gains remote outputs: `OUTPUT_ADD/REMOVE` records from `fenestrad`
+  carrying the viewer's monitor geometry in points, scale, refresh range, HDR capabilities and
+  colour space. It routes input arriving from `fenestrad` exactly as it routes Tactus input
+  (F4c, F4c′), and it tells each renderer which of its windows are on remote outputs.
+  **frescod gets no network**, and it never reads scene bytes from the network.
+- **fresco-renderer** gains a scene-stream writer: for each window on a remote output it keeps
+  a per-viewer acked version and writes the canonical difference (§5.2) into a sealed memfd
+  ring that the broker hands to `fenestrad`. The writer serialises from the renderer's own
+  validated structures, never by copying the client's bytes, so only canonical records leave
+  the jail.
+- **fenestrad** is a new jailed daemon, its own uid (`_fenestra`), no filesystem but its socket
+  directory, a `listen` grant on one UDP port (background-apps.md: local network by default,
+  wider only by the person's choice). It terminates QUIC, authenticates the session (§11.2),
+  schedules what to send (§8), runs the fallback encoders in a child jail (§7.4), and carries
+  input and acks back to frescod as fixed-size records. It parses nothing but its own transport
+  framing and the viewer's fixed-size input and ack records.
+
+### 3.3 The viewer side
+
+- **fenestra-net** (jail, own uid, outbound UDP to the one host only, no filesystem) holds the
+  QUIC connection and demultiplexes streams. It does not parse scene records; it hands each
+  window's stream to that window's renderer over a socket pair.
+- **fresco-renderer**, the *same signed bundle* the host runs, one per remote client (as on the
+  host), in the same empty jail. It runs the full validator on the incoming stream (H9: an
+  authenticated host may be compromised), holds the scene, rasterises at the viewer's scale with
+  the viewer's GPU or the compute renderer, and hands packed frames to the viewer's frescod like
+  any local renderer. A malicious host can therefore exploit, at worst, a zero-capability
+  renderer jail: no network, no files, no other windows (contrast §2.1, §2.2's client-side
+  CVEs).
+- **The viewer's frescod** composes remote windows among local ones (rootless) or inside one
+  local window (whole desktop). It draws **its own trusted marking** around remote content
+  (§11.5) and owns the cursor.
+- **The Fenestra app** (Pergola, unprivileged) is the connect dialog, the session list, the
+  toolbar (full screen, view only, disconnect, stats) and the settings. Every one of those
+  actions is also a `fenestra` CLI command (§15).
+
+### 3.4 Two presentation modes
+
+- **Whole desktop.** The viewer's frescod gives the session one local window (or full screen)
+  whose size is the remote output. The host's Forum (bar, dock, wallpaper, window manager) runs
+  on the host and its layout arrives as window placements in the stream. Moving a remote window
+  is a round trip to the host's WM; the cursor, scrolling (§6.3) and animations are not.
+- **Rootless.** The host's Forum does not manage remote outputs; instead each remote top-level
+  window becomes a local window managed by the viewer's Forum. Moves, resizes (§6.4), focus
+  and stacking happen locally at local latency; the host learns the size and focus so the app
+  can lay out. Pop-ups and dialogs keep their parent relation (fresco-popups.md). The host's
+  bar and dock are not shown; the viewer's dock shows remote apps with a host badge.
+
+## 4. What the host has to change, and what it saves
+
+### 4.1 Remote outputs are monitors
+
+Treating a viewer as monitors reuses everything resolution-independence.md built: an app's
+scene is emitted in the device pixels of the monitor its window lives on, so a window on a
+viewer's 2x Retina-class panel is drawn by the app at 2x. **Text is shaped and rasterised by
+the app for the viewer's actual pixel density** (glyph atlases at the viewer's scale), so it
+is as sharp as if the app ran locally. No other remote protocol can do this; they all render at
+the session's resolution and scale a picture.
+
+A viewer with two monitors at different scales gives two remote outputs; moving a window
+between them re-emits at the new scale (resolution-independence.md §7), exactly as locally.
+
+### 4.2 The host keeps its own screen
+
+A host with a local seat can keep showing its own session while viewed (decision 3): its own
+monitors stay outputs, the remote ones are added. Whole-desktop mirroring of the *same* layout
+uses the existing mirror machinery (`OP_WM_MIRROR_OUTPUT`) with the remote output as the mirror
+target, re-emitted at the viewer's scale.
+
+### 4.3 Version skew and missing features
+
+The scene stream carries the wire version and a feature set agreed at connect. If the viewer
+lacks a node kind (an older viewer, or a node a future host added), the host's renderer rasters
+**that window** locally and it goes as pixels (§7.3), with the stats overlay saying why. A new
+feature never breaks an old viewer; it only costs bandwidth until the viewer is updated.
+
+### 4.4 Headless hosts need no GPU
+
+In scene mode nothing on the host rasters a window that is only on remote outputs: the
+renderer validates and keeps the scene and the viewer draws it. A cloud VM or a headless box
+serves full-quality sessions with no GPU and a little CPU, and it rasters only fallback regions
+(pixel-mode windows, GPU surfaces) when those exist. This is the opposite of RDP and game
+streaming, where the host pays for rendering and encoding every frame.
+
+## 5. The scene stream
+
+### 5.1 What travels
+
+Per window, in the vocabulary frescod already accepts (wire-format.md, fresco-protocol), after
+validation and canonicalisation by the host's renderer:
+
+| Class | Content | Size, typical |
+|---|---|---|
+| Window | create, destroy, title, role, parent, placement (whole desktop), size, scale | tens of bytes |
+| Nodes | keyed node set/clear: rects, paths, fills (`ATRIUM_CORE_FILL`), glyph runs (`ATRIUM_TEXT_GLYPH_RUN`), textures, groups and places (`ATRIUM_CORE_GROUP`, `PLACE`) | ~32 bytes a glyph, tens to hundreds of bytes per other node |
+| Slots | texture slots by CAS hash, and region updates (`OP_SLOT_UPDATE_REGION`), including glyph atlas pages and their growth | once per blob, then a reference |
+| Animations | `OP_ANIMATION_START/CANCEL` tracks | one record per animation, not per frame |
+| Video | layer create, place, colour (fresco-video.md §3), and frames by the path in §7.1 | §7 |
+| Surfaces | external surface nodes; their pixels by §7.2 | §7 |
+| Frame marks | `SCENE_FRAME_BEGIN/END`, so the viewer never shows half a frame | bytes |
+
+transport.md's estimates still hold in kind: a session's first frame costs its fonts' atlases,
+icons and wallpaper (a few MB, once, and cached across sessions, §5.4); typing costs a glyph
+instance and a caret move (well under 1 KB a keystroke); an idle screen costs nothing. These
+are estimates to be measured in R2, not results.
+
+### 5.2 State sync, not a replayed log
+
+Fenestra synchronises state the way mosh and Stoa do (§2.7):
+
+- Each window's scene has a version. The viewer acks the versions it has fully applied (end of
+  frame). The host's renderer keeps, per viewer, the acked version and sends the **difference
+  between the acked scene and the current scene**: nodes set or cleared since, slots referenced
+  that the viewer has not been sent.
+- If the network is slow, intermediate states are **skipped**, never queued: when the next
+  send opportunity comes, the difference is computed from the latest state. Ten fast edits to a
+  node during a congested second become one record. Nothing ages in a queue (failure 7).
+- The renderer keeps a per-node "changed at version" number so the difference is a walk over
+  changed nodes, not a full compare. Memory: one version number per node per window and one
+  acked version per viewer.
+- A lost or corrupt datagram or a gap is not special: the viewer simply has not acked, so the
+  next difference covers it. A viewer that cannot keep up (or reconnects) gets a full state
+  from version 0, which is fresco-recovery.md's replay seen from the other side.
+
+### 5.3 Ordering and atomicity
+
+Records for one window travel on one QUIC stream, in frame order; a frame is applied on the
+viewer only when its END arrives, so the viewer never draws a torn frame. Windows are
+independent streams, so a large image upload in one window never delays typing in another
+(QUIC has no head-of-line blocking across streams; TCP does).
+
+### 5.4 Content-addressed blobs and the viewer's cache
+
+- Blobs (images, atlas pages, fill geometry blocks, font files) are sent once and referenced by
+  SHA-256 hash. The viewer verifies every hash on arrival (H2) and refuses a mismatch.
+- **Possession, not global dedup** (aqueduct.md §6.6): the viewer keeps a separate cache per
+  (host identity, persona) and tells the host only which of *that host's* blobs it holds. A
+  host cannot probe for blobs another host sent, and the viewer never says "I have H" for a hash
+  it did not receive from that host. One exception: the **system font files** are public,
+  version-pinned and identical on every Atrium machine; the handshake exchanges the font set's
+  manifest hash, and a matching set costs nothing to sync.
+- The cache holds pictures of the person's documents, so on disk it is **personal data at
+  rest** and lives in the viewing persona's key group (AGENTS.md at-rest rule), in the Fenestra
+  app's overlay, encrypted with the persona. A viewer without that directory (a kiosk, a guest)
+  caches in memory only. The cache is bounded (default 1 GiB, Curia setting) and evicts least
+  recently used. `fenestra cache clear [--host H]` empties it.
+
+### 5.5 Images, progressively and by visibility
+
+- Large textures are sent as a small preview first (a reduced copy the host makes in the
+  renderer jail, carried in the same slot with a "preview" flag), then the full blob. The viewer
+  shows the preview at once, then swaps. RDP's progressive codec does this for pixels it had to
+  encode; here it applies only to images the app supplied, and the final image is exact.
+- Blobs are queued by visibility: on screen first, then near the viewport (the band API's
+  readahead), then off screen. A blob that stops being referenced before it is sent is dropped
+  from the queue.
+
+## 6. Latency
+
+### 6.1 The budget
+
+For an input that changes the screen (a click, a key):
+
+| Step | Pixel streaming (RDP, Parsec) | Fenestra scene mode |
+|---|---|---|
+| Input to host | RTT/2 | RTT/2 |
+| App reacts and redraws | app time | app time (emit only, no host raster) |
+| Host capture and encode | 2 to 10 ms with hardware, more in software | none: validate and diff the changed nodes, microseconds to a millisecond |
+| Network | RTT/2 plus serialisation of a video frame | RTT/2 plus a few hundred bytes |
+| Viewer decode | 1 to 5 ms (hardware) | none |
+| Viewer raster | none | the changed region only (incremental, fresco-incremental drawing), sub-millisecond to a few ms |
+| Compose and scan out | next vblank | next vblank (VRR where available) |
+
+Ranges for pixel streaming are typical published figures, not our measurements; ours are to be
+measured in R2 and R6 on real links (TCG timings are never product numbers). The point is
+structural: Fenestra removes the encode and decode stages and their buffers, and it sends
+small payloads, so on a given link its click-to-photon time is RTT plus app time plus about one
+frame.
+
+### 6.2 What never waits for the network
+
+These happen on the viewer with no round trip at all, so they feel local at any RTT:
+
+- **The cursor.** Drawn by the viewer's frescod at the local pointer position; the host's
+  cursor shape (and hotspot) arrives as a blob. Pointer motion is sent to the host coalesced
+  to the viewer's refresh rate.
+- **Animations.** Server-side animations (`OP_ANIMATION_START`, tracks on groups) run on the
+  viewer's frame clock at its refresh rate; only the start and cancel travel. A 120 Hz viewer
+  gets 120 Hz animation from a host that has no display.
+- **Video pacing.** Video frames carry their presentation time and the viewer's frescod
+  presents them against its own vblank (fresco-video.md §4), so playback is smooth even with
+  network jitter, within the buffer the player chose.
+- **Window management in rootless mode**: moving, raising, focusing, minimising.
+- **Hover and pressed states on trusted chrome** the viewer draws itself (its own title bars in
+  rootless mode).
+
+### 6.3 Scrolling on the viewer (decision 4)
+
+Scrolling is the round trip people notice most. Today a SCROLL group's offset is set by the
+app (fresco-scene-groups.md §4). Fenestra proposes a **viewer-scrollable** flag on a SCROLL
+group: the app declares the scrollable range and has sent content (via bands) beyond the
+viewport; the viewer's frescod moves the offset itself on wheel and touchpad input, at once,
+and tells the host the new offset, which forwards it to the app as an ordinary scroll event.
+The app then fills newly exposed bands. If the viewer scrolls past what it has, it shows the
+group's background (as a browser compositor shows checkerboard) until the band arrives.
+
+This is how browsers keep scrolling smooth when their main thread is busy, and it makes remote
+scrolling feel local. Pergola's ScrollView and the Navigator's document views are the users;
+an app that does not set the flag behaves as today. The same flag helps locally (scrolling no
+longer waits on a busy app), which is a reason to build it in frescod rather than in Fenestra.
+
+### 6.4 Resizing in rootless mode
+
+A local resize of a remote window cannot wait for the app. The viewer shows the last frame
+anchored at the top-left and clipped or padded with the window's background while the app
+re-lays out, then swaps in the new frame atomically, the way macOS handles slow apps. Groups
+let the viewer stretch nothing: content is never scaled, only clipped.
+
+### 6.5 Typing (decision 5)
+
+Predictive echo (Stoa §3.4, mosh) works because a terminal's next state after a printable key
+is very predictable. A GUI text field is predictable in the same way if the app tells the
+viewer enough: Fenestra proposes an optional **edit hint** on a text field's group: caret
+position, line box, font size and colour, a glyph atlas already on the viewer, and the field's
+"plain insert" behaviour. With it, the viewer draws a typed glyph at the caret immediately,
+underlined faintly as tentative (mosh's convention), and drops the prediction when the host's
+frame for that keystroke arrives. A wrong guess (autocomplete, a shortcut, a rich-text rule)
+lasts one round trip. Without the hint, typing costs a round trip, as in every other protocol.
+
+This is the one place Fenestra puts behaviour into the scene, so v1 ships without it and R7
+adds it for Pergola's single-line and plain-text fields only, measured against a recorded
+typing corpus as mosh did.
+
+### 6.6 Frame pacing and the host's clock
+
+The host does not pace frames to any display (a remote output has no vblank on the host). Each
+window's renderer sends when its app ends a frame and the transport has room (§8.2); the viewer
+composes on its own vblank. Frame callbacks to the app (when to draw next) are driven by the
+viewer's acks, so an app animating by itself draws at the rate the viewer actually displays,
+not faster: the app never produces frames that would be skipped.
+
+## 7. Content that cannot travel as a scene
+
+### 7.1 Video layers
+
+A player puts decoded NV12 or P010 frames into a video layer (fresco-video.md). Two paths, in
+order of preference:
+
+1. **Compressed passthrough (decision 6).** When the source is a codec the viewer can decode
+   and the player is not doing anything to the frames, the best remote video is the original
+   bitstream: no re-encode, no quality loss, and a fraction of the bitrate of re-encoding. This
+   needs a new video-layer mode in which the player hands frescod compressed access units
+   instead of pictures (the player already has them: it decoded them). On a local output
+   frescod would have to decode, which it must never do, so this mode is offered **only on
+   remote outputs**, and the viewer decodes in a zero-capability decoder jail (the player's
+   decoder worker bundle, atrium-player.md §4: dav1d, libvpx). Codecs: AV1, VP9, VP8 in v1
+   (permissive decoders already in the tree). H.264 and HEVC streams go by path 2 unless the
+   viewer has OpenH264 through Hospes (hospes.md) or a hardware decoder.
+2. **Re-encode the layer.** The host's `fenestra-enc` child jail reads the layer's ring and
+   encodes it at the layer's own size and rate, low-delay settings (no B-frames, periodic intra
+   refresh instead of keyframes), sent as datagrams. Encoders: a hardware encoder when the GPU
+   driver gets one (VCN encode, not built), otherwise SVT-AV1 or rav1e in realtime presets.
+   The viewer feeds decoded frames into a local video layer, so presentation timing, colour
+   conversion and HDR tone mapping (fresco-video.md §5) run on the viewer for its own monitor.
+
+Either way the player's controls and subtitles are ordinary scene nodes drawn over the video,
+so they stay sharp and respond instantly while the video beneath them is compressed.
+
+**Protected frames** never leave the host: a protected layer is black with a "protected video
+is not shown remotely" label on the viewer, the same rule as capture exclusion
+(fresco-video.md §6).
+
+### 7.2 External GPU surfaces (games, 3D viewports)
+
+A surface's pixels exist only as a GPU image on the host (fresco-surfaces.md). Fenestra
+copies the surface on the host GPU and encodes it like a video layer (path 2), at the surface's
+size and its push or pull rate. This is the game-streaming case of §2.6 and gets their
+techniques: no playout buffer, low-delay encode, datagrams with forward error correction,
+bitrate from congestion control (§8.3). Because the surface is one node in the window's scene,
+only its rect is encoded; the app's toolbar and panels around a 3D viewport stay scene nodes.
+A host with no GPU has no external surfaces to send.
+
+A later option is to send the surface's own rendering commands (the Atrium GPU IR or the
+Vulkan subset) and render on the viewer's GPU. That is SPICE's remote Virgl idea and has the
+same hazard (a remote GPU command stream is a large attack surface on the viewer's GPU driver);
+it is out of scope and listed in §18.
+
+### 7.3 Pixel-mode windows and windows the viewer cannot draw
+
+Windows in split pixel mode (`OP_SLOT_UPDATE_REGION` of RGBA pixels as their content), legacy
+clients, and windows using a node kind the viewer lacks (§4.3) are rastered by the host's
+renderer and sent as pixels, damage region by damage region (the renderer already knows the
+damage rect, fresco incremental drawing). Encoding per region:
+
+- Small or static damage (a caret, a hover, a dialog): **lossless**, the region's changed
+  tiles with zstd. Text in these windows therefore stays exact.
+- A region that changes on most frames for more than about half a second: switches to the
+  video encoder for that rect, and back to lossless once it settles, with a final lossless
+  refresh so nothing stays smeared (RDP's "lossy then refine", but with the refine guaranteed).
+
+### 7.4 The encoder jail
+
+Encoders are large C codebases and the GPU copy path touches the driver, so `fenestrad` never
+encodes itself. Each encoded region gets a `fenestra-enc` instance in a one-shot jail (the
+renderer's pattern): input from a sealed memfd ring, output a byte stream to `fenestrad`, no
+network, no files, a memory and CPU limit. Decoders on the viewer are the player's decoder
+worker bundle, same jail shape. Licences: dav1d (BSD-2), libvpx (BSD-3), SVT-AV1
+(BSD-3-Clause-Clear), rav1e (BSD-2), zstd (BSD); all pass `scripts/licence-audit.py`'s policy,
+and patent posture follows atrium-player.md §4 (royalty-free codecs native, H.264 through
+Hospes only).
+
+## 8. Transport, bandwidth and congestion
+
+### 8.1 One QUIC connection
+
+QUIC (RFC 9000) over UDP, through a permissive Rust stack (quinn with rustls; both MIT or
+Apache-2.0, audited by `licence-audit.py` before adding):
+
+- **Reliable streams** for each window's scene stream, for blob uploads (lower priority), for
+  control (outputs, clipboard offers, session events).
+- **Unreliable datagrams** (RFC 9221) for encoded video and surface frames (a late frame is
+  dropped, not retransmitted), pointer motion (the latest position wins) and acks.
+- **Connection migration**: the session survives the viewer changing networks (Wi-Fi to
+  wired, a new address), as mosh does, without a reconnect.
+
+Why not TCP or the Stoa datagram envelope: TCP queues stale data behind a lost packet (failure
+7) and cannot carry datagrams; Stoa's raw envelope (aqueduct-remote.md §5) is the right shape
+for a terminal but would mean re-inventing streams, priorities and congestion control that
+QUIC already has. Why not WebRTC: it is a large stack, browser-shaped, and its strengths (SDP,
+ICE) are what Concursus provides in Atrium's own idiom (§8.5).
+
+### 8.2 Priorities
+
+Strict priority, highest first, so a heavy class can never starve a light one:
+
+1. Input from the viewer, and acks.
+2. Scene records for the focused window, then other visible windows.
+3. Cursor shape, clipboard offers, session control.
+4. Video and surface datagrams (rate-limited by §8.3, not by priority alone).
+5. Blobs on screen, then near the viewport, then off screen (§5.5).
+
+Scene records for a window are only sent when the window has something newer than its acked
+version, and at most once per viewer frame (§6.6), so priority 2 cannot flood.
+
+### 8.3 Congestion control and the degrade ladder
+
+- QUIC's congestion controller (BBR-style, delay-based rather than loss-based, so it does not
+  fill router buffers; L4S where the path supports it) sets the send rate. Fenestra keeps the
+  bytes in flight near the bandwidth-delay product: it never builds a queue that would add
+  latency (bufferbloat), and it measures RTT continuously.
+- Encoded regions get the rate left after scene traffic, with their encoder bitrate set from it
+  each second; video and surfaces adapt, text never does.
+- When the link gets worse, Fenestra steps down in this order and back up when it recovers:
+  1. Delay off-screen blob uploads.
+  2. Send previews instead of full images for new on-screen images.
+  3. Lower the frame rate of encoded regions, then their bitrate.
+  4. Coalesce scene frames of background windows to one per second.
+  5. Last: the focused window's scene frames are coalesced to the rate the link sustains.
+     Text is never made lossy; a slow link shows it later, never blurrier.
+
+### 8.4 Measurements the viewer shows
+
+`fenestra stats` and the toolbar's statistics panel: RTT, send rate, bytes per class, frames
+skipped by state sync, blobs pending, encoded regions and their bitrates, click-to-frame time
+(the viewer stamps an input and measures when the host's frame acking it lands). These are the
+numbers R2 and R6 are judged by.
+
+### 8.5 Finding the host
+
+v1: an address or name the person types (`fenestra connect host`), over SSH (§11.2). Later:
+hosts the person has paired appear in the Fenestra app through mDNS on the local network
+(discovery only; no trust from it), and Concursus (concursus.md) for hosts behind NAT, with its
+relay as the fallback when direct UDP fails.
+
+## 9. Input
+
+- The viewer sends **HID usages and positions**, not characters: key usage (page 0x07),
+  modifiers, pointer position in points relative to the window, buttons, scroll deltas (pixel
+  and line), touchpad gestures, gamepad state (atrium-input.md §4.1 shapes). The host applies
+  its own keyboard layout, so shortcuts behave as on the host; text input methods run on the
+  host.
+- Option (decision 7): **use the viewer's layout** by sending the keysym the viewer's layout
+  produced alongside the usage; the host uses it when the session is set to "viewer layout".
+  This is what people expect from a laptop with a different layout than the workstation.
+- Input becomes ordinary host input in frescod, injected as from a Tactus device with the
+  session's device ids. It is routed by the host's compositor-owned geometry (H7), and real
+  presses from a full-input session mint activation tokens (tabula.md §2) exactly as local
+  presses do: a remote person is the person (aqueduct-remote.md §1). A view-only session sends
+  no input at all; the viewer's frescod does not even forward it.
+- Every input record is fixed-size, bounded and rate-limited (at most one pointer motion per
+  viewer frame, a key-event cap per second); `fenestrad` drops a viewer that exceeds the caps.
+- Local shortcuts on the viewer (switch away, release the keyboard, leave full screen) are
+  caught by the viewer's frescod first and never sent; a "send keys to host" mode in full
+  screen sends everything except one escape chord.
+
+## 10. Audio, clipboard, files
+
+- **Audio.** Lyra on the host gains a remote sink per session (lyra-external-device.md is the
+  model); streams are mixed on the host and sent as Opus (BSD) datagrams with timestamps, and
+  the viewer's Lyra plays them. Video layers carry presentation times on the same session
+  clock so picture and sound stay in step. Microphone input from the viewer is a separate grant
+  (decision 8), off by default.
+- **Clipboard.** Through Tabula on both ends with per-direction switches (host to viewer,
+  viewer to host), both on by default for a full session, both off for a restricted one. Only
+  formats Tabula already handles cross, as CAS blobs; nothing is offered until the person
+  pastes (the paste on one side asks the other side for the bytes), so the clipboard is not
+  streamed. This is the channel Check Point used against RDP clients, so the viewer's Tabula
+  treats remote clipboard data like any untrusted input and paths are never interpreted.
+- **Files.** Not a Fenestra feature. Drag and drop of files between viewer and host goes
+  through Scrinium's picker on the receiving side (a press there chooses where it lands), never
+  by writing a path the sender names. v1 has no file transfer; R8 adds drag from viewer to a
+  remote app as an upload into that app's grant.
+- **No device redirection** (USB, smartcards, printers) in v1. Each of those is a large attack
+  surface in RDP and needs its own spec.
+
+## 11. Security
+
+### 11.1 Threat model
+
+| Party | Can do | Contained by |
+|---|---|---|
+| Network attacker | Read, change, replay, drop packets | QUIC TLS 1.3, keys bound to the SSH handoff (§11.2); content hashes (H2) |
+| **Hostile host** (a compromised workstation or cloud desktop you connect to) | Send any bytes on any stream | Every parser of host bytes runs in a zero-capability jail: renderer (full validator, H9), decoders, `fenestra-net` (framing only). Budgets (F4h) and cost limits (H6) per remote client. Remote content is marked and confined (§11.5). Clipboard and files only by the viewer person's press. |
+| **Hostile viewer** (a stolen laptop with a valid key, a compromised viewer) | Send input and acks; see what the session shows | Session capabilities (view-only, app, window scope); input bounded (§9); `fenestrad` parses only fixed-size records; tokens expire and can be revoked from the host (§11.6); the host shows that it is being viewed (§11.4). A compromised viewer sees what the session displays; that is inherent (aqueduct-remote.md §1). |
+| A hostile app on the host | Draw anything in its own windows | Unchanged from local: H1–H8. Remote outputs do not give it more: it cannot learn that it is being viewed remotely beyond its output's properties (decision 9). |
+| Another user or persona on the host | Try to view or join a session that is not theirs | Sessions are minted by the session's own user over SSH (§11.2); `fenestrad` maps a session to exactly one seat session and persona. |
+
+### 11.2 Authentication and keys
+
+- **Default: the SSH handoff** of aqueduct-remote.md §2, unchanged: `fenestra connect host`
+  runs `ssh host aqueduct-shell mint fresco ...`, sshd authenticates the person with their
+  key (from the viewer's Arca SSH agent: the key is used, never read, arca.md), and the mint
+  returns `{address, port, session id, K_sess, caps, expiry}` inside the SSH channel.
+- **Binding the QUIC connection to the mint.** The QUIC handshake uses TLS 1.3 with an
+  external pre-shared key derived from `K_sess` (HKDF-SHA-256, label `"fenestra quic psk"`), in
+  PSK-with-ECDHE mode so the session still gets forward secrecy. No certificates, no PKI, no
+  trust-on-first-use prompt: a network attacker cannot complete the handshake without breaking
+  SSH, and `K_sess` itself never crosses the QUIC wire. `fenestrad` stores only `H(K_sess)`
+  (aqueduct-remote.md §6) and holds the PSK in memory for the session's life.
+- **Pairing without SSH (R9).** For a viewer that is not set up for SSH (a phone, a tablet),
+  pairing mints a device key in the viewer's Arca and registers its public half on the host
+  through a code shown on the host's own screen and typed on the viewer (or a QR code); the host
+  keeps paired device keys per persona in Arca, revocable in Curia and `fenestra devices`.
+  Paired devices mint the same session token; the PSK binding is unchanged.
+- **Reconnect** within the token's expiry presents the session id and a proof of `K_sess` (a
+  fresh QUIC handshake with the same PSK); after expiry the viewer re-mints over SSH. The
+  session on the host is never lost on expiry, only the credential.
+
+### 11.3 Jails, uids and grants
+
+| Process | Machine | uid | Network | Filesystem | Parses |
+|---|---|---|---|---|---|
+| frescod broker | host | `_frescod` | none (unchanged) | none | fixed records from `fenestrad` |
+| fresco-renderer | both | `_fresco-render` | none | none | client wire (host); scene stream (viewer) |
+| `fenestrad` | host | `_fenestra` | `listen`, one UDP port, local network unless widened | its socket dir | QUIC framing; fixed input and ack records |
+| `fenestra-enc` | host | `_fenestra-enc` | none | none | its memfd ring (pixels, no structure) |
+| `fenestra-net` | viewer | per viewing persona | outbound UDP to one host address | none | QUIC framing; stream demux |
+| decoder workers | viewer | player's decoder uid | none | none | compressed video (hostile) |
+| Fenestra app | viewer | the app's uid | none | its overlay (cache, §5.4) | session list, settings |
+
+`fenestrad`'s listen grant is a system service grant in its services.d manifest, not an app's
+background grant; it listens only while at least one person on the host has allowed remote
+viewing (Curia, `fenestra host enable`), and the port is closed otherwise. No code goes into
+portcullisd for Fenestra: the jails use existing manifest grants (AGENTS.md review rule).
+
+### 11.4 The host always shows that it is being viewed
+
+When a viewer is attached to a session, the host's frescod draws a trusted indicator in the
+chrome lane (F4d) on every local monitor of that session: who (key comment or paired device
+name), view-only or full control, and a one-press Disconnect. The bar shows it too, but the
+indicator is frescod's, so an app cannot cover or fake its absence (H7). A host with the screen
+locked (decision 3) shows the indicator on the lock screen.
+
+### 11.5 Remote content on the viewer cannot pose as local
+
+H7 applies across the network:
+
+- Remote windows can never take the viewer's Chrome, Notification or lock-screen roles; the
+  viewer's frescod maps every remote role to Document, Dialog or Popup inside the remote area.
+- In rootless mode every remote window gets a viewer-drawn **host strip** (the host's name and
+  a colour the person chose for it), like the Navigator's origin strip, in the trusted lane.
+  In whole-desktop mode the frame of the session window carries it. A remote host therefore
+  cannot draw a convincing local Arca prompt or Vestibulum unlock sheet: those never appear
+  without the strip on the viewer, and the viewer's own trusted sheets are never remote.
+- Secure input (F4f) and credential slots on the host work for the remote person, but the
+  viewer shows that the field is remote; the viewer's Arca never autofills into a remote window.
+
+### 11.6 Sessions, capabilities and revocation
+
+- Session capabilities from aqueduct-remote.md §4: `input = "full" | "none"`, `scope =
+  "session" | "app:<id>" | "window:<id>"`, `clipboard`, plus Fenestra's `audio`, `microphone`
+  and `layout` keys. A scoped session's remote outputs show only the windows in scope; the
+  host's renderer for other apps never emits a stream for that viewer.
+- `fenestra sessions` and `fenestra revoke <id>` on the host (and the indicator's Disconnect)
+  end a session at once: `fenestrad` closes the connection and forgets the PSK; the remote
+  outputs go and Forum moves the windows back to local monitors (or keeps them parked on a
+  headless host).
+- Chained remoting (viewing a host from a session that is itself remote) needs a fresh consent
+  for a full mint, per aqueduct-remote.md §8's lean.
+
+### 11.7 Residual risks, stated
+
+- A compromised host shows the remote person whatever it likes inside the remote area, and can
+  try to phish them there. The host strip is the mitigation; it cannot stop a person typing a
+  password for the *host* into a fake host dialog, which is the same as any compromised machine.
+- The scene stream reveals more structure than pixels would: window titles, the text of
+  documents as glyph ids, which font. Both ends already hold this; the transport is encrypted;
+  it matters only for a compromised viewer, who sees the screen anyway.
+- Timing of acks and frame callbacks is a cross-session timing channel at the host (H10); it
+  is no wider than the local one.
+- A viewer's cache is a second copy of the person's on-screen data; it is encrypted in their
+  key group and can be turned off (decision 10).
+
+## 12. Persistence, roaming and reconnect
+
+- Apps live on the host; a dropped connection only removes remote outputs after a grace period
+  (default 2 minutes, decision 11) during which windows stay where they were and apps see no
+  change. Reconnecting within it resumes at the acked versions: typically a few KB of
+  difference, not a full redraw.
+- After the grace period the outputs go; windows move to the host's local monitors, or on a
+  headless host to a parked virtual output that keeps the layout for the next viewer.
+- QUIC connection migration covers address changes without a reconnect (§8.1).
+- If the host's frescod restarts, its clients replay (fresco-recovery.md §3) and the streams
+  resume from version 0; the viewer keeps showing the last frames meanwhile, marked stale.
+
+## 13. Several monitors, DPI, colour
+
+- A viewer with several monitors offers each as a remote output, with its geometry, scale,
+  refresh range and HDR capabilities. In whole-desktop mode the person picks "all my monitors"
+  or "this window"; in rootless mode windows go wherever the viewer's Forum puts them.
+- Colour: scene content is drawn on the viewer for the viewer's monitor, so an HDR viewer gets
+  HDR video tone mapping and SDR UI in its own colour pipeline (fresco-video.md §5), and the
+  host needs no knowledge of the viewer's panel beyond what the output declares.
+- Span groups (fresco-span.md) are not offered on remote outputs in v1.
+
+## 14. Viewers that are not Atrium (later)
+
+The viewer side is three parts: QUIC, the renderer (`fresco-compute`, Rust, with a CPU
+reference path and the compute kernels), and composition. A portable `fenestra` viewer for
+macOS (insula-host-macos.md's layer) and later a browser viewer (WebGPU, the compute kernels
+compiled for it, WebTransport for QUIC) are plausible because nothing in the stream is
+FreeBSD-specific. They would run the renderer in-process without Atrium's jails, so they get
+the validator but not the containment; their spec must say how they confine it (a macOS
+sandbox profile, the browser's process). Not in v1.
+
+## 15. CLI: everything the GUI does
+
+Shankar's rule: every GUI action has a command. `fenestra` on both ends:
+
+| GUI | CLI |
+|---|---|
+| Connect dialog | `fenestra connect HOST [--user U] [--view-only] [--app ID \| --window ID] [--rootless \| --desktop] [--fullscreen] [--monitors all\|current]` |
+| Session list (viewer) | `fenestra list [--json]` |
+| Toolbar: disconnect, full screen, send keys | `fenestra disconnect ID`, `fenestra fullscreen ID on\|off`, `fenestra keys ID host\|local` |
+| Statistics panel | `fenestra stats ID [--watch] [--json]` |
+| Host: allow remote viewing | `fenestra host enable\|disable`, `fenestra host status [--json]` |
+| Host: who is viewing, disconnect (indicator) | `fenestra sessions [--json]`, `fenestra revoke ID` |
+| Restricted share ("share this window") | `fenestra share --window ID --view-only [--expires 1h]` (mints and prints a connect line) |
+| Paired devices | `fenestra devices [--json]`, `fenestra pair`, `fenestra unpair DEVICE` |
+| Settings (cache size, keyboard layout, clipboard directions, audio, microphone, grace period) | `fenestra config get\|set KEY VALUE` (the same Curia keys) |
+| Clear cache | `fenestra cache clear [--host H]`, `fenestra cache status` |
+| Host colour and name on the strip | `fenestra host-label HOST --name N --colour C` |
+
+`--json` output is stable and documented, so scripts and the VM gates use it.
+
+## 16. How the design answers each failure in §2.8
+
+| Failure | Where it shows up | Fenestra |
+|---|---|---|
+| 1. Text degraded | VNC JPEG, RDP 4:2:0, game streams | Text is glyph runs rastered on the viewer at its own scale (§4.1). Never lossy, at any bandwidth (§8.3). Pixel-mode windows use lossless for static regions with a guaranteed final refresh (§7.3). |
+| 2. Encode, decode and queue latency | RDP, VNC, SPICE streaming | No encode or decode in scene mode; state sync means no queue (§5.2, §6.1). Encoded regions use game-streaming low-delay settings with no playout buffer (§7). |
+| 3. Bandwidth scales with pixels | all pixel protocols | Scales with changes; idle costs nothing; blobs once per host, cached (§5). Encoded regions are only the rects that need them. |
+| 4. Re-scaled pictures, wrong DPI, HDR, refresh | RDP, VNC, Waypipe | Viewer monitors are host outputs; apps draw at viewer scale; animations at viewer refresh; colour on the viewer (§4.1, §6.2, §13). |
+| 5. Apps stop speaking the command protocol | RDP orders, SPICE QXL, X11 | Atrium apps already speak Fresco and nothing else; frescod refuses foreign vocabularies. The fallback is per region, so one 3D viewport does not turn the whole window into video (§7.2). |
+| 6. Round trips on the drawing path | X11 | No request in the stream waits for the viewer; text measurement and shaping are in the app (resolution-independence.md, pergola). Cursor, animation, scrolling and rootless window management are local (§6.2, §6.3). |
+| 7. Stale frames under congestion | TCP protocols | Diff against acked state, skip intermediates; QUIC streams per window; datagrams for media (§5.2, §8). |
+| 8. Unconfined viewers, weak auth, side channels | VNC and RDP CVEs, Reverse RDP | Every host-supplied byte is parsed in an empty jail on the viewer; SSH-anchored PSK, no passwords; clipboard by paste only, no file paths, no device redirection; trusted host strip and host indicator (§11). |
+
+## 17. Decisions for Shankar
+
+1. **Take the scene from the host's renderer jails and present viewers as remote outputs of
+   the host's frescod**, rather than letting apps connect to a remote frescod
+   (transport.md's sketch). *Recommend yes.* Apps keep no network, the session survives the
+   viewer leaving, apps draw at the viewer's scale for free, and the validated canonical scene
+   is the only thing that crosses.
+2. **Whole desktop first (R3), rootless second (R4).** *Recommend yes.* Whole desktop needs no
+   change to the viewer's Forum and proves the stream; rootless is the nicer daily experience
+   and comes right after.
+3. **When a viewer attaches to a session that also has a local seat, keep the local screen
+   live and show the indicator**, rather than locking it as Windows RDP does. *Recommend: live
+   by default, with a per-host setting to lock the local screen while viewed.* Live is what you
+   want for your own two machines; lock is what you want for an office machine.
+4. **Viewer-scrollable SCROLL groups (§6.3), built in frescod so local scrolling benefits
+   too.** *Recommend yes,* in R5. It is the biggest perceived-latency win after the cursor.
+5. **Typing prediction through edit hints (§6.5): not in v1; R7 for Pergola plain-text fields
+   only, judged on a typing corpus.** *Recommend yes.* It is the only behaviour in the scene and
+   should earn its place with numbers.
+6. **Compressed video passthrough for remote outputs (§7.1, path 1)**, a new video-layer mode
+   the player uses only when its window is on a remote output. *Recommend yes,* in R6. It is the
+   difference between sending a film at its own bitrate and re-encoding it at a worse one.
+7. **Keyboard: host layout by default, "viewer layout" as a per-session option (§9).**
+   *Recommend yes.*
+8. **Audio in v1 (output only); microphone as a separate grant, off by default.** *Recommend
+   yes.*
+9. **Apps are not told that an output is remote** (they see its scale, size and refresh like
+   any monitor). *Recommend yes:* nothing an app should do differently depends on it, and
+   telling them invites apps that behave differently when watched. The one exception is the
+   player's passthrough choice (decision 6), which frescod offers and the player takes without
+   learning why.
+10. **Viewer cache on disk in the persona's key group, 1 GiB default, with a switch for memory
+    only.** *Recommend yes.* Reconnects and repeat sessions are near free with it.
+11. **A dropped viewer keeps its outputs for 2 minutes** before windows move home.
+    *Recommend yes.*
+12. **QUIC (quinn + rustls) rather than TCP or Stoa's raw envelope.** *Recommend yes,* subject
+    to the licence audit of the crates and their dependencies.
+13. **The name Fenestra** (`fenestrad`, `fenestra-net`, `fenestra`). *Recommend yes;* NAMING.md
+    gets the row once accepted.
+
+## 18. Out of scope, and honest limits
+
+- **App round trips stay round trips.** A click whose result the app must compute (opening a
+  menu that the app builds on demand, a search) costs one RTT plus app time, like every other
+  protocol. Fenestra removes everything else from that path, but it cannot beat the speed of
+  light. Over 150 ms links, rootless mode, local scrolling and (later) typing prediction carry
+  the experience.
+- **Pixel-heavy apps** (games, 3D, video editors' previews) are as good as the fallback
+  encoder: game-streaming quality, not better.
+- **First connection to a new host** costs the session's blobs (estimated a few MB); on a slow
+  link the first screen is slower than RDP's first frame, and every later one is faster.
+- **Remote GPU command streams** (rendering a game's Vulkan on the viewer), **foreign
+  desktops**, **USB and smartcard redirection**, **multi-viewer collaboration** with several
+  people controlling one session at once (a shared view is supported; shared control needs
+  input arbitration), and **file transfer** beyond the R8 drag are not designed here.
+
+## 19. Build plan
+
+Each step has a gate script (sourcing `scripts/lib/gate.sh`) and runs in cloud VMs first; Mac
+VM runs only with the coordinator's go.
+
+| Step | What | Gate |
+|---|---|---|
+| R0 | This spec reviewed and decided. QUIC crates licence-audited. | review thread sign-off |
+| R1 | Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
+| R2 | `fenestrad` and `fenestra-net` with QUIC, SSH-handoff PSK, remote outputs in frescod, whole-desktop mode with a session window on the viewer, input, cursor, stats. Two cloud VMs on one host network with `netem` delay and loss. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150 ms added RTT, 3 runs each |
+| R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
+| R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |
+| R5 | Viewer-scrollable SCROLL groups in frescod (local and remote), Pergola ScrollView and Navigator documents set the flag. | `scroll_bench` locally; scroll latency at 150 ms RTT in the R2 rig |
+| R6 | Fallbacks: pixel-mode regions (lossless and video switching), video layers (re-encode, then compressed passthrough), external surfaces; `fenestra-enc` jail; audio. | encoded-region quality (final lossless refresh asserted), AV sync, bitrate follows `netem` rate changes |
+| R7 | Typing prediction for Pergola plain-text fields. | typing corpus: share of keystrokes shown before the host frame, misprediction rate |
+| R8 | Clipboard both ways via Tabula, drag of files into a remote app via Scrinium. | `fenestra-clipboard-vm.sh` |
+| R9 | Pairing without SSH (Arca device keys), mDNS discovery, Concursus for NAT. | pairing and revocation gate |
+| R10 | Real hardware: two Atrium machines on a LAN and over a real WAN; R9700 host for surfaces. | numbers for §6.1, 3 runs per arm |
+
+## 20. Sources
+
+- Microsoft, *Graphics encoding over the Remote Desktop Protocol* (Azure Virtual Desktop docs):
+  https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding
+- Microsoft, MS-RDPEGFX, RemoteFX progressive codec:
+  https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/f8c3c134-bf99-45eb-be7e-d22c8178255f
+- Microsoft, *RDP 10 AVC/H.264 improvements* (AVC444 and text):
+  https://techcommunity.microsoft.com/t5/microsoft-security-and/remote-desktop-protocol-rdp-10-avc-h-264-improvements-in-windows/ba-p/249588
+- Palo Alto Unit 42, *CVE-2019-0708 (BlueKeep)*: https://unit42.paloaltonetworks.com/cve-2019-0708-bluekeep/
+- Check Point Research, *Reverse RDP attack*: https://research.checkpoint.com/2019/reverse-rdp-attack-code-execution-on-rdp-clients/
+- Kaspersky, *37 vulnerabilities in open source VNC systems* (2019):
+  https://www.kaspersky.com/about/press-releases/kaspersky-uncovers-37-vulnerabilities-in-open-source
+- SPICE: *Spice for Newbies*: https://www.spice-space.org/spice-for-newbies.html; Red Hat bug
+  1158029 (WAN latency, WONTFIX): https://bugzilla.redhat.com/show_bug.cgi?id=1158029;
+  spice-devel, *Remote 3d support - streaming and lag* (2017):
+  https://lists.freedesktop.org/archives/spice-devel/2017-February/035578.html
+- K. Packard, J. Gettys, *X Window System Network Performance* (FREENIX 2003):
+  https://static.usenix.org/events/usenix03/tech/freenix03/full_papers/packard/packard.pdf;
+  Linux Journal, *The Arrival of NX*: https://www.linuxjournal.com/article/8480
+- Waypipe man page: https://www.mankier.com/1/waypipe; announcement:
+  https://lists.freedesktop.org/archives/wayland-devel/2019-June/040687.html
+- Parsec, *A networking protocol built for the lowest latency interactive game streaming*:
+  https://parsec.app/blog/a-networking-protocol-built-for-the-lowest-latency-interactive-game-streaming-1fd5a03a6007
+- K. Winstein, H. Balakrishnan, *Mosh: An Interactive Remote Shell for Mobile Clients*, USENIX
+  ATC 2012: https://mosh.org/mosh-paper.pdf
+- RFC 9000 (QUIC), RFC 9221 (QUIC datagrams), RFC 8446 §2.2 (TLS 1.3 PSK with (EC)DHE).
