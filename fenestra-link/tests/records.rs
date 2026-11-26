@@ -22,6 +22,8 @@ fn samples() -> Vec<Rec> {
         Rec::Input(Input::Button { button: 5, pressed: false }),
         Rec::Input(Input::Scroll { dx: 0.0, dy: -120.0 }),
         Rec::Input(Input::MotionIn { window: 3, x: 10.5, y: 0.0 }),
+        Rec::Input(Input::Focus { window: 3 }),
+        Rec::Input(Input::Resize { window: 3, width: 900, height: 600 }),
     ]
 }
 
@@ -101,6 +103,9 @@ fn hostile_records_are_refused() {
         Rec::Input(Input::Scroll { dx: 0.0, dy: 1e9 }).encode(),
         Rec::Input(Input::MotionIn { window: 0, x: 1.0, y: 1.0 }).encode(),
         Rec::Input(Input::MotionIn { window: 3, x: -1.0, y: 1.0 }).encode(),
+        Rec::Input(Input::Focus { window: 0 }).encode(),
+        Rec::Input(Input::Resize { window: 3, width: 63, height: 600 }).encode(),
+        Rec::Input(Input::Resize { window: 3, width: 900, height: 8193 }).encode(),
         {
             // A window on input that is not pointer-in-a-window.
             let mut b = Rec::Input(Input::Key { usage: 4, pressed: true, modifiers: 0 }).encode();

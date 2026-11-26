@@ -84,6 +84,12 @@ pub enum Input {
     Button { button: u8, pressed: bool },
     /// Scroll at the pointer, in pixels.
     Scroll { dx: f32, dy: f32 },
+    /// Per-app sessions: the person is in `window` on the viewer; keys
+    /// go to it (focus and raise on the host).
+    Focus { window: u32 },
+    /// Per-app sessions: the person resized `window` on the viewer to
+    /// `width` x `height` device pixels (fenestra.md §6.4).
+    Resize { window: u32, width: u32, height: u32 },
 }
 
 impl Eq for Input {}
@@ -184,8 +190,13 @@ impl Rec {
                     Input::Button { button, pressed } => (3, pressed as u32, u64::from(button), 0),
                     Input::Scroll { dx, dy } => (4, 0, u64::from(dx.to_bits()), u64::from(dy.to_bits())),
                     Input::MotionIn { x, y, .. } => (5, 0, u64::from(x.to_bits()), u64::from(y.to_bits())),
+                    Input::Focus { .. } => (6, 0, 0, 0),
+                    Input::Resize { width, height, .. } => (7, 0, u64::from(width) | u64::from(height) << 32, 0),
                 };
-                let window = if let Input::MotionIn { window, .. } = *i { window } else { 0 };
+                let window = match *i {
+                    Input::MotionIn { window, .. } | Input::Focus { window } | Input::Resize { window, .. } => window,
+                    _ => 0,
+                };
                 Head { kind: INPUT, window, ticket: sub, flag, a, b, len: 0 }
             }
             Rec::Output { width, height, scale_milli } => {
@@ -271,7 +282,7 @@ impl Rec {
             }
             END => Rec::End { window: window(h.window)?, ticket: h.ticket, now: ver(&h)? },
             INPUT => {
-                unused(h.window == 0 || h.ticket == 5)?;
+                unused(h.window == 0 || (5..=7).contains(&h.ticket))?;
                 let f32_of = |v: u64| -> Result<f32, Refused> {
                     let v = u32::try_from(v).map_err(|_| Refused("unused field not zero"))?;
                     let f = f32::from_bits(v);
@@ -314,6 +325,18 @@ impl Rec {
                             return Err(Refused("pointer off the window"));
                         }
                         Input::MotionIn { window: window(h.window)?, x, y }
+                    }
+                    6 => {
+                        unused(h.flag == 0 && h.a == 0 && h.b == 0)?;
+                        Input::Focus { window: window(h.window)? }
+                    }
+                    7 => {
+                        unused(h.flag == 0 && h.b == 0)?;
+                        let (width, height) = (h.a as u32, (h.a >> 32) as u32);
+                        if !OUTPUT_SIDE.contains(&width) || !OUTPUT_SIDE.contains(&height) {
+                            return Err(Refused("window size"));
+                        }
+                        Input::Resize { window: window(h.window)?, width, height }
                     }
                     _ => return Err(Refused("unknown input")),
                 })

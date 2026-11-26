@@ -126,7 +126,22 @@ impl Views {
     /// Input as the host takes it. In a per-app session a pointer given in
     /// the host screen's pixels (a script) goes to the topmost window the
     /// layout has there, in that window's pixels; nowhere, it is dropped.
+    /// A focus or resize for window 0 (a script's) is for the topmost
+    /// window the layout has.
     pub fn route(&self, i: scene::Input) -> Option<scene::Input> {
+        let top = || self.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.1.last().map(|p| p.0));
+        let i = match i {
+            scene::Input::Focus { window: 0 } => scene::Input::Focus { window: top()? },
+            scene::Input::Resize { window: 0, width, height } => scene::Input::Resize { window: top()?, width, height },
+            i => i,
+        };
+        // A size the wire takes: a window resized smaller asks for the
+        // least (the host's minimum may be larger anyway).
+        let side = |v: u32| v.clamp(*scene::OUTPUT_SIDE.start(), *scene::OUTPUT_SIDE.end());
+        let i = match i {
+            scene::Input::Resize { window, width, height } => scene::Input::Resize { window, width: side(width), height: side(height) },
+            i => i,
+        };
         let scene::Input::Motion { x, y } = i else { return Some(i) };
         if self.mode() != Some(false) {
             return Some(i);
@@ -539,6 +554,9 @@ mod tests {
         assert_eq!(views.route(scene::Input::Motion { x: 90.0, y: 5.0 }), None, "no window there");
         let k = scene::Input::Key { usage: 4, pressed: true, modifiers: 0 };
         assert_eq!(views.route(k), Some(k));
+        assert_eq!(views.route(scene::Input::Resize { window: 0, width: 900, height: 600 }), Some(scene::Input::Resize { window: 3, width: 900, height: 600 }), "a script's: the topmost");
+        assert_eq!(views.route(scene::Input::Focus { window: 2 }), Some(scene::Input::Focus { window: 2 }));
+        assert_eq!(views.route(scene::Input::Resize { window: 2, width: 10, height: 9000 }), Some(scene::Input::Resize { window: 2, width: 64, height: 8192 }), "sizes the wire takes");
     }
 
     #[test]

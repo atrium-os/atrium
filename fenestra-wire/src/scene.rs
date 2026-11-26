@@ -136,6 +136,10 @@ pub enum Input {
     /// Per-app sessions: the pointer to `(x, y)` inside `window`, in its
     /// pixels; buttons and scrolls then go to that window.
     MotionIn { window: u32, x: f32, y: f32 },
+    /// Per-app sessions: the person is in `window`; keys go to it.
+    Focus { window: u32 },
+    /// Per-app sessions: the person resized `window` here (§6.4).
+    Resize { window: u32, width: u32, height: u32 },
 }
 
 impl Eq for Input {}
@@ -178,6 +182,16 @@ impl Control {
                     b.push(7);
                     b.extend_from_slice(&dx.to_le_bytes());
                     b.extend_from_slice(&dy.to_le_bytes());
+                }
+                Input::Focus { window } => {
+                    b.push(11);
+                    b.extend_from_slice(&window.to_le_bytes());
+                }
+                Input::Resize { window, width, height } => {
+                    b.push(12);
+                    b.extend_from_slice(&window.to_le_bytes());
+                    b.extend_from_slice(&width.to_le_bytes());
+                    b.extend_from_slice(&height.to_le_bytes());
                 }
                 Input::MotionIn { window, x, y } => {
                     b.push(10);
@@ -296,6 +310,20 @@ impl Control {
                     return Err(bad());
                 }
                 Ok(Control::Input(Input::MotionIn { window, x, y }))
+            }
+            Some(11) if b.len() == 5 => {
+                let window = u32_at(1)?;
+                if !(1..=u32::from(u16::MAX)).contains(&window) {
+                    return Err(bad());
+                }
+                Ok(Control::Input(Input::Focus { window }))
+            }
+            Some(12) if b.len() == 13 => {
+                let (window, width, height) = (u32_at(1)?, u32_at(5)?, u32_at(9)?);
+                if !(1..=u32::from(u16::MAX)).contains(&window) || !OUTPUT_SIDE.contains(&width) || !OUTPUT_SIDE.contains(&height) {
+                    return Err(bad());
+                }
+                Ok(Control::Input(Input::Resize { window, width, height }))
             }
             Some(9) if b.len() == 13 => {
                 let (width, height, scale_milli) = (u32_at(1)?, u32_at(5)?, u32_at(9)?);

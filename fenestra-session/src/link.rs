@@ -203,12 +203,12 @@ impl Source for LinkSource {
     /// Input goes on to frescod in the host screen's pixels: a pointer
     /// off the screen is moved onto its edge, input before any layout (or
     /// past the link's queue) is dropped. A pointer in a window is kept
-    /// inside that window, and dropped for a window the layout does not
-    /// have.
+    /// inside that window; it, a focus and a resize are dropped for a
+    /// window the layout does not have.
     fn input(&self, i: Input) {
         let Some(((w, h), inside)) = self.state.lock().ok().and_then(|st| {
             let inside = match i {
-                Input::MotionIn { window, .. } => Some(st.windows.iter().find(|p| p.0 == window).map(|p| (p.3, p.4))),
+                Input::MotionIn { window, .. } | Input::Focus { window } | Input::Resize { window, .. } => Some(st.windows.iter().find(|p| p.0 == window).map(|p| (p.3, p.4))),
                 _ => None,
             };
             Some((st.screen?, inside))
@@ -223,6 +223,14 @@ impl Source for LinkSource {
             Input::MotionIn { window, x, y } => {
                 let Some(Some((ww, wh))) = inside else { return };
                 fenestra_link::Input::MotionIn { window, x: clamp(x, ww), y: clamp(y, wh) }
+            }
+            Input::Focus { window } => {
+                let Some(Some(_)) = inside else { return };
+                fenestra_link::Input::Focus { window }
+            }
+            Input::Resize { window, width, height } => {
+                let Some(Some(_)) = inside else { return };
+                fenestra_link::Input::Resize { window, width, height }
             }
             Input::Scroll { dx, dy } => {
                 let m = fenestra_link::MAX_SCROLL;

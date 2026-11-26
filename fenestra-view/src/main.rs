@@ -7,7 +7,9 @@
 //! (gates, §14.2): draw the host's windows for `--run-secs`, then write
 //! `window-ID.png`, `desktop.png` and `viewer.txt` to `--out`.
 //! `--reconnect-after S` drops the connection after S seconds and connects
-//! again, resuming from what it holds. `--output WxH[@SCALE]` asks the host
+//! again, resuming from what it holds. `--input FILE` lines: `SECONDS
+//! MOVE x y | BTN b 0|1 | KEY usage 0|1 [mods] | SCROLL dy | RESIZE w h |
+//! FOCUS` (the last two for the topmost window of a per-app session). `--output WxH[@SCALE]` asks the host
 //! for a remote output of that size and scale (§4.1); the windowed viewer
 //! asks for its window's, and again as it is resized.
 //!
@@ -327,6 +329,13 @@ fn parse_script(text: &str) -> Result<Vec<(f64, Input, bool)>, String> {
                 modifiers: w.get(4).map_or(Some(0), |v| v.parse().ok()).ok_or_else(bad)?,
             },
             Some("SCROLL") => Input::Scroll { dx: 0.0, dy: f(2)? },
+            // Per-app sessions, the topmost window: the person resizes it
+            // or moves into it on the viewer.
+            Some("RESIZE") => {
+                let side = |i: usize| w.get(i).and_then(|v| v.parse::<u32>().ok()).filter(|v| fenestra_wire::scene::OUTPUT_SIDE.contains(v)).ok_or_else(bad);
+                Input::Resize { window: 0, width: side(2)?, height: side(3)? }
+            }
+            Some("FOCUS") => Input::Focus { window: 0 },
             _ => return Err(bad()),
         };
         out.push((at, i, probe));

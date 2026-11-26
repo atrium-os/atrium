@@ -1860,6 +1860,40 @@ impl Compositor {
         }
     }
 
+    /// A top-level window that remote input may act on (fenestra.md §3.4):
+    /// on screen (so not behind the lock), not held by a sheet, not a
+    /// slot or a pop-up.
+    fn remote_target(&self, id: WindowId) -> bool {
+        id != 0
+            && self.z_order.contains(&id)
+            && !self.held(id)
+            && self.windows.get(&id).is_some_and(|w| !w.hidden && w.slot.is_none() && w.popup.is_none())
+    }
+
+    /// Per-app remote sessions: the person moved to window `id` on the
+    /// viewer. It is raised and takes the keys. False when it may not.
+    pub fn remote_focus(&mut self, id: WindowId) -> bool {
+        if !self.remote_target(id) {
+            return false;
+        }
+        self.raise(id);
+        true
+    }
+
+    /// Per-app remote sessions: the person resized window `id` on the
+    /// viewer to `w` x `h` device pixels (§6.4). Never below the window's
+    /// minimum size at its scale. False when it may not.
+    pub fn remote_resize(&mut self, id: WindowId, w: u32, h: u32) -> bool {
+        if !self.remote_target(id) {
+            return false;
+        }
+        let Some(win) = self.windows.get(&id) else { return false };
+        let min = |pt: u32| fresco_protocol::pt_to_device(pt as f32, win.scale_milli);
+        let (w, h) = (w.max(min(win.min_size.0)).max(1), h.max(min(win.min_size.1)).max(1));
+        self.resize_window(id, w, h);
+        true
+    }
+
     /// Per-app remote sessions (fenestra.md §3.4): the pointer at `(x, y)`
     /// inside window `id`, which the viewer shows apart from the others
     /// even where the host stacks them over each other. The cursor moves
@@ -2447,6 +2481,25 @@ mod notification_tests {
         assert_eq!(c.pointer_in(77, 5.0, 6.0).0, 0, "no such window");
         c.windows.get_mut(&a).unwrap().hidden = true;
         assert_eq!(c.pointer_in(a, 5.0, 6.0).0, 0, "not on screen");
+    }
+
+    #[test]
+    fn a_remote_focus_and_resize_reach_only_a_window_on_screen() {
+        let mut c = Compositor::new();
+        let a = c.create(1, (300, 200));
+        let b = c.create(2, (300, 200));
+        assert_ne!(c.focus, Some(a));
+        assert!(c.remote_focus(a));
+        assert_eq!((c.focus, c.z_order.last()), (Some(a), Some(&a)), "focused and raised");
+        assert!(c.remote_resize(b, 640, 480));
+        assert_eq!(c.windows[&b].size, (640.0, 480.0));
+        c.windows.get_mut(&b).unwrap().min_size = (400, 300);
+        assert!(c.remote_resize(b, 100, 100));
+        assert_eq!(c.windows[&b].size, (400.0, 300.0), "not below its minimum");
+        assert!(!c.remote_focus(77) && !c.remote_resize(77, 100, 100), "no such window");
+        c.windows.get_mut(&a).unwrap().owner_uid = 1001;
+        c.set_lock(Some(vec![65001]));
+        assert!(!c.remote_focus(a) && !c.remote_resize(a, 100, 100), "behind the lock");
     }
 
     #[test]

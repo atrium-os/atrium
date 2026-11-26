@@ -150,13 +150,29 @@ impl Broker {
                     if !self.remote_on() {
                         continue;
                     }
-                    // A pointer in a window is taken only in a per-app
+                    // A pointer in, focus on or size for a window is taken only in a per-app
                     // session (no WM: in a desktop the person sees the WM's
                     // stacking), and only for a window this link was last
                     // told of: the session's own check is a jail's that
                     // parses peer bytes, so it is not the one relied on.
                     let i = match i {
-                        Input::MotionIn { window, .. } if !self.placed_in_apps(window) => continue,
+                        Input::MotionIn { window, .. } | Input::Focus { window } | Input::Resize { window, .. } if !self.placed_in_apps(window) => continue,
+                        Input::Focus { window } => {
+                            if let Ok(id) = u16::try_from(window) {
+                                if self.comp.lock().unwrap().remote_focus(id) {
+                                    self.redraw.wake();
+                                }
+                            }
+                            continue;
+                        }
+                        Input::Resize { window, width, height } => {
+                            if let Ok(id) = u16::try_from(window) {
+                                if self.comp.lock().unwrap().remote_resize(id, width, height) {
+                                    self.redraw.wake();
+                                }
+                            }
+                            continue;
+                        }
                         i => i,
                     };
                     let placed = |w: u32| self.placed_in_apps(w);
@@ -457,6 +473,8 @@ fn remote_input(comp: &Arc<Mutex<Compositor>>, sink: &Sender<DisplayEvent>, i: I
             let (_, _, target) = at(p);
             DisplayEvent::InputPointerScroll { window_id: target, dx, dy, phase: 0 }
         }
+        // Taken by the link loop itself.
+        Input::Focus { .. } | Input::Resize { .. } => return,
     };
     let _ = sink.send(ev);
 }

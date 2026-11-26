@@ -39,7 +39,15 @@ struct Win {
     host: Option<u32>,
     /// Per-app: the host window's size as last asked of this one.
     size: (u32, u32),
+    /// Per-app: a size the person gave it here and the host was asked
+    /// for, and when; layouts with another size do not resize this window
+    /// back until the host answers or [`RESIZE_WAIT`] passes (§6.4).
+    asked: Option<((u32, u32), std::time::Instant)>,
 }
+
+/// How long a local resize waits for the host's answer before the host's
+/// size wins.
+const RESIZE_WAIT: Duration = Duration::from_secs(2);
 
 struct App {
     views: Arc<Views>,
@@ -74,7 +82,7 @@ impl App {
             }
         };
         match softbuffer::Context::new(w.clone()).and_then(|c| softbuffer::Surface::new(&c, w.clone())) {
-            Ok(surface) => Some(Win { w, surface, host, size: host_size }),
+            Ok(surface) => Some(Win { w, surface, host, size: host_size, asked: None }),
             Err(e) => {
                 eprintln!("fenestra-view: no surface: {e}");
                 None
@@ -121,7 +129,12 @@ impl App {
                     }
                     match self.wins.values_mut().find(|w| w.host == Some(id)) {
                         Some(win) => {
-                            if win.size != (pw, ph) {
+                            if let Some((want, at)) = win.asked {
+                                if want == (pw, ph) || at.elapsed() > RESIZE_WAIT {
+                                    win.asked = None;
+                                }
+                            }
+                            if win.asked.is_none() && win.size != (pw, ph) {
                                 win.size = (pw, ph);
                                 let _ = win.w.request_inner_size(PhysicalSize::new(pw, ph + Self::strip(&win.w)));
                             }
@@ -244,12 +257,33 @@ impl ApplicationHandler<()> for App {
             },
             WindowEvent::RedrawRequested => self.draw(id),
             WindowEvent::Resized(size) => {
-                if let Some(win) = self.wins.get(&id) {
-                    if win.host.is_none() {
+                let mut ask = None;
+                if let Some(win) = self.wins.get_mut(&id) {
+                    match win.host {
                         // The host's output follows the desktop's window (§4.1).
-                        self.views.set_output(size.width, size.height, (win.w.scale_factor() * 1000.0).round() as u32);
+                        None => self.views.set_output(size.width, size.height, (win.w.scale_factor() * 1000.0).round() as u32),
+                        // The person resized an app's window: the app is
+                        // asked for that size; until it answers, its last
+                        // frame stays at the top left, clipped or padded.
+                        Some(host) => {
+                            let want = (size.width, size.height.saturating_sub(Self::strip(&win.w)));
+                            if want != win.size && want.0 > 0 && want.1 > 0 {
+                                win.size = want;
+                                win.asked = Some((want, std::time::Instant::now()));
+                                ask = Some(Input::Resize { window: host, width: want.0, height: want.1 });
+                            }
+                        }
                     }
                     win.w.request_redraw();
+                }
+                if let Some(i) = ask {
+                    self.send(i);
+                }
+            }
+            WindowEvent::Focused(true) => {
+                // Keys go to the app whose window the person is in.
+                if let Some(host) = self.wins.get(&id).and_then(|w| w.host) {
+                    self.send(Input::Focus { window: host });
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

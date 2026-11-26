@@ -191,6 +191,8 @@ fn scene_framing_round_trips_and_refuses() {
         Input::Button { button: 1, pressed: false },
         Input::Scroll { dx: 0.0, dy: -120.0 },
         Input::MotionIn { window: 4, x: 0.0, y: 31.5 },
+        Input::Focus { window: 4 },
+        Input::Resize { window: 4, width: 900, height: 600 },
     ] {
         assert_eq!(Control::decode(&Control::Input(i).encode()).unwrap(), Control::Input(i));
     }
@@ -200,6 +202,9 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&Control::Input(Input::MotionIn { window: 0, x: 1.0, y: 1.0 }).encode()).is_err(), "window 0");
     assert!(Control::decode(&Control::Input(Input::MotionIn { window: 70000, x: 1.0, y: 1.0 }).encode()).is_err(), "past u16");
     assert!(Control::decode(&Control::Input(Input::MotionIn { window: 4, x: -0.5, y: 1.0 }).encode()).is_err(), "off the window");
+    assert!(Control::decode(&Control::Input(Input::Focus { window: 0 }).encode()).is_err());
+    assert!(Control::decode(&Control::Input(Input::Resize { window: 4, width: 63, height: 600 }).encode()).is_err(), "too small");
+    assert!(Control::decode(&Control::Input(Input::Resize { window: 4, width: 900, height: 9000 }).encode()).is_err(), "too large");
 }
 
 #[test]

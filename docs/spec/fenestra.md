@@ -1685,7 +1685,14 @@ frescod's `Compositor::pointer_in` moves the cursor to that point of the window 
 the window, or to its slot or pop-up hit there, even where another window covers it on the
 host's screen; buttons and scrolls follow the window it pinned. A window not on screen, or held
 by a sheet, takes nothing. A script's screen-pixel `MOVE` is turned into `MotionIn` for the
-topmost window the layout has there. Closing one app's window on the viewer hides it there
+topmost window the layout has there. Focusing a per-app window on the viewer sends `Input::Focus { window }` (control tag 11, link
+input 6) and frescod raises the window and gives it the keys; resizing one sends
+`Input::Resize { window, width, height }` (tag 12, link input 7, each side 64 to 8192) and
+frescod resizes it, never below the app's minimum at its scale, so the app lays out at the new
+size. Both take the same checks as `MotionIn` (per-app only, a placed window on screen, not
+held, not a slot or pop-up). While the app re-lays out, the viewer keeps the last frame at the
+top left, clipped or padded (§6.4), and does not snap the window back to an older layout's size
+for 2 s or until the host answers. Closing one app's window on the viewer hides it there
 until the host closes it (closing it on the host is R4). `scripts/fenestra-desktop-vm.sh` runs
 per-app by default (each window drawn at its own size, every window's interior equal to the
 host's screen) and the whole desktop with `FEN_WM=1` (forum-wm in the guest; the whole screen

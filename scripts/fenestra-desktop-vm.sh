@@ -24,7 +24,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 18 || echo 14) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -33,7 +33,9 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/fenestra-desktop.XXXXXX")
 RUN="${RUN_SECS:-150}"
 # The viewer's input, seconds from its start (it connects within ~10 s): a
 # click on a cell and "123" Enter; it reconnects at 70 s; then right arrow
-# and "45" Enter; nothing from 120 s.
+# and "45" Enter; at 94 s it moves into the topmost window and resizes it
+# to 900x600 (per app the host takes both; on a WM's desktop it takes
+# neither); nothing from 120 s.
 cat >"$W/input.txt" <<'EOF'
 45 MOVE 300 200
 45.2 BTN 1 1
@@ -54,6 +56,8 @@ cat >"$W/input.txt" <<'EOF'
 87.1 KEY 34 0
 88 KEY 40 1
 88.1 KEY 40 0
+94 FOCUS
+95 RESIZE 900 600
 EOF
 fen_fenestrad
 "$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" --transport "${FEN_TRANSPORT:-auto}" ${FEN_OUTPUT:+--output "$FEN_OUTPUT"} \
@@ -92,6 +96,11 @@ check "nothing sent while idle" 0 "$(awk '$1 == "idle_bytes" { print $2 }' "$V")
 cmp=$(compare "$W/host.png")
 check "every window equal to frescod's own screen" equal "$cmp"
 if [ "${FEN_WM:-0}" = 1 ]; then
+    check "a resize from the viewer refused on a WM's desktop" "1280 658" "$(awk '$1 == "placed" { print $5, $6; exit }' "$V")"
+else
+    check "the app took the size the viewer's window was given" "900 600" "$(awk '$1 == "placed" { print $5, $6; exit }' "$V")"
+fi
+if [ "${FEN_WM:-0}" = 1 ]; then
     check "the whole screen equal, the strip, focus ring and background included" equal "$(compare_all "$W/host.png")"
 else
     check "each window drawn at its own size, as its own" yes "$(awk '$1 == "placed" { p[$2] = $5 "x" $6 } $1 == "window" { w[$2] = $3 } END { n = 0; for (i in p) { if (w[i] != p[i]) { print "no (" i ": " w[i] " vs " p[i] ")"; exit } n++ } print (n ? "yes" : "no (none placed)") }' "$V")"
@@ -102,7 +111,7 @@ check "the typing reached the viewer (its desktop differs from the screen before
 check "the viewer's input changed the host's screen" yes "$(cmp -s "$W/host-middle.png" "$W/host-before.png" && echo no || echo yes)"
 check "input sent after the reconnect changed it again" yes "$(cmp -s "$W/host.png" "$W/host-middle.png" && echo no || echo yes)"
 ins=$(grep 'viewer [0-9] gone' "$W/fenestrad.log" | sed 's/.*inputs \([0-9]*\) dropped \([0-9]*\).*/\1:\2/' | tr '\n' ' ')
-check "the session passed on every input event, on both connections, none dropped" "11:0 8:0 " "$ins"
+check "the session passed on every input event, on both connections, none dropped" "11:0 10:0 " "$ins"
 grep 'fenestra-session' "$W/fenestrad.log" | tail -5
 check "the viewer reconnected" yes "$(grep -c 'connected to' "$W/view.log" | awk '{ print ($1 >= 2) ? "yes" : "no (" $1 ")" }')"
 r2=$(grep 'viewer 2 gone' "$W/fenestrad.log" | sed 's/.*resumed \([0-9]*\) resent \([0-9]*\).*/\1 \2/')
