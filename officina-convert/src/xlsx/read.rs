@@ -1681,10 +1681,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     let mut rep = Report::default();
     // Styles, before the cells that name them.
     let theme = wb_rels.values().find(|(t, _)| t.ends_with("/theme")).map(|(_, p)| p.clone());
-    let theme = match theme {
-        Some(p) => super::styles::theme_colors(&z.read_name(&p)?.unwrap_or_default()),
-        None => super::styles::theme_colors(b""),
+    let theme_xml = match theme {
+        Some(p) => z.read_name(&p)?.unwrap_or_default(),
+        None => Vec::new(),
     };
+    let theme = super::styles::theme_colors(&theme_xml);
+    let mut look = officina_grid::look::Look { theme: super::theme::read(&theme_xml), ..Default::default() };
     let mut dxfs = Vec::new();
     let mut indexed = officina_grid::numfmt::PALETTE;
     let xf_ids: Vec<StyleId> = match wb_rels.values().find(|(t, _)| t.ends_with("/styles")).map(|(_, p)| p.clone()) {
@@ -1775,7 +1777,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     let person_path = wb_rels.values().find(|(t, _)| t == super::threaded::PERSON_REL).map(|(_, path)| path.as_str());
     let mut people = super::threaded::persons(&z, person_path, &mut rep)?;
     for (i, (_, part)) in sheets.iter().enumerate() {
-        super::chart::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
+        super::chart::read_sheet(&mut wb, i as u16, &z, part, &theme, &mut look.shapes, &mut rep)?;
         super::comments::read_sheet_with_people(&mut wb, i as u16, &z, part, &mut people, &mut rep)?;
         resolve_links(&mut wb, i as u16, &z, part)?;
     }
@@ -1809,6 +1811,16 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     // Macros, kept inert.
     let parts: Vec<String> = sheets.iter().map(|(_, p)| p.clone()).collect();
     super::macros::read(&z, &mut wb, &wb_xml, &wb_rels, &parts, &mut rep)?;
+    // The look: theme, shapes, then our extension's table styles and cameras.
+    if look.valid(wb.sheet_count()).is_err() {
+        look.shapes.clear();
+        look.theme = Default::default();
+        rep.note(Kind::Dropped, "a theme or shapes this engine can't use");
+    }
+    crate::lookxml::read(&wb_xml, &wb, &mut look, &mut rep);
+    if !look.is_default() {
+        officina_core::history::Op::apply(officina_grid::ops::GridOp::Look(Box::new(look)), &mut wb);
+    }
     out.report.merge(rep);
     Ok((wb, out))
 }
@@ -1838,7 +1850,7 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], dxfs: &[super::condfmt::Dxf
                     };
                     let header = attr(&e, b"headerRowCount")?.map_or(true, |v| v != "0");
                     let totals = attr(&e, b"totalsRowCount")?.is_some_and(|v| v != "0");
-                    t = Some(Table { name: name.into(), rect: Rect { sheet, r0, c0, r1, c1 }, header, totals, columns: Vec::new(), style: None, stripes: false, filter: None });
+                    t = Some(Table { name: name.into(), rect: Rect { sheet, r0, c0, r1, c1 }, header, totals, columns: Vec::new(), style: None, stripes: false, bands: Default::default(), filter: None });
                 }
                 b"tableColumn" => {
                     if let (Some(t), Some(n)) = (t.as_mut(), attr(&e, b"name")?) {
@@ -1852,7 +1864,11 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], dxfs: &[super::condfmt::Dxf
                 b"tableStyleInfo" => {
                     if let Some(t) = t.as_mut() {
                         t.style = attr(&e, b"name")?.filter(|n| !n.is_empty() && n.len() <= 255).map(Into::into);
-                        t.stripes = attr(&e, b"showRowStripes")?.is_some_and(|v| v == "1" || v == "true");
+                        let on = |v: Option<String>| v.is_some_and(|v| v == "1" || v == "true");
+                        t.stripes = on(attr(&e, b"showRowStripes")?);
+                        t.bands.cols = on(attr(&e, b"showColumnStripes")?);
+                        t.bands.first = on(attr(&e, b"showFirstColumn")?);
+                        t.bands.last = on(attr(&e, b"showLastColumn")?);
                     }
                 }
                 _ => {}

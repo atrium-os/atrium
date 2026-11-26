@@ -131,6 +131,8 @@ pub enum GridOp {
     DateSystem1904(bool),
     /// The workbook's Custom Views, the whole list replaced.
     CustomViews(Vec<crate::views::CustomView>),
+    /// The workbook's theme, custom table styles, shapes and cameras.
+    Look(Box<crate::look::Look>),
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -396,6 +398,11 @@ impl GridOp {
             GridOp::CustomViews(list) => {
                 w.u8(39);
                 crate::views::encode(list, &mut w);
+                return w.into_bytes();
+            }
+            GridOp::Look(look) => {
+                w.u8(40);
+                look.encode(&mut w);
                 return w.into_bytes();
             }
             GridOp::Properties(p) => {
@@ -706,6 +713,13 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::DateSystem1904(on));
+        }
+        if kind == 40 {
+            let look = crate::look::Look::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Look(Box::new(look)));
         }
         if kind == 39 {
             let list = crate::views::decode(&mut r)?;
@@ -1075,6 +1089,12 @@ impl Op<Workbook> for GridOp {
                     return GridOp::Batch(Vec::new());
                 }
                 GridOp::CustomViews(std::mem::replace(&mut wb.views, list))
+            }
+            GridOp::Look(look) => {
+                if look.valid(wb.sheet_count()).is_err() {
+                    return GridOp::Batch(Vec::new());
+                }
+                GridOp::Look(Box::new(std::mem::replace(&mut wb.look, *look)))
             }
             GridOp::DateSystem1904(on) => {
                 use crate::eval::dates::DateSystem;
@@ -1580,7 +1600,7 @@ mod tests {
         wb.set_input(a("C1"), "=SUM(T[Qty])").unwrap();
         wb.recalc();
         assert_eq!(wb.get(a("C1")), Value::Err(ErrorKind::Ref));
-        let t = Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true, filter: None };
+        let t = Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true, bands: Default::default(), filter: None };
         let ch = Chart {
             kind: ChartKind::Column,
             grouping: Grouping::Standard,

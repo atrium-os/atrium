@@ -44,3 +44,4 @@ pub mod hypothesis;
 pub mod solver;
 pub mod chartformat;
 pub mod pivottools;
+pub mod objects;

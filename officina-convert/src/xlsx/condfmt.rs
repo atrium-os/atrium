@@ -34,6 +34,8 @@ pub(super) struct DxfTable {
     pub rules: Vec<Dxf>,
     colors: Vec<AppearanceFilter>,
     color_ids: HashMap<AppearanceFilter, usize>,
+    /// The custom table styles' parts, after the colours: `(style, part kind, look)`.
+    table_parts: Vec<(usize, usize, officina_grid::look::TablePart)>,
 }
 
 impl DxfTable {
@@ -54,7 +56,36 @@ impl DxfTable {
                 }
             }
         }
-        Self { rules, colors, color_ids }
+        let mut table_parts = Vec::new();
+        for (i, st) in wb.workbook_look().table_styles.iter().enumerate() {
+            for (k, p) in st.parts.iter().enumerate() {
+                if let Some(p) = p {
+                    table_parts.push((i, k, *p));
+                }
+            }
+        }
+        Self { rules, colors, color_ids, table_parts }
+    }
+
+    /// `<tableStyles>` for the custom table styles, their parts pointing at the
+    /// formats `dxfs_xml` put after the rules' and colours'.
+    pub fn table_styles_xml(&self, wb: &Workbook) -> String {
+        let styles = &wb.workbook_look().table_styles;
+        if styles.is_empty() {
+            return String::new();
+        }
+        let base = self.rules.len() + self.colors.len();
+        let mut o = format!(r#"<tableStyles count="{}">"#, styles.len());
+        for (i, st) in styles.iter().enumerate() {
+            let mine: Vec<_> = self.table_parts.iter().enumerate().filter(|(_, p)| p.0 == i).collect();
+            let _ = write!(o, r#"<tableStyle name="{}" pivot="0" count="{}">"#, esc(&st.name), mine.len());
+            for (j, (_, k, _)) in mine {
+                let _ = write!(o, r#"<tableStyleElement type="{}" dxfId="{}"/>"#, officina_grid::look::PART_NAMES[*k], base + j);
+            }
+            o.push_str("</tableStyle>");
+        }
+        o.push_str("</tableStyles>");
+        o
     }
 
     pub fn color_id(&self, color: AppearanceFilter) -> usize {
@@ -72,7 +103,7 @@ fn esc(s: &str) -> String {
 
 /// `<dxfs>` for the styles part (`num_fmt_ids` gives each code its id).
 pub(super) fn dxfs_xml(table: &DxfTable, num_fmt_id: &mut dyn FnMut(&str) -> u32) -> String {
-    let mut o = format!(r#"<dxfs count="{}">"#, table.rules.len() + table.colors.len());
+    let mut o = format!(r#"<dxfs count="{}">"#, table.rules.len() + table.colors.len() + table.table_parts.len());
     for d in &table.rules {
         o.push_str("<dxf>");
         if d.color.is_some() || d.bold.is_some() || d.italic.is_some() || d.underline.is_some() || d.strike.is_some() {
@@ -119,6 +150,30 @@ pub(super) fn dxfs_xml(table: &DxfTable, num_fmt_id: &mut dyn FnMut(&str) -> u32
             }
             (false, None) => o.push_str(r#"<dxf><font><color auto="1"/></font></dxf>"#),
         }
+    }
+    for (_, _, p) in &table.table_parts {
+        o.push_str("<dxf>");
+        if p.bold || p.text.is_some() {
+            o.push_str("<font>");
+            if p.bold {
+                o.push_str(r#"<b/>"#);
+            }
+            if let Some(c) = p.text {
+                let _ = write!(o, r#"<color rgb="FF{c:06X}"/>"#);
+            }
+            o.push_str("</font>");
+        }
+        if let Some(c) = p.fill {
+            let _ = write!(o, r#"<fill><patternFill patternType="solid"><fgColor rgb="FF{c:06X}"/><bgColor rgb="FF{c:06X}"/></patternFill></fill>"#);
+        }
+        if let Some(c) = p.border {
+            o.push_str("<border>");
+            for side in ["left", "right", "top", "bottom"] {
+                let _ = write!(o, r#"<{side} style="thin"><color rgb="FF{c:06X}"/></{side}>"#);
+            }
+            o.push_str("</border>");
+        }
+        o.push_str("</dxf>");
     }
     o.push_str("</dxfs>");
     o

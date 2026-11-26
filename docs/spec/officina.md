@@ -5639,6 +5639,49 @@ Tests:
   - Excel's "Qtr1" labels and an inclusive timeline end, read as this engine's;
   - the same book through `.ods`.
 
+### 16.165 Look and objects: themes, table styles, shapes and text boxes, Camera, Quick Analysis (2026-11-26)
+Round 4 of the six-round finishing plan. The workbook's look is one grid value, `officina_grid::look::Look`: the theme, custom table styles, shapes and Camera pictures. One op, `GridOp::Look` (wire kind 40), replaces it, and a look that fails `Look::valid` applies as nothing. Native files keep it in a `LOOK` chunk, written only when it isn't the default. Inserting or deleting rows and columns moves shapes and cameras with their cells and a camera's source with its range; a camera whose source is deleted goes. Deleting a sheet takes its shapes and the cameras on it or reading it, and moving a sheet keeps them pointed at the right one. Sheet protection allows the look to change except shapes and cameras on a sheet that isn't open to objects.
+
+**Themes** (`look.rs`). A theme is a name, Excel's twelve colours (dark 1, light 1, dark 2, light 2, six accents, two link colours) and heading and body fonts. Twelve are built in: Office, Office 2007, Grayscale, Blue, Blue Green, Green, Yellow Orange, Orange Red, Red Violet, Violet, Median and Paper. Cells hold plain RGB, so `Workbook::theme_op` is a restyle: each cell colour (fill, font, border) that was one of the old theme's colours becomes the new theme's colour in the same slot, and each font named as the old heading or body font becomes the new one. Other colours and fonts stay. It is one undo step. Unnamed fonts are drawn in the grid's own sans as before; the theme fonts rename only fonts set by name. Charts take their series colours from the theme's accents (and darker tints after six), and the chart cache key includes the theme, so a theme change redraws them.
+
+**Table styles**. Excel's gallery is computed from the theme: Light 1–21, Medium 1–28 and Dark 1–11, each family seven styles (dark 1, then accents 1–6). A style is up to seven parts (whole table, header row, total row, row stripe, column stripe, first column, last column), each with a fill, text colour, bold and a border colour. `Workbook::table_cell_look` gives a table cell's look from its style and the table's options: banded rows (the table's `stripes`), banded columns, first column and last column (`TableBands`, kept in the tables' wire flags). Custom styles are named in the look, up to 64, and can't take a built-in name. The grid draws table cells with their style's look; a table with an unknown style keeps the plain tint it had.
+
+**In Sheets** (`atrium-sheets/src/objects.rs`), five typed bars on the Data menu. Each line is one undo step, split on `;` where it takes several settings, and anything refused changes nothing and says why.
+- **Themes…** `theme Green` applies a whole theme; `colors Violet` takes only its colours, `fonts Paper` or `fonts Georgia / Verdana` only fonts; `list` names the built-in themes.
+- **Table Design…** (in a table) `style Medium 9` (or `TableStyleMedium9`, a custom name, `none`); `banded rows`, `banded columns`, `first column`, `last column`, each with `no` to turn it off; `new style Brand with header 1F4E78 text white bold, stripe DDEBF7, whole border 1F4E78` makes a custom style from parts (whole, header, totals, stripe, column stripe, first column, last column) and settings (a fill colour, `text COLOUR`, `bold`, `border COLOUR`); `delete style NAME` removes one, and tables using it keep the plain tint. Colours are `none`, a theme colour (`accent1`…`accent6`, `dark1`, `light1`, `dark2`, `light2`), a colour name or six hex digits.
+- **Insert Shape…** `rounded "Next step" at D2 size 4x3 fill accent2 line none text white bold 14`. Friendly kinds are rectangle, rounded, oval, triangle, arrow, star, diamond, hexagon, heart, cloud and callout, and any DrawingML preset name works (the set `.pptx` and `.docx` shapes use, over 180) (`flowChartDecision`). `text box "Words"` makes a shape with no fill or outline. On a shape the same settings change it, and `delete`, `front` and `back` remove it or change its order. Shapes are drawn with the preset's outline (`officina-shapes`), filled and stroked, with the text centred and wrapped in the preset's text rectangle. They move and resize by dragging like charts.
+- **Camera…** `A1:B6 at D1` (or `Sheet2!A1:C9 at D1`) places a live picture of the range: its cells with fills, gridlines and formatted text, stretched to the picture's box and redrawn as the cells change. On a camera, `source RANGE` points it elsewhere and `delete` removes it. A source is at most 10,000 cells, and a workbook holds at most 64 cameras.
+- **Quick Analysis…** on the selection: `data bars [COLOUR]`, `color scale`, `icon set`, `greater than N`, `top N` or `top N%`, `clear format`; `chart KIND`; `totals sum|average|count|percent|running [below|right]` (as Quick Totals, a sum below by default); `table`; `sparklines line|column|win/loss`.
+
+**Files**.
+- `.xlsx`:
+  - The theme is `xl/theme/theme1.xml`, written when it isn't Office's: the colour scheme, the major and minor Latin fonts and the plain format scheme DrawingML requires. Reading takes a file's theme name, colours and fonts; a theme with Office's colours and fonts (Excel's "Office Theme") reads as the default, so a plain file carries no look.
+  - Table options are `tableStyleInfo`'s `showColumnStripes`, `showFirstColumn` and `showLastColumn`, both ways.
+  - Custom table styles are written as Excel's `<tableStyles>` in `styles.xml`, each part a `tableStyleElement` pointing at a `dxf` after the conditional formats' (font bold and colour, solid fill, thin border), so Excel shows them. On reading we take them from our extension (below); a foreign file's own custom styles aren't read yet.
+  - Shapes are `xdr:sp` in the sheet's drawing, after its charts and pictures: `prstGeom`, `solidFill` or `noFill`, an `a:ln`, the text as centred paragraphs with the size, bold and colour on each run, `txBox="1"` for a text box and `descr` for alt text. Reading takes explicit `spPr` settings first and the shape's `xdr:style` references (`fillRef`, `lnRef`, `fontRef`, theme colours resolved through the file's theme) for the rest. Grouped shapes, connectors and custom geometry are dropped and reported.
+  - Camera pictures and custom styles ride in a workbook `extLst` extension holding an `officina:look` element (`urn:atrium:officina:look:1`) that Excel passes over. Excel shows no Camera picture.
+- `.ods`:
+  - Shapes are `draw:custom-shape` in the sheet's `table:shapes`, with the outline written as an enhanced geometry (`ooxml-…` type and path, as `.odp` writes it) and an automatic graphic style for fill, outline and text, so LibreOffice draws them. `officina:` attributes carry our exact settings and cell anchor. Reading prefers those, and otherwise takes LibreOffice's own shapes from their graphic style and outline type (Office presets by `ooxml-` name, LibreOffice's own types by the `.odp` mapping).
+  - Table styles and options are `officina:table-style` and `officina:bands` on the named database range.
+  - The theme, custom table styles and cameras are an `officina:look` element at the end of `office:spreadsheet`, which LibreOffice ignores.
+- Reading our element is bounded: it is parsed as a small tree under the crate's XML limits, and each part is kept only if the look stays valid with it, so an unknown sheet, a bad colour, a built-in style name or an oversized camera source drops that part alone, with a note.
+
+**Not built yet**:
+- Reading a foreign file's custom table styles from `styles.xml`.
+- Shape rotation, flips, adjustment handles, gradients, shadows, connectors and groups on sheets; rich text runs inside a shape.
+- Excel's own Camera picture (a picture linked by a formula); Excel opens our file without it.
+- Theme effects and the theme's colour variants; a theme saved as a `.thmx` file.
+
+Tests:
+- grid: a theme change recolours the old theme's colours and renames its fonts, and undoes; built-in and custom table styles with their options give the expected header, stripe, totals and first-column looks, and a custom style can't take a built-in name; shapes and cameras survive the wire (every truncation fails cleanly) and the native file, follow inserted rows, and go with a deleted sheet.
+- Sheets: Themes, Table Design with a custom style, Insert Shape (shapes and text boxes, delete and order) and Camera, and Quick Analysis formats, charts, totals and sparklines through the bars.
+- convert:
+  - the theme, a custom table style with all four options, a callout and a text box on two sheets and a camera survive `.xlsx` and `.ods`, and a plain book carries no look;
+  - the `.xlsx` parts are what Excel reads (theme name and accent, `tableStyle` elements, the table options, `prstGeom`, run size and bold, `txBox`);
+  - an Excel-style shape takes its colours from its style references, and a grouped shape is dropped with a note;
+  - hostile `officina:look` parts (an unknown sheet, an oversized camera source, a built-in style name, a bad colour) are dropped one by one;
+  - LibreOffice opens both files and saves them again, and the callout's outline, text and fill and the text box come back (and the theme, through `.xlsx`).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

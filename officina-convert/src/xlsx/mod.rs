@@ -18,6 +18,7 @@ pub mod pivot;
 pub mod read;
 pub mod sparkline;
 pub mod styles;
+mod theme;
 pub mod validation;
 mod threaded;
 pub mod write;

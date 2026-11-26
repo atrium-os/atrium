@@ -125,6 +125,12 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if pictures.len() != wb.pictures().len() {
         ops.push(GridOp::Pictures(pictures));
     }
+    let mut look = wb.workbook_look().clone();
+    look.shapes.retain(|x| x.anchor.sheet != s);
+    look.cameras.retain(|x| x.anchor.sheet != s && x.source.sheet != s);
+    if look != *wb.workbook_look() {
+        ops.push(GridOp::Look(Box::new(look)));
+    }
     let pivots = wb.pivot_state();
     // A pivot on the sheet or reading it goes; one elsewhere loses the slicers on it.
     let kept_p: Vec<_> = pivots.iter().filter(|(p, _)| p.source.sheet != s && p.dest.sheet != s).cloned()
@@ -238,7 +244,7 @@ mod tests {
         put(&mut wb, 2, "A2", "=Total");
         wb.define_name("Total", None, "=Calc!$A$1").unwrap();
         wb.define_name("Local", Some(2), "=Data!$A$3").unwrap();
-        let t = crate::tables::Table { name: "Q".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true, filter: None };
+        let t = crate::tables::Table { name: "Q".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true, bands: Default::default(), filter: None };
         GridOp::Tables(vec![t]).apply(&mut wb);
         let ch = crate::charts::Chart {
             kind: crate::charts::ChartKind::Column,

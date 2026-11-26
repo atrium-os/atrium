@@ -270,6 +270,8 @@ struct Styles {
     text_script: HashMap<String, officina_grid::style::Script>,
     /// Cell styles with `style:map` conditions.
     cond_maps: bool,
+    /// Graphic styles (drawn shapes): fill, outline and text.
+    graphic: HashMap<String, super::chart::GraphicStyle>,
 }
 
 impl Styles {
@@ -338,6 +340,34 @@ impl Styles {
                         "style:table-row-properties" if cur_family == "table-row" => {
                             if let Some(h) = a.get("style:row-height").and_then(|h| length_px(h)) {
                                 self.row_height.insert(cur_name.clone(), h);
+                            }
+                        }
+                        "style:graphic-properties" if cur_family == "graphic" && self.graphic.len() < 4096 => {
+                            let g = self.graphic.entry(cur_name.clone()).or_default();
+                            let rgb = |k: &str| a.get(k).and_then(|v| v.strip_prefix('#')).and_then(|v| u32::from_str_radix(v, 16).ok()).map(|c| c & 0xFF_FFFF);
+                            match a.get("draw:fill").map(String::as_str) {
+                                Some("none") => g.fill = Some(None),
+                                Some("solid") | None if rgb("draw:fill-color").is_some() => g.fill = Some(rgb("draw:fill-color")),
+                                _ => {}
+                            }
+                            match a.get("draw:stroke").map(String::as_str) {
+                                Some("none") => g.line = Some(None),
+                                _ if rgb("svg:stroke-color").is_some() => g.line = Some(rgb("svg:stroke-color")),
+                                _ => {}
+                            }
+                        }
+                        "style:text-properties" if cur_family == "graphic" => {
+                            if let Some(g) = self.graphic.get_mut(&cur_name).or(None) {
+                                g.text_color = a.get("fo:color").and_then(|v| v.strip_prefix('#')).and_then(|v| u32::from_str_radix(v, 16).ok()).map(|c| c & 0xFF_FFFF);
+                                g.size = a.get("fo:font-size").and_then(|v| length_px(v)).map(|px| (px * 72.0 / 96.0 * 20.0).round().clamp(20.0, 8000.0) as u16);
+                                g.bold = a.get("fo:font-weight").map(|w| w == "bold" || w.parse::<u32>().is_ok_and(|n| n >= 600));
+                            } else if self.graphic.len() < 4096 {
+                                self.graphic.insert(cur_name.clone(), super::chart::GraphicStyle {
+                                    text_color: a.get("fo:color").and_then(|v| v.strip_prefix('#')).and_then(|v| u32::from_str_radix(v, 16).ok()).map(|c| c & 0xFF_FFFF),
+                                    size: a.get("fo:font-size").and_then(|v| length_px(v)).map(|px| (px * 72.0 / 96.0 * 20.0).round().clamp(20.0, 8000.0) as u16),
+                                    bold: a.get("fo:font-weight").map(|w| w == "bold" || w.parse::<u32>().is_ok_and(|n| n >= 600)),
+                                    ..Default::default()
+                                });
                             }
                         }
                         "style:text-properties" => {
@@ -1021,7 +1051,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut db: Option<(Option<String>, String, bool, Vec<(u32, Cond)>)> = None;
     let mut filters: Vec<(Option<String>, String, Vec<(u32, Cond)>)> = Vec::new();
     // Named database ranges: (name, range, header row).
-    let mut db_tables: Vec<(String, String, bool)> = Vec::new();
+    // Named database ranges: name, target, header, and our table style and bands.
+    let mut db_tables: Vec<(String, String, bool, Option<String>, [bool; 4])> = Vec::new();
     // Conditional formats (LibreOffice's) and the one being read.
     let mut cf: Option<CfIn> = None;
     let mut cond_formats: Vec<CfIn> = Vec::new();
@@ -1113,8 +1144,23 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 b"draw:object" => f.href = attrs(e).remove("xlink:href"),
                                 b"draw:image" if f.image.is_none() => f.image = attrs(e).remove("xlink:href"),
                                 b"svg:desc" if !empty => f.in_desc = true,
+                                b"draw:enhanced-geometry" => {
+                                    if let Some(sh) = f.shape.as_mut() {
+                                        sh.kind = attrs(e).remove("draw:type");
+                                    }
+                                }
+                                b"text:p" => {
+                                    if let Some(sh) = f.shape.as_mut().filter(|sh| sh.paras.len() < 4096) {
+                                        sh.paras.push(String::new());
+                                        sh.in_p = !empty;
+                                    }
+                                }
                                 _ => {}
                             }
+                        }
+                    } else if name == b"text:line-break" {
+                        if let Some(sh) = frame.as_mut().and_then(|f| f.shape.as_mut()).filter(|sh| sh.in_p) {
+                            sh.push("\n");
                         }
                     }
                     if !empty {
@@ -1321,8 +1367,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             ann = Some(Annotation { thread, ..Annotation::default() });
                         }
                     }
-                    b"draw:frame" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS + officina_grid::charts::MAX_PICTURES => {
+                    b"draw:frame" | b"draw:custom-shape" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS + officina_grid::charts::MAX_PICTURES + officina_grid::look::MAX_SHAPES => {
                         let a = attrs(e);
+                        let shape = (name == b"draw:custom-shape").then(|| super::chart::ShapeOdsIn::new(&a, &styles.graphic));
                         let len = |k: &str| a.get(k).and_then(|v| length_px(v)).unwrap_or(0.0);
                         let f = super::chart::FrameIn {
                             sheet: sheet.unwrap_or(0),
@@ -1339,6 +1386,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             transformed: a.contains_key("draw:transform"),
                             desc: String::new(),
                             in_desc: false,
+                            shape,
                         };
                         if empty {
                             frames.push(f);
@@ -1574,7 +1622,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 if db_tables.len() >= officina_grid::tables::MAX_TABLES {
                                     continue;
                                 }
-                                db_tables.push((n.clone(), target.clone(), a.get("table:contains-header").map_or(true, |v| !matches!(v.as_str(), "false" | "0"))));
+                                let style = a.get("officina:table-style").filter(|n| !n.is_empty() && n.len() <= 255).cloned();
+                                let mut bands = [false; 4];
+                                for (b, v) in bands.iter_mut().zip(a.get("officina:bands").map_or("", |v| v.as_str()).split(' ')) {
+                                    *b = v == "1";
+                                }
+                                db_tables.push((n.clone(), target.clone(), a.get("table:contains-header").map_or(true, |v| !matches!(v.as_str(), "false" | "0")), style, bands));
                             }
                             if !empty {
                                 db = Some((named.cloned(), target.clone(), buttons, Vec::new()));
@@ -1648,6 +1701,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                 }
             }
             Event::Text(t) if frame_depth > 0 => {
+                if let Some(sh) = frame.as_mut().and_then(|f| f.shape.as_mut()).filter(|sh| sh.in_p) {
+                    sh.push(&t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?);
+                }
                 if let Some(f) = frame.as_mut().filter(|f| f.in_desc) {
                     let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
                     let room = officina_grid::charts::MAX_ALT.saturating_sub(f.desc.len());
@@ -1670,6 +1726,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     if frame_depth == 1 && name == b"svg:desc" {
                         if let Some(f) = frame.as_mut() {
                             f.in_desc = false;
+                        }
+                    }
+                    if frame_depth == 1 && name == b"text:p" {
+                        if let Some(sh) = frame.as_mut().and_then(|f| f.shape.as_mut()) {
+                            sh.in_p = false;
                         }
                     }
                     if frame_depth == 0 {
@@ -1932,7 +1993,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
 
     // Tables, from named database ranges; their columns are named by the header row.
-    for (name, target, header) in db_tables {
+    for (name, target, header, style, bands) in db_tables {
         let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
         let mut columns: Vec<Arc<str>> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1944,7 +2005,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             }
             columns.push(n.as_str().into());
         }
-        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals: false, columns, style: None, stripes: false, filter: None };
+        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals: false, columns, style: style.map(|s| s.as_str().into()), stripes: bands[0], bands: officina_grid::tables::TableBands { cols: bands[1], first: bands[2], last: bands[3] }, filter: None };
         if let Err(why) = wb.add_table(t) {
             rep.note_at(Kind::Dropped, "tables this engine can't use (kept as plain cells)", || format!("{name}: {why}"));
         }
@@ -2066,7 +2127,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Pivot tables, over the cells they wrote.
     super::pivot::make(&mut wb, pilots, &mut rep);
     // Charts, once every sheet and its sizes exist.
-    super::chart::read_frames(&mut wb, &z, frames, &mut rep);
+    let mut look = officina_grid::look::Look { shapes: super::chart::read_frames(&mut wb, &z, frames, &mut rep), ..Default::default() };
+    // The theme, custom table styles and cameras, from our element.
+    crate::lookxml::read(&content, &wb, &mut look, &mut rep);
+    if !look.is_default() {
+        officina_core::history::Op::apply(officina_grid::ops::GridOp::Look(Box::new(look)), &mut wb);
+    }
     // Macros, kept inert.
     super::macros::read(&z, &mut wb, &mut rep)?;
     // Frozen panes, from the view settings.

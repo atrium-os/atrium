@@ -233,6 +233,16 @@ pub enum DataCmd {
     FormatChart,
     /// PivotTable Tools… (Show Values As, calculated fields, grouping, slicers, timelines, PivotChart; typed).
     PivotTools,
+    /// Themes… (the workbook's theme, colours and fonts; typed).
+    Themes,
+    /// Table Design… (the table style gallery, its options, custom styles; typed).
+    TableDesign,
+    /// Insert Shape… (shapes and text boxes; typed), or the shape at the cursor.
+    Shapes,
+    /// Camera… (a live picture of a range; typed).
+    Camera,
+    /// Quick Analysis… for the selection (typed).
+    QuickAnalysis,
     /// Check Accessibility (a bar stepping through what it finds).
     CheckAccessibility,
     /// Insert Checkbox (or take it off, from a checkbox).
@@ -692,6 +702,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Custom Views…"), Some(DataCmd::CustomViews)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
+        (MenuItem::new("Quick Analysis…"), Some(DataCmd::QuickAnalysis)),
+        (MenuItem::new("Themes…"), Some(DataCmd::Themes)),
         (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
         (MenuItem::new("Spelling…").shortcut("F7"), Some(DataCmd::Spelling)),
         (MenuItem::new("AutoCorrect Options…"), Some(DataCmd::AutoCorrect)),
@@ -744,6 +756,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         }
         None => v.push((MenuItem::new("Format as Table").shortcut("Ctrl+T").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
     }
+    v.push((MenuItem::new("Table Design…").enabled(crate::objects::can_design(d, (row, col))), Some(DataCmd::TableDesign)));
+    v.push((MenuItem::new("Insert Shape…"), Some(DataCmd::Shapes)));
+    v.push((MenuItem::new("Camera…"), Some(DataCmd::Camera)));
     v.push((MenuItem::new("Insert Checkbox").checked(wb.style(CellAddr::new(s, row, col)).checkbox).separated(), Some(DataCmd::Checkbox)));
     v.push((MenuItem::new("Insert Column Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Column))));
     v.push((MenuItem::new("Insert Line Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Line))));
@@ -2785,7 +2800,7 @@ fn hidden_in(st: &officina_grid::filter::FilterState, r: &Rect) -> u32 {
     st.hidden.iter().filter(|(a, b)| *b > r.r0 && *a <= r.r1).map(|(a, b)| b.min(&r.r1) - a.max(&(r.r0 + 1)) + 1).sum()
 }
 
-fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Result<String, String> {
+pub(crate) fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Result<String, String> {
     let s = d.sheet;
     let (row, col) = cursor;
     let need = || "Put the cursor in your data (or select it) first.".to_string();
@@ -3209,7 +3224,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::FormatChart | DataCmd::PivotTools | DataCmd::CheckAccessibility => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::FormatChart | DataCmd::PivotTools | DataCmd::Themes | DataCmd::TableDesign | DataCmd::Shapes | DataCmd::Camera | DataCmd::QuickAnalysis | DataCmd::CheckAccessibility => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3360,7 +3375,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 columns.push(n.as_str().into());
             }
             let name = (1..).map(|i| format!("Table{i}")).find(|n| d.wb.table(n).is_none() && d.wb.names().iter().all(|x| !x.name.eq_ignore_ascii_case(n))).unwrap();
-            let table = Table { name: name.as_str().into(), rect: t.rect, header: t.header, totals: false, columns, style: Some("TableStyleMedium2".into()), stripes: true, filter: None };
+            let table = Table { name: name.as_str().into(), rect: t.rect, header: t.header, totals: false, columns, style: Some("TableStyleMedium2".into()), stripes: true, bands: Default::default(), filter: None };
             let mut all = d.wb.tables().to_vec();
             all.push(table.clone());
             // Check it the way the engine will, so a refusal is said, not dropped.

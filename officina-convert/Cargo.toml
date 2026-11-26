@@ -25,6 +25,7 @@ read = ["dep:quick-xml", "dep:navigator-image", "dep:navigator-dom", "dep:serde_
 [dependencies]
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
+officina-shapes = { path = "../officina-shapes" }
 officina-text = { path = "../officina-text" }
 officina-slides = { path = "../officina-slides" }
 # Headers only (sizes, sniffing): the apps draw the pictures.

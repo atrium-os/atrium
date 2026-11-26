@@ -106,7 +106,7 @@ fn table_filters_invalidate_cross_sheet_subtotals() {
         totals: false,
         columns: vec!["Amount".into()],
         style: None,
-        stripes: false,
+        stripes: false, bands: Default::default(),
         filter: None,
     })
     .unwrap();

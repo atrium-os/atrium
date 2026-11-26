@@ -30,7 +30,7 @@ pub(crate) fn color_of(e: &BytesStart, theme: &[u32]) -> Option<u32> {
 }
 
 #[cfg(feature = "read")]
-fn attrs(e: &BytesStart) -> HashMap<Vec<u8>, String> {
+pub(super) fn attrs(e: &BytesStart) -> HashMap<Vec<u8>, String> {
     let mut m = HashMap::new();
     for a in e.attributes().with_checks(false).flatten() {
         if let Ok(v) = a.unescape_value() {
@@ -582,7 +582,7 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
     write_with_dxfs(wb, &super::condfmt::DxfTable::new(wb))
 }
 
-pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) -> Vec<u8> {
+pub(super) fn write_with_dxfs(wb: &Workbook, dxfs_table: &super::condfmt::DxfTable) -> Vec<u8> {
     let mut fmts: Vec<(u32, String)> = Vec::new();
     let mut fonts: Vec<Font> = vec![Font::default()];
     let mut fills = vec![(None, None, None), (None, PatternFill::new("gray125", None, None), None)];
@@ -693,7 +693,7 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
         xfs.push_str("</xf>");
     }
     // Conditional formats' formats; their number formats join the list.
-    let dxfs = super::condfmt::dxfs_xml(dxfs, &mut |code| match numfmt::builtin_id(code) {
+    let dxfs = super::condfmt::dxfs_xml(dxfs_table, &mut |code| match numfmt::builtin_id(code) {
         Some(id) => id,
         None => match fmts.iter().find(|(_, c)| c == code) {
             Some((id, _)) => *id,
@@ -800,6 +800,7 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
     let _ = write!(o, r#"<cellXfs count="{n}">{xfs}</cellXfs>"#);
     o.push_str(r#"<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#);
     o.push_str(&dxfs);
+    o.push_str(&dxfs_table.table_styles_xml(wb));
     o.push_str("</styleSheet>");
     o.into_bytes()
 }

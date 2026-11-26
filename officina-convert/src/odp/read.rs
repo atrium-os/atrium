@@ -211,7 +211,7 @@ fn ph_kind(class: &str) -> Option<Option<PhKind>> {
 }
 
 /// ODF custom shape types that have an OOXML preset of the same outline.
-fn preset_of(t: &str) -> Option<&'static str> {
+pub(crate) fn preset_of(t: &str) -> Option<&'static str> {
     Some(match t {
         "rectangle" | "mso-spt1" => "rect",
         "round-rectangle" | "mso-spt2" => "roundRect",

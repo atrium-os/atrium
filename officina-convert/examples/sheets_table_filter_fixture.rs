@@ -33,7 +33,7 @@ fn table(wb: &mut Workbook, name: &str, row: u32, col: u32, statuses: &[&str], k
         totals: false,
         columns: vec!["Item".into(), "Status".into()],
         style: None,
-        stripes: false,
+        stripes: false, bands: Default::default(),
         filter: None,
     };
     let filter = AutoFilter {

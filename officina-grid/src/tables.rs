@@ -31,9 +31,19 @@ pub struct Table {
     pub columns: Vec<Arc<str>>,
     /// The table style's name (`TableStyleMedium2`), kept for files.
     pub style: Option<Arc<str>>,
-    /// Banded rows, kept for files.
+    /// Banded rows.
     pub stripes: bool,
+    /// Banded columns and the first and last columns set apart.
+    pub bands: TableBands,
     pub filter: Option<TableFilter>,
+}
+
+/// Table Design's other style options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableBands {
+    pub cols: bool,
+    pub first: bool,
+    pub last: bool,
 }
 
 /// Predicates and last-applied row visibility, relative to the table's top left.
@@ -135,7 +145,8 @@ impl Table {
         w.var(self.rect.c0 as u64);
         w.var(self.rect.r1 as u64);
         w.var(self.rect.c1 as u64);
-        w.u8(self.header as u8 | (self.totals as u8) << 1 | (self.stripes as u8) << 2 | (self.filter.is_some() as u8) << 3);
+        w.u8(self.header as u8 | (self.totals as u8) << 1 | (self.stripes as u8) << 2 | (self.filter.is_some() as u8) << 3
+            | (self.bands.cols as u8) << 4 | (self.bands.first as u8) << 5 | (self.bands.last as u8) << 6);
         w.str(self.style.as_deref().unwrap_or(""));
         for c in &self.columns {
             w.str(c);
@@ -182,6 +193,7 @@ impl Table {
             header: flags & 1 != 0,
             totals: flags & 2 != 0,
             stripes: flags & 4 != 0,
+            bands: TableBands { cols: flags & 16 != 0, first: flags & 32 != 0, last: flags & 64 != 0 },
             style: (!style.is_empty()).then(|| Arc::from(style)),
             columns,
             filter: None,
@@ -385,7 +397,7 @@ mod tests {
             totals: true,
             columns: vec!["Region".into(), "Qty".into(), "Price".into(), "Total".into()],
             style: Some("TableStyleMedium2".into()),
-            stripes: true, filter: None,
+            stripes: true, bands: Default::default(), filter: None,
         })
         .unwrap();
         wb

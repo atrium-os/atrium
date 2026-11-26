@@ -19,6 +19,7 @@ pub mod ppt;
 pub mod docx;
 pub mod html_clipboard;
 pub mod launch;
+mod lookxml;
 pub mod odt;
 pub mod pictures;
 pub mod odfcrypt;

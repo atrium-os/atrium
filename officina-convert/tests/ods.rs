@@ -251,7 +251,7 @@ fn ods_tables_keep_live_references_and_standard_range_fallbacks() {
     for r in 1..5u32 {
         wb.set_value(CellAddr::new(0, r, 6), Value::Num(r as f64));
     }
-    wb.add_table(Table { name: "Orders".into(), rect: Rect { sheet: 0, r0: 0, c0: 5, r1: 4, c1: 6 }, header: true, totals: false, columns: vec!["Item".into(), "Qty".into()], style: None, stripes: false, filter: None }).unwrap();
+    wb.add_table(Table { name: "Orders".into(), rect: Rect { sheet: 0, r0: 0, c0: 5, r1: 4, c1: 6 }, header: true, totals: false, columns: vec!["Item".into(), "Qty".into()], style: None, stripes: false, bands: Default::default(), filter: None }).unwrap();
     wb.fill_formula(0, 7, 1, 4, "=Orders[@Qty]*2").unwrap();
     wb.set_formula(CellAddr::new(1, 20, 0), "=SUM(Orders[Qty])").unwrap();
     wb.recalc();

@@ -62,7 +62,7 @@ fn fixture() -> Workbook {
         totals: false,
         columns: vec!["Product".into(), "Units".into()],
         style: Some("TableStyleMedium2".into()),
-        stripes: true, filter: None,
+        stripes: true, bands: Default::default(), filter: None,
     })
     .unwrap();
     book.set_input(at(1, 3), "=SUM(Orders[Units])").unwrap();

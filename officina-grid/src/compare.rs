@@ -1140,7 +1140,7 @@ mod tests {
         let mut theirs = book(&[&["Region", "Amount"], &["East", "3"]]);
         let table = |name: &str| Table {
             name: name.into(), rect: Rect { sheet: 0, r0: 0, r1: 1, c0: 1, c1: 1 },
-            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes: false, filter: None,
+            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes: false, bands: Default::default(), filter: None,
         };
         ours.add_table(table("KeepTable")).unwrap();
         theirs.add_table(table("NewTable")).unwrap();

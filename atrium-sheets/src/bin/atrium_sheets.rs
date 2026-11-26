@@ -1328,7 +1328,7 @@ mod document_tests {
         doc.wb.set_input(CellAddr::new(0, 0, 0), "Units").unwrap();
         doc.wb.add_table(Table {
             name: "Sales".into(), rect, header: true, totals: true,
-            columns: vec!["Units".into()], style: Some("TableStyleMedium2".into()), stripes: true, filter: None,
+            columns: vec!["Units".into()], style: Some("TableStyleMedium2".into()), stripes: true, bands: Default::default(), filter: None,
         }).unwrap();
         doc.wb.define_name("Rate", None, "=3").unwrap();
         doc.wb.set_input(CellAddr::new(0, 0, 1), "=Rate").unwrap();

@@ -230,6 +230,7 @@ dependencies = [
  "officina-draw",
  "officina-grid",
  "officina-pdf",
+ "officina-shapes",
  "officina-spell",
  "pergola",
  "portcullis-ipc",
@@ -1340,6 +1341,7 @@ dependencies = [
  "officina-core",
  "officina-grid",
  "officina-pict",
+ "officina-shapes",
  "officina-slides",
  "officina-text",
  "pbkdf2",
@@ -1365,6 +1367,7 @@ name = "officina-grid"
 version = "0.1.0"
 dependencies = [
  "officina-core",
+ "officina-shapes",
  "regex",
 ]
 

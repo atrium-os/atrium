@@ -37,7 +37,7 @@ pub struct SheetSource {
 
 type ViewKey = (u16, u64, usize, usize, usize, usize, usize, usize, usize, u64);
 type ColViewKey = (u16, u64, usize, usize, usize, u64);
-type ChartKey = (u16, u32, u32, u64, bool);
+type ChartKey = (u16, u32, u32, u64, bool, u64);
 
 impl SheetSource {
     /// The sheet on screen's zoom (1: 100 %): rows, columns and cell text
@@ -439,6 +439,10 @@ pub fn total_cell(wb: &officina_grid::Workbook, a: CellAddr) -> bool {
 /// (32-39) and the button (the low bits; `SLICER_CLEAR` its clear button,
 /// `SLICER_FRAME` the frame).
 pub const KEY_SLICER: u64 = 1 << 55;
+/// A shape or text box's float: its index in the workbook's shapes.
+pub const KEY_SHAPE: u64 = 1 << 54;
+/// A Camera picture's float: its index in the workbook's cameras.
+pub const KEY_CAMERA: u64 = 1 << 53;
 pub const SLICER_CLEAR: u32 = u32::MAX - 1;
 const SLICER_FRAME: u32 = u32::MAX;
 
@@ -471,6 +475,48 @@ impl SheetSource {
     /// Slicers and timelines on this sheet: a frame with the field's name, a
     /// clear button while it filters, and a button for each item (a column
     /// down) or period (a row across, the latest that fit).
+    /// Where an anchor sits on the grid, px: x, y, w, h.
+    fn anchor_px(&self, a: &officina_grid::charts::Anchor) -> [f64; 4] {
+        let z = self.zoom_factor();
+        let x0 = self.col_left(a.from.1) + a.from.2 as f64 * 96.0 / 72.0 * z;
+        let y0 = self.row_top(a.from.0) + a.from.3 as f64 * 96.0 / 72.0 * z;
+        let x1 = self.col_left(a.to.1) + a.to.2 as f64 * 96.0 / 72.0 * z;
+        let y1 = self.row_top(a.to.0) + a.to.3 as f64 * 96.0 / 72.0 * z;
+        [x0, y0, (x1 - x0).clamp(0.0, 8000.0), (y1 - y0).clamp(0.0, 8000.0)]
+    }
+
+    /// Shapes and text boxes, and Camera pictures, on the sheet in `view`.
+    fn object_floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
+        let d = self.doc.borrow();
+        let look = d.wb.workbook_look();
+        let mut out = Vec::new();
+        let seen = |at: [f64; 4]| at[2] >= 4.0 && at[3] >= 4.0 && at[0] <= view[0] + view[2] && at[1] <= view[1] + view[3] && at[0] + at[2] >= view[0] && at[1] + at[3] >= view[1];
+        let z = self.zoom_factor() as f32;
+        for (i, c) in look.cameras.iter().enumerate() {
+            if c.anchor.sheet != d.sheet {
+                continue;
+            }
+            let at = self.anchor_px(&c.anchor);
+            if !seen(at) {
+                continue;
+            }
+            let nodes = camera_nodes(&d.wb, c, at[2] as f32, at[3] as f32, z, theme);
+            out.push(pergola::widgets::GridFloat { key: KEY_CAMERA | i as u64, at, nodes: Rc::new(nodes), movable: true, pressable: false });
+        }
+        for (i, s) in look.shapes.iter().enumerate() {
+            if s.anchor.sheet != d.sheet {
+                continue;
+            }
+            let at = self.anchor_px(&s.anchor);
+            if !seen(at) {
+                continue;
+            }
+            let nodes = shape_nodes(s, at[2] as f32, at[3] as f32, z);
+            out.push(pergola::widgets::GridFloat { key: KEY_SHAPE | i as u64, at, nodes: Rc::new(nodes), movable: true, pressable: false });
+        }
+        out
+    }
+
     fn slicer_floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
         use pergola::theme::{font, type_size, Weight};
         let d = self.doc.borrow();
@@ -596,6 +642,10 @@ impl SheetSource {
             let mut nodes = Vec::new();
             let accent = theme.accent_fill();
             let first_data = r.r0 + t.header as u32;
+            // A known style draws in the cells themselves.
+            if t.style.as_deref().is_some_and(|n| d.wb.table_style_parts(n).is_some()) {
+                continue;
+            }
             if t.stripes {
                 let a = self.row_at(fy0).max(first_data);
                 let b = self.row_at(fy1).min(r.r1);
@@ -1116,6 +1166,11 @@ impl SheetSource {
                 }
             }
         }
+        if let Some(t) = d.wb.table_at(d.sheet, r, c) {
+            if let Some(p) = d.wb.table_cell_look(t, r, c) {
+                cv = table_view(cv, &p, t, r, c);
+            }
+        }
         let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v, d.wb.date_system()) };
         // A link reads as one: blue, unless the cell has a colour of its own.
         if let Some(v) = cv.as_mut().filter(|v| v.color.is_none() && !v.text.is_empty()) {
@@ -1136,6 +1191,142 @@ impl SheetSource {
         }
         cv
     }
+}
+
+/// A table cell as its style shows it: the part's fill, text colour and
+/// bold where the cell has none of its own, and the part's borders where the
+/// cell has none (round the table, under its header, over its totals row).
+fn table_view(cv: Option<CellView>, p: &officina_grid::look::TablePart, t: &officina_grid::tables::Table, r: u32, c: u32) -> Option<CellView> {
+    if p.fill.is_none() && p.text.is_none() && !p.bold && p.border.is_none() {
+        return cv;
+    }
+    let mut v = cv.unwrap_or_else(|| CellView::text(""));
+    if v.fill.is_none() && v.pattern.is_none() && v.gradient.is_none() {
+        v.fill = p.fill.map(rgb);
+    }
+    if v.color.is_none() {
+        v.color = p.text.map(rgb);
+    }
+    v.bold |= p.bold;
+    if let Some(b) = p.border {
+        let rect = t.rect;
+        let header_edge = t.header && r == rect.r0;
+        let totals_edge = t.totals && r == rect.r1;
+        // Left, right, top, bottom.
+        let edges = [c == rect.c0, c == rect.c1, r == rect.r0 || totals_edge, r == rect.r1 || header_edge];
+        for (k, on) in edges.into_iter().enumerate() {
+            if on && v.borders[k].is_none() {
+                v.borders[k] = Some((1.0, rgb(b)));
+            }
+        }
+    }
+    Some(v)
+}
+
+/// A Camera picture: its source's cells as they show (fills, text, light
+/// gridlines), stretched to a `w` × `h` px box and framed.
+fn camera_nodes(wb: &officina_grid::Workbook, cam: &officina_grid::look::Camera, w: f32, h: f32, _zoom: f32, theme: &pergola::theme::Semantic) -> Vec<pergola::Node> {
+    let src = cam.source;
+    let mut out = vec![
+        pergola::Node::Rect { rect: pergola::Rect::new(-1.0, -1.0, w + 2.0, h + 2.0), fill: theme.border_default(), radius: 0.0 },
+        pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, w, h), fill: rgb(0xFFFFFF), radius: 0.0 },
+    ];
+    if src.sheet as usize >= wb.sheet_count() {
+        return out;
+    }
+    let sh = wb.sheet(src.sheet);
+    let widths: Vec<f32> = (src.c0..=src.c1).map(|c| sh.col_sizes.size(c) as f32).collect();
+    let heights: Vec<f32> = (src.r0..=src.r1).map(|r| sh.row_sizes.size(r) as f32).collect();
+    let (tw, th) = (widths.iter().sum::<f32>().max(1.0), heights.iter().sum::<f32>().max(1.0));
+    let (sx, sy) = (w / tw, h / th);
+    let grid = Color::from_hex("#E1E3E6");
+    let mut y = 0.0;
+    for (ri, &rh) in heights.iter().enumerate() {
+        let r = src.r0 + ri as u32;
+        let mut x = 0.0;
+        for (ci, &cw) in widths.iter().enumerate() {
+            let c = src.c0 + ci as u32;
+            let (cx, cy, cwp, chp) = (x * sx, y * sy, cw * sx, rh * sy);
+            let a = officina_grid::CellAddr::new(src.sheet, r, c);
+            let st = wb.style(a);
+            if let Some(f) = st.fill {
+                out.push(pergola::Node::Rect { rect: pergola::Rect::new(cx, cy, cwp, chp), fill: rgb(f), radius: 0.0 });
+            }
+            if sh.show_grid {
+                out.push(pergola::Node::Rect { rect: pergola::Rect::new(cx + cwp - 1.0, cy, 1.0, chp), fill: grid, radius: 0.0 });
+                out.push(pergola::Node::Rect { rect: pergola::Rect::new(cx, cy + chp - 1.0, cwp, 1.0), fill: grid, radius: 0.0 });
+            }
+            let v = wb.get(a);
+            if !v.is_empty() && cwp >= 4.0 && chp >= 4.0 {
+                let text = wb.formatted(a).text;
+                let size = (font_px(&st.font).unwrap_or(pergola::theme::type_size::SM) * sy.min(sx).min(4.0)).clamp(4.0, 96.0);
+                let style = pergola::TextStyle {
+                    family: pergola::theme::font::SANS.into(),
+                    size,
+                    weight: if st.font.bold { pergola::theme::Weight::Bold } else { pergola::theme::Weight::Regular },
+                    color: rgb(st.font.color.unwrap_or(0x202124)),
+                };
+                let tw = pergola::text::measure(&text, &style).w.min(cwp - 4.0);
+                let right = matches!(v, officina_grid::Value::Num(_)) && !matches!(st.h_align, HAlign::Left | HAlign::Center);
+                let tx = if right { cx + cwp - 2.0 - tw } else if st.h_align == HAlign::Center { cx + (cwp - tw) / 2.0 } else { cx + 2.0 };
+                out.push(pergola::Node::Text { rect: pergola::Rect::new(tx, cy + (chp - size * 1.3).max(0.0) / 2.0, tw.max(0.0), size * 1.3), content: text, style });
+            }
+            x += cw;
+        }
+        y += rh;
+    }
+    out
+}
+
+/// A shape's outline as pergola nodes in a `w` × `h` px box: filled, stroked
+/// and its text centred in the preset's text box.
+fn shape_nodes(s: &officina_grid::look::Shape, w: f32, h: f32, zoom: f32) -> Vec<pergola::Node> {
+    use pergola::shape::{Paint, PathData, Shape as Sh, Stroke};
+    const K: f32 = 100.0;
+    let g = officina_shapes::Geom::preset(&s.geom);
+    let (wi, hi) = ((w * K).round() as i64, (h * K).round() as i64);
+    let (paths, _) = officina_shapes::geom::paths(&g, wi.max(1), hi.max(1));
+    let mut out = Vec::new();
+    for p in paths {
+        let (sx, sy) = (w / (p.w.max(1) as f32), h / (p.h.max(1) as f32));
+        let mut d = PathData::new();
+        for cmd in &p.cmds {
+            d = match *cmd {
+                officina_shapes::PathCmd::Move(x, y) => d.move_to(x as f32 * sx, y as f32 * sy),
+                officina_shapes::PathCmd::Line(x, y) => d.line_to(x as f32 * sx, y as f32 * sy),
+                officina_shapes::PathCmd::Cubic(a, b, c, e, x, y) => d.cubic_to(a as f32 * sx, b as f32 * sy, c as f32 * sx, e as f32 * sy, x as f32 * sx, y as f32 * sy),
+                officina_shapes::PathCmd::Close => d.close(),
+            };
+        }
+        let mut sh = Sh::new(d);
+        if let (true, Some(f)) = (p.filled, s.fill) {
+            sh = sh.fill(Paint::Solid(rgb(f)));
+        }
+        if let (true, Some(l)) = (p.stroked, s.line) {
+            sh = sh.stroke(Stroke::new(Paint::Solid(rgb(l)), 1.5 * zoom));
+        }
+        out.extend(sh.fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
+    }
+    if !s.text.is_empty() {
+        let [l, t, r, b] = officina_shapes::geom::text_rect(&g, wi.max(1), hi.max(1));
+        let (l, t, r, b) = (l as f32 / K, t as f32 / K, r as f32 / K, b as f32 / K);
+        let size = pergola::theme::type_size::SM * f32::from(s.text_size) / 220.0 * zoom;
+        let style = pergola::TextStyle {
+            family: pergola::theme::font::SANS.into(),
+            size,
+            weight: if s.bold { pergola::theme::Weight::Bold } else { pergola::theme::Weight::Regular },
+            color: rgb(s.text_color.unwrap_or(0x202124)),
+        };
+        let lines = wrap_lines(&s.text, &style, (r - l - 8.0).max(8.0), 40);
+        let line_h = size * 1.3;
+        let top = t + ((b - t) - line_h * lines.len() as f32).max(0.0) / 2.0;
+        for (k, line) in lines.iter().enumerate() {
+            let lw = pergola::text::measure(line, &style).w;
+            let x = l + ((r - l) - lw).max(0.0) / 2.0;
+            out.push(pergola::Node::Text { rect: pergola::Rect::new(x, top + k as f32 * line_h, lw, line_h), content: line.clone(), style: style.clone() });
+        }
+    }
+    out
 }
 
 /// The local date and time now: year, month, day, hour, minute.
@@ -1194,6 +1385,7 @@ impl GridSource for SheetSource {
         out.extend(self.fill_button(theme));
         out.extend(self.invalid_rings(view));
         out.extend(self.slicer_floats(view, theme));
+        out.extend(self.object_floats(view, theme));
         let d = self.doc.borrow();
         let charts = d.wb.charts();
         if charts.is_empty() {
@@ -1217,7 +1409,7 @@ impl GridSource for SheetSource {
             if w < 4.0 || h < 4.0 || x0 > view[0] + view[2] || y0 > view[1] + view[3] || x0 + w < view[0] || y0 + h < view[1] {
                 continue;
             }
-            let key = (d.sheet, w as u32, h as u32, ch.data_version(&d.wb), dark);
+            let key = (d.sheet, w as u32, h as u32, ch.data_version(&d.wb), dark, d.wb.theme().colors[4..10].iter().fold(0u64, |a, &c| a.rotate_left(24) ^ u64::from(c)));
             let nodes = match &cache[i] {
                 Some((k, n)) if *k == key => n.clone(),
                 _ => {
@@ -1226,6 +1418,10 @@ impl GridSource for SheetSource {
                     let data = ch.data(&d.wb, 1_000_000);
                     let title = ch.title.as_ref().map(|t| officina_grid::charts::Chart::text(&d.wb, t));
                     let mut st = officina_draw::chart::Style::default();
+                    // The workbook theme's accents, then darker ones.
+                    let accents = &d.wb.theme().colors[4..10];
+                    let as_rgba = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, 1.0];
+                    st.series = accents.iter().map(|&c| as_rgba(c)).chain(accents.iter().map(|&c| as_rgba(officina_grid::look::tint(c, -0.4)))).collect();
                     if dark {
                         st.background = [0.13, 0.14, 0.15, 1.0];
                         st.text = [0.91, 0.92, 0.93, 1.0];

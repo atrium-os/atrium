@@ -23,6 +23,7 @@ atrium-open = { path = "../atrium-open" }
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
+officina-shapes = { path = "../officina-shapes" }
 # Writers, protection and the launcher: the readers run in the convert worker.
 officina-convert = { path = "../officina-convert", default-features = false }
 officina-draw = { path = "../officina-draw" }

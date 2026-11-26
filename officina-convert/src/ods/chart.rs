@@ -48,6 +48,106 @@ pub(crate) struct FrameIn {
     /// The frame's `svg:desc` (a chart's alt text), at most `MAX_ALT` bytes.
     pub desc: String,
     pub in_desc: bool,
+    /// A `draw:custom-shape`: what makes it a sheet shape.
+    pub shape: Option<ShapeOdsIn>,
+}
+
+/// A graphic style's fill, outline and text look (`None`: not set there).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GraphicStyle {
+    pub fill: Option<Option<u32>>,
+    pub line: Option<Option<u32>>,
+    pub text_color: Option<u32>,
+    pub size: Option<u16>,
+    pub bold: Option<bool>,
+}
+
+/// A `draw:custom-shape` being read: our own attributes when we wrote it,
+/// else its graphic style and outline type.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShapeOdsIn {
+    pub name: String,
+    pub ours: HashMap<String, String>,
+    pub style: GraphicStyle,
+    pub kind: Option<String>,
+    pub paras: Vec<String>,
+    pub in_p: bool,
+    text: usize,
+}
+
+impl ShapeOdsIn {
+    pub fn new(a: &HashMap<String, String>, graphic: &HashMap<String, GraphicStyle>) -> ShapeOdsIn {
+        ShapeOdsIn {
+            name: a.get("draw:name").cloned().unwrap_or_default(),
+            ours: a.iter().filter(|(k, v)| k.starts_with("officina:") && v.len() <= 64).map(|(k, v)| (k.clone(), v.clone())).collect(),
+            style: a.get("draw:style-name").and_then(|n| graphic.get(n)).cloned().unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    /// Adds text to the paragraph being read, within the shape text limit.
+    pub fn push(&mut self, t: &str) {
+        if self.text + t.len() > officina_grid::look::MAX_SHAPE_TEXT {
+            return;
+        }
+        if let Some(p) = self.paras.last_mut() {
+            self.text += t.len();
+            p.push_str(t);
+        }
+    }
+
+    #[cfg(feature = "read")]
+    fn finish(self, wb: &Workbook, mut anchor: Anchor, alt: &str, n: usize) -> Option<officina_grid::look::Shape> {
+        let color = |k: &str| -> Option<Option<u32>> {
+            match self.ours.get(k).map(String::as_str) {
+                Some("none") => Some(None),
+                Some(v) if v.len() == 6 => u32::from_str_radix(v, 16).ok().map(Some),
+                _ => None,
+            }
+        };
+        let corner = |k: &str| -> Option<(u32, u32, f32, f32)> {
+            let v: Vec<&str> = self.ours.get(k)?.split(' ').collect();
+            let [r, c, x, y] = v[..] else { return None };
+            let (x, y): (f32, f32) = (x.parse().ok()?, y.parse().ok()?);
+            (x.is_finite() && y.is_finite()).then_some((r.parse().ok()?, c.parse().ok()?, x, y))
+        };
+        // Ours, exactly where we put it.
+        if let (Some(from), Some(to)) = (corner("officina:from"), corner("officina:to")) {
+            anchor.from = from;
+            anchor.to = to;
+        }
+        let geom = match self.ours.get("officina:geom") {
+            Some(g) => g.clone(),
+            None => {
+                let ty = self.kind.as_deref().unwrap_or("rectangle");
+                match ty.strip_prefix("ooxml-") {
+                    Some(p) => p.to_string(),
+                    None => crate::odp::read::preset_of(ty)?.to_string(),
+                }
+            }
+        };
+        officina_shapes::presets::preset(&geom)?;
+        let accent = wb.theme().colors[4];
+        let mut text = self.paras.join("\n");
+        let cut = text.floor_char_boundary(text.len().min(officina_grid::look::MAX_SHAPE_TEXT));
+        text.truncate(cut);
+        let mut name: String = self.name.chars().filter(|c| !c.is_control()).take(officina_grid::look::MAX_NAME / 4).collect();
+        if name.is_empty() {
+            name = format!("Shape {}", n + 1);
+        }
+        Some(officina_grid::look::Shape {
+            name: name.into(),
+            anchor,
+            geom: geom.as_str().into(),
+            fill: color("officina:fill").or(self.style.fill).unwrap_or(Some(accent)),
+            line: color("officina:line").or(self.style.line).unwrap_or(None),
+            text: text.into(),
+            text_color: color("officina:text-color").unwrap_or(self.style.text_color),
+            text_size: self.ours.get("officina:size").and_then(|v| v.parse().ok()).or(self.style.size).unwrap_or(220).clamp(20, 8000),
+            bold: self.ours.get("officina:bold").map(|v| v == "1").or(self.style.bold).unwrap_or(false),
+            alt: officina_grid::charts::clean_alt(alt),
+        })
+    }
 }
 
 const PT_PX: f64 = 72.0 / 96.0;
@@ -103,8 +203,10 @@ fn cell_at(wb: &Workbook, sheet: u16, x: f64, y: f64) -> (u32, u32, f32, f32) {
 
 #[cfg(feature = "read")]
 /// Turns sheet frames into charts and bounded embedded pictures.
-pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, rep: &mut Report) {
-    for f in frames {
+/// Returns the sheet shapes among them, for the workbook's look.
+pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, rep: &mut Report) -> Vec<officina_grid::look::Shape> {
+    let mut shapes = Vec::new();
+    for mut f in frames {
         if (f.sheet as usize) >= wb.sheet_count() {
             continue;
         }
@@ -123,6 +225,13 @@ pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, 
             None => cell_at(wb, f.sheet, x0 + f.w, y0 + f.h),
         };
         let anchor = Anchor { sheet: f.sheet, from, to };
+        if let Some(sh) = f.shape.take() {
+            match sh.finish(wb, anchor, &f.desc, shapes.len()) {
+                Some(x) if shapes.len() < officina_grid::look::MAX_SHAPES => shapes.push(x),
+                _ => rep.note(Kind::Dropped, "drawn shapes with custom outlines"),
+            }
+            continue;
+        }
         // Chart frames can also carry a cached preview. Prefer the chart.
         let Some(href) = f.href.as_deref() else {
             let added = f.image.as_deref().is_some_and(|href| {
@@ -160,6 +269,7 @@ pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, 
             None => rep.note(Kind::Dropped, "embedded objects other than charts, and chart kinds Officina doesn't draw yet"),
         }
     }
+    shapes
 }
 
 #[cfg(feature = "read")]
@@ -653,12 +763,53 @@ pub(crate) fn picture_xml(wb: &Workbook, p: &officina_grid::charts::Picture, i: 
     ))
 }
 
-fn frame_inches(wb: &Workbook, a: Anchor) -> [String; 4] {
+fn frame_px(wb: &Workbook, a: Anchor) -> [f64; 4] {
     let sh = wb.sheet(a.sheet);
     let pos = |(r, col, dx, dy): (u32, u32, f32, f32)| (sh.col_sizes.offset(col) + dx as f64 / PT_PX, sh.row_sizes.offset(r) + dy as f64 / PT_PX);
     let (x0, y0) = pos(a.from);
     let (x1, y1) = pos(a.to);
-    [x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0)].map(|px| format!("{:.6}in", px / 96.0))
+    [x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0)]
+}
+
+fn frame_inches(wb: &Workbook, a: Anchor) -> [String; 4] {
+    frame_px(wb, a).map(|px| format!("{:.6}in", px / 96.0))
+}
+
+fn hex(c: Option<u32>) -> String {
+    c.map_or_else(|| "none".into(), |c| format!("{c:06X}"))
+}
+
+/// The graphic style of shape `i`: fill, outline and its text's look.
+pub(crate) fn shape_style_xml(s: &officina_grid::look::Shape, i: usize) -> String {
+    let fill = s.fill.map_or_else(|| r#"draw:fill="none""#.to_string(), |c| format!(r##"draw:fill="solid" draw:fill-color="#{c:06x}""##));
+    let line = s.line.map_or_else(|| r#"draw:stroke="none""#.to_string(), |c| format!(r##"draw:stroke="solid" svg:stroke-color="#{c:06x}" svg:stroke-width="0.0139in""##));
+    let color = s.text_color.map_or(String::new(), |c| format!(r##" fo:color="#{c:06x}""##));
+    format!(
+        r#"<style:style style:name="grS{i}" style:family="graphic"><style:graphic-properties {fill} {line} draw:textarea-horizontal-align="center" draw:textarea-vertical-align="middle" fo:wrap-option="wrap"/><style:paragraph-properties fo:text-align="center"/><style:text-properties{color} fo:font-size="{}pt" fo:font-weight="{}"/></style:style>"#,
+        f64::from(s.text_size) / 20.0,
+        if s.bold { "bold" } else { "normal" }
+    )
+}
+
+/// Shape `i` as a `draw:custom-shape` with its outline drawn, and our settings
+/// as `officina:` attributes so it reads back exactly.
+pub(crate) fn shape_xml(wb: &Workbook, s: &officina_grid::look::Shape, i: usize) -> String {
+    let [x, y, w, h] = frame_inches(wb, s.anchor);
+    let [_, _, pw, ph] = frame_px(wb, s.anchor);
+    let geom = crate::odp::write::geometry(&officina_shapes::Geom::preset(&s.geom), pw * 9525.0, ph * 9525.0, true);
+    let c = |p: (u32, u32, f32, f32)| format!("{} {} {} {}", p.0, p.1, p.2, p.3);
+    let desc = s.alt.as_deref().map_or(String::new(), |a| format!("<svg:desc>{}</svg:desc>", crate::xml::esc(a)));
+    let mut o = format!(
+        r#"<draw:custom-shape draw:z-index="{}" draw:name="{}" draw:style-name="grS{i}" svg:x="{x}" svg:y="{y}" svg:width="{w}" svg:height="{h}" officina:geom="{}" officina:fill="{}" officina:line="{}" officina:text-color="{}" officina:size="{}" officina:bold="{}" officina:from="{}" officina:to="{}">{desc}"#,
+        1000 + i, crate::xml::esc(&s.name), crate::xml::esc(&s.geom), hex(s.fill), hex(s.line), hex(s.text_color), s.text_size, s.bold as u8, c(s.anchor.from), c(s.anchor.to)
+    );
+    if !s.text.is_empty() {
+        for line in s.text.split('\n') {
+            let _ = write!(o, "<text:p>{}</text:p>", crate::xml::esc(line));
+        }
+    }
+    let _ = write!(o, "<draw:enhanced-geometry {geom}/></draw:custom-shape>");
+    o
 }
 
 /// The `draw:frame` for chart `i` (shown as `Object {i+1}`), anchored to its sheet.

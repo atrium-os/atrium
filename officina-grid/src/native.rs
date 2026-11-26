@@ -32,6 +32,7 @@
 //! | 36 | PROPERTIES | document properties: title, subject, author, keywords, category, comments, then the final mark when set |
 //! | 37 | GRID_COLORS | sheets' gridline colours other than automatic: count; per sheet, its index and 0xRRGGBB |
 //! | 38 | CUSTOM_VIEWS | Custom Views: count; each name, sheet, cursor, zoom, its filter state, column widths and hidden widths ([`crate::views`]) |
+//! | 39 | LOOK | theme (name, twelve colours, heading and body fonts), custom table styles, shapes and text boxes, Camera pictures ([`crate::look`]) |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -78,6 +79,7 @@ pub const IGNORED_ERRORS: u16 = 35;
 pub const PROPERTIES: u16 = 36;
 pub const GRID_COLORS: u16 = 37;
 pub const CUSTOM_VIEWS: u16 = 38;
+pub const LOOK: u16 = 39;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -235,6 +237,12 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         let mut w = Writer::new();
         crate::views::encode(&wb.views, &mut w);
         c.add(CUSTOM_VIEWS, &w.into_bytes())?;
+    }
+
+    if !wb.look.is_default() {
+        let mut w = Writer::new();
+        wb.look.encode(&mut w);
+        c.add(LOOK, &w.into_bytes())?;
     }
 
     if !wb.props.is_empty() {
@@ -1178,6 +1186,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             sh.show_headings = f & 2 == 0;
             sh.show_zeros = f & 4 == 0;
         }
+        done(&r)?;
+    }
+
+    let mut looks = of(LOOK);
+    if let Some(i) = looks.next() {
+        if looks.next().is_some() {
+            return Err(LoadError::Bad("repeated look"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let look = crate::look::Look::decode(&mut r)?;
+        look.valid(wb.sheets.len()).map_err(LoadError::Bad)?;
+        wb.look = look;
         done(&r)?;
     }
 

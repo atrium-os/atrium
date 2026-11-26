@@ -2844,6 +2844,18 @@ impl Sheets {
         // A row typed into that may need to grow (several lines).
         let mut grow = None;
         match a {
+            GridAction::PlaceFloat { key, .. } if key & (crate::source::KEY_SHAPE | crate::source::KEY_CAMERA) != 0 => {
+                let mut look = d.wb.workbook_look().clone();
+                let i = (key & 0xFFFF_FFFF) as usize;
+                let shape = key & crate::source::KEY_SHAPE != 0;
+                let slot = if shape { look.shapes.get_mut(i).map(|s| &mut s.anchor) } else { look.cameras.get_mut(i).map(|c| &mut c.anchor) };
+                if let (Some(a), Some(an)) = (slot, anchor) {
+                    let moved = a.from.0 != an.from.0 || a.from.1 != an.from.1;
+                    *a = an;
+                    let label = match (shape, moved) { (true, true) => "Move Shape", (true, false) => "Size Shape", (false, true) => "Move Picture", (false, false) => "Size Picture" };
+                    d.run(label, vec![officina_grid::ops::GridOp::Look(Box::new(look))]);
+                }
+            }
             GridAction::PlaceFloat { key, .. } => {
                 let mut all = d.wb.charts().to_vec();
                 if let (Some(c), Some(an)) = (all.get_mut(key as usize), anchor) {
@@ -2853,6 +2865,16 @@ impl Sheets {
                 }
             }
             GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Spelling | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Selected(_) | GridAction::PasteSpecial | GridAction::Zoom(_) | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::DeleteFloat(key) if key & (crate::source::KEY_SHAPE | crate::source::KEY_CAMERA) != 0 => {
+                let mut look = d.wb.workbook_look().clone();
+                let i = (key & 0xFFFF_FFFF) as usize;
+                let shape = key & crate::source::KEY_SHAPE != 0;
+                let gone = if shape { (i < look.shapes.len()).then(|| look.shapes.remove(i).name) } else { (i < look.cameras.len()).then(|| look.cameras.remove(i).name) };
+                if let Some(name) = gone {
+                    d.run(if shape { "Delete Shape" } else { "Delete Picture" }, vec![officina_grid::ops::GridOp::Look(Box::new(look))]);
+                    d.status = format!("{name} deleted.");
+                }
+            }
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -4237,7 +4259,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::DataAnalysis | crate::data::DataCmd::Solver | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText | crate::data::DataCmd::FormatChart | crate::data::DataCmd::PivotTools)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::DataAnalysis | crate::data::DataCmd::Solver | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText | crate::data::DataCmd::FormatChart | crate::data::DataCmd::PivotTools | crate::data::DataCmd::Themes | crate::data::DataCmd::TableDesign | crate::data::DataCmd::Shapes | crate::data::DataCmd::Camera | crate::data::DataCmd::QuickAnalysis)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.
@@ -5978,7 +6000,7 @@ mod tests {
         }
         let table = |name: &str, sheet, col, stripes| Table {
             name: name.into(), rect: Cells { sheet, r0: 0, r1: 2, c0: col, c1: col },
-            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes, filter: None,
+            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes, bands: Default::default(), filter: None,
         };
         let pivot = |name: &str, sales, summary, col, agg| {
             let mut p = Pivot::new(name, Cells { sheet: sales, r0: 0, r1: 2, c0: 0, c1: 1 }, CellAddr::new(summary, 0, col));

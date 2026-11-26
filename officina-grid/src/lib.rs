@@ -30,6 +30,7 @@ pub mod fast;
 pub mod filter;
 pub mod flashfill;
 pub mod links;
+pub mod look;
 pub mod validation;
 pub mod macros;
 pub mod merges;

@@ -93,6 +93,14 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
                 .charts()
                 .iter()
                 .filter(|ch| !open_to(wb, ch.anchor.sheet, "objects"))),
+        // The theme and table styles are the workbook's; shapes and cameras
+        // on a protected sheet are its objects.
+        GridOp::Look(look) => {
+            let fixed = |s: u16| !open_to(wb, s, "objects");
+            let now = wb.workbook_look();
+            look.shapes.iter().filter(|x| fixed(x.anchor.sheet)).eq(now.shapes.iter().filter(|x| fixed(x.anchor.sheet)))
+                && look.cameras.iter().filter(|x| fixed(x.anchor.sheet)).eq(now.cameras.iter().filter(|x| fixed(x.anchor.sheet)))
+        }
         GridOp::Pictures(pictures) => pictures
             .iter()
             .filter(|p| !open_to(wb, p.anchor.sheet, "objects"))

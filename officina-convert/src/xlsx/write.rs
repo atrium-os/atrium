@@ -37,6 +37,14 @@ const FUTURE: &[&str] = &[
 const FUTURE_WS: &[&str] = &["FILTER", "SORT"];
 
 /// The cell-metadata part dynamic array formulas point at (`cm="1"`).
+/// Whether sheet `s` has a drawing: charts, pictures or shapes.
+fn has_drawing(wb: &Workbook, s: u16) -> bool {
+    wb.charts().iter().any(|c| c.anchor.sheet == s) || wb.pictures().iter().any(|p| p.anchor.sheet == s) || wb.workbook_look().shapes.iter().any(|x| x.anchor.sheet == s)
+}
+
+/// The workbook extension holding Officina's look (see `crate::lookxml`).
+pub(super) const LOOK_EXT: &str = "6F1C0B6E-6A2B-4F3E-9C61-0FF1C1A100C1";
+
 const METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#;
 
 fn filter_values(out: &mut Vec<u8>, values: &[String], calendar: Option<&officina_grid::filter::CalendarSelection>) {
@@ -680,7 +688,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         o.extend_from_slice(b"</ignoredErrors>");
     }
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
-    if wb.charts().iter().any(|c| c.anchor.sheet == s) || wb.pictures().iter().any(|p| p.anchor.sheet == s) {
+    if has_drawing(wb, s) {
         let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
     }
     if !wb.comments(s).is_empty() {
@@ -822,7 +830,7 @@ fn table_xml(t: &officina_grid::tables::Table, id: usize, system: officina_grid:
     if let Some(st) = &t.style {
         o.extend_from_slice(b"<tableStyleInfo name=\"");
         esc(&mut o, st);
-        let _ = write!(o, r#"" showFirstColumn="0" showLastColumn="0" showRowStripes="{}" showColumnStripes="0"/>"#, t.stripes as u8);
+        let _ = write!(o, r#"" showFirstColumn="{}" showLastColumn="{}" showRowStripes="{}" showColumnStripes="{}"/>"#, t.bands.first as u8, t.bands.last as u8, t.stripes as u8, t.bands.cols as u8);
     }
     o.extend_from_slice(b"</table>");
     o
@@ -900,7 +908,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         ct.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#, s + 1));
     }
     for s in 0..n {
-        if wb.charts().iter().any(|c| c.anchor.sheet as usize == s) || wb.pictures().iter().any(|p| p.anchor.sheet as usize == s) {
+        if has_drawing(wb, s as u16) {
             ct.push_str(&format!(r#"<Override PartName="/xl/drawings/drawing{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#, s + 1));
         }
     }
@@ -943,6 +951,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     }
     if props.marked_final {
         ct.push_str(r#"<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/>"#);
+    }
+    let themed = *wb.theme() != officina_grid::look::Theme::default();
+    if themed {
+        ct.push_str(&format!(r#"<Override PartName="/xl/theme/theme1.xml" ContentType="{}"/>"#, super::theme::TYPE));
     }
     ct.push_str("</Types>");
     z.add("[Content_Types].xml", ct.as_bytes())?;
@@ -1061,6 +1073,11 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         w.extend_from_slice(b"</pivotCaches>");
     }
+    // What Excel has no place for (custom table styles, Camera pictures), for us.
+    let ours = crate::lookxml::write(wb, crate::lookxml::Parts { theme: false, shapes: false });
+    if !ours.is_empty() {
+        let _ = write!(w, r#"<extLst><ext uri="{{{LOOK_EXT}}}">{ours}</ext></extLst>"#);
+    }
     w.extend_from_slice(b"</workbook>");
     z.add("xl/workbook.xml", &w)?;
     let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
@@ -1083,6 +1100,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     if threads.has_people() {
         r.push_str(&format!(r#"<Relationship Id="rIdPeople" Type="{}" Target="persons/person.xml"/>"#, super::threaded::PERSON_REL));
         z.add("xl/persons/person.xml", threads.persons_xml().as_bytes())?;
+    }
+    if themed {
+        r.push_str(&format!(r#"<Relationship Id="rIdTheme" Type="{}" Target="theme/theme1.xml"/>"#, super::theme::REL));
+        z.add("xl/theme/theme1.xml", super::theme::write(wb.theme()).as_bytes())?;
     }
     r.push_str("</Relationships>");
     z.add("xl/_rels/workbook.xml.rels", r.as_bytes())?;
@@ -1108,17 +1129,18 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         let pictures: Vec<usize> = wb.pictures().iter().enumerate()
             .filter(|(_, p)| p.anchor.sheet as usize == s).map(|(i, _)| i).collect();
         let pivots_here: Vec<_> = pivots.iter().filter(|(_, p)| p.dest.sheet as usize == s).map(|&(i, _)| i).collect();
+        let shapes: Vec<usize> = wb.workbook_look().shapes.iter().enumerate().filter(|(_, x)| x.anchor.sheet as usize == s).map(|(i, _)| i).collect();
         let noted = !wb.comments(s as u16).is_empty();
         let external: Vec<&str> = wb.links(s as u16).values().filter(|l| l.is_external()).map(|l| &*l.target).collect();
-        if !mine.is_empty() || !charts.is_empty() || !pictures.is_empty() || !pivots_here.is_empty() || noted || !external.is_empty() {
+        if !mine.is_empty() || !charts.is_empty() || !pictures.is_empty() || !shapes.is_empty() || !pivots_here.is_empty() || noted || !external.is_empty() {
             let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
             for (j, i) in mine.iter().enumerate() {
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
             }
-            if !charts.is_empty() || !pictures.is_empty() {
-                // One drawing per sheet with charts, numbered by its sheet.
+            if !charts.is_empty() || !pictures.is_empty() || !shapes.is_empty() {
+                // One drawing per sheet with charts, pictures or shapes, numbered by its sheet.
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{}.xml"/>"#, mine.len() + 1, s + 1));
-                z.add(&format!("xl/drawings/drawing{}.xml", s + 1), super::chart::drawing_xml(wb, &charts, &pictures).as_bytes())?;
+                z.add(&format!("xl/drawings/drawing{}.xml", s + 1), super::chart::drawing_xml(wb, &charts, &pictures, &shapes).as_bytes())?;
                 let mut dr = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
                 for (j, i) in charts.iter().enumerate() {
                     if super::chart::is_ex(&wb.charts()[i - 1]) {

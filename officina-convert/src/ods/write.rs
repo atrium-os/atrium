@@ -1178,6 +1178,9 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             shapes.push_str(&xml);
         }
     }
+    for (i, x) in wb.workbook_look().shapes.iter().enumerate().filter(|(_, x)| x.anchor.sheet == s) {
+        shapes.push_str(&super::chart::shape_xml(wb, x, i));
+    }
     if !shapes.is_empty() {
         let _ = write!(out, "<table:shapes>{shapes}</table:shapes>");
     }
@@ -1492,6 +1495,11 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
         out.push_str(r#"" table:target-range-address=""#);
         esc(&mut out, &addr);
         let _ = write!(out, r#"" table:contains-header="{}""#, t.header);
+        if let Some(st) = &t.style {
+            out.push_str(r#" officina:table-style=""#);
+            esc(&mut out, st);
+            let _ = write!(out, r#"" officina:bands="{} {} {} {}""#, t.stripes as u8, t.bands.cols as u8, t.bands.first as u8, t.bands.last as u8);
+        }
         if let Some(filter) = t.filter.as_ref().filter(|f| f.conds.iter().all(|(_, cond)| supports_filter(cond))) {
             let _ = write!(out, r#" table:display-filter-buttons="{}">"#, t.header);
             filter_conditions(&mut out, &filter.conds, 0, whole_cell);
@@ -1609,6 +1617,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     auto.push_str(&cells);
+    for (i, x) in wb.workbook_look().shapes.iter().enumerate() {
+        auto.push_str(&super::chart::shape_style_xml(x, i));
+    }
     auto.push_str(r#"<style:style style:name="Tsuper" style:family="text"><style:text-properties style:text-position="super 58%"/></style:style>"#);
     auto.push_str(r#"<style:style style:name="Tsub" style:family="text"><style:text-properties style:text-position="sub 58%"/></style:style>"#);
     let comment_styles: BTreeSet<u8> = (0..wb.sheet_count() as u16)
@@ -1682,6 +1693,8 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     content.push_str(&names_xml(wb, None));
     content.push_str(&filters_xml(wb, whole_cell));
     content.push_str(&super::pivot::tables_xml(wb));
+    // The theme, custom table styles and Camera pictures, which ODF has no place for.
+    content.push_str(&crate::lookxml::write(wb, crate::lookxml::Parts { theme: true, shapes: false }));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/>{cf}</office:styles></office:document-styles>"#, cf = super::condfmt::styles_xml(&super::condfmt::dxfs(wb)));
     let macros = super::macros::writable(wb);

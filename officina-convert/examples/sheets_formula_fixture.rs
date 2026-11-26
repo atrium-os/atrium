@@ -64,7 +64,7 @@ fn workbook() -> Workbook {
         totals: false,
         columns: vec!["Units".into()],
         style: None,
-        stripes: false,
+        stripes: false, bands: Default::default(),
         filter: None,
     })
     .unwrap();

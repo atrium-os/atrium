@@ -457,6 +457,29 @@ pub(crate) fn shift_with_ids(
         ops.push(GridOp::Pictures(pictures));
     }
 
+    // Shapes and Camera pictures: where they sit, and what a camera shows.
+    let mut look = wb.workbook_look().clone();
+    for shape in look.shapes.iter_mut().filter(|x| x.anchor.sheet == sheet) {
+        shape.anchor.from = pin(shape.anchor.from);
+        shape.anchor.to = pin(shape.anchor.to);
+    }
+    look.cameras.retain_mut(|camera| {
+        if camera.anchor.sheet == sheet {
+            camera.anchor.from = pin(camera.anchor.from);
+            camera.anchor.to = pin(camera.anchor.to);
+        }
+        if on(&camera.source) {
+            match s.map_rect(camera.source) {
+                Some(r) => camera.source = r,
+                None => return false,
+            }
+        }
+        true
+    });
+    if look != *wb.workbook_look() {
+        ops.push(GridOp::Look(Box::new(look)));
+    }
+
     // Pivot tables: their sources and outputs.
     let pivots = wb.pivot_state();
     let moved: Vec<_> = pivots.iter().filter_map(|(p, area)| {
@@ -742,7 +765,7 @@ mod tests {
         wb.add_table(Table {
             name: "Orders".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 1 },
             header: true, totals: false, columns: vec!["Item".into(), "Status".into()],
-            style: None, stripes: false,
+            style: None, stripes: false, bands: Default::default(),
             filter: Some(TableFilter { conds: vec![(1, Cond::Values(vec!["Open".into()]))], hidden: vec![(2, 3)] }),
         }).unwrap();
         let before = wb.tables().to_vec();
@@ -763,7 +786,7 @@ mod tests {
     #[test]
     fn columns_and_the_sheets_parts_move() {
         let mut wb = book(&[&["Name", "Qty", "Price"], &["pens", "3", "2"], &["ink", "4", "5"], &["", "=SUM(B2:B3)", "=B4*C3"]]);
-        let t = crate::tables::Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 2 }, header: true, totals: false, columns: vec!["Name".into(), "Qty".into(), "Price".into()], style: None, stripes: true, filter: None };
+        let t = crate::tables::Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 2 }, header: true, totals: false, columns: vec!["Name".into(), "Qty".into(), "Price".into()], style: None, stripes: true, bands: Default::default(), filter: None };
         GridOp::Tables(vec![t]).apply(&mut wb);
         let before = grid(&wb, 0);
         // A column before Qty.

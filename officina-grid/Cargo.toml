@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 officina-core = { path = "../officina-core" }
+officina-shapes = { path = "../officina-shapes" }
 
 regex = "1.12"
 

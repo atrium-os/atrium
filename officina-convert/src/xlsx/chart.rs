@@ -45,7 +45,7 @@ fn range(wb: &Workbook, f: &str) -> Option<Rect> {
 
 #[cfg(feature = "read")]
 /// Reads the charts of sheet `sheet` (its part is `part`).
-pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str, rep: &mut Report) -> Result<(), XlsxError> {
+pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str, theme: &[u32], shapes: &mut Vec<officina_grid::look::Shape>, rep: &mut Report) -> Result<(), XlsxError> {
     let mut drawings: Vec<String> = internal_rels(z, part)?.into_values().filter(|(t, _)| t.ends_with("/drawing")).map(|(_, p)| p).collect();
     drawings.sort();
     for d in drawings {
@@ -70,14 +70,22 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
         let mut other = false;
         // Inside `mc:Fallback`: the stand-in for a reader without the `mc:Choice`.
         let mut fallback = 0u32;
+        // The shape being read, and how deep in a group (shapes in groups are dropped).
+        let mut sp: Option<ShapeIn> = None;
+        let mut group = 0u32;
         loop {
             match r.read_event_into(&mut buf)? {
                 Event::Start(e) if fallback > 0 => fallback += u32::from(e.local_name().as_ref() == b"Fallback"),
                 Event::Empty(_) if fallback > 0 => {}
                 Event::End(e) if fallback > 0 => fallback -= u32::from(e.local_name().as_ref() == b"Fallback"),
                 Event::Start(e) if e.local_name().as_ref() == b"Fallback" => fallback = 1,
-                Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
+                ev @ (Event::Start(_) | Event::Empty(_)) => {
+                    let ev_kind = if matches!(ev, Event::Start(_)) { EvKind::Start } else { EvKind::Empty };
+                    let (Event::Start(e) | Event::Empty(e)) = ev else { unreachable!() };
+                    match e.local_name().as_ref() {
                     b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor" => {
+                        sp = None;
+                        group = 0;
                         anchor_kind = match e.local_name().as_ref() {
                             b"twoCellAnchor" => b"twoCellAnchor",
                             b"oneCellAnchor" => b"oneCellAnchor",
@@ -99,7 +107,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         pos[0][1] = attr(&e, b"x")?.and_then(|s| s.parse().ok()).unwrap_or(0);
                         pos[0][3] = attr(&e, b"y")?.and_then(|s| s.parse().ok()).unwrap_or(0);
                     }
-                    b"ext" if !in_picture && matches!(anchor_kind, b"oneCellAnchor" | b"absoluteAnchor") => {
+                    b"ext" if !in_picture && sp.is_none() && matches!(anchor_kind, b"oneCellAnchor" | b"absoluteAnchor") => {
                         pos[1][1] = attr(&e, b"cx")?.and_then(|s| s.parse().ok()).unwrap_or(0);
                         pos[1][3] = attr(&e, b"cy")?.and_then(|s| s.parse().ok()).unwrap_or(0);
                     }
@@ -115,7 +123,12 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         }
                     }
                     b"pic" if !anchor_kind.is_empty() => in_picture = true,
-                    b"cNvPr" if !anchor_kind.is_empty() => descr = attr(&e, b"descr")?,
+                    b"cNvPr" if !anchor_kind.is_empty() => {
+                        descr = attr(&e, b"descr")?;
+                        if let Some(x) = sp.as_mut() {
+                            x.name = attr(&e, b"name")?.unwrap_or_default();
+                        }
+                    }
                     b"srcRect" if in_picture => {
                         for (inset, side) in crop.iter_mut().zip([b"l", b"t", b"r", b"b"]) {
                             if let Some(value) = attr(&e, side)? {
@@ -145,10 +158,33 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                             }
                         }
                     }
-                    b"sp" | b"cxnSp" | b"grpSp" if !anchor_kind.is_empty() => other = true,
+                    b"grpSp" if !anchor_kind.is_empty() => {
+                        other = true;
+                        group += u32::from(matches!(ev_kind, EvKind::Start));
+                    }
+                    b"cxnSp" if !anchor_kind.is_empty() => other = true,
+                    b"sp" if !anchor_kind.is_empty() => {
+                        if group > 0 || sp.is_some() {
+                            other = true;
+                        } else {
+                            sp = Some(ShapeIn::default());
+                        }
+                    }
+                    n if sp.is_some() => {
+                        let a = super::styles::attrs(&e);
+                        if let Some(x) = sp.as_mut() {
+                            x.start(n, &a, matches!(ev_kind, EvKind::Start), theme);
+                        }
+                    }
                     _ => {}
-                },
+                }
+                }
                 Event::Text(t) => {
+                    if let Some(x) = sp.as_mut().filter(|x| x.in_t) {
+                        if let Ok(v) = t.unescape() {
+                            x.push(&v);
+                        }
+                    }
                     if let Some(f) = field.take() {
                         let v: i64 = t.unescape().ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
                         let i = match f {
@@ -162,6 +198,12 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                 }
                 Event::End(e) => match e.local_name().as_ref() {
                     b"col" | b"colOff" | b"row" | b"rowOff" => field = None,
+                    b"grpSp" => group = group.saturating_sub(1),
+                    n if sp.is_some() && n != b"twoCellAnchor" && n != b"oneCellAnchor" && n != b"absoluteAnchor" => {
+                        if let Some(x) = sp.as_mut() {
+                            x.end(n);
+                        }
+                    }
                     b"pic" => {
                         in_picture = false;
                         if picture.is_none() && link.is_none() {
@@ -177,12 +219,18 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         }
                         anchor_kind = b"";
                         if other {
-                            rep.note(Kind::Dropped, "drawing shapes");
+                            rep.note(Kind::Dropped, "grouped shapes and connectors");
                         }
                         let cl = |v: i64, max: u32| v.clamp(0, max as i64 - 1) as u32;
                         let off = |v: i64| (v as f64 / EMU_PT).clamp(0.0, 1e6) as f32;
                         let corner = |p: [i64; 4]| (cl(p[2], officina_grid::addr::MAX_ROWS), cl(p[0], officina_grid::addr::MAX_COLS), off(p[1]), off(p[3]));
                         let anchor = Anchor { sheet, from: corner(pos[0]), to: corner(pos[1]) };
+                        if let Some(x) = sp.take().filter(|_| !other) {
+                            match x.finish(anchor, descr.clone(), shapes.len()) {
+                                Some(shape) if shapes.len() < officina_grid::look::MAX_SHAPES => shapes.push(shape),
+                                _ => rep.note(Kind::Dropped, "shapes with custom geometry or beyond the limit"),
+                            }
+                        }
                         if !other && (picture.is_some() || link.is_some()) {
                             let bytes = match picture.take().and_then(|p| z.find(&p)) {
                                 Some(entry) if usize::try_from(entry.size).ok().is_some_and(|size| wb.can_add_picture(size)) => Some(z.read(entry)?),
@@ -220,6 +268,175 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "read")]
+enum EvKind {
+    Start,
+    Empty,
+}
+
+#[cfg(feature = "read")]
+/// A drawing shape (`xdr:sp`) being read. Explicit settings in `spPr` and the
+/// first run win; the shape's `xdr:style` references fill in the rest.
+#[derive(Default)]
+struct ShapeIn {
+    name: String,
+    text_box: bool,
+    geom: Option<String>,
+    custom: bool,
+    fill: Option<Option<u32>>,
+    line: Option<Option<u32>>,
+    text_color: Option<u32>,
+    size: Option<u16>,
+    bold: Option<bool>,
+    style: [Option<u32>; 3],
+    paras: Vec<String>,
+    in_sppr: bool,
+    in_ln: bool,
+    in_rpr: bool,
+    in_t: bool,
+    in_ref: Option<usize>,
+    runs: u32,
+    text: usize,
+}
+
+#[cfg(feature = "read")]
+impl ShapeIn {
+    fn color(n: &[u8], a: &std::collections::HashMap<Vec<u8>, String>, theme: &[u32]) -> Option<u32> {
+        let v = a.get(b"val".as_slice())?;
+        match n {
+            b"srgbClr" => u32::from_str_radix(v, 16).ok().filter(|c| *c <= 0xFF_FFFF),
+            b"schemeClr" => {
+                let i = match v.as_str() {
+                    "lt1" | "bg1" => 0,
+                    "dk1" | "tx1" => 1,
+                    "lt2" | "bg2" => 2,
+                    "dk2" | "tx2" => 3,
+                    "accent1" => 4,
+                    "accent2" => 5,
+                    "accent3" => 6,
+                    "accent4" => 7,
+                    "accent5" => 8,
+                    "accent6" => 9,
+                    "hlink" => 10,
+                    "folHlink" => 11,
+                    _ => return None,
+                };
+                theme.get(i).copied()
+            }
+            _ => None,
+        }
+    }
+
+    fn start(&mut self, n: &[u8], a: &std::collections::HashMap<Vec<u8>, String>, open: bool, theme: &[u32]) {
+        match n {
+            b"cNvPr" => self.name = a.get(b"name".as_slice()).cloned().unwrap_or_default(),
+            b"cNvSpPr" => self.text_box = a.get(b"txBox".as_slice()).is_some_and(|v| v == "1" || v == "true"),
+            b"spPr" => self.in_sppr = open,
+            b"ln" if self.in_sppr => self.in_ln = open,
+            b"prstGeom" => self.geom = a.get(b"prst".as_slice()).cloned(),
+            b"custGeom" => self.custom = true,
+            b"noFill" if self.in_ln => {
+                self.line.get_or_insert(None);
+            }
+            b"noFill" if self.in_sppr => {
+                self.fill.get_or_insert(None);
+            }
+            b"srgbClr" | b"schemeClr" => {
+                let Some(c) = Self::color(n, a, theme) else { return };
+                if self.in_rpr {
+                    self.text_color.get_or_insert(c);
+                } else if self.in_ln {
+                    self.line.get_or_insert(Some(c));
+                } else if self.in_sppr {
+                    self.fill.get_or_insert(Some(c));
+                } else if let Some(i) = self.in_ref {
+                    self.style[i].get_or_insert(c);
+                }
+            }
+            b"fillRef" | b"lnRef" | b"fontRef" if open => {
+                self.in_ref = Some(match n {
+                    b"fillRef" => 0,
+                    b"lnRef" => 1,
+                    _ => 2,
+                });
+            }
+            b"p" => {
+                if self.paras.len() < 4096 {
+                    self.paras.push(String::new());
+                }
+            }
+            b"rPr" | b"endParaRPr" => {
+                if n == b"rPr" {
+                    self.runs += 1;
+                }
+                if self.runs <= 1 {
+                    if let Some(sz) = a.get(b"sz".as_slice()).and_then(|v| v.parse::<u32>().ok()) {
+                        self.size.get_or_insert((sz / 5).clamp(20, 8000) as u16);
+                    }
+                    if let Some(b) = a.get(b"b".as_slice()) {
+                        self.bold.get_or_insert(b == "1" || b == "true");
+                    }
+                    self.in_rpr = open;
+                }
+            }
+            b"t" => self.in_t = open,
+            _ => {}
+        }
+    }
+
+    /// Adds run text to the paragraph being read, within the shape text limit.
+    fn push(&mut self, t: &str) {
+        if self.text + t.len() > officina_grid::look::MAX_SHAPE_TEXT {
+            return;
+        }
+        if let Some(p) = self.paras.last_mut() {
+            self.text += t.len();
+            p.push_str(t);
+        }
+    }
+
+    fn end(&mut self, n: &[u8]) {
+        match n {
+            b"spPr" => self.in_sppr = false,
+            b"ln" => self.in_ln = false,
+            b"rPr" | b"endParaRPr" => self.in_rpr = false,
+            b"fillRef" | b"lnRef" | b"fontRef" => self.in_ref = None,
+            b"t" => self.in_t = false,
+            _ => {}
+        }
+    }
+
+    fn finish(self, anchor: Anchor, descr: Option<String>, n: usize) -> Option<officina_grid::look::Shape> {
+        let geom = self.geom.unwrap_or_else(|| "rect".into());
+        if self.custom || officina_shapes::presets::preset(&geom).is_none() {
+            return None;
+        }
+        let plain = self.text_box;
+        let mut text = self.paras.join("\n");
+        let mut cut = text.len().min(officina_grid::look::MAX_SHAPE_TEXT);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        let mut name: String = self.name.chars().filter(|c| !c.is_control()).take(officina_grid::look::MAX_NAME / 4).collect();
+        if name.is_empty() {
+            name = format!("Shape {}", n + 1);
+        }
+        Some(officina_grid::look::Shape {
+            name: name.into(),
+            anchor,
+            geom: geom.into(),
+            fill: self.fill.unwrap_or(if plain { None } else { self.style[0] }),
+            line: self.line.unwrap_or(if plain { None } else { self.style[1] }),
+            text: text.into(),
+            text_color: self.text_color.or(if plain { None } else { self.style[2] }),
+            text_size: self.size.unwrap_or(220),
+            bold: self.bold.unwrap_or(false),
+            alt: descr.and_then(|d| officina_grid::charts::clean_alt(&d)),
+        })
+    }
 }
 
 #[cfg(feature = "read")]
@@ -1104,9 +1321,30 @@ fn chartex_xml(wb: &Workbook, c: &Chart) -> String {
     o
 }
 
+/// One shape (`xdr:sp`) of a drawing: preset geometry, fill, outline and text.
+fn shape_xml(o: &mut String, s: &officina_grid::look::Shape, id: usize) {
+    let solid = |c: u32| format!(r#"<a:solidFill><a:srgbClr val="{c:06X}"/></a:solidFill>"#);
+    let descr = s.alt.as_deref().map_or(String::new(), |a| format!(r#" descr="{}""#, esc(a).replace('\n', "&#10;")));
+    let tx = if s.is_text_box() { r#" txBox="1""# } else { "" };
+    let fill = s.fill.map_or_else(|| "<a:noFill/>".to_string(), solid);
+    let line = s.line.map_or_else(|| "<a:ln><a:noFill/></a:ln>".to_string(), |c| format!(r#"<a:ln w="12700">{}</a:ln>"#, solid(c)));
+    let _ = write!(o, r#"<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="{id}" name="{}"{descr}/><xdr:cNvSpPr{tx}/></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="{}"><a:avLst/></a:prstGeom>{fill}{line}</xdr:spPr><xdr:txBody><a:bodyPr wrap="square" rtlCol="0" anchor="ctr"/><a:lstStyle/>"#,
+        esc(&s.name), esc(&s.geom));
+    let rpr = format!(r#"lang="en-US" sz="{}" b="{}""#, u32::from(s.text_size) * 5, s.bold as u8);
+    let color = s.text_color.map_or(String::new(), solid);
+    for line in s.text.split('\n') {
+        if line.is_empty() {
+            let _ = write!(o, r#"<a:p><a:pPr algn="ctr"/><a:endParaRPr {rpr}/></a:p>"#);
+        } else {
+            let _ = write!(o, r#"<a:p><a:pPr algn="ctr"/><a:r><a:rPr {rpr}>{color}</a:rPr><a:t>{}</a:t></a:r></a:p>"#, esc(line));
+        }
+    }
+    o.push_str("</xdr:txBody></xdr:sp><xdr:clientData/></xdr:twoCellAnchor>");
+}
+
 /// `xl/drawings/drawingN.xml` for the charts `ids` (their numbers in the package,
 /// from 1) of one sheet; the drawing's relationship `rId{j+1}` is chart `j`.
-pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> String {
+pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize], shapes: &[usize]) -> String {
     let mut o = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#);
     let anchor = |o: &mut String, a: Anchor| {
         let emu = |pt: f32| (f64::from(pt) * EMU_PT).round() as i64;
@@ -1152,6 +1390,11 @@ pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> S
         let id = ids.len() + j + 2;
         let descr = picture.alt.as_deref().map_or(String::new(), |a| format!(r#" descr="{}""#, esc(a).replace('\n', "&#10;")));
         let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"{descr}/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"{embed}{link}/><a:srcRect l="{l}" t="{t}" r="{r}" b="{b}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm rot="{rotation}"/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
+    }
+    for (j, &i) in shapes.iter().enumerate() {
+        let s = &wb.workbook_look().shapes[i];
+        anchor(&mut o, s.anchor);
+        shape_xml(&mut o, s, ids.len() + pictures.len() + j + 2);
     }
     o.push_str("</xdr:wsDr>");
     o

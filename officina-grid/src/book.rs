@@ -259,6 +259,8 @@ pub struct Workbook {
     pub(crate) props: crate::docprops::DocProps,
     /// Custom Views ([`crate::views`]).
     pub(crate) views: Vec<crate::views::CustomView>,
+    /// Theme, custom table styles, shapes and cameras ([`crate::look`]).
+    pub(crate) look: crate::look::Look,
     pub(crate) sheets: Vec<Sheet>,
     pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
@@ -324,6 +326,7 @@ impl Workbook {
             unlocked_ranges: Vec::new(),
             props: Default::default(),
             views: Vec::new(),
+            look: Default::default(),
             sheets: Vec::new(),
             tracked_cells: None,
             strings: StringPool::new(),
@@ -1251,6 +1254,13 @@ impl Workbook {
         self.replace_charts(cs);
         for picture in &mut self.pictures {
             picture.anchor.sheet = m(picture.anchor.sheet);
+        }
+        for shape in &mut self.look.shapes {
+            shape.anchor.sheet = m(shape.anchor.sheet);
+        }
+        for camera in &mut self.look.cameras {
+            camera.anchor.sheet = m(camera.anchor.sheet);
+            camera.source = rect(camera.source);
         }
         let ps: Vec<_> = self.pivot_state().into_iter().map(|(mut pv, area)| {
             pv.source = rect(pv.source);
