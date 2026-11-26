@@ -438,8 +438,10 @@ impl Sprites {
         self.warming
     }
 
-    /// Tiles a drawing for hidden content, in place of [`PREWARM`].
-    #[cfg(test)]
+    /// Tiles a drawing for hidden content, in place of [`PREWARM`]. For
+    /// tests (frescod's own included), so not behind `cfg(test)`, which does
+    /// not reach across crates.
+    #[doc(hidden)]
     pub fn set_prewarm(&mut self, tiles: u32) {
         self.prewarm = tiles;
     }

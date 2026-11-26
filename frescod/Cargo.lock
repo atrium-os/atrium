@@ -957,6 +957,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fresco-render-core"
+version = "0.1.0"
+dependencies = [
+ "fresco-compute",
+ "fresco-protocol",
+ "fresco-scene-server",
+ "fresco-vulkan",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "fresco-scene-server"
 version = "0.1.0"
 dependencies = [
@@ -1029,6 +1041,7 @@ dependencies = [
  "fresco-aqueduct-bridge",
  "fresco-compute",
  "fresco-protocol",
+ "fresco-render-core",
  "fresco-scene-server",
  "fresco-split",
  "fresco-text",

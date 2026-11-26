@@ -857,7 +857,7 @@ fn empty(c: Option<[f32; 4]>) -> bool {
 /// With `promote`, animated groups become [`Sprite`]s; `false` if that
 /// was asked and the window is not in a shape that allows it (`w` is then
 /// to be built again without).
-pub(crate) fn grouped_frame(
+pub fn grouped_frame(
     state: &fresco_scene_server::command::envelope_frontend::WindowSceneState,
     w: &mut WindowFrame,
     promote: Option<&std::collections::HashSet<u32>>,

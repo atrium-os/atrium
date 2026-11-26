@@ -95,9 +95,8 @@ mod caps;
 #[path = "../lock.rs"]
 #[allow(dead_code)]
 mod lock;
-#[path = "../pack.rs"]
-#[allow(dead_code)]
-mod pack;
+#[allow(unused_imports)]
+use fresco_render_core::pack;
 #[path = "../chrome.rs"]
 #[allow(dead_code)]
 mod chrome;

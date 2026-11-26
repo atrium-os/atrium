@@ -79,6 +79,8 @@ aqueduct-gpu-host   = { path = "../aqueduct-gpu-host" }
 fresco-aqueduct-bridge = { path = "../fresco-aqueduct-bridge" }
 fresco-text         = { path = "../fresco-text" }
 fresco-split        = { path = "../fresco-split" }
+# A window scene packed for the kernels, and sprites: shared with Fenestra.
+fresco-render-core  = { path = "../fresco-render-core" }
 # The app GPU channel (F6 G2): checks and builds app GPU work.
 atrium-gpu-app      = { path = "../atrium-gpu-app", features = ["device"] }
 # Split mode asks portcullisd (ExecInstance) to start each renderer; the

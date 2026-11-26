@@ -1,0 +1,15 @@
+[package]
+name = "fresco-render-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The portable half of a Fresco window renderer: a window's scene packed for the compute kernels, and sprite drawing. Used by frescod's renderer jail and by Fenestra's viewers (docs/spec/fenestra.md §14.1)."
+
+[dependencies]
+fresco-scene-server = { path = "../fresco-scene-server" }
+fresco-vulkan       = { path = "../fresco-vulkan" }
+fresco-compute      = { path = "../fresco-compute" }
+fresco-protocol     = { path = "../fresco-protocol" }
+serde               = "1"
+log                 = "0.4"

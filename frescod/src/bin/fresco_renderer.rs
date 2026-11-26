@@ -50,10 +50,8 @@ use fresco_split::{slot, Input, Msg, Role, MAX_WINDOWS, MAX_WINDOW_DIM};
 mod chrome;
 #[path = "../laminar.rs"]
 mod laminar;
-#[path = "../pack.rs"]
-mod pack;
-#[path = "../sprites.rs"]
-mod sprites;
+use fresco_render_core::pack;
+use fresco_render_core::sprites;
 #[path = "../redraw.rs"]
 mod redraw;
 #[path = "../credential.rs"]
