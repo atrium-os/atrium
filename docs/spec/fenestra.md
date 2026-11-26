@@ -1,6 +1,6 @@
 # Fenestra: a remote compositor that receives the scene, not the pixels
 
-Status: **proposed 2026-11-26, nothing built.** Shankar asked for "a remote compositor, which
+Status: **accepted 2026-11-26** (Shankar: "agreed" to all §17 decisions as recommended, plus decision 16), nothing built. Shankar asked for "a remote compositor, which
 can display the same scenegraph coming through the network", with research into what goes
 wrong with RDP, VNC and the rest, and whether we can get low latency and high quality remote
 viewing. Decisions are in §17. Reviewed adversarially by the review thread on 2026-11-26; its
