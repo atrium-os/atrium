@@ -71,6 +71,7 @@ const OP_RESET: u16 = 0x0C03;
 const OP_READ_LOCAL_VERSION: u16 = 0x1001;
 const OP_READ_LOCAL_COMMANDS: u16 = 0x1002;
 const OP_READ_LOCAL_FEATURES: u16 = 0x1003;
+const OP_READ_LOCAL_EXTENDED_FEATURES: u16 = 0x1004;
 const OP_READ_BUFFER_SIZE: u16 = 0x1005;
 const OP_LE_READ_BUFFER_SIZE: u16 = 0x2002;
 const OP_LE_READ_FEATURES: u16 = 0x2003;
@@ -159,6 +160,28 @@ pub fn controller(h: &mut impl Hci, u: &UsbInfo) -> String {
         }
     }
     if !le_only {
+        // Page 2 bit 8: Secure Connections (Controller Support), which BR/EDR
+        // Secure Connections pairing needs (§7); without it Classic keys are
+        // P-192 and the no-downgrade rule refuses them.
+        for page in [1u8, 2] {
+            match ask(h, OP_READ_LOCAL_EXTENDED_FEATURES, &[page]) {
+                // page, max page, features[8]
+                Ok(r) if r.len() >= 10 => {
+                    let f = u64::from_le_bytes([r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]]);
+                    let _ = write!(o, "  hci: lmp features page {} of {} 0x{f:016x}", r[0], r[1]);
+                    if page == 2 {
+                        let _ = write!(o, " (br/edr secure connections {})", if f & (1 << 8) != 0 { "yes" } else { "no" });
+                    }
+                    o.push('\n');
+                }
+                Ok(r) => {
+                    let _ = writeln!(o, "  hci: lmp features page {page}: short reply {}", hex(&r));
+                }
+                Err(e) => {
+                    let _ = writeln!(o, "  hci: lmp features page {page} failed: {e}");
+                }
+            }
+        }
         match ask(h, OP_READ_BUFFER_SIZE, &[]) {
             // acl len u16, sco len u8, acl count u16, sco count u16
             Ok(r) if r.len() >= 7 => {
