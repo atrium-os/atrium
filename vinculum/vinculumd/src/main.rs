@@ -107,6 +107,12 @@ impl Link {
 fn accept_transport(path: &str, uids: &[u32]) -> std::io::Result<UnixStream> {
     let _ = std::fs::remove_file(path);
     let l = std::os::unix::net::UnixListener::bind(path)?;
+    // The driver runs as its own uid in the socket directory's group
+    // (vinculum-service.sh makes it _vinculum:_vinculum-hci 0750), and
+    // connect(2) needs write on the socket: group rw, nothing for others.
+    // The peer-uid check below still decides who is taken.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     eprintln!("vinculumd: waiting for a controller on {path}");
     loop {
         let (s, _) = l.accept()?;

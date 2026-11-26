@@ -321,6 +321,9 @@ fn main() {
     let mut out = Vec::new();
     let mut reset_since: Option<std::time::Instant> = None;
     let mut last_connect: Option<std::time::Instant> = None;
+    // The last connect failure logged, so a refusal that is not "host not
+    // up yet" (EACCES on the socket, say) is said once, not hidden.
+    let mut last_connect_err: Option<std::io::ErrorKind> = None;
     loop {
         if relay.resetting && reset_since.is_some_and(|t| t.elapsed().as_millis() as u64 >= RESET_WAIT_MS) {
             eprintln!("vinculum-hci: controller did not complete the reset; taking the next host anyway");
@@ -335,7 +338,17 @@ fn main() {
         if let (HostSide::Connect(path), None, false) = (&side, host.as_ref(), relay.resetting) {
             if last_connect.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
                 last_connect = Some(std::time::Instant::now());
-                if let Ok(s) = UnixStream::connect(path) {
+                let c = UnixStream::connect(path);
+                if let Err(e) = &c {
+                    let quiet = matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
+                    if !quiet && last_connect_err != Some(e.kind()) {
+                        eprintln!("vinculum-hci: connect to the host at {path}: {e}; retrying");
+                    }
+                    last_connect_err = Some(e.kind());
+                } else {
+                    last_connect_err = None;
+                }
+                if let Ok(s) = c {
                     if peer_allowed(&s, &host_uids) {
                         eprintln!("vinculum-hci: connected to the host");
                         relay.host_reset();
