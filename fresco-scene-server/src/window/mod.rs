@@ -1833,6 +1833,12 @@ impl Compositor {
     }
 
     pub fn raise(&mut self, id: WindowId) -> Option<FocusChange> {
+        self.raise_by(id, fresco_protocol::focus_cause::UNKNOWN)
+    }
+
+    /// [`Self::raise`], saying what moved the focus
+    /// (`fresco_protocol::focus_cause`).
+    pub fn raise_by(&mut self, id: WindowId, cause: u8) -> Option<FocusChange> {
         if !self.z_order.iter().any(|&w| w == id) {
             return None;
         }
@@ -1850,11 +1856,11 @@ impl Compositor {
         } else {
             if let Some(p) = prev {
                 self.emit(DisplayEvent::WindowFocusChanged {
-                    window_id: p as u32, gained: false, cause: fresco_protocol::focus_cause::UNKNOWN,
+                    window_id: p as u32, gained: false, cause,
                 });
             }
             self.emit(DisplayEvent::WindowFocusChanged {
-                window_id: id as u32, gained: true, cause: fresco_protocol::focus_cause::UNKNOWN,
+                window_id: id as u32, gained: true, cause,
             });
             Some(FocusChange { prev, new: id })
         }
@@ -1871,25 +1877,33 @@ impl Compositor {
     }
 
     /// Per-app remote sessions: the person moved to window `id` on the
-    /// viewer. It is raised and takes the keys. False when it may not.
-    pub fn remote_focus(&mut self, id: WindowId) -> bool {
+    /// viewer. It is raised and takes the keys (cause `REMOTE`). False when
+    /// it may not, which includes while a window of a trusted sheet uid
+    /// (`guarded`: Sigillum, Arca's prompts) is on screen: a viewer never
+    /// covers one or takes the local person's keys from it.
+    pub fn remote_focus(&mut self, id: WindowId, guarded: &[u32]) -> bool {
         if !self.remote_target(id) {
             return false;
         }
-        self.raise(id);
+        let trusted_up = self.z_order.iter().any(|w| self.windows.get(w).is_some_and(|w| !w.hidden && w.owner_uid != 0 && guarded.contains(&w.owner_uid)));
+        if trusted_up {
+            return false;
+        }
+        self.raise_by(id, fresco_protocol::focus_cause::REMOTE);
         true
     }
 
     /// Per-app remote sessions: the person resized window `id` on the
     /// viewer to `w` x `h` device pixels (§6.4). Never below the window's
-    /// minimum size at its scale. False when it may not.
-    pub fn remote_resize(&mut self, id: WindowId, w: u32, h: u32) -> bool {
+    /// minimum size at its scale, never past `max` (the screen). False
+    /// when it may not.
+    pub fn remote_resize(&mut self, id: WindowId, w: u32, h: u32, max: (u32, u32)) -> bool {
         if !self.remote_target(id) {
             return false;
         }
         let Some(win) = self.windows.get(&id) else { return false };
         let min = |pt: u32| fresco_protocol::pt_to_device(pt as f32, win.scale_milli);
-        let (w, h) = (w.max(min(win.min_size.0)).max(1), h.max(min(win.min_size.1)).max(1));
+        let (w, h) = (w.max(min(win.min_size.0)).min(max.0).max(1), h.max(min(win.min_size.1)).min(max.1).max(1));
         self.resize_window(id, w, h);
         true
     }
@@ -2489,17 +2503,26 @@ mod notification_tests {
         let a = c.create(1, (300, 200));
         let b = c.create(2, (300, 200));
         assert_ne!(c.focus, Some(a));
-        assert!(c.remote_focus(a));
+        assert!(c.remote_focus(a, &[]));
         assert_eq!((c.focus, c.z_order.last()), (Some(a), Some(&a)), "focused and raised");
-        assert!(c.remote_resize(b, 640, 480));
+        let screen = (1280, 720);
+        assert!(c.remote_resize(b, 640, 480, screen));
         assert_eq!(c.windows[&b].size, (640.0, 480.0));
+        assert!(c.remote_resize(b, 8192, 8192, screen));
+        assert_eq!(c.windows[&b].size, (1280.0, 720.0), "never past the screen");
         c.windows.get_mut(&b).unwrap().min_size = (400, 300);
-        assert!(c.remote_resize(b, 100, 100));
+        assert!(c.remote_resize(b, 100, 100, screen));
         assert_eq!(c.windows[&b].size, (400.0, 300.0), "not below its minimum");
-        assert!(!c.remote_focus(77) && !c.remote_resize(77, 100, 100), "no such window");
+        assert!(!c.remote_focus(77, &[]) && !c.remote_resize(77, 100, 100, screen), "no such window");
+        // A trusted sheet's window on screen: no remote focus over it.
+        let t = c.create(3, (200, 100));
+        c.windows.get_mut(&t).unwrap().owner_uid = 65020;
+        assert!(!c.remote_focus(b, &[65020]));
+        assert_eq!(c.z_order.last(), Some(&t), "it stays on top");
+        assert!(c.remote_focus(b, &[]));
         c.windows.get_mut(&a).unwrap().owner_uid = 1001;
         c.set_lock(Some(vec![65001]));
-        assert!(!c.remote_focus(a) && !c.remote_resize(a, 100, 100), "behind the lock");
+        assert!(!c.remote_focus(a, &[]) && !c.remote_resize(a, 100, 100, screen), "behind the lock");
     }
 
     #[test]

@@ -354,6 +354,7 @@ impl Broker {
     /// Tell renderers the sizes the WM gave their windows since the last
     /// frame. Called once per frame, before the windows are snapshot.
     pub fn sync(&self) {
+        self.apply_remote_resizes();
         let sizes: HashMap<u16, (u32, u32)> = {
             let c = self.comp.lock().unwrap();
             let screen = self.screen();

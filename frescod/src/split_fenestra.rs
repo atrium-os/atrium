@@ -49,6 +49,10 @@ pub(super) struct Link {
     /// loop has yet to act on a change of it.
     output: Option<(u32, u32, u32)>,
     output_moved: bool,
+    /// Per-app resizes from the viewer since the last frame, latest a
+    /// window; only placed windows get here, so it is bounded by the
+    /// layout.
+    resizes: HashMap<u32, (u32, u32)>,
 }
 
 /// A renderer's side of the remote session.
@@ -114,6 +118,7 @@ impl Broker {
             f.tx = Some(tx);
             f.sock = Some(s);
             f.layout = None;
+            f.resizes.clear();
         }
         let _ = std::thread::Builder::new().name("frescod-fenestra-out".into()).spawn(move || {
             for rec in rx.iter() {
@@ -159,18 +164,17 @@ impl Broker {
                         Input::MotionIn { window, .. } | Input::Focus { window } | Input::Resize { window, .. } if !self.placed_in_apps(window) => continue,
                         Input::Focus { window } => {
                             if let Ok(id) = u16::try_from(window) {
-                                if self.comp.lock().unwrap().remote_focus(id) {
+                                if self.comp.lock().unwrap().remote_focus(id, crate::activation::sheet_uids()) {
                                     self.redraw.wake();
                                 }
                             }
                             continue;
                         }
                         Input::Resize { window, width, height } => {
-                            if let Ok(id) = u16::try_from(window) {
-                                if self.comp.lock().unwrap().remote_resize(id, width, height) {
-                                    self.redraw.wake();
-                                }
-                            }
+                            // Latest wins; the frame applies at most one
+                            // a window (`apply_remote_resizes`).
+                            self.fen.lock().unwrap().resizes.insert(window, (width, height));
+                            self.redraw.wake();
                             continue;
                         }
                         i => i,
@@ -179,6 +183,22 @@ impl Broker {
                     remote_input(&self.comp, sink, i, &mut pointer, &placed);
                 }
                 _ => unreachable!("from_broker() covers the rest"),
+            }
+        }
+    }
+
+    /// Once a frame: the viewer's latest size for each window it resized,
+    /// each side at most the screen's, for a window still placed.
+    pub(super) fn apply_remote_resizes(&self) {
+        let r = std::mem::take(&mut self.fen.lock().unwrap().resizes);
+        if r.is_empty() {
+            return;
+        }
+        let screen = self.screen();
+        for (window, (w, h)) in r {
+            let Ok(id) = u16::try_from(window) else { continue };
+            if self.placed_in_apps(window) {
+                self.comp.lock().unwrap().remote_resize(id, w, h, (screen.0.max(1), screen.1.max(1)));
             }
         }
     }
@@ -228,6 +248,7 @@ impl Broker {
             }
             f.on = on;
             f.layout = None;
+            f.resizes.clear();
             f.chrome = None;
             if !on && f.output.take().is_some() {
                 f.output_moved = true;

@@ -24,6 +24,8 @@ fn samples() -> Vec<Msg> {
         Msg::FrameDone { window: 1, slot: 0 },
         Msg::Geometry { window: 2, width: 1920, height: 1080 },
         Msg::Focus { window: 2, gained: true, cause: 2 },
+        // A remote viewer moved the focus (fresco_protocol::focus_cause::REMOTE).
+        Msg::Focus { window: 2, gained: true, cause: 4 },
         Msg::CloseRequested { window: 2 },
         Msg::RasterRefused { window: 2, cost_mops: 975_000, limit_mops: 2147 },
         Msg::Scale { window: 2, scale_milli: 1500, width: 1920, height: 57 },

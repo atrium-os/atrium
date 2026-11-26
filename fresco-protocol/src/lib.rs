@@ -487,6 +487,8 @@ pub mod focus_cause {
     pub const KEYBOARD: u8 = 2;
     /// The system or an app (a window opened, one closed).
     pub const PROGRAM: u8 = 3;
+    /// A remote viewer's person (fenestra.md §3.4).
+    pub const REMOTE: u8 = 4;
 }
 
 /// One mode the monitor offers, as `OP_WM_DISPLAY_MODES` lists it.

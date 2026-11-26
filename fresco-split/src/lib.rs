@@ -84,6 +84,9 @@ pub enum Input {
     Magnify { x: f32, y: f32, scale: f32, phase: u8 },
 }
 
+/// The last `fresco_protocol::focus_cause` a `Focus` may carry (`REMOTE`).
+const FOCUS_CAUSE_MAX: u32 = 4;
+
 /// One record.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
@@ -160,7 +163,7 @@ pub enum Msg {
     /// The WM gave `window` this size (the surface the next frame fills).
     Geometry { window: u32, width: u32, height: u32 },
     /// Focus gained or lost.
-    /// `cause`: what moved it (`fresco_protocol::focus_cause`, 0..=3).
+    /// `cause`: what moved it (`fresco_protocol::focus_cause`, 0..=4).
     Focus { window: u32, gained: bool, cause: u8 },
     /// The user asked to close the window.
     CloseRequested { window: u32 },
@@ -991,7 +994,7 @@ impl Msg {
             FOCUS => Msg::Focus {
                 window,
                 gained: flag(r.get(2))?,
-                cause: if r.get(3) <= 3 { r.get(3) as u8 } else { return Err(Refused("focus cause")) },
+                cause: if r.get(3) <= FOCUS_CAUSE_MAX { r.get(3) as u8 } else { return Err(Refused("focus cause")) },
             },
             CLOSE => Msg::CloseRequested { window },
             RASTER_REFUSED => Msg::RasterRefused { window, cost_mops: r.get(2), limit_mops: r.get(3) },
