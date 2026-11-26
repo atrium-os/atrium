@@ -684,6 +684,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Clients (frescod) reach us through the socket directory's group, and
+    // connect(2) needs write on the socket: group rw, nothing for others.
+    // The peer-uid check still decides who is served.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660)) {
+            eprintln!("tactusd: chmod {sock}: {e}");
+            std::process::exit(1);
+        }
+    }
     let hub = Arc::new(Hub {
         state: Mutex::new(State { last_key: None, clients: Vec::new(), devices: HashMap::new(), repeat: Repeat::new(Settings::from_env()) }),
         wake: Condvar::new(),

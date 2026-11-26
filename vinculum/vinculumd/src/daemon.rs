@@ -73,6 +73,8 @@ struct Daemon {
     /// The controller is scanning (for a user's scan, or in the
     /// background for bonded LE devices that want to reconnect).
     scanning: bool,
+    /// The running LE scan was started (or restarted) for a user's scan.
+    scan_for_user: bool,
     /// A control client asked for a scan.
     user_scan: bool,
     /// A Classic inquiry is running (alongside a user's scan only).
@@ -398,11 +400,19 @@ impl Daemon {
 
     fn update_scan(&mut self) {
         let want = self.host.is_ready() && !self.off && self.le_connecting.is_none() && (self.user_scan || self.background_scan_wanted());
+        let now = self.now();
         if want != self.scanning {
-            let now = self.now();
             self.host.le_scan(want, now);
             self.scanning = want;
+        } else if want && self.user_scan && !self.scan_for_user {
+            // A background scan (bonded devices away) is already running
+            // with the controller's duplicate filter on, so a device it saw
+            // would never be reported to this user's scan: restart it,
+            // which clears the filter.
+            self.host.le_scan(false, now);
+            self.host.le_scan(true, now);
         }
+        self.scan_for_user = self.scanning && self.user_scan;
         self.update_inquiry();
     }
 
@@ -837,6 +847,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         pairable: Pairable::default(),
         clients: Vec::new(),
         scanning: false,
+        scan_for_user: false,
         user_scan: false,
         inquiring: false,
         off,
