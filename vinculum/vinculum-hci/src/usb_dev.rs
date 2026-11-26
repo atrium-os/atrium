@@ -125,7 +125,8 @@ extern "C" {
     fn libusb_get_bus_number(dev: *mut Device) -> u8;
     fn libusb_get_device_address(dev: *mut Device) -> u8;
     fn libusb_open(dev: *mut Device, handle: *mut *mut Handle) -> c_int;
-    fn libusb_set_auto_detach_kernel_driver(handle: *mut Handle, enable: c_int) -> c_int;
+    fn libusb_kernel_driver_active(handle: *mut Handle, iface: c_int) -> c_int;
+    fn libusb_detach_kernel_driver(handle: *mut Handle, iface: c_int) -> c_int;
     fn libusb_claim_interface(handle: *mut Handle, iface: c_int) -> c_int;
     fn libusb_control_transfer(
         handle: *mut Handle,
@@ -369,12 +370,25 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
 /// Makes the kernel let go of `usb`, configures it if it is not, and claims
 /// its HCI interface. Returns the configuration it was in when found.
 fn claim(usb: &Usb, name: &str) -> std::io::Result<u8> {
-    // The kernel's own driver (ng_ubt on stock FreeBSD) must let go; on
-    // macOS nothing holds a third-party controller, and libusb says so.
+    // The kernel's own driver (ng_ubt on stock FreeBSD) must let go. Ask
+    // first and detach only when one is attached: under dispensatord the
+    // kernel driver is already detached, and FreeBSD's detach ioctl needs
+    // PRIV_DRIVER, which the jailed driver uid lacks (libusb's auto-detach
+    // would call it unconditionally and fail the claim). macOS answers
+    // not-supported: nothing there holds a third-party controller.
     // SAFETY: the handle was just opened.
-    let r = unsafe { libusb_set_auto_detach_kernel_driver(usb.handle, 1) };
-    if r < 0 && r != LIBUSB_ERROR_NOT_SUPPORTED {
-        return Err(io_err("auto-detach", r));
+    let active = unsafe { libusb_kernel_driver_active(usb.handle, usb.iface as c_int) };
+    if active == 1 {
+        // SAFETY: the handle was just opened; no interface is claimed yet.
+        let r = unsafe { libusb_detach_kernel_driver(usb.handle, usb.iface as c_int) };
+        if r < 0 {
+            return Err(io_err(&format!("detach the kernel driver from interface {} of {name}", usb.iface), r));
+        }
+        eprintln!("vinculum-hci: {name}: detached the kernel driver from interface {}", usb.iface);
+    } else if active < 0 && active != LIBUSB_ERROR_NOT_SUPPORTED {
+        // Not an authority check: if a kernel driver does hold the
+        // interface, the claim below fails and says so.
+        eprintln!("vinculum-hci: {name}: ask for a kernel driver on interface {}: {}", usb.iface, err_name(active));
     }
     // A controller whose device descriptor says class 0xE0 (the UB500) is
     // left unconfigured by macOS, which configures only composite (class 0)
