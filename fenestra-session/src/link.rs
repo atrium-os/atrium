@@ -35,6 +35,8 @@ struct State {
     screen: Option<(u32, u32)>,
     windows: Vec<Placed>,
     layout_gen: u64,
+    chrome: Option<fenestra_link::chrome::Chrome>,
+    chrome_gen: u64,
     next_ticket: u32,
     pending: HashMap<u32, Pending>,
     ended: bool,
@@ -117,6 +119,14 @@ impl LinkSource {
                     drop(st);
                     wake.send_modify(|g| *g += 1);
                 }
+                Rec::Chrome(c) => {
+                    if st.chrome.as_ref() != Some(&c) {
+                        st.chrome = Some(c);
+                        st.chrome_gen += 1;
+                        drop(st);
+                        wake.send_modify(|g| *g += 1);
+                    }
+                }
                 Rec::Data { window, ticket, bytes } => {
                     let Some(p) = st.pending.get_mut(&ticket) else { return format!("data for ticket {ticket} not asked for") };
                     if p.window != window {
@@ -186,6 +196,11 @@ impl Source for LinkSource {
         if self.out.try_send(Rec::Input(i)).is_err() {
             log::warn!("fenestra-session: the link is full; input dropped");
         }
+    }
+
+    fn chrome(&self) -> Option<(u64, Control)> {
+        let st = self.state.lock().ok()?;
+        Some((st.chrome_gen, Control::Chrome(st.chrome.clone()?)))
     }
 
     fn layout(&self) -> Option<(u64, Control)> {

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fenestra_wire::frame::Msg;
+use fenestra_wire::scene::chrome::Chrome;
 use fenestra_wire::scene::{self, Ack, Control, WindowHeader, WINDOW_HEADER_LEN};
 use fenestra_wire::{HostConn, WireError};
 use fresco_render_core::pack::SceneState;
@@ -81,6 +82,10 @@ pub struct Views {
     /// Whole-desktop sessions: the host's screen and where its windows
     /// are, bottom to top.
     pub layout: Mutex<Option<((u32, u32), Vec<scene::Placed>)>>,
+    /// Whole-desktop sessions: the host's trusted chrome and background,
+    /// and the chrome as last drawn here.
+    pub chrome: Mutex<Option<Chrome>>,
+    chrome_drawn: Mutex<Option<(Chrome, (u32, u32), Vec<u32>)>>,
 }
 
 impl Views {
@@ -121,6 +126,9 @@ pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), W
                         }
                         Control::Layout { screen, windows } => {
                             *views.layout.lock().unwrap_or_else(|e| e.into_inner()) = Some((screen, windows));
+                        }
+                        Control::Chrome(c) => {
+                            *views.chrome.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
                         }
                         Control::Resume(_) | Control::Input(_) => return Err(WireError::Protocol("a viewer's message from the host")),
                     },
@@ -254,8 +262,47 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, px: &[u32]) -> std::io::Res
     wr.write_image_data(&rgba).map_err(std::io::Error::other)
 }
 
+/// The host's chrome drawn for a `screen`-sized desktop: its pixels from
+/// the top left, `width` x `height` (premultiplied BGRA). Drawn by the
+/// same reference rasterizer as the windows, and again only when the
+/// chrome or the screen changed.
+fn chrome_pixels(views: &Views, chrome: &Chrome, screen: (u32, u32)) -> (u32, u32, Vec<u32>) {
+    let mut drawn = views.chrome_drawn.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((c, s, px)) = drawn.as_ref() {
+        if c == chrome && *s == screen {
+            return (u32::from(c.size.0).min(s.0), u32::from(c.size.1).min(s.1), px.clone());
+        }
+    }
+    let (w, h) = (u32::from(chrome.size.0).min(screen.0), u32::from(chrome.size.1).min(screen.1));
+    let rects = chrome
+        .rects
+        .iter()
+        .map(|r| fresco_compute::Rect {
+            position: [f32::from(r.x), f32::from(r.y)],
+            size: [f32::from(r.w), f32::from(r.h)],
+            color: chrome.palette[usize::from(r.colour)],
+            radius: f32::from(r.radius_half) / 2.0,
+        })
+        .collect();
+    let px = if w == 0 || h == 0 {
+        Vec::new()
+    } else {
+        let f = fresco_compute::Frame::pack(&fresco_compute::Scene { rects, ..Default::default() }, w, h, w);
+        fresco_compute::reference::render(&f)
+    };
+    *drawn = Some((chrome.clone(), screen, px.clone()));
+    (w, h, px)
+}
+
+/// Opaque BGRA of an sRGB colour.
+fn opaque([r, g, b]: [u8; 3]) -> u32 {
+    0xff00_0000 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+}
+
 /// The whole desktop as the layout places the windows held: each window
-/// over the ones below it (premultiplied BGRA, source over), on black.
+/// over the ones below it (premultiplied BGRA, source over), on the
+/// host's background (black before the host said), with the host's
+/// chrome on top.
 pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
     // A host that sends no layout (the simulator): its windows at the
     // origin, on a screen as large as the largest.
@@ -279,7 +326,9 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
         }
     };
     let (sw, sh) = screen;
-    let mut out = vec![0xff00_0000u32; sw as usize * sh as usize];
+    let chrome = views.chrome.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let background = chrome.as_ref().map_or(0xff00_0000, |c| opaque(c.background));
+    let mut out = vec![background; sw as usize * sh as usize];
     let windows = views.windows.lock().unwrap_or_else(|e| e.into_inner());
     for (id, x, y, _, _) in placed {
         let Some(v) = windows.get(&id) else { continue };
@@ -301,6 +350,15 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
         }
     }
     drop(windows);
+    if let Some(c) = chrome {
+        let (w, h, px) = chrome_pixels(views, &c, (sw, sh));
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let d = &mut out[row * sw as usize + col];
+                *d = over(px[row * w as usize + col], *d);
+            }
+        }
+    }
     let mut bytes = Vec::with_capacity(out.len() * 4);
     for p in &out {
         bytes.extend_from_slice(&p.to_le_bytes());
@@ -326,4 +384,28 @@ fn over(s: u32, d: u32) -> u32 {
         o |= c.min(255) << sh;
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_desktop_has_the_hosts_background_and_chrome_on_top() {
+        let views = Views::default();
+        *views.layout.lock().unwrap() = Some(((8, 6), Vec::new()));
+        // Before the host says: black.
+        assert_eq!(desktop(&views).unwrap().0 .2[20], 0xff00_0000);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let c = Chrome::from_rects([10, 128, 140], (8, 3), [([0.0, 0.0, 8.0, 2.0], white, 0.0)]).unwrap();
+        *views.chrome.lock().unwrap() = Some(c);
+        let (_, _, px) = desktop(&views).unwrap().0;
+        assert_eq!(px[0], 0xffff_ffff, "the strip");
+        assert_eq!(px[8 * 2], 0xff0a_808c, "under the strip, inside the layer: the background");
+        assert_eq!(px[8 * 5 + 7], 0xff0a_808c, "the background");
+        // A chrome larger than the screen is cut to it.
+        let big = Chrome::from_rects([0, 0, 0], (100, 100), [([0.0, 0.0, 100.0, 100.0], white, 0.0)]).unwrap();
+        *views.chrome.lock().unwrap() = Some(big);
+        assert!(desktop(&views).unwrap().0 .2.iter().all(|&p| p == 0xffff_ffff));
+    }
 }

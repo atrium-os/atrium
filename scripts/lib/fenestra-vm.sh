@@ -9,6 +9,7 @@
 #                          FEN_JAIL=1: sessions in jails through jaild
 #   compare HOST.png       each placed window's interior on the viewer's
 #                          desktop ($W/view/desktop.png) against HOST.png
+#   compare_all HOST.png   every pixel of the two
 #
 # Needs the VM booted with NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300.
 
@@ -122,6 +123,24 @@ fen_fenestrad() {
 # strip): trusted chrome frescod draws over every window, not streamed yet.
 STRIP=$(sed -n 's/^pub const STRIP_PT: *[a-z0-9]* *= *\([0-9]*\).*/\1/p' "$ROOT/frescod/src/chrome.rs")
 [ -n "$STRIP" ] || gate_abort "no STRIP_PT in frescod/src/chrome.rs"
+compare_all() { python3 -I - "$1" "$W/view/desktop.png" <<'EOF'
+import sys
+from PIL import Image
+h = Image.open(sys.argv[1]).convert("RGB")
+v = Image.open(sys.argv[2]).convert("RGB")
+if h.size != v.size:
+    print(f"sizes {h.size} {v.size}"); sys.exit()
+a, b = h.tobytes(), v.tobytes()
+bad = [k // 3 for k in range(0, len(a), 3) if a[k:k+3] != b[k:k+3]]
+if not bad:
+    print("equal")
+else:
+    w = h.size[0]
+    ys = [p // w for p in bad]
+    print(f"{len(bad)} px differ, rows {min(ys)}-{max(ys)}")
+EOF
+}
+
 compare() { python3 -I - "$1" "$W/view/desktop.png" "$V" "$STRIP" <<'EOF'
 import sys
 from PIL import Image

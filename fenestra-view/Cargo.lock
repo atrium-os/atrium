@@ -736,11 +736,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fenestra-link"
+version = "0.1.0"
+
+[[package]]
 name = "fenestra-view"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "fenestra-wire",
+ "fresco-compute",
  "fresco-render-core",
  "fresco-scene-server",
  "log",
@@ -755,6 +760,7 @@ dependencies = [
 name = "fenestra-wire"
 version = "0.1.0"
 dependencies = [
+ "fenestra-link",
  "log",
  "quinn",
  "ring",

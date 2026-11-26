@@ -12,6 +12,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 ring = "0.17"
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
 log = "0.4"
+fenestra-link = { path = "../fenestra-link" }
 
 [dev-dependencies]
 bytes = "1"

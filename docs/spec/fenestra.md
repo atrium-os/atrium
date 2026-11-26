@@ -1596,8 +1596,20 @@ reading is cut off, never waited on.
 **Differences from §3.2, for now.** Every window streams while a session is on (the whole
 screen mirrored, §4.2) rather than only windows on remote outputs; remote outputs with the
 viewer's sizes and scales come with the windowed viewer. The renderer answers a want with a
-difference made on demand rather than writing a ring ahead. The gates run renderers unconfined unless `FEN_JAIL=1`. The trusted
-strip and window 0 (the WM's background) are not streamed yet.
+difference made on demand rather than writing a ring ahead. The gates run renderers unconfined unless `FEN_JAIL=1`. Window 0
+(the WM's background) has no stream until it has an owner in split mode (F4c); the viewer fills
+the background with frescod's own colour.
+
+**frescod's chrome on the viewer (§11.5).** Each frame, while a session is on, the broker sends
+its trusted chrome layer (the strip, the focus ring, slot frames, hosted-panel labels: all
+solid rects, text included as coverage runs) and the background colour as one `Chrome` record
+when it changed (`fenestra_link::chrome`: a palette of at most 64 linear colours and at most 6000
+rects of 10 bytes in whole pixels, checked in full on decode, under one 64 KiB control message).
+fenestrad keeps the last layout and chrome for a session that joins later. The viewer draws the
+background, the windows, then the chrome, with the same reference rasterizer as the windows, so
+its desktop equals frescod's screen pixel for pixel. On the viewer the chrome is host content,
+inside the remote area: it says what the host's frescod says about the host's windows and never
+takes the viewer's own trusted lane (the viewer's host strip, R4, stays outside it).
 
 **Gates.**
 
@@ -1608,12 +1620,12 @@ strip and window 0 (the WM's background) are not streamed yet.
 - `scripts/fenestra-desktop-vm.sh` (cloud VM, `NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300`):
   frescod in split mode with atrium-sheets, fenestrad and its session in the guest, the
   viewer in the container, minting over real ssh into the guest and driven only from the viewer
-(frescod has no injector). 13/13, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 16/16
+(frescod has no injector). 14/14, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 17/17
 confined as on Atrium: frescod as `_frescod`, every renderer an `org.atrium.fresco.renderer` jail
 from portcullisd as `_fresco-render`, the session in its jail (its own vnet, uid 60500, checked
 from the kernel) and gone after its grace: the
-  viewer's desktop equals frescod's own screen over every window, outside the strip and the
-  focus ring; typing before and after a reconnect reaches the host and comes back; every input
+  viewer's desktop equals frescod's own screen over every window, and the whole screen
+  pixel for pixel with the strip, focus ring and background (14/14, 17/17 confined); typing before and after a reconnect reaches the host and comes back; every input
   event passed on, none dropped; 0 scene bytes while idle; the second connection resumed
   without resending (8.8 KB for its typing).
 
@@ -1693,7 +1705,7 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** The strip and background on the viewer; fenestrad as `_fenestra` in its own jail;
+**Next in R2.** fenestrad as `_fenestra` in its own jail;
 remote outputs at the viewer's size and scale; compressing
 region updates as blobs are.
 

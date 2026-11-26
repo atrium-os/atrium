@@ -7,6 +7,7 @@
 //!   one is covered by the next;
 //! - on the control stream, `Msg::App` bodies of [`Control`].
 
+pub use fenestra_link::chrome;
 use crate::WireError;
 
 /// `magic u32 | window u32 | epoch u64` at the start of a window stream.
@@ -112,6 +113,9 @@ pub enum Control {
     Layout { screen: (u32, u32), windows: Vec<Placed> },
     /// Viewer: input, in the host screen's pixels (whole desktop, §9).
     Input(Input),
+    /// Host, whole-desktop sessions: frescod's trusted chrome and the
+    /// background (§11.5), drawn above and below the windows.
+    Chrome(fenestra_link::chrome::Chrome),
 }
 
 /// A viewer's input event (§9).
@@ -165,6 +169,10 @@ impl Control {
                     b.extend_from_slice(&dy.to_le_bytes());
                 }
             },
+            Control::Chrome(c) => {
+                b.push(8);
+                b.extend_from_slice(&c.encode());
+            }
             Control::Layout { screen, windows } => {
                 b.push(3);
                 b.extend_from_slice(&screen.0.to_le_bytes());
@@ -252,6 +260,7 @@ impl Control {
                 }
                 Ok(Control::Layout { screen, windows })
             }
+            Some(8) => fenestra_link::chrome::Chrome::decode(&b[1..]).map(Control::Chrome).map_err(|_| bad()),
             _ => Err(bad()),
         }
     }

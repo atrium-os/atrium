@@ -22,7 +22,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 16 || echo 13) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) ))
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 17 || echo 14) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -84,6 +84,7 @@ check "no stream errors" 0 "$(awk '$1 == "errors" { print $2 }' "$V")"
 check "nothing sent while idle" 0 "$(awk '$1 == "idle_bytes" { print $2 }' "$V")"
 cmp=$(compare "$W/host.png")
 check "every window equal to frescod's own screen" equal "$cmp"
+check "the whole screen equal, the strip, focus ring and background included" equal "$(compare_all "$W/host.png")"
 # The positive control: the screen before the last typing is not what the
 # viewer ended with, so the comparison sees a typed cell.
 check "the typing reached the viewer (its desktop differs from the screen before it)" yes "$(compare "$W/host-middle.png" | grep -q differ && echo yes || echo no)"

@@ -10,7 +10,7 @@
 //! it sends the layout (where the windows are) when it moved.
 //!
 //! frescod gets no network: the link is a local socket, and the network is
-//! fenestrad's session jails' (§3.2, §11.3).
+//! fenestrad's session jails' (§3.2, §11.5).
 
 use std::collections::HashMap;
 use std::io;
@@ -42,6 +42,9 @@ pub(super) struct Link {
     sock: Option<UnixStream>,
     on: bool,
     layout: Option<Rec>,
+    chrome: Option<Rec>,
+    /// The chrome could not be carried (logged once until it can again).
+    chrome_refused: bool,
 }
 
 /// A renderer's side of the remote session.
@@ -176,6 +179,7 @@ impl Broker {
             }
             f.on = on;
             f.layout = None;
+            f.chrome = None;
         }
         log::info!("frescod: remote session {}", if on { "on" } else { "off" });
         let rs: Vec<Arc<Renderer>> = self.renderers.lock().unwrap().values().cloned().collect();
@@ -265,6 +269,47 @@ impl Broker {
             _ => unreachable!("only stream records come here"),
         }
         Ok(())
+    }
+
+    /// Once a frame, while a session is on: frescod's own chrome layer
+    /// (`c`, at the screen's origin) and the background, if they changed.
+    /// A viewer draws them over and under the windows (fenestra.md §11.5).
+    pub(crate) fn send_chrome(&self, c: &crate::pack::WindowFrame) {
+        if !self.remote_on() {
+            return;
+        }
+        let made = if c.paths.is_empty() && c.batches.is_empty() && c.glyph_batches.is_empty() && c.fills.is_empty() && c.frame.is_none() && c.pixels.is_none() && c.pos == (0.0, 0.0) {
+            let lut = fresco_compute::lut();
+            let bg = fresco_compute::CLEAR_COLOR;
+            let enc = |v: f32| fresco_compute::reference::encode(&lut, v) as u8;
+            fenestra_link::chrome::Chrome::from_rects(
+                [enc(bg[0]), enc(bg[1]), enc(bg[2])],
+                c.size,
+                c.rects.iter().map(|n| ([n.position[0], n.position[1], n.size[0], n.size[1]], n.color, n.radius)),
+            )
+            .map_err(|e| e.to_string())
+        } else {
+            Err("a chrome layer with more than rects".to_string())
+        };
+        let mut f = self.fen.lock().unwrap();
+        let rec = match made {
+            Ok(ch) => {
+                f.chrome_refused = false;
+                Rec::Chrome(ch)
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut f.chrome_refused, true) {
+                    log::warn!("frescod: the chrome is not sent to viewers: {e}");
+                }
+                return;
+            }
+        };
+        if f.chrome.as_ref() == Some(&rec) {
+            return;
+        }
+        f.chrome = Some(rec.clone());
+        drop(f);
+        self.to_fenestra(rec);
     }
 
     /// Once a frame, while a session is on: where the renderers' windows

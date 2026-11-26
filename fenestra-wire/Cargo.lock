@@ -57,10 +57,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fenestra-link"
+version = "0.1.0"
+
+[[package]]
 name = "fenestra-wire"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fenestra-link",
  "log",
  "quinn",
  "ring",

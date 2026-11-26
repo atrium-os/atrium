@@ -9,9 +9,12 @@
 //! A `Want` asks the broker for one window's difference from what a viewer
 //! holds; the answer is any number of `Data` records then one `End`, all
 //! with the want's ticket. `Changed` says a window's stream moved on, and
-//! `Layout` where the windows are, bottom to top.
+//! `Layout` where the windows are, bottom to top. `Chrome` is frescod's
+//! own layer and the background ([`chrome`]), checked in full on decode.
 
 use std::io::{self, Read, Write};
+
+pub mod chrome;
 
 pub const HEADER: usize = 40;
 /// The largest `Data` payload (the broker splits larger differences).
@@ -48,6 +51,8 @@ pub enum Rec {
     /// (`None`: the window is not there).
     End { window: u32, ticket: u32, now: Option<Version> },
     Layout { screen: (u32, u32), windows: Vec<Placed> },
+    /// frescod → fenestrad: its trusted chrome and the background.
+    Chrome(chrome::Chrome),
     /// fenestrad → frescod: the viewer's input, in the host screen's
     /// pixels, routed as frescod routes its own input devices'.
     Input(Input),
@@ -79,6 +84,7 @@ mod kind {
     pub const DATA: u32 = 0x11;
     pub const END: u32 = 0x12;
     pub const LAYOUT: u32 = 0x13;
+    pub const CHROME: u32 = 0x14;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +180,10 @@ impl Rec {
                 }
                 Head { kind: LAYOUT, window: 0, ticket: 0, flag: 0, a: u64::from(screen.0), b: u64::from(screen.1), len: payload.len() as u32 }
             }
+            Rec::Chrome(c) => {
+                payload = c.encode();
+                Head { kind: CHROME, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
+            }
         };
         let mut out = h.bytes().to_vec();
         out.extend_from_slice(&payload);
@@ -188,6 +198,7 @@ impl Rec {
         let max = match h.kind {
             kind::DATA => MAX_DATA,
             kind::LAYOUT => MAX_LAYOUT * PLACED,
+            kind::CHROME => chrome::MAX_BODY,
             kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT => 0,
             _ => return Err(Refused("unknown kind")),
         };
@@ -298,13 +309,17 @@ impl Rec {
                 }
                 Rec::Layout { screen, windows }
             }
+            CHROME => {
+                unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
+                Rec::Chrome(chrome::Chrome::decode(payload).map_err(|e| Refused(e.0))?)
+            }
             _ => return Err(Refused("unknown kind")),
         })
     }
 
     /// Records the broker sends; it takes only the others.
     pub fn from_broker(&self) -> bool {
-        matches!(self, Rec::Changed { .. } | Rec::Data { .. } | Rec::End { .. } | Rec::Layout { .. })
+        matches!(self, Rec::Changed { .. } | Rec::Data { .. } | Rec::End { .. } | Rec::Layout { .. } | Rec::Chrome(_))
     }
 }
 

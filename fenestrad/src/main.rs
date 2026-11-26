@@ -108,6 +108,11 @@ struct Table {
     tickets: HashMap<u32, (u32, u32)>,
     next: u32,
     on: bool,
+    /// The layout and chrome frescod last sent while on: frescod sends
+    /// each only when it changes, so a session that joins later gets
+    /// them from here.
+    layout: Option<Rec>,
+    chrome: Option<Rec>,
 }
 
 struct Relay {
@@ -126,6 +131,8 @@ impl Relay {
         let on = t.sessions.values().any(|s| s.on);
         if on != t.on {
             t.on = on;
+            t.layout = None;
+            t.chrome = None;
             if let Err(e) = self.to_frescod(&Rec::Session { on }) {
                 die(format!("frescod: {e}"));
             }
@@ -156,7 +163,18 @@ impl Relay {
             };
             let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
             match rec {
-                Rec::Changed { .. } | Rec::Layout { .. } => {
+                Rec::Layout { .. } | Rec::Chrome(_) => {
+                    if matches!(rec, Rec::Layout { .. }) {
+                        t.layout = Some(rec.clone());
+                    } else {
+                        t.chrome = Some(rec.clone());
+                    }
+                    let ids: Vec<u32> = t.sessions.keys().copied().collect();
+                    for id in ids {
+                        Relay::to_session(&mut t, id, rec.clone());
+                    }
+                }
+                Rec::Changed { .. } => {
                     let ids: Vec<u32> = t.sessions.keys().copied().collect();
                     for id in ids {
                         Relay::to_session(&mut t, id, rec.clone());
@@ -193,11 +211,18 @@ impl Relay {
                 Err(e) => return e.to_string(),
             };
             let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            let was_on = t.on;
             let Some(s) = t.sessions.get_mut(&id) else { return "ended".into() };
             match rec {
                 Rec::Session { on } => {
+                    let joins = on && !s.on && was_on;
                     s.on = on;
                     self.sync_on(&mut t);
+                    if joins {
+                        for rec in [t.layout.clone(), t.chrome.clone()].into_iter().flatten() {
+                            Relay::to_session(&mut t, id, rec);
+                        }
+                    }
                 }
                 Rec::Want { window, ticket, base } => {
                     if s.wants >= MAX_WANTS {

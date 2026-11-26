@@ -12,6 +12,7 @@ fn samples() -> Vec<Rec> {
         Rec::End { window: 1, ticket: 9, now: None },
         Rec::Layout { screen: (1280, 720), windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1 }] },
         Rec::Layout { screen: (1, 1), windows: vec![] },
+        Rec::Chrome(fenestra_link::chrome::Chrome::from_rects([10, 128, 140], (1280, 26), [([0.0, 0.0, 1280.0, 24.0], [0.08, 0.08, 0.1, 1.0], 0.0)]).unwrap()),
         Rec::Input(Input::Key { usage: 0x04, pressed: true, modifiers: 0x02 }),
         Rec::Input(Input::Key { usage: 0xffff, pressed: false, modifiers: 0xff }),
         Rec::Input(Input::Motion { x: 640.5, y: 0.0 }),
@@ -80,6 +81,14 @@ fn hostile_records_are_refused() {
         Rec::Layout { screen: (9, 9), windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1 }] }.encode(),
         Rec::Data { window: 1, ticket: 0, bytes: vec![] }.encode(),
         Rec::Layout { screen: (0, 9), windows: vec![] }.encode(),
+        {
+            // A chrome whose rect names a colour it does not have.
+            let c = fenestra_link::chrome::Chrome::from_rects([0; 3], (9, 9), [([0.0, 0.0, 9.0, 9.0], [0.1, 0.1, 0.1, 1.0], 0.0)]).unwrap();
+            let mut b = Rec::Chrome(c).encode();
+            let n = b.len();
+            b[n - 2] = 3;
+            b
+        },
         Rec::Input(Input::Motion { x: f32::NAN, y: 0.0 }).encode(),
         Rec::Input(Input::Motion { x: -1.0, y: 0.0 }).encode(),
         Rec::Input(Input::Button { button: 6, pressed: true }).encode(),

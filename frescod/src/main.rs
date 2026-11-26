@@ -1776,6 +1776,7 @@ fn render_one_frame(
         let mut c = chrome::build_with(px, screen_w, focus, origin, note.as_deref(), &rects, &slots, &covers, &hosted, &islands, chip.as_ref().map(|(n, c)| (n.as_str(), *c)));
         chrome::sheet_frames(&mut c, px, &sheets, px.strip());
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
+        b.send_chrome(&c);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
     } else if let Some(mut c) = chrome::slot_frames(px, &slots, &island_ids.iter().filter_map(|&id| island_at(id, None)).collect::<Vec<_>>())

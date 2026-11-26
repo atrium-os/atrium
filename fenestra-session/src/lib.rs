@@ -112,6 +112,11 @@ pub trait Source: Send + Sync + 'static {
     fn layout(&self) -> Option<(u64, scene::Control)> {
         None
     }
+    /// Whole-desktop sessions: the host's trusted chrome and background,
+    /// and a number that moves when they do.
+    fn chrome(&self) -> Option<(u64, scene::Control)> {
+        None
+    }
     /// A viewer's input, already bounded and rate-limited by [`serve`].
     /// The simulator has nowhere to send it.
     fn input(&self, _i: scene::Input) {}
@@ -211,6 +216,7 @@ pub async fn serve<S: Source>(
     let mut outs: BTreeMap<u32, Out> = BTreeMap::new();
     let mut want_whole: std::collections::BTreeSet<u32> = Default::default();
     let mut layout_sent: Option<u64> = None;
+    let mut chrome_sent: Option<u64> = None;
     loop {
         // Where the windows are, before their contents (a viewer draws a
         // window it has no place for nowhere).
@@ -218,6 +224,12 @@ pub async fn serve<S: Source>(
             if layout_sent != Some(gen) {
                 control.send(&Msg::App(l.encode())).await?;
                 layout_sent = Some(gen);
+            }
+        }
+        if let Some((gen, c)) = host.chrome() {
+            if chrome_sent != Some(gen) {
+                control.send(&Msg::App(c.encode())).await?;
+                chrome_sent = Some(gen);
             }
         }
         // Push what changed to every window, one write at a time.
