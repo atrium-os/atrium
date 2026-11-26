@@ -157,6 +157,8 @@ pub struct CellView {
     pub vspread: bool,
     /// How each of `borders` (left, right, top, bottom) is drawn.
     pub dashes: [Dash; 4],
+    /// The face the text draws in, when not the grid's own sans (or mono).
+    pub family: Option<&'static str>,
 }
 
 /// How a border line is drawn along its edge.
@@ -443,7 +445,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false, dashes: [Dash::Solid; 4] }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false, dashes: [Dash::Solid; 4], family: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -2238,7 +2240,7 @@ pub fn needed_width(cv: &CellView) -> f64 {
 }
 
 fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
-    let st = TextStyle { family: if cv.mono { font::MONO } else { font::SANS }.into(), size: cv.size.unwrap_or(TEXT_SIZE), weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
+    let st = TextStyle { family: cv.family.unwrap_or(if cv.mono { font::MONO } else { font::SANS }).into(), size: cv.size.unwrap_or(TEXT_SIZE), weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
     let mut st = crate::inline::style(&st, cv.marks & crate::inline::Emphasis::Italic as u8);
     if cv.marks & (crate::inline::Emphasis::Super as u8 | crate::inline::Emphasis::Sub as u8) != 0 {
         st.size *= crate::inline::SCRIPT_SCALE;

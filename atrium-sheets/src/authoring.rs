@@ -37,6 +37,8 @@ pub enum AuthorCmd {
     Case,
     Whole,
     Workbook,
+    /// Look in values as they show rather than in what was typed.
+    Values,
     Find(bool),
     Replace(bool),
     Split(Split),
@@ -72,6 +74,7 @@ pub(super) struct Authoring {
     case: Mutable<bool>,
     whole: Mutable<bool>,
     all_sheets: Mutable<bool>,
+    values: Mutable<bool>,
     split: Mutable<Split>,
     extra_scrolls: [Mutable<ScrollState>; 3],
     active: Mutable<usize>,
@@ -90,6 +93,7 @@ impl Authoring {
             case: rev.sibling(false),
             whole: rev.sibling(false),
             all_sheets: rev.sibling(false),
+            values: rev.sibling(false),
             split: rev.sibling(Split::None),
             extra_scrolls: std::array::from_fn(|_| rev.sibling(ScrollState::default())),
             active: rev.sibling(0),
@@ -159,7 +163,8 @@ impl Authoring {
     }
 
     fn search(&self, s: &Sheets, forward: bool, replace: Option<bool>) -> Result<(), String> {
-        let search = Search::new(self.query.get_cloned().text(), self.case.get(), self.whole.get())?;
+        // Excel's wildcards: * any run, ? any one, ~ before either as itself.
+        let search = Search::excel(self.query.get_cloned().text(), self.case.get(), self.whole.get())?;
         let replacement = self.replacement.get_cloned();
         if replacement.text().len() > 16_384 { return Err("The replacement text is too long.".into()); }
         let mut d = s.doc.borrow_mut();
@@ -167,6 +172,9 @@ impl Authoring {
         let cursor = CellAddr::new(d.sheet, row, col);
         let sheets = if self.all_sheets.get() { 0..d.wb.sheet_count() as u16 } else { d.sheet..d.sheet + 1 };
 
+        if replace.is_some() && self.values.get() {
+            return Err("Replace changes what was typed: turn Values off to replace.".into());
+        }
         if let Some(all) = replace {
             let mut ops = Vec::new();
             let mut bytes = 0;
@@ -214,14 +222,19 @@ impl Authoring {
         let mut wrapped = None;
         let mut next = None;
         let better = |a, b| if forward { a < b } else { a > b };
+        let mut seen = |at: CellAddr, text: &str| {
+            if search.matches(text) {
+                if wrapped.is_none_or(|old| better(at, old)) { wrapped = Some(at); }
+                if better(cursor, at) && next.is_none_or(|old| better(at, old)) { next = Some(at); }
+            }
+            true
+        };
         for sheet in sheets {
-            find::inputs(&d.wb, sheet, &mut |at, _, text| {
-                if search.matches(&text) {
-                    if wrapped.is_none_or(|old| better(at, old)) { wrapped = Some(at); }
-                    if better(cursor, at) && next.is_none_or(|old| better(at, old)) { next = Some(at); }
-                }
-                true
-            });
+            if self.values.get() {
+                find::values(&d.wb, sheet, &mut |at, text| seen(at, &text));
+            } else {
+                find::inputs(&d.wb, sheet, &mut |at, _, text| seen(at, &text));
+            }
         }
         let at = next.or(wrapped).ok_or("No matching cell inputs.")?;
         let message = format!("Found in {}!{}.", d.wb.sheet_name(at.sheet), a1(at.row, at.col));
@@ -292,6 +305,7 @@ impl Authoring {
             AuthorCmd::Case => { self.case.set(!self.case.get()); Ok(()) }
             AuthorCmd::Whole => { self.whole.set(!self.whole.get()); Ok(()) }
             AuthorCmd::Workbook => { self.all_sheets.set(!self.all_sheets.get()); Ok(()) }
+            AuthorCmd::Values => { self.values.set(!self.values.get()); Ok(()) }
             AuthorCmd::Find(forward) => self.search(s, forward, None),
             AuthorCmd::Replace(all) => self.search(s, true, Some(all)),
             AuthorCmd::Split(mode) => {
@@ -431,18 +445,20 @@ impl Authoring {
             ctx.on_click(back, || {});
             let field_width = (width - 16.0).max(0.0);
             let submit = push(AuthorCmd::Find(true));
-            TextField::new(self.query.clone()).key(0x4649_4e44).placeholder("Find text or formula").autofocus(true)
+            TextField::new(self.query.clone()).key(0x4649_4e44).placeholder("Find text or formula (* and ? as wildcards)").autofocus(true)
                 .at(x + 8.0, y + 8.0).width(field_width).on_submit(move |_| submit()).render(ctx);
             let replace = push(AuthorCmd::Replace(false));
             TextField::new(self.replacement.clone()).placeholder("Replace with").at(x + 8.0, y + 44.0).width(field_width)
                 .on_submit(move |_| replace()).render(ctx);
             let options = [("Match case", self.case.get(), AuthorCmd::Case),
                 ("Whole cell", self.whole.get(), AuthorCmd::Whole),
-                ("All sheets", self.all_sheets.get(), AuthorCmd::Workbook)];
+                ("All sheets", self.all_sheets.get(), AuthorCmd::Workbook),
+                ("Values", self.values.get(), AuthorCmd::Values)];
+            let n = options.len() as f32;
             for (i, (label, on, action)) in options.into_iter().enumerate() {
                 let state = Mutable::new(if on { Check::On } else { Check::Off });
                 let click = push(action);
-                Checkbox::new(state, label).at(x + 8.0 + i as f32 * field_width / 3.0, y + 82.0)
+                Checkbox::new(state, label).at(x + 8.0 + i as f32 * field_width / n, y + 82.0)
                     .on_change(move |_| click()).render(ctx);
             }
             let commands = [("Previous", AuthorCmd::Find(false)), ("Next", AuthorCmd::Find(true)),
@@ -645,6 +661,46 @@ mod tests {
         run(&s, AuthorCmd::Find(true));
         assert_eq!(s.doc.borrow().sheet, 1);
         assert_eq!(s.grid.get_cloned().cursor, (0, 0));
+    }
+
+    #[test]
+    fn find_takes_excel_wildcards_and_looks_in_values() {
+        let s = sheets(b"cat,coat\n5*2,52\n");
+        {
+            let mut d = s.doc.borrow_mut();
+            d.wb.set_input(CellAddr::new(0, 2, 0), "=40+2").unwrap();
+            d.wb.recalc();
+        }
+        run(&s, AuthorCmd::FindOpen);
+        // c*t finds both words, from the cursor on.
+        s.authoring.query.set(TextEdit::new("c?t"));
+        run(&s, AuthorCmd::Whole);
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.grid.get_cloned().cursor, (0, 0));
+        s.authoring.query.set(TextEdit::new("c*t"));
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.grid.get_cloned().cursor, (0, 1));
+        // ~* is a star itself.
+        s.authoring.query.set(TextEdit::new("5~*2"));
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.grid.get_cloned().cursor, (1, 0));
+        // 42 is a value, not what was typed: found only looking in values.
+        s.authoring.query.set(TextEdit::new("42"));
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.doc.borrow().status, "No matching cell inputs.");
+        run(&s, AuthorCmd::Values);
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.grid.get_cloned().cursor, (2, 0));
+        s.authoring.replacement.set(TextEdit::new("x"));
+        run(&s, AuthorCmd::Replace(true));
+        assert!(s.doc.borrow().status.contains("turn Values off"), "{}", s.doc.borrow().status);
+        // Replace with a wildcard takes the whole run.
+        run(&s, AuthorCmd::Values);
+        run(&s, AuthorCmd::Whole);
+        s.authoring.query.set(TextEdit::new("o*"));
+        s.authoring.replacement.set(TextEdit::new("ow"));
+        run(&s, AuthorCmd::Replace(true));
+        assert_eq!(s.doc.borrow().wb.value(0, 0, 1), officina_grid::Value::str("cow"));
     }
 
     #[test]

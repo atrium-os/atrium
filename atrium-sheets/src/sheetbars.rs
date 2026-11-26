@@ -1,4 +1,4 @@
-//! Bars for a sheet's own settings and the selection's font size: Font
+//! Bars for a sheet's own settings and the selection's font: Font…, Font
 //! Size…, Move or Copy Sheet…, Standard Width… and Standard Height….
 
 use officina_grid::ops::GridOp;
@@ -135,6 +135,52 @@ pub fn move_start(d: &Doc) -> String {
     }
 }
 
+/// The longest font name Excel keeps.
+pub const MAX_FONT_NAME: usize = 31;
+
+/// The selection's font name, as the Font bar starts: `automatic` for
+/// the grid's own.
+pub fn font_name_start(d: &Doc, sel: CellRange) -> String {
+    d.wb.style(CellAddr::new(d.sheet, sel.r0, sel.c0)).font.name.as_deref().map_or("automatic".into(), str::to_string)
+}
+
+/// Font…: the selection's text in a font by name, as Excel's font box
+/// takes any name (`Calibri`, `Times New Roman`); `automatic` goes back to
+/// the grid's own. The name is kept as typed for the files; the cells draw
+/// in the bundled face that stands in for it. One step.
+pub fn font_name(d: &mut Doc, sel: CellRange, typed: &str) -> Result<String, String> {
+    let name = typed.trim();
+    let r = Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    let set: Option<std::sync::Arc<str>> = if name.is_empty() || name.eq_ignore_ascii_case("automatic") || name.eq_ignore_ascii_case("default") {
+        None
+    } else {
+        if name.chars().count() > MAX_FONT_NAME {
+            return Err(format!("A font name is at most {MAX_FONT_NAME} characters."));
+        }
+        if name.chars().any(|c| c.is_control() || matches!(c, '"' | '<' | '>' | '&' | ';' | ',')) {
+            return Err("A font name can't hold control characters, quotes, angle brackets, &, ; or commas.".into());
+        }
+        Some(name.into())
+    };
+    let op = GridOp::restyle(&d.wb, r, |st| {
+        let mut st = st.clone();
+        st.font.name = set.clone();
+        st
+    });
+    if !d.run_action("Font", vec![op]) {
+        return Err(std::mem::take(&mut d.status));
+    }
+    Ok(match set.as_deref() {
+        None => "Text in the sheet's own font.".into(),
+        Some(n) if crate::source::is_mono_font(n) => format!("Font: {n} (drawn in the grid's monospace)."),
+        Some(n) => match crate::source::drawn_family(n) {
+            Some(f) if !f.eq_ignore_ascii_case(n) => format!("Font: {n} (drawn with {f})."),
+            Some(_) => format!("Font: {n}."),
+            None => format!("Font: {n} (drawn in the grid's own sans)."),
+        },
+    })
+}
+
 /// Move or Copy Sheet…: the current sheet (or a copy of it) before or
 /// after a sheet, first or at the end. Refused while the workbook's
 /// structure is protected, as each step on its own is.
@@ -233,6 +279,36 @@ mod tests {
         assert!(font_size(&mut d, sel, "500").is_err());
         d.undo();
         assert_eq!(d.wb.style(CellAddr::new(0, 0, 0)).font.size, Some(210));
+    }
+
+    #[test]
+    fn the_font_bar_keeps_any_name_and_draws_its_stand_in() {
+        use pergola::widgets::GridSource;
+        let d = std::rc::Rc::new(std::cell::RefCell::new(doc(&["A"])));
+        let src = crate::source::SheetSource::new(d.clone());
+        let sel = CellRange { r0: 0, c0: 0, r1: 1, c1: 1 };
+        assert_eq!(font_name_start(&d.borrow(), sel), "automatic");
+        assert_eq!(font_name(&mut d.borrow_mut(), sel, "Calibri").unwrap(), "Font: Calibri (drawn with Carlito).");
+        assert_eq!(d.borrow().wb.style(CellAddr::new(0, 1, 1)).font.name.as_deref(), Some("Calibri"));
+        assert_eq!(src.cell(0, 0).unwrap().family, Some("Carlito"));
+        assert_eq!(font_name_start(&d.borrow(), sel), "Calibri");
+        font_name(&mut d.borrow_mut(), sel, "Times New Roman").unwrap();
+        assert_eq!(src.cell(1, 1).unwrap().family, Some("Liberation Serif"));
+        // A family we ship draws as itself; an unknown sans and Plex in the grid's own.
+        assert_eq!(font_name(&mut d.borrow_mut(), sel, "Inter").unwrap(), "Font: Inter.");
+        assert_eq!(src.cell(0, 0).unwrap().family, Some("Inter"));
+        assert!(font_name(&mut d.borrow_mut(), sel, "Wingding Sans Deluxe").unwrap().contains("own sans"));
+        assert_eq!(src.cell(0, 0).unwrap().family, None);
+        // Monospace names keep the grid's monospace.
+        font_name(&mut d.borrow_mut(), sel, "Courier New").unwrap();
+        let cv = src.cell(0, 0).unwrap();
+        assert!(cv.mono && cv.family.is_none());
+        assert!(font_name(&mut d.borrow_mut(), sel, &"x".repeat(32)).is_err());
+        assert!(font_name(&mut d.borrow_mut(), sel, "Bad\u{7}Name").is_err() && font_name(&mut d.borrow_mut(), sel, "A;B").is_err());
+        font_name(&mut d.borrow_mut(), sel, "automatic").unwrap();
+        assert_eq!(d.borrow().wb.style(CellAddr::new(0, 0, 0)).font.name, None);
+        d.borrow_mut().undo();
+        assert_eq!(d.borrow().wb.style(CellAddr::new(0, 0, 0)).font.name.as_deref(), Some("Courier New"));
     }
 
     #[test]

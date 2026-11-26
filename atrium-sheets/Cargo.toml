@@ -29,6 +29,8 @@ officina-draw = { path = "../officina-draw" }
 # Printing: the sheet as PDF (no in-process picture decoder).
 officina-pdf = { path = "../officina-pdf", default-features = false }
 pergola = { path = "../pergola" }
+# Which bundled face a cell's font name draws in.
+atrium-fonts = { path = "../atrium-fonts" }
 limen = { path = "../limen" }
 monstrator = { path = "../monstrator" }
 fresco-protocol = { path = "../fresco-protocol" }

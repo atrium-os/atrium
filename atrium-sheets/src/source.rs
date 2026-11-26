@@ -146,6 +146,13 @@ pub fn font_marks(f: &officina_grid::style::Font) -> u8 {
 /// Whether a font named `name` is a monospace one, drawn in the monospace
 /// face (the others in the sans face): Courier, Consolas, Menlo and the
 /// like, and any name saying Mono or Code.
+/// The bundled face a cell's font name draws in (Carlito for Calibri,
+/// Liberation Sans for Arial…), or `None` for the grid's own sans: Plex,
+/// the generic names and sans faces we know nothing about.
+pub fn drawn_family(name: &str) -> Option<&'static str> {
+    atrium_fonts::Library::resolve(name).map(|r| r.family)
+}
+
 pub fn is_mono_font(name: &str) -> bool {
     const MONO: [&str; 9] = ["courier", "consolas", "menlo", "monaco", "lucida console", "inconsolata", "mono", "code", "fixedsys"];
     let n = name.to_ascii_lowercase();
@@ -186,6 +193,9 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
     cv.marks = font_marks(&st.font);
     cv.size = font_px(&st.font);
     cv.mono = st.font.name.as_deref().is_some_and(is_mono_font);
+    if !cv.mono {
+        cv.family = st.font.name.as_deref().and_then(drawn_family);
+    }
     if st.indent > 0 && matches!(st.h_align, officina_grid::style::HAlign::Left | officina_grid::style::HAlign::General) {
         cv.indent = st.indent;
     }

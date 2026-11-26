@@ -218,6 +218,7 @@ dependencies = [
 name = "atrium-sheets"
 version = "0.1.0"
 dependencies = [
+ "atrium-fonts",
  "atrium-open",
  "fresco-client",
  "fresco-protocol",

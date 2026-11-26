@@ -5311,6 +5311,16 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
 - LibreOffice check (`fonteffects_lo.rs`, LibreOffice 24.2): a red gridline colour survives our `.xlsx` to LibreOffice's `.ods`, and our `.ods` through LibreOffice back to `.ods`. LibreOffice does not write a gridline colour to `.xlsx` at all, even its own, and it reads a pattern fill as a single blended colour.
 - Tests: `officina-convert` `tests/fonteffects.rs` (gridline colours through `.xlsx`, snapped to the palette, and `.ods`, LibreOffice's grey as automatic), Sheets `format` (pattern names and colours, none, undo, refusals, the bar's start; the four special formats as shown; the gridline colour bar, drawn, saved natively, automatic again) and `series` (Fill in each direction, one-row and one-column selections, the sheet's edge).
 
+### 16.156 Font…, cells drawn in their own font, Find with wildcards and in values (2026-11-26)
+
+`font_name` in `atrium-sheets/src/sheetbars.rs`, `drawn_family` in `atrium-sheets/src/source.rs`, `CellView::family` in Pergola, `Search::excel` and `find::values` in `officina-grid/src/find.rs`, `atrium-sheets/src/authoring.rs`.
+
+- **Font…** (a bar, in the cell menu before Font Size…): any font name, as Excel's font box takes one (`Calibri`, `Times New Roman`), at most 31 characters, with no control characters, quotes, angle brackets, `&`, `;` or commas. `automatic` goes back to the sheet's own font. The name is kept as typed, so the files carry it. The status says which face draws it. One step.
+- **Cells draw in their font**, whether set here or read from a file: the name goes through `atrium_fonts::Library::resolve` to the face Atrium ships for it (Calibri as Carlito, Cambria as Caladea, Arial and Helvetica as Liberation Sans, Times New Roman as Liberation Serif, a family we ship as itself). Plex, the generic names and sans faces we don't know keep the grid's own sans, and monospace names keep the grid's monospace (Font: Mono). Italic text still draws in Plex Italic, since the renderer opens a named family's upright face only.
+- **Find uses Excel's wildcards**: `*` for any run of characters, `?` for any one, and `~` before `*`, `?` or `~` for the character itself. Other characters are plain. Replace takes the whole run a wildcard matches (`o*` in `coat` replaced by `ow` gives `cow`), as Excel's does.
+- **Values** (a new Find option beside Match case, Whole cell and All sheets), as Excel's Look in: Values: finds what cells show (a formula's result through its number format, `50%`) rather than what was typed. Replace is refused while it is on, as Excel's Replace looks in formulas only. Cells whose value protection hides are skipped.
+- Tests: `officina-grid` `find` (wildcards, `~`, whole cell, case, the greedy replacement, refusals; values as shown), Sheets `sheetbars` (font names and their faces, Plex, unknown and monospace names, refusals, automatic, undo) and `authoring` (wildcard finds, `~*`, a value found only in values, Replace refused there, a wildcard replacement).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

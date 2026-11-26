@@ -279,6 +279,7 @@ pub enum DataCmd {
     /// Bars in [`crate::sheetbars`]: Font Size…, Move or Copy Sheet…,
     /// Standard Width… and Standard Height….
     FontSize,
+    FontName,
     MoveOrCopy,
     StandardWidth,
     StandardHeight,
@@ -586,6 +587,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Column Width…"), Some(DataCmd::ColWidth)),
         (MenuItem::new("Standard Height…"), Some(DataCmd::StandardHeight)),
         (MenuItem::new("Standard Width…"), Some(DataCmd::StandardWidth)),
+        (MenuItem::new("Font…"), Some(DataCmd::FontName)),
         (MenuItem::new("Font Size…"), Some(DataCmd::FontSize)),
         (MenuItem::new("AutoFit Column Width"), Some(DataCmd::AutoFitCols)),
         (MenuItem::new("Unhide Columns").enabled(wb.sheet(s).col_sizes.overrides().iter().any(|&(c, w)| w <= 0.0 && (sel.c0..=sel.c1).contains(&c))), Some(DataCmd::UnhideCols)),
@@ -3174,7 +3176,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
