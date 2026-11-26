@@ -268,6 +268,8 @@ pub enum DataCmd {
     ForecastSheet,
     /// Data Analysis… (the Analysis ToolPak tools, typed).
     DataAnalysis,
+    /// Solver… (objective, variable cells, constraints, typed).
+    Solver,
     /// Protect Sheet and Unprotect Sheet (bars for the password when one is
     /// needed) and Protection Options (a bar); [`crate::lock`].
     ProtectSheet,
@@ -709,6 +711,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Data Form…"), Some(DataCmd::DataForm)),
         (MenuItem::new("Forecast Sheet…"), Some(DataCmd::ForecastSheet)),
         (MenuItem::new("Data Analysis…"), Some(DataCmd::DataAnalysis)),
+        (MenuItem::new("Solver…"), Some(DataCmd::Solver)),
         (MenuItem::new("Show Detail"), Some(DataCmd::ShowDetail)),
         (MenuItem::new("Hide Detail"), Some(DataCmd::HideDetail)),
         (MenuItem::new("Clear Outline").enabled([officina_grid::shift::Axis::Rows, officina_grid::shift::Axis::Cols].iter().any(|&a| !wb.sheet(s).outline(a).groups().is_empty())), Some(DataCmd::ClearOutline)),
@@ -1124,7 +1127,7 @@ pub fn goal_seek_start(d: &Doc, cursor: (u32, u32)) -> String {
     format!("{goal}, {}", cell.unwrap_or_default())
 }
 
-fn show_num(n: f64) -> String {
+pub(crate) fn show_num(n: f64) -> String {
     let t = format!("{n:.6}");
     let t = t.trim_end_matches('0').trim_end_matches('.');
     if t == "-0" { "0".into() } else { t.to_string() }
@@ -3318,7 +3321,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::AddWatch => crate::formulas::add_watches(d, sel),
         DataCmd::ApplyNames => crate::formulas::apply_names(d, sel),
         DataCmd::AutoOutline => crate::formulas::auto_outline(d, sel),
-        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument | DataCmd::DataForm | DataCmd::QuickTotals | DataCmd::GoToSpecial | DataCmd::ForecastSheet | DataCmd::DataAnalysis => Ok(String::new()),
+        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument | DataCmd::DataForm | DataCmd::QuickTotals | DataCmd::GoToSpecial | DataCmd::ForecastSheet | DataCmd::DataAnalysis | DataCmd::Solver => Ok(String::new()),
         DataCmd::LockCells => crate::special::toggle_protection(d, sel, true),
         DataCmd::HideFormula => crate::special::toggle_protection(d, sel, false),
         DataCmd::ShowDetail => crate::special::detail(d, sel, true),

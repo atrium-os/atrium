@@ -5450,6 +5450,78 @@ Tests (Sheets, `analysis`):
 
 The unused `Rect` import that §16.160 left in `accessibility.rs` is moved into its tests.
 
+### 16.162 The rest of the Analysis ToolPak, and Solver (2026-11-26)
+
+Round 1 of the six that finish Sheets. The code is in `atrium-sheets/src/hypothesis.rs` (the new Data Analysis tools), `atrium-sheets/src/solver.rs`, and the Solver… item after Data Analysis… in `data.rs`, `whatif.rs` and `app.rs`.
+
+**Data Analysis…** gains the ToolPak's remaining tools in the §16.161 bar. They take the same `labels`, `to CELL` and new-sheet rules. Tools that compare two variables take a second range after the first. Except for Fourier, every number is a formula, so the tables follow later edits to the data. Excel writes fixed values.
+
+- **ANOVA** (`anova RANGE`): Anova: Single Factor, one group to a column, from 2 to 200 groups.
+  - It has a SUMMARY (Count, Sum, Average, Variance) and the ANOVA table: SS, df, MS, F, P-value and F crit for Between and Within Groups and the Total.
+  - Within is the sum of each group's DEVSQ. Total is DEVSQ over all the groups. Between is the difference.
+  - P-value is F.DIST.RT and F crit is F.INV.RT at `alpha` (0.05 by default).
+- **Two-factor ANOVA** (`anova2 RANGE`):
+  - **Without replication**: one value for each row and column. `labels` reads both the first row and the first column. It gives a SUMMARY of each row and column, then Rows, Columns, Error and Total.
+  - **With replication** (`rows N`, N rows to a sample): the first row and first column are labels, as Excel requires. It gives Sample, Columns, Interaction, Within and Total.
+  - Its summary is shortened: each sample's average in each column, plus the totals. Excel lists Count, Sum, Average and Variance for every sample.
+- **F-Test Two-Sample for Variances** (`ftest A, B`): Mean, Variance, Observations, df, F, and the one-tail P and F Critical. Like Excel, it uses the lower tail when F < 1.
+- **t-Tests** (`ttest paired`, `ttest equal`, `ttest unequal`; `difference D` sets the hypothesized mean difference):
+  - Mean, Variance, Observations, then Pearson Correlation (paired) or Pooled Variance (equal variances).
+  - Then Hypothesized Mean Difference, df, t Stat, and the one-tail and two-tail P and t Critical (T.DIST.RT, T.INV, T.DIST.2T, T.INV.2T).
+  - Unequal variances use Welch's df rounded to a whole number, as the ToolPak does.
+  - Paired needs as many numbers in each range. Its t uses the variance of the differences, VAR₁ + VAR₂ − 2·COVARIANCE.S.
+- **z-Test: Two Sample for Means** (`ztest A, B, variances V1 V2`): the known variances are required. Then z, and the one-tail and two-tail P and z Critical.
+- **Regression** (`regression Y, X`, with up to 16 X columns; options `constant zero`, `confidence 95%`, `residuals`): Excel's SUMMARY OUTPUT.
+  - Regression Statistics: Multiple R, R Square, Adjusted R Square, Standard Error and Observations.
+  - ANOVA: df, SS, MS, F and Significance F.
+  - Coefficients for the intercept and each X, with Standard Error, t Stat, P-value and the confidence bounds.
+  - Each of these numbers is an `INDEX` into `LINEST(Y, X, const, TRUE)`.
+  - `residuals` adds the predicted Y and residual for each row, for up to 100,000 rows.
+- **Fourier Analysis** (`fourier RANGE`, `inverse`): the discrete Fourier transform of 2, 4, … 4,096 numbers or complex texts.
+  - It is written as complex text, as IMSUM and the other complex functions write it (`-2+2i`).
+  - Rounding noise smaller than 10⁻¹² of the largest part shows as 0.
+  - `inverse` divides by n, so a transform and its inverse give back the input.
+
+**Solver…** is in the Data menu, after Data Analysis…. It works as Excel's Solver add-in, typed in a bar: `max B10, by B1:B3, B4 <= 100, B1:B3 int, report`. With the cursor on a formula, the bar starts as `max CELL, by `.
+
+- **Objective**: `max CELL`, `min CELL`, or `CELL = value`.
+- **Cells to change**: `by` and ranges, at most 200 cells. They must hold numbers or be empty, not formulas.
+- **Constraints**:
+  - `CELLS <= | >= | = a value`, or `CELLS <= CELLS` (one cell on the right, or one for each cell on the left), at most 1,000.
+  - `CELLS int` and `CELLS bin` (whole numbers, or 0 and 1).
+  - The cells change only to values of 0 or more unless you add `unconstrained`. This matches Excel's default, "Make Unconstrained Variables Non-Negative".
+- **Method**:
+  - Solver first checks whether the model is linear. It measures the objective and every constraint at zero and at each unit step, then checks those coefficients at two other points.
+  - A linear model is solved exactly with a two-phase simplex (dense tableau, Bland's rule).
+  - Integer and binary cells are handled with depth-first branch and bound, up to 5,000 nodes.
+  - Any other model uses Nelder–Mead on the objective plus a growing penalty for broken constraints. Like Excel's GRG Nonlinear, it finds a local optimum; it is not GRG, so the path and sometimes the answer differ.
+  - `simplex` refuses a model that isn't linear. `nonlinear` skips the linearity check. Integer cells need a linear model.
+- **Limits and checks**:
+  - Solver stops after 20 seconds or 200,000 evaluations.
+  - It checks the answer on the sheet itself to Excel's 10⁻⁶ precision before keeping it.
+  - It says when the model is unbounded, infeasible, or stopped at a limit. The messages follow Excel's wording.
+- **Undo**: the answer goes in as one undo step, and every cell is put back while Solver works.
+- **Report**: `report` adds an Answer Report sheet in the same undo step. It lists:
+  - the objective cell's original and final value;
+  - each variable cell's original and final value, Contin or Integer;
+  - each constraint's cell value, formula (`$A$4<=4`), Binding or Not Binding, and slack.
+- **Not built yet**: Excel's Sensitivity and Limits reports, the Evolutionary method, and saving the Solver model with the sheet. In Excel the model lives in hidden names such as `solver_opt`. Here the model is not kept once the bar closes.
+
+Tests:
+- `hypothesis`:
+  - single-factor ANOVA against worked values (SS 54 and 6, F 27, p 0.001, F crit 5.1433);
+  - two-factor ANOVA with and without replication, worked by hand;
+  - the paired, equal and unequal t-tests, the F-test and the z-test, including Welch's rounded df and the refusals;
+  - Regression against a hand fit, with its residuals;
+  - Fourier of 1, 2, 3, 4 and back.
+- `solver`:
+  - the textbook product-mix LP (x = 2, y = 6, profit 36) and its Answer Report, undone in one step;
+  - an integer optimum that differs from the rounded LP answer;
+  - a value-of goal and a minimum;
+  - unbounded and infeasible models;
+  - a nonlinear minimum, with and without non-negative cells;
+  - the simplex on its own, including the infeasible and unbounded cases.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

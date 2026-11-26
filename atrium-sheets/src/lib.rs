@@ -40,3 +40,5 @@ pub mod customviews;
 pub mod accessibility;
 pub mod checkbox;
 pub mod analysis;
+pub mod hypothesis;
+pub mod solver;

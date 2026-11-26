@@ -23,7 +23,7 @@ const MAX_OUT: u64 = 1_000_000;
 const MAX_BINS: usize = 10_000;
 
 /// The tools the bar knows, as their first word.
-pub const TOOLS: &str = "descriptive, histogram, rank, moving average, smoothing, correlation, covariance, sampling, random";
+pub const TOOLS: &str = "descriptive, anova, anova2, ftest, ttest paired, ttest equal, ttest unequal, ztest, regression, fourier, histogram, rank, moving average, smoothing, correlation, covariance, sampling, random";
 
 /// The bar's text to start with: descriptive statistics of the selection,
 /// with labels when its first row is text over numbers.
@@ -33,24 +33,24 @@ pub fn start(d: &Doc, sel: CellRange) -> String {
     format!("descriptive {}{}", range_text(&area), if text_top { ", labels" } else { "" })
 }
 
-fn range_text(r: &Rect) -> String {
+pub(crate) fn range_text(r: &Rect) -> String {
     if r.r0 == r.r1 && r.c0 == r.c1 { a1(r.r0, r.c0) } else { format!("{}:{}", a1(r.r0, r.c0), a1(r.r1, r.c1)) }
 }
 
 /// `Sheet1!$A$2:$A$9`, for a formula on any sheet.
-fn abs_ref(wb: &Workbook, r: &Rect) -> String {
+pub(crate) fn abs_ref(wb: &Workbook, r: &Rect) -> String {
     let cell = |row: u32, c: u32| format!("${}${}", col_name(c), row as u64 + 1);
     let cells = if r.r0 == r.r1 && r.c0 == r.c1 { cell(r.r0, r.c0) } else { format!("{}:{}", cell(r.r0, r.c0), cell(r.r1, r.c1)) };
     format!("{}!{cells}", crate::formulas::sheet_ref(wb, r.sheet))
 }
 
 /// One series of the input: its label and its cells (below the label).
-struct Series {
-    label: String,
-    area: Rect,
+pub(crate) struct Series {
+    pub(crate) label: String,
+    pub(crate) area: Rect,
 }
 
-fn series(wb: &Workbook, area: &Rect, labels: bool) -> Result<Vec<Series>, String> {
+pub(crate) fn series(wb: &Workbook, area: &Rect, labels: bool) -> Result<Vec<Series>, String> {
     if area.cells() > MAX_AREA_CELLS {
         return Err(format!("Analyse at most {MAX_AREA_CELLS} cells at once."));
     }
@@ -69,7 +69,7 @@ fn series(wb: &Workbook, area: &Rect, labels: bool) -> Result<Vec<Series>, Strin
 }
 
 /// The numbers of `r`, in order (text, blanks and errors left out).
-fn numbers(wb: &Workbook, r: &Rect) -> Vec<f64> {
+pub(crate) fn numbers(wb: &Workbook, r: &Rect) -> Vec<f64> {
     let mut v = Vec::new();
     for row in r.r0..=r.r1 {
         for c in r.c0..=r.c1 {
@@ -83,34 +83,34 @@ fn numbers(wb: &Workbook, r: &Rect) -> Vec<f64> {
 
 /// What the tool writes: rows of inputs from its top-left, and number
 /// formats for some of its cells (row, col offsets from there).
-struct Table {
-    name: &'static str,
-    rows: Vec<Vec<Input>>,
-    formats: Vec<(u32, u32, u32, u32, &'static str)>,
-    say: String,
+pub(crate) struct Table {
+    pub(crate) name: &'static str,
+    pub(crate) rows: Vec<Vec<Input>>,
+    pub(crate) formats: Vec<(u32, u32, u32, u32, &'static str)>,
+    pub(crate) say: String,
 }
 
-fn text(s: &str) -> Input {
+pub(crate) fn text(s: &str) -> Input {
     Input::Value(Value::str(s))
 }
 
-fn num(x: f64) -> Input {
+pub(crate) fn num(x: f64) -> Input {
     Input::Value(Value::Num(x))
 }
 
-fn na() -> Input {
+pub(crate) fn na() -> Input {
     Input::Value(Value::Err(ErrorKind::NA))
 }
 
 /// The options after the range: words, and `word value` pairs.
-struct Options {
-    labels: bool,
-    rest: Vec<String>,
-    to: Option<String>,
-    seed: Option<u64>,
+pub(crate) struct Options {
+    pub(crate) labels: bool,
+    pub(crate) rest: Vec<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) seed: Option<u64>,
 }
 
-fn options(parts: &[&str]) -> Result<Options, String> {
+pub(crate) fn options(parts: &[&str]) -> Result<Options, String> {
     let mut o = Options { labels: false, rest: Vec::new(), to: None, seed: None };
     for p in parts {
         let p = p.trim();
@@ -131,7 +131,7 @@ fn options(parts: &[&str]) -> Result<Options, String> {
 }
 
 /// The value after `word` in the options, if one says it.
-fn option_num(o: &Options, word: &str) -> Result<Option<f64>, String> {
+pub(crate) fn option_num(o: &Options, word: &str) -> Result<Option<f64>, String> {
     for r in &o.rest {
         if let Some(v) = r.strip_prefix(word) {
             let v = v.trim().trim_end_matches('%');
@@ -142,7 +142,7 @@ fn option_num(o: &Options, word: &str) -> Result<Option<f64>, String> {
     Ok(None)
 }
 
-fn unknown(o: &Options, known: &[&str]) -> Result<(), String> {
+pub(crate) fn unknown(o: &Options, known: &[&str]) -> Result<(), String> {
     match o.rest.iter().find(|r| !known.iter().any(|k| r.starts_with(k))) {
         Some(r) => Err(format!("{r:?} isn't an option here; it takes {}.", known.join(", "))),
         None => Ok(()),
@@ -153,14 +153,19 @@ fn unknown(o: &Options, known: &[&str]) -> Result<(), String> {
 pub fn run(d: &mut Doc, typed: &str) -> Result<String, String> {
     let t = typed.trim();
     let low = t.to_lowercase();
-    let (tool, rest) = ["moving average", "descriptive statistics", "descriptive", "histogram", "rank and percentile", "rank", "exponential smoothing", "smoothing", "correlation", "covariance", "sampling", "random number generation", "random"]
+    let (tool, rest) = ["anova single factor", "anova2", "anova", "two-factor anova", "ttest paired", "t-test paired", "ttest equal", "t-test equal", "ttest unequal", "t-test unequal", "ftest", "f-test", "ztest", "z-test", "regression", "fourier", "moving average", "descriptive statistics", "descriptive", "histogram", "rank and percentile", "rank", "exponential smoothing", "smoothing", "correlation", "covariance", "sampling", "random number generation", "random"]
         .iter()
         .find(|k| low.starts_with(**k) && low.get(k.len()..).is_some_and(|r| r.chars().next().is_none_or(char::is_whitespace)))
         .map(|k| (*k, t.get(k.len()..).unwrap_or("").trim()))
         .ok_or_else(|| format!("Start with a tool: {TOOLS}."))?;
     let parts: Vec<&str> = rest.split(',').collect();
+    // Tools that compare two ranges read the second after the first.
+    let two = crate::hypothesis::two_ranges(tool);
+    let opts_from = if two { 2 } else { 1 };
     let table = if tool.starts_with("random") {
         random(&options(&parts[1..])?, parts[0])?
+    } else if let Some(t) = crate::hypothesis::run(&d.wb, d.sheet, tool, &parts, &options(parts.get(opts_from..).unwrap_or(&[]))?)? {
+        t
     } else {
         let area = parse_area(&d.wb, d.sheet, parts[0]).map_err(|e| if parts[0].trim().is_empty() { "Type the input range after the tool, such as descriptive A1:B20.".into() } else { e })?;
         let o = options(&parts[1..])?;
@@ -176,7 +181,7 @@ pub fn run(d: &mut Doc, typed: &str) -> Result<String, String> {
             _ => sampling(wb, &area, &o)?,
         }
     };
-    let o = options(&parts[1..])?;
+    let o = options(parts.get(opts_from..).unwrap_or(&[]))?;
     write(d, table, o.to.as_deref())
 }
 
@@ -190,11 +195,44 @@ fn placed(rows: Vec<Vec<Input>>, r0: u32, c0: u32) -> Vec<Vec<Input>> {
                 .enumerate()
                 .map(|(c, input)| match input {
                     Input::Formula(f) if f.contains("{UP}") && r > 0 => Input::Formula(f.replace("{UP}", &a1(r0 + r as u32 - 1, c0 + c as u32))),
+                    Input::Formula(f) if f.contains('{') => Input::Formula(tokens(&f, r0, c0)),
                     other => other,
                 })
                 .collect()
         })
         .collect()
+}
+
+/// `{R:C}` in a formula is the table's own cell R rows and C columns from
+/// its top left; it becomes that cell's A1 name.
+fn tokens(f: &str, r0: u32, c0: u32) -> String {
+    let mut out = String::with_capacity(f.len());
+    let mut rest = f;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        let parsed = tail.find('}').and_then(|j| {
+            let (r, c) = tail[..j].split_once(':')?;
+            Some((r.parse::<u32>().ok()?, c.parse::<u32>().ok()?, j))
+        });
+        match parsed {
+            Some((r, c, j)) => {
+                out.push_str(&a1(r0 + r, c0 + c));
+                rest = &tail[j + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The table's own cell `r`, `c` in a formula (see [`tokens`]).
+pub(crate) fn at(r: usize, c: usize) -> String {
+    format!("{{{r}:{c}}}")
 }
 
 fn write(d: &mut Doc, t: Table, to: Option<&str>) -> Result<String, String> {
@@ -735,6 +773,6 @@ mod tests {
         assert!((0..100).all(|r| matches!(v(&d, 0, r, 12), Value::Num(n) if n == 0.0 || n == 1.0)));
         assert!(run(&mut d, "random 0x2").is_err());
         assert!(run(&mut d, "random 10, uniform 5 1").is_err());
-        assert!(run(&mut d, "anova A1:B6").unwrap_err().starts_with("Start with a tool"));
+        assert!(run(&mut d, "manova A1:B6").unwrap_err().starts_with("Start with a tool"));
     }
 }
