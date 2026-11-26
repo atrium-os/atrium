@@ -302,6 +302,79 @@ and every change that only reduces. A change that grants always waits
 for the person at the sheet. Its words and refusals are the GUI's, from
 one table in `portcullis-ipc`, so the two never drift.
 
+## 5b. With no screen: building over Stoa (Shankar, 2026-11-26)
+
+Shankar: "I'm thinking of users building using stoa without GUI." A
+person attaches to a workspace console from another machine with
+`stoactl` ([stoa.md §2, §4.5](stoa.md)), then builds, bundles, installs,
+runs, and allows a background server, with no screen at the Atrium end.
+Every press in §3–§5a assumes a screen: the confirm sheet, the install
+sheet, and the Terminal's asks for `pkg` and `make run`. So each needs a
+second place to be answered.
+
+**The answer goes where the asker is.** When an ask comes from a pane
+that a Stoa client is attached to, portcullisd sends the confirm to
+that client instead of the screen. The screen may be locked, or another
+person may be sitting at it.
+
+- **The confirm travels on Stoa's control channel, not in the pane.**
+  portcullisd sends stoad (its own `_stoad` uid) the request's words and
+  its nonce, as it would send them to the sheet. stoad delivers them to
+  the attached client as a control datagram. The client draws them on
+  its own status row, outside the pane's grid and in a style the pane
+  can't produce. Nothing the pane prints can draw there, and nothing
+  the pane reads sees the ask.
+- **The person answers by typing `allow`.** The client's own key
+  handler reads the word, not the pane's input, and sends it back as a
+  control datagram. A single `y` or Enter doesn't count, so a person
+  mid-command can't approve by accident. stoad passes the nonce and the
+  answer to portcullisd.
+- **What proves it is the person.** The Stoa session itself does: sshd's
+  userauth of the person's key, and the session's MAC key anchored in
+  the SSH handshake (stoa.md §2). portcullisd takes the answer only:
+  - from stoad's uid;
+  - for that nonce;
+  - for a session that stoad authenticated as the owner of the asking
+    jail;
+  - while a client is attached.
+
+  This is the same trust a GUI press puts in frescod.
+- **The same channel answers every ask that needs a press, not only this
+  proposal's:** `background allow` and `listen allow`, `pkg install` in a
+  workspace (`WorkspaceAdmin`), `make run` (`WorkspaceRun`),
+  `opifex side-load` (the install sheet takes a stoad answer bound to its
+  own nonce), and `portcullis launch`'s first-launch prompt. So a
+  headless person can build, install and run their app end to end.
+- **A security-key touch, optionally.** A person can require that a
+  remote approval also carry a touch of their FIDO2 key, through the
+  forwarded ssh agent (`sk-ecdsa`). The recommendation is to offer it as
+  a setting, off by default (G10).
+
+**Two things block this today. Both are decisions, not just code:**
+
+1. **sshd.** homes.md §6 says images for people ship without the host's
+   sshd, while Stoa and aqueduct-remote authenticate through it. For
+   headless use, the recommendation is to ship sshd restricted to the
+   handoff: `ForceCommand` to `stoa-shell` or `aqueduct-shell`, no
+   password logins, no TTY, no forwarding except the agent. The
+   person's uid then exists only for the handoff's few milliseconds,
+   and the shell runs in a workspace or console jail as always (G9).
+2. **Unlocking the person's data.** A person's workspaces and app data
+   are in their persona's key group ([tessera-encryption.md](tessera-encryption.md)),
+   which opens when they sign in at the screen. A person who has only
+   come in over Stoa has it locked: Stoa already runs such sessions in
+   memory only (stoa.md §5.4a), and workspaces can't start. Headless
+   building needs a remote unlock, such as the person's passphrase or a
+   FIDO2 touch over the same channel, handed to Vestibulum and Arca.
+   That belongs in Vestibulum's spec, with its own review, so this
+   proposal only names it (G11). Until then, a headless person must
+   have signed in at the screen once since boot.
+
+Once the person is unlocked, background apps start at their first Stoa
+sign-in after boot, as at a screen sign-in (§3.3). They stop when the
+person's last session ends, screen or Stoa, before the keys are put
+away.
+
 ## 6. What changes where
 
 | Where | Change |
@@ -318,6 +391,9 @@ one table in `portcullis-ipc`, so the two never drift.
 | SDK | `status-item` and `server` templates; `cargo atrium check` warns on a `listen` with no `[resources]` |
 | `portcullis` CLI | `background list/allow/disallow/quit/log` and `listen list/allow/disallow`, `--json`, `--user` for root (§5a) |
 | Terminal (stoa-term) | forwards the OSC 7770 ask's fields untouched, with the pane's jail from stoad |
+| stoad and `stoactl` | the confirm on the control channel: the status-row ask, the typed `allow`, nonce passed back; asks routed to the attached client when the pane has one |
+| opifex-sheet, `WorkspaceAdmin`, `WorkspaceRun`, launch prompt | take a stoad answer bound to their nonce as well as a press |
+| image | sshd restricted to the Stoa/aqueduct handoff (if G9) |
 | a system confirm sheet (new, opifex-sheet's pattern) | shows portcullisd's words for one request and returns its press with the nonce; portcullisd takes approvals only from its uid |
 | Artifex | the templates in New project; the Package card lines |
 
@@ -382,6 +458,9 @@ read only the manifest and the person's grant.
 | G6 | Should ports be 1024+ only, with no internet reach? | Yes for v1 (§8) |
 | G7 | Templates: Rust first, C after? | Yes |
 | G8 | Should a CLI change that grants be confirmed on a system sheet with portcullisd's own words, while one that only takes away needs no press, and root can act for anyone with a notice? | Yes (§5a) |
+| G9 | Should images for people ship sshd, restricted to the Stoa handoff (ForceCommand, keys only), so that people can use it with no screen? | Yes (§5b); this changes homes.md §6 |
+| G10 | Should remote approvals require a security-key touch? | Offer it as a setting, off by default |
+| G11 | Should remote unlock of a person's data go to its own Vestibulum proposal? | Yes; until then, headless needs one screen sign-in since boot |
 
 ### Review
 
