@@ -88,12 +88,24 @@ allow_rctl = true
     else
         LAUNCH="FRESCOD_RENDERER_LAUNCHER=unconfined"; AS_USER=""
     fi
+    FSOCK=$G/fenestra.sock
+    if [ "${FEN_SERVICE:-0}" = 1 ]; then
+        # fenestrad as the boot service (fenestra-service.sh, its rc.d
+        # script): frescod serves the link where the service's manifest
+        # says, in the directory the commissioning made.
+        g "mkdir -p $D/svc/scripts $D/svc/fenestrad/etc/rc.d" || gate_abort "make the service tree"
+        put "$ROOT/scripts/fenestra-service.sh" "$D/svc/scripts/" && put "$ROOT/fenestrad/etc/rc.d/atrium_fenestrad" "$D/svc/fenestrad/etc/rc.d/" \
+            || gate_abort "copy the service files"
+        g "service atrium_fenestrad onestop >/dev/null 2>&1; sh $D/svc/scripts/fenestra-service.sh $D/fenestrad $D/fenestra-shell $D/fenestra-session vtnet0 10.0.2.0/24 10.0.2.15" \
+            || gate_abort "fenestra-service.sh failed"
+        FSOCK=/atrium/sockets/fenestra/fenestra.sock
+    fi
     echo "=== host"
     g "cd $G && env FRESCOD_SPLIT=1 $LAUNCH FRESCOD_RENDERER_BIN=$D/fresco-renderer \
         FRESCOD_HEADLESS_PNG=$G/screen FRESCOD_SOCK=$G/fresco.sock FRESCOD_WM_SOCK=$G/wm.sock \
-        FRESCOD_FENESTRA_SOCK=$G/fenestra.sock daemon -f -o $G/frescod.log $AS_USER $D/frescod </dev/null"
-    i=0; while [ $i -lt 90 ] && ! g "test -S $G/fresco.sock && test -S $G/fenestra.sock"; do sleep 2; i=$((i+1)); done
-    g "test -S $G/fenestra.sock" || { g "tail -20 $G/frescod.log"; gate_abort "frescod did not open the fenestra link"; }
+        FRESCOD_FENESTRA_SOCK=$FSOCK daemon -f -o $G/frescod.log $AS_USER $D/frescod </dev/null"
+    i=0; while [ $i -lt 90 ] && ! g "test -S $G/fresco.sock && test -S $FSOCK"; do sleep 2; i=$((i+1)); done
+    g "test -S $FSOCK" || { g "tail -20 $G/frescod.log"; gate_abort "frescod did not open the fenestra link"; }
     g "chmod 666 $G/fresco.sock"
     if [ "${FEN_WM:-0}" = 1 ]; then
         g "chmod 666 $G/wm.sock; cd $G && env FRESCO_SOCKET=$G/fresco.sock FRESCO_WM_SOCKET=$G/wm.sock FORUM_CTL_SOCKET=$G/ctl.sock daemon -f -o $G/wm.log $D/forum-wm </dev/null"
@@ -110,6 +122,17 @@ allow_rctl = true
 }
 
 fen_fenestrad() {
+    if [ "${FEN_SERVICE:-0}" = 1 ]; then
+        # The commissioned service, through rc; mints from the seat's user.
+        SEAT=/atrium/sockets/ostiarius/active-session
+        g "test -e $SEAT || { mkdir -p /atrium/sockets/ostiarius && echo root >$SEAT && touch $G/made-seat; }
+            sysrc atrium_fenestrad_grace=15 atrium_fenestrad_logfile=$G/fenestrad.log >/dev/null && service atrium_fenestrad start" \
+            || gate_abort "service atrium_fenestrad start failed"
+        i=0; while [ $i -lt 30 ] && ! g "test -S /var/run/fenestra/mint.sock"; do sleep 1; i=$((i+1)); done
+        g "test -S /var/run/fenestra/mint.sock" || { g "tail -20 /var/log/messages"; gate_abort "the service did not open its mint socket"; }
+        FEN_SSH="ssh $SSHOPT -n -o ConnectTimeout=30 -p ${VM_SSH_PORT:-2222} root@localhost env PATH=/usr/local/bin:/bin:/usr/bin"
+        return
+    fi
     if [ "${FEN_JAIL:-0}" = 1 ]; then
         # Each session in its own jail through jaild (deploy-portcullis.sh
         # installs jaild and this tree's policy): its own uid and vnet, one

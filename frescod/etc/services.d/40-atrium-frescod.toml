@@ -124,3 +124,14 @@ path = "/usr/local/bin/atrium-frescod"
 argv = ["atrium-frescod"]
 uid  = 65010   # _frescod
 gid  = 65010
+
+# Fenestra's link (docs/spec/fenestra.md §19b): only fenestrad, as
+# _fenestra, may hold it. Served only where scripts/fenestra-service.sh made
+# /atrium/sockets/fenestra (owned _frescod, group _fenestra, 0750); on other
+# hosts frescod says so in its log and serves no link.
+[[exec.env]]
+key   = "FRESCOD_FENESTRA_SOCK"
+value = "/atrium/sockets/fenestra/fenestra.sock"
+[[exec.env]]
+key   = "FRESCOD_FENESTRA_UIDS"
+value = "65057"   # _fenestra

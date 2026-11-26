@@ -3,7 +3,10 @@
 # session from a real frescod in the cloud VM to fenestra-view --headless in
 # the container, over QUIC on a forwarded UDP port. Without a WM on the host
 # the session is per-app (each window on its own on the viewer); with
-# FEN_WM=1 forum-wm runs and it is the whole desktop (§3.4).
+# FEN_WM=1 forum-wm runs and it is the whole desktop (§3.4). FEN_SERVICE=1
+# (implies FEN_JAIL=1) commissions fenestrad as the boot service
+# (fenestra-service.sh, its rc.d script) and checks it comes back whole
+# after either side is killed and that a stop leaves nothing.
 #
 # In the guest: frescod in split mode (each client in its own renderer
 # process, here unconfined) with the fenestra link on, an app (Officina's
@@ -24,7 +27,8 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
+[ "${FEN_SERVICE:-0}" = 1 ] && FEN_JAIL=1
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 3 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -71,7 +75,7 @@ sleep 15
 g "cp $G/screen.png $G/before.png"
 # While the viewer is attached: the jail as the kernel has it.
 [ "${FEN_JAIL:-0}" = 1 ] && RJ=$(g "ps -ax -o user= -o jid= -o comm= | awk '\$3 == \"fresco-renderer\"'")
-[ "${FEN_JAIL:-0}" = 1 ] && FU=$(g "ps -ax -o user= -o ppid= -o comm= | awk '\$3 == \"fenestrad\" { print \$1 }' | sort | tr '\n' ' '")
+[ "${FEN_JAIL:-0}" = 1 ] && FU=$(g "ps -ax -o user= -o ppid= -o comm= | awk '\$3 ~ /^(atrium-)?fenestrad\$/ { print \$1 }' | sort | tr '\n' ' '")
 [ "${FEN_JAIL:-0}" = 1 ] && JL=$(g "jls -j system-fenestra-60500 vnet 2>/dev/null; ps -J system-fenestra-60500 -o uid= -o comm= 2>/dev/null" | tr -s ' \n' ' ')
 sleep 50
 g "cp $G/screen.png $G/middle.png"
@@ -147,6 +151,36 @@ if [ "${FEN_JAIL:-0}" = 1 ]; then
     check "after its grace the session's jail is gone" gone "$(g "jls -j system-fenestra-60500 jid >/dev/null 2>&1" && echo present || echo gone)"
 else
     check "the session is still up after its viewer left" yes "$(g "pgrep -x fenestra-session >/dev/null" && echo yes || echo "no: $(tail -2 "$W/fenestrad.log")")"
+fi
+if [ "${FEN_SERVICE:-0}" = 1 ]; then
+    # The service as rc and daemon(8) keep it. Each side's pid, root's and
+    # _fenestra's.
+    side() { g "ps -ax -o user= -o pid= -o comm= | awk '\$3 == \"atrium-fenestrad\" && \$1 == \"$1\" { print \$2 }'"; }
+    whole() {   # one root side and one _fenestra side, new, taking mints
+        i=0; while [ $i -lt 20 ]; do
+            r=$(side root); u=$(side _fenestra)
+            [ -n "$r" ] && [ -n "$u" ] && [ "$r" != "$1" ] && [ "$u" != "$2" ] && g "test -S /var/run/fenestra/mint.sock" && { echo "$r $u"; return; }
+            sleep 1; i=$((i+1)); done
+        echo "no: root [$(side root)] _fenestra [$(side _fenestra)]"; }
+    R0=$(side root); U0=$(side _fenestra)
+    # The root side killed outright: its other side goes with it (no
+    # orphan holding the mint socket and frescod's link) and daemon(8)
+    # starts the pair again, which takes frescod's link again.
+    g "kill -9 $R0"
+    P1=$(whole "$R0" "$U0")
+    case "$P1" in no:*) bad "killed outright, fenestrad came back whole: $P1";;
+        *) check "killed outright, fenestrad came back whole, the old side gone" "gone" "$(g "kill -0 $U0 2>/dev/null" && echo "orphan $U0" || echo gone)";; esac
+    # The unprivileged side killed: the root side ends with it, and the
+    # pair comes back.
+    set -- $P1
+    g "kill -9 ${2:-0}"
+    P2=$(whole "${1:-0}" "${2:-0}")
+    case "$P2" in no:*) bad "its unprivileged side killed, the service came back: $P2";; *) ok "its unprivileged side killed, the service came back";; esac
+    # A stop takes it all down: both sides and any session jail.
+    g "service atrium_fenestrad stop >/dev/null 2>&1"
+    i=0; while [ $i -lt 15 ] && [ -n "$(side root)$(side _fenestra)" ]; do sleep 1; i=$((i+1)); done
+    check "service stop ends both sides and every session jail" "none" "$( [ -z "$(side root)$(side _fenestra)" ] && ! g "jls name | grep -q '^system-fenestra-'" && echo none || echo "left: $(side root) $(side _fenestra) $(g "jls name | grep system-fenestra-")")"
+    g "test -e $G/made-seat && rm -f /atrium/sockets/ostiarius/active-session; sysrc -x atrium_fenestrad_grace atrium_fenestrad_logfile >/dev/null 2>&1; true"
 fi
 g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; true"
 echo "  evidence in $W"

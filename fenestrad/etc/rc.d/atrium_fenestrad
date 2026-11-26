@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# PROVIDE: atrium_fenestrad
+# REQUIRE: LOGIN atrium_jaild
+# KEYWORD: shutdown
+#
+# fenestrad, Fenestra's daemon on the host (docs/spec/fenestra.md §3.2,
+# §19b). Root only to bind the mint socket and to keep jaild: it forks a
+# root side that holds jaild and answers two fixed requests, and the rest
+# runs as _fenestra, which reads every peer's bytes and holds frescod's
+# link. Each viewing session gets its own jail from jaild. daemon(8)
+# starts it again when it exits (frescod restarted, or not up yet).
+# Installed by scripts/fenestra-service.sh.
+#
+# Remote viewing is off until atrium_fenestrad_enable=YES and the network
+# viewers come from is named:
+#   atrium_fenestrad_lan="vtnet0 192.168.1.0/24"   interface and subnet
+#   atrium_fenestrad_public_ip="192.168.1.20"      the address mints name
+# and optionally:
+#   atrium_fenestrad_grace=SECONDS   how long a session waits for its viewer
+#   atrium_fenestrad_logfile=PATH    its log there, not syslog
+
+. /etc/rc.subr
+
+name=atrium_fenestrad
+rcvar=atrium_fenestrad_enable
+pidfile=/var/run/${name}.pid
+procname=/usr/sbin/daemon
+command=/usr/sbin/daemon
+
+load_rc_config $name
+: ${atrium_fenestrad_enable:=NO}
+: ${atrium_fenestrad_lan:=}
+: ${atrium_fenestrad_public_ip:=}
+: ${atrium_fenestrad_grace:=}
+: ${atrium_fenestrad_logfile:=}
+
+start_precmd=atrium_fenestrad_prestart
+atrium_fenestrad_prestart()
+{
+	set -- ${atrium_fenestrad_lan}
+	if [ $# -ne 2 ] || [ -z "${atrium_fenestrad_public_ip}" ]; then
+		err 1 "set atrium_fenestrad_lan=\"IFACE SUBNET\" and atrium_fenestrad_public_ip"
+	fi
+	case "${atrium_fenestrad_grace}" in
+	*[!0-9]*) err 1 "atrium_fenestrad_grace is a number of seconds" ;;
+	esac
+	install -d -o root -g wheel -m 0755 /var/run/fenestra
+}
+
+if [ -n "${atrium_fenestrad_logfile}" ]; then
+	_log="-o ${atrium_fenestrad_logfile}"
+else
+	_log="-S -T atrium-fenestrad"
+fi
+
+command_args="-R 2 -P ${pidfile} ${_log} /usr/local/sbin/atrium-fenestrad \
+	--frescod /atrium/sockets/fenestra/fenestra.sock \
+	--session /usr/local/bin/atrium-fenestra-session \
+	--mint-sock /var/run/fenestra/mint.sock \
+	--jaild /var/run/atrium/jaild.sock --lan ${atrium_fenestrad_lan} \
+	--public-ip ${atrium_fenestrad_public_ip} --user _fenestra \
+	${atrium_fenestrad_grace:+--grace ${atrium_fenestrad_grace}}"
+
+run_rc_command "$1"

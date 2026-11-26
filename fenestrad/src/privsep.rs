@@ -159,16 +159,56 @@ pub mod jailer {
             -1 => crate::die(format!("fork: {}", io::Error::last_os_error())),
             0 => {
                 drop(parent);
+                // This side ends with the root side, even one killed
+                // outright: no orphan holding the mint socket and frescod's
+                // link. A root side already gone before this was set
+                // leaves us adopted: end now.
+                let mut sig: libc::c_int = libc::SIGKILL;
+                // SAFETY: procctl on our own pid with a pointer to a live int.
+                let set = unsafe { libc::procctl(libc::P_PID, 0, libc::PROC_PDEATHSIG_CTL, (&mut sig as *mut libc::c_int).cast()) };
+                // SAFETY: getppid has no preconditions.
+                if set != 0 || unsafe { libc::getppid() } == 1 {
+                    crate::die("the root side is gone");
+                }
                 Jailer { sock: Mutex::new(child) }
             }
             _ => {
                 drop(child);
+                // A stop (SIGTERM, SIGINT, SIGHUP from rc or daemon(8))
+                // goes to the unprivileged side; its going ends `serve`,
+                // which takes down every session jail before this exits.
+                CHILD.store(pid, std::sync::atomic::Ordering::Relaxed);
+                for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                    // SAFETY: an all-zero sigaction is valid to fill; the
+                    // handler only calls kill(2), which is
+                    // async-signal-safe, and SA_RESTART resumes the recv
+                    // the signal interrupts.
+                    unsafe {
+                        let mut sa: libc::sigaction = std::mem::zeroed();
+                        sa.sa_sigaction = pass_on as extern "C" fn(libc::c_int) as usize as libc::sighandler_t;
+                        sa.sa_flags = libc::SA_RESTART;
+                        libc::sigemptyset(&mut sa.sa_mask);
+                        libc::sigaction(s, &sa, std::ptr::null_mut());
+                    }
+                }
                 serve(parent.as_fd(), &make(), &args);
                 let mut st = 0;
                 // SAFETY: reaps our own child.
                 unsafe { libc::waitpid(pid, &mut st, 0) };
                 std::process::exit(0)
             }
+        }
+    }
+
+    /// The unprivileged side's pid, for [`pass_on`].
+    static CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// The root side's stop handler: the stop goes to the other side.
+    extern "C" fn pass_on(_: libc::c_int) {
+        let pid = CHILD.load(std::sync::atomic::Ordering::Relaxed);
+        if pid > 0 {
+            // SAFETY: kill(2) is async-signal-safe; `pid` is our own child.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 
