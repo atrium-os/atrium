@@ -1686,9 +1686,11 @@ the window, or to its slot or pop-up hit there, even where another window covers
 host's screen; buttons and scrolls follow the window it pinned. A window not on screen, or held
 by a sheet, takes nothing. A script's screen-pixel `MOVE` is turned into `MotionIn` for the
 topmost window the layout has there. Focusing a per-app window on the viewer sends `Input::Focus { window }` (control tag 11, link
-input 6) and frescod raises the window and gives it the keys; resizing one sends
+input 6) and frescod raises the window and gives it the keys (focus cause `REMOTE`), never while a window of a
+trusted sheet uid (Sigillum, Arca's prompts) is on screen; resizing one sends
 `Input::Resize { window, width, height }` (tag 12, link input 7, each side 64 to 8192) and
-frescod resizes it, never below the app's minimum at its scale, so the app lays out at the new
+frescod resizes it at the next frame (latest a window wins), never below the app's minimum at
+its scale nor past the screen, so the app lays out at the new
 size. Both take the same checks as `MotionIn` (per-app only, a placed window on screen, not
 held, not a slot or pop-up). While the app re-lays out, the viewer keeps the last frame at the
 top left, clipped or padded (§6.4), and does not snap the window back to an older layout's size
