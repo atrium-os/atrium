@@ -180,10 +180,11 @@ fn main() {
             if let Event::Devices { devices } = c.call(Request::Devices) {
                 for d in devices {
                     println!(
-                        "{} {:?} {}{}{}",
+                        "{} {:?} {}{}{}{}",
                         d.address,
                         d.name,
                         if d.authenticated { "authenticated" } else { "unauthenticated" },
+                        if d.secure_connections { "" } else { ", weaker key (no Secure Connections)" },
                         if d.keyboard_allowed { ", keyboard allowed" } else { "" },
                         if d.connected { ", connected" } else { "" }
                     );

@@ -220,7 +220,15 @@ fn bd() -> hci::Address {
 }
 
 fn classic_host() -> Host {
-    let mut h = ready_host(4);
+    classic_host_on(ready_host(4))
+}
+
+/// A connected Classic link on a controller without BR/EDR Secure Connections.
+fn classic_host_no_sc() -> Host {
+    classic_host_on(vinculum_host::testing::ready_host_page2(4, 0))
+}
+
+fn classic_host_on(mut h: Host) -> Host {
     h.on_frame(
         event(hci::ConnectionComplete {
             status: ErrorCode::Success,
@@ -324,4 +332,65 @@ fn authentication_complete_nobody_asked_for_is_a_violation() {
     auth_complete(&mut h);
     assert_eq!(h.stats().link_violations, 1);
     assert!(events(&mut h).is_empty());
+}
+
+/// Pairs on `h` until the link key arrives, then completes authentication.
+fn classic_pair_with_key(h: &mut Host, key_type: hci::KeyType) {
+    h.pair(7, cfg(), 0).unwrap();
+    assert_eq!(drain(h).0, vec![OpCode::AuthenticationRequested]);
+    ok(h, OpCode::AuthenticationRequested);
+    h.on_frame(event(hci::LinkKeyRequest { bd_addr: bd() }), 0);
+    drain(h);
+    h.on_frame(vinculum_host::testing::complete(hci::LinkKeyRequestNegativeReplyComplete { status: ErrorCode::Success, bd_addr: bd(), num_hci_command_packets: 1 }), 0);
+    h.on_frame(event(hci::IoCapabilityRequest { bd_addr: bd() }), 0);
+    assert_eq!(drain(h).0, vec![OpCode::IoCapabilityRequestReply]);
+    h.on_frame(vinculum_host::testing::complete(hci::IoCapabilityRequestReplyComplete { status: ErrorCode::Success, bd_addr: bd(), num_hci_command_packets: 1 }), 0);
+    h.on_frame(event(hci::LinkKeyNotification { bd_addr: bd(), link_key: [9; 16], key_type }), 0);
+    auth_complete(h);
+}
+
+fn key_size_16(h: &mut Host) {
+    h.on_frame(
+        vinculum_host::testing::complete(hci::ReadEncryptionKeySizeComplete {
+            status: ErrorCode::Success,
+            connection_handle: 7,
+            key_size: 16,
+            num_hci_command_packets: 1,
+        }),
+        0,
+    );
+}
+
+#[test]
+fn a_controller_without_bredr_sc_keeps_an_authenticated_p192_key_marked_weaker() {
+    let mut h = classic_host_no_sc();
+    assert!(!h.info().bredr_secure_connections());
+    classic_pair_with_key(&mut h, hci::KeyType::AuthenticatedP192);
+    let ev = events(&mut h);
+    assert!(ev.is_empty(), "{ev:?}");
+    assert_eq!(drain(&mut h).0, vec![OpCode::SetConnectionEncryption]);
+    ok(&mut h, OpCode::SetConnectionEncryption);
+    h.on_frame(event(hci::EncryptionChange { status: ErrorCode::Success, connection_handle: 7, encryption_enabled: hci::EncryptionEnabled::On }), 0);
+    assert_eq!(drain(&mut h).0.last(), Some(&OpCode::ReadEncryptionKeySize));
+    key_size_16(&mut h);
+    let ev = events(&mut h);
+    let bond = ev.iter().find_map(|e| if let HostEvent::Paired { bond, .. } = e { Some(bond.clone()) } else { None }).expect("paired");
+    assert!(bond.authenticated && !bond.secure_connections);
+    assert!(h.is_encrypted(7));
+
+    // Unauthenticated P-192 (Just Works) is still refused there.
+    let mut h = classic_host_no_sc();
+    classic_pair_with_key(&mut h, hci::KeyType::UnauthenticatedP192);
+    assert!(matches!(events(&mut h).as_slice(), [HostEvent::PairingFailed { handle: 7, .. }]));
+
+    // And a stored P-192 bond comes back up with E0.
+    let mut h = classic_host_no_sc();
+    h.encrypt_bond(7, [5; 16], false, 0).unwrap();
+    ok(&mut h, OpCode::AuthenticationRequested);
+    auth_complete(&mut h);
+    ok(&mut h, OpCode::SetConnectionEncryption);
+    h.on_frame(event(hci::EncryptionChange { status: ErrorCode::Success, connection_handle: 7, encryption_enabled: hci::EncryptionEnabled::On }), 0);
+    assert_eq!(drain(&mut h).0.last(), Some(&OpCode::ReadEncryptionKeySize));
+    key_size_16(&mut h);
+    assert!(h.is_encrypted(7));
 }

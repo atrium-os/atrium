@@ -529,7 +529,7 @@ impl Daemon {
             HostEvent::Ready(info) => {
                 eprintln!("vinculumd: controller ready, HCI version {}, {} bonds", info.hci_version, self.bonds.len());
                 if !info.le_only() && !info.bredr_secure_connections() {
-                    eprintln!("vinculumd: this controller has no BR/EDR Secure Connections: Classic pairing makes P-192 keys only, which the no-downgrade rule refuses (bluetooth.md §7); LE is unaffected");
+                    eprintln!("vinculumd: this controller has no BR/EDR Secure Connections: Classic pairings make P-192 keys, kept only when authenticated and shown as weaker (bluetooth.md §7); LE is unaffected");
                 }
                 self.update_page_scan();
                 self.update_scan();
@@ -571,8 +571,8 @@ impl Daemon {
                         self.host.disconnect(handle, now);
                     }
                 } else if let Some(k) = self.bond_for(a) {
-                    let ltk = self.bonds[k].1.ltk;
-                    if self.host.encrypt(handle, ltk, now).is_err() {
+                    let (ltk, sc) = (self.bonds[k].1.ltk, self.bonds[k].1.secure_connections);
+                    if self.host.encrypt_bond(handle, ltk, sc, now).is_err() {
                         self.host.disconnect(handle, now);
                     }
                 } else {
@@ -765,8 +765,9 @@ impl Daemon {
                 let pairable = self.pairable.is_open(now) && self.agents() > 0;
                 match policy::on_security_request(bonded.is_some(), pairable) {
                     OnSecurityRequest::Encrypt => {
-                        let ltk = self.bonds[bonded.expect("bonded")].1.ltk;
-                        let _ = self.host.encrypt(handle, ltk, now);
+                        let b = &self.bonds[bonded.expect("bonded")].1;
+                        let (ltk, sc) = (b.ltk, b.secure_connections);
+                        let _ = self.host.encrypt_bond(handle, ltk, sc, now);
                     }
                     OnSecurityRequest::Pair => {
                         let _ = self.start_pair(handle);

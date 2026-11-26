@@ -123,11 +123,12 @@ impl Host {
         self.issue(to_cmd(hci::AuthenticationRequested { connection_handle: handle }), Tag::Encrypt(handle));
     }
 
-    pub(crate) fn classic_encrypt(&mut self, handle: u16, key: [u8; 16]) {
+    /// `secure_connections`: the stored key is P-256, so the link must come
+    /// up with AES-CCM; a P-192 key (made on a controller without BR/EDR
+    /// Secure Connections, §7) comes up with E0.
+    pub(crate) fn classic_encrypt(&mut self, handle: u16, key: [u8; 16], secure_connections: bool) {
         let c = self.conns.get_mut(&handle).expect("checked");
-        // Bonds are SC-only (pairing refuses anything else), so the link
-        // must come up with AES-CCM.
-        c.classic = Some(ClassicSec { key: Some(key), authenticating: true, sc_key: true, ..Default::default() });
+        c.classic = Some(ClassicSec { key: Some(key), authenticating: true, sc_key: secure_connections, ..Default::default() });
         self.issue(to_cmd(hci::AuthenticationRequested { connection_handle: handle }), Tag::Encrypt(handle));
     }
 
@@ -266,8 +267,14 @@ impl Host {
                 if s.pairing {
                     match s.new_key.as_ref().map(|k| k.1) {
                         Some(hci::KeyType::AuthenticatedP256 | hci::KeyType::UnauthenticatedP256) => s.sc_key = true,
+                        // A controller without BR/EDR Secure Connections can
+                        // only make P-192 keys: an authenticated one (numeric
+                        // comparison or passkey) is kept, marked weaker (§7).
+                        // On a controller that has SC it is a downgrade.
+                        Some(hci::KeyType::AuthenticatedP192) if !self.info.bredr_secure_connections() => s.sc_key = false,
                         Some(t) => {
-                            // Legacy (P-192 or combination) keys: refused (§7).
+                            // Unauthenticated P-192, combination keys, and
+                            // P-192 where SC was possible: refused (§7).
                             self.kick(h);
                             return self.classic_fail(h, &format!("peer gave a {t:?} key; Secure Connections required"));
                         }
@@ -324,12 +331,12 @@ impl Host {
         if let Some(mut s) = s {
             if s.pairing {
                 let (key, t) = s.new_key.take().expect("checked at authentication");
-                let authenticated = t == hci::KeyType::AuthenticatedP256;
+                let authenticated = matches!(t, hci::KeyType::AuthenticatedP256 | hci::KeyType::AuthenticatedP192);
                 let m = method(s.io_cap.unwrap_or(IoCap::NoInputNoOutput), io_from(s.peer_io.unwrap_or(3)), true);
                 let bond = Bond {
                     ltk: key,
                     key_size: 16,
-                    secure_connections: true,
+                    secure_connections: s.sc_key,
                     authenticated,
                     method: if authenticated { m } else { Method::JustWorks },
                     peer_irk: None,

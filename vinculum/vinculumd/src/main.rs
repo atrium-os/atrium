@@ -364,7 +364,7 @@ fn main() {
                     let at = Address::from_msb(peer.address, peer.random);
                     if let Some(b) = vinculum_keys::find(bonds.iter().map(|(_, b)| b), &at) {
                         println!("bonded: {} ({}authenticated)", b.name, if b.authenticated { "" } else { "un" });
-                        if let Err(e) = host.encrypt(handle, b.ltk, now()) {
+                        if let Err(e) = host.encrypt_bond(handle, b.ltk, b.secure_connections, now()) {
                             eprintln!("vinculumd: encrypt: {e}");
                             ok = false;
                         }

@@ -72,11 +72,14 @@ pub fn new_bond(stored: Option<&Bond>, new: &Bond) -> NewBond {
     NewBond::Replace
 }
 
-/// Whether a bond may carry keyboard reports (§7): only an authenticated,
-/// Secure Connections key. A Just Works keyboard gets mouse and consumer
-/// reports until it is paired again with passkey or numeric comparison.
+/// Whether a bond may carry keyboard reports (§7): only an authenticated
+/// key of 16 bytes, Secure Connections on LE (legacy LE keys never), and on
+/// Classic also an authenticated P-192 key, which pairing keeps only on a
+/// controller without BR/EDR Secure Connections (Shankar, 2026-11-26). A
+/// Just Works keyboard gets mouse and consumer reports until it is paired
+/// again with passkey or numeric comparison.
 pub fn keyboard_allowed(b: &Bond) -> bool {
-    b.authenticated && b.secure_connections && b.key_size == 16
+    b.authenticated && b.key_size == 16 && (b.secure_connections || b.classic)
 }
 
 /// A Security Request from the peripheral: encrypt with the stored bond
@@ -146,7 +149,16 @@ mod tests {
     fn keyboards_need_authenticated_keys() {
         assert!(keyboard_allowed(&bond(true, true, 16)));
         assert!(!keyboard_allowed(&bond(true, false, 16)));
-        assert!(!keyboard_allowed(&bond(false, true, 16)));
+        assert!(!keyboard_allowed(&bond(false, true, 16)), "LE legacy, never");
+        let classic = |sc, auth| {
+            let mut b = bond(sc, auth, 16);
+            b.classic = true;
+            b
+        };
+        assert!(keyboard_allowed(&classic(false, true)), "Classic authenticated P-192 (controller without SC)");
+        assert!(!keyboard_allowed(&classic(false, false)));
+        // A P-192 key never replaces a Secure Connections one.
+        assert!(matches!(new_bond(Some(&classic(true, true)), &classic(false, true)), NewBond::Refuse(_)));
     }
 
     #[test]

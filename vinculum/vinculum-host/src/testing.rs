@@ -105,11 +105,29 @@ pub fn answer(cmd: &Frame, le_buffers: u8) -> Option<Frame> {
 /// A Host that has finished bring-up against the canned controller.
 /// Returns it with its output drained.
 pub fn ready_host(le_buffers: u8) -> Host {
+    ready_host_page2(le_buffers, 1 << 8)
+}
+
+/// As `ready_host`, with the controller's LMP features page 2 set to
+/// `page2` (0: no BR/EDR Secure Connections, like the RTL8761BU).
+pub fn ready_host_page2(le_buffers: u8, page2: u64) -> Host {
     let mut h = Host::new();
     h.start(0);
     for _ in 0..32 {
         let Some(cmd) = h.poll_frame() else { break };
-        if let Some(a) = answer(&cmd, le_buffers) {
+        let ext = hci::Command::decode_full(&cmd.packet).is_ok_and(|c| c.op_code == OpCode::ReadLocalExtendedFeatures);
+        let a = if ext {
+            Some(complete(hci::ReadLocalExtendedFeaturesComplete {
+                status: ErrorCode::Success,
+                page_number: 2,
+                maximum_page_number: 2,
+                extended_lmp_features: page2,
+                num_hci_command_packets: 1,
+            }))
+        } else {
+            answer(&cmd, le_buffers)
+        };
+        if let Some(a) = a {
             h.on_frame(a, 0);
         }
     }

@@ -106,6 +106,12 @@ impl Host {
     /// Encrypts a link with a stored key: LE (EDIV and Rand are zero for SC
     /// keys) or a Classic link key (authenticate, then encrypt). Result: `Encrypted` or `EncryptionFailed`.
     pub fn encrypt(&mut self, handle: u16, ltk: [u8; 16], now_ms: u64) -> Result<(), &'static str> {
+        self.encrypt_bond(handle, ltk, true, now_ms)
+    }
+
+    /// As `encrypt`, for a stored key that may be a Classic P-192 one
+    /// (`secure_connections` false).
+    pub fn encrypt_bond(&mut self, handle: u16, ltk: [u8; 16], secure_connections: bool, now_ms: u64) -> Result<(), &'static str> {
         let conn = self.conns.get_mut(&handle).ok_or("no such connection")?;
         if !conn.central {
             return Err("encryption needs a link where we are central");
@@ -114,7 +120,7 @@ impl Host {
             return Err("security procedure already running");
         }
         if conn.transport == Transport::BrEdr {
-            self.classic_encrypt(handle, ltk);
+            self.classic_encrypt(handle, ltk, secure_connections);
         } else {
             self.start_encryption(handle, ltk);
         }
