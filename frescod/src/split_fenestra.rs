@@ -150,11 +150,31 @@ impl Broker {
                     if !self.remote_on() {
                         continue;
                     }
-                    remote_input(&self.comp, sink, i, &mut pointer);
+                    // A pointer in a window is taken only in a per-app
+                    // session (no WM: in a desktop the person sees the WM's
+                    // stacking), and only for a window this link was last
+                    // told of: the session's own check is a jail's that
+                    // parses peer bytes, so it is not the one relied on.
+                    let i = match i {
+                        Input::MotionIn { window, .. } if !self.placed_in_apps(window) => continue,
+                        i => i,
+                    };
+                    let placed = |w: u32| self.placed_in_apps(w);
+                    remote_input(&self.comp, sink, i, &mut pointer, &placed);
                 }
                 _ => unreachable!("from_broker() covers the rest"),
             }
         }
+    }
+
+    /// Whether `window` was in the last layout sent on this link, and
+    /// that layout was a per-app one with no WM running now.
+    fn placed_in_apps(&self, window: u32) -> bool {
+        if self.comp.lock().unwrap().wm_running {
+            return false;
+        }
+        let f = self.fen.lock().unwrap();
+        matches!(&f.layout, Some(Rec::Layout { desktop: false, windows, .. }) if windows.iter().any(|p| p.window == window))
     }
 
     fn end_link(&self) {
@@ -396,11 +416,13 @@ struct Pointer {
 /// own: the same cursor, hit-test and focus. Remote input mints no
 /// activation token (fenestra.md §11: what a remote press may authorise is
 /// decided separately).
-fn remote_input(comp: &Arc<Mutex<Compositor>>, sink: &Sender<DisplayEvent>, i: Input, p: &mut Pointer) {
+fn remote_input(comp: &Arc<Mutex<Compositor>>, sink: &Sender<DisplayEvent>, i: Input, p: &mut Pointer, placed: &dyn Fn(u32) -> bool) {
     use crate::injector_reader::{cursor_here, cursor_to, focused_window};
     // Where a button or scroll lands: in the pinned window (asked again,
-    // so one gone or held since takes nothing), else the hit-test's.
+    // so one gone, held or no longer placed since takes nothing), else
+    // the hit-test's.
     let at = |p: &Pointer| match p.pinned {
+        Some((w, _, _)) if !placed(w) => (0.0, 0.0, 0),
         Some((w, x, y)) => {
             let (t, (lx, ly)) = comp.lock().unwrap().pointer_in(w as u16, x, y);
             (lx, ly, t as u32)

@@ -1865,7 +1865,9 @@ impl Compositor {
     /// even where the host stacks them over each other. The cursor moves
     /// to that point of the screen; what is hit there is taken when it is
     /// `id` or a slot or pop-up of it, else `id` itself. A window that is
-    /// not on screen, or that a sheet holds, takes nothing (0).
+    /// not on screen, or that a sheet holds, takes nothing (0), nor does
+    /// a point on one of its islands that the host's screen shows covered
+    /// (navigator-ui.md §6.3): the island's own rule, whoever covers it.
     pub fn pointer_in(&mut self, id: WindowId, x: f32, y: f32) -> (WindowId, (f32, f32)) {
         let Some(pos) = self.windows.get(&id).filter(|w| !w.hidden && id != 0).map(|w| w.pos) else {
             return (0, (x, y));
@@ -1879,7 +1881,20 @@ impl Compositor {
         let ours = hit == id
             || self.windows.get(&hit).is_some_and(|w| w.slot.is_some_and(|s| s.parent == id) || w.popup.as_ref().is_some_and(|p| p.parent == id));
         if ours {
-            (hit, local)
+            return (hit, local);
+        }
+        let covered_island = self.shown.as_ref().is_some_and(|shown| {
+            shown.iter().any(|l| {
+                let [x0, y0, x1, y1] = l.rect;
+                let inside = at.0 >= x0 as f32 && at.0 < x1 as f32 && at.1 >= y0 as f32 && at.1 < y1 as f32;
+                inside
+                    && self.is_island(l.id)
+                    && self.windows.get(&l.id).and_then(|w| w.slot).is_some_and(|s| s.parent == id)
+                    && self.island_covered_in(shown.iter().map(|l| (l.id, l.rect)), l.id)
+            })
+        });
+        if covered_island {
+            (0, (x, y))
         } else {
             (id, (x, y))
         }
@@ -2432,6 +2447,37 @@ mod notification_tests {
         assert_eq!(c.pointer_in(77, 5.0, 6.0).0, 0, "no such window");
         c.windows.get_mut(&a).unwrap().hidden = true;
         assert_eq!(c.pointer_in(a, 5.0, 6.0).0, 0, "not on screen");
+    }
+
+    #[test]
+    fn a_pointer_in_a_window_reaches_nothing_while_locked() {
+        let mut c = Compositor::new();
+        let a = c.create(1, (300, 200));
+        c.windows.get_mut(&a).unwrap().owner_uid = 1001;
+        assert_eq!(c.pointer_in(a, 5.0, 6.0).0, a);
+        c.set_lock(Some(vec![65001]));
+        assert_eq!(c.pointer_in(a, 5.0, 6.0).0, 0, "an app window behind the lock takes nothing");
+        c.set_lock(None);
+        assert_eq!(c.pointer_in(a, 5.0, 6.0).0, a);
+    }
+
+    #[test]
+    fn a_pointer_in_a_window_does_not_reach_its_covered_island() {
+        let mut c = Compositor::new();
+        let p = c.create(1, (300, 200));
+        let i = c.create(1, (100, 100));
+        c.windows.get_mut(&i).unwrap().slot = Some(Slot { parent: p, rect: [0.0, 0.0, 100.0, 100.0], kind: fresco_protocol::slot::kind::ISLAND, z: 0 });
+        c.windows.get_mut(&i).unwrap().pos = (0.0, 0.0);
+        let x = c.create(2, (50, 50));
+        c.windows.get_mut(&x).unwrap().pos = (80.0, 80.0);
+        // On the host's screen: the parent, its island, and another app's
+        // window over the island's corner.
+        let layer = |id, rect| ShownLayer { id, rect, alpha: None };
+        c.shown = Some(vec![layer(p, [0, 0, 300, 200]), layer(i, [0, 0, 100, 100]), layer(x, [80, 80, 130, 130])]);
+        assert_eq!(c.pointer_in(p, 10.0, 10.0).0, 0, "the island is covered: nobody takes it");
+        assert_eq!(c.pointer_in(p, 200.0, 150.0).0, p, "the parent's own part");
+        c.shown = Some(vec![layer(p, [0, 0, 300, 200]), layer(i, [0, 0, 100, 100])]);
+        assert_eq!(c.pointer_in(p, 10.0, 10.0).0, i, "uncovered, the island takes it");
     }
 
     #[test]

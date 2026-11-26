@@ -280,7 +280,13 @@ app's size, with no host wallpaper or trusted strip around it; the viewer draws 
 on each (§11.5). Every `Layout` says which (`desktop`), and the viewer follows it as it changes.
 In a per-app session the host still stacks its windows somewhere on its screen, possibly over
 each other, so the viewer's pointer goes as a position in a window (`MotionIn`), never as a
-screen position; buttons and scrolls go to that window.
+screen position; buttons and scrolls go to that window. frescod takes `MotionIn` only while no
+WM runs and only for a window its last layout to that link placed (the session's own check is
+in the jail that parses the viewer's bytes, so it is not the one relied on), and keeps the
+host's rules there: a window off screen, behind the lock or held by a sheet takes nothing, nor
+does a point on one of its islands that the host's screen shows covered (navigator-ui.md §6.3).
+Until R4 draws a window's slots and pop-ups inside its own viewer window, they are placed in
+the layout, and so shown, as windows of their own.
 
 ## 4. What the host has to change, and what it saves
 
