@@ -22,6 +22,7 @@
 #   2. the grant (this computer): the person gets "probe 9000" through
 #      127.0.0.1; another user is refused there and directly;
 #   3. the network allowed: lanpeer gets "probe 8080"; it can't reach 9000;
+#      a held connection from each side is counted;
 #   4. the network changes (another router): the LAN rule goes; back again:
 #      it returns;
 #   5. a second app asking for 8080 doesn't get it; the first keeps it;
@@ -37,7 +38,7 @@ set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin listen 21
+gate_begin listen 24
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 V() { "$ROOT/scripts/vssh" "$@"; }
 TGT=${CARGO_TARGET_DIR:-$ROOT/portcullis/target}
@@ -55,12 +56,12 @@ A1=org.test.lsrv; A2=org.test.lsrv2
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
     -p portcullisd -p portcullis-cli -p opifex -p jaild \
-    --bin portcullisd --bin portcullis --bin opifex --bin atrium-jaild --example listen_probe --example fake_netd) \
+    --bin portcullisd --bin portcullis --bin opifex --bin atrium-jaild --example listen_probe --example fake_netd --example jaild_ask) \
     || gate_abort "cross-build failed"
 
 echo "=== install"
 V "mkdir -p $B"
-for b in release/portcullisd release/portcullis release/opifex release/atrium-jaild release/examples/listen_probe release/examples/fake_netd; do
+for b in release/portcullisd release/portcullis release/opifex release/atrium-jaild release/examples/listen_probe release/examples/fake_netd release/examples/jaild_ask; do
     scp -q $K -P "$VM_SSH_PORT" "$TGT/$TARGET/$b" root@localhost:$B/ || gate_abort "copy $b"
 done
 scp -q $K -P "$VM_SSH_PORT" "$ROOT/etc/atrium.pf" root@localhost:$B/ || gate_abort "copy atrium.pf"
@@ -122,7 +123,7 @@ HOME_NET=wired-$GWMAC
 SEQ=0; ROUTER=192.168.77.2
 net() { # router: a changed answer is an event to portcullisd
     ROUTER=$1; SEQ=$((SEQ + 1))
-    V "printf 'iface name=$LIF mac=x state=bound addr=192.168.77.1/24 router=$1 link=up internet=yes egress=1 seq=$SEQ\nok\n' > $B/status.txt"
+    V "printf 'iface name=$LIF mac=x state=bound addr=192.168.77.1/24 router=$1 link=up internet=yes egress=1 seq=$SEQ\nok\n' > $B/status.new && mv $B/status.new $B/status.txt"
 }
 net 192.168.77.2
 V "pkill -f fake_netd; daemon -f $B/fake_netd $NETD $B/status.txt"
@@ -134,9 +135,9 @@ grant() { # app networks
 }
 # Settings' SetListen asks portcullisd to look again; a file edit doesn't,
 # so the check pokes it with an atrium-net event.
-policy() { printf '%s' "$1" | V "cat > /var/db/atrium/$U/policy.toml"; net $ROUTER; }
-lan() { V "jexec lanpeer nc -w 3 $1 $2 < /dev/null" 2>/dev/null | tr -d '\r'; }
-as() { V "su -m $1 -c 'nc -w 3 $2 $3 < /dev/null'" 2>/dev/null | tr -d '\r'; }
+policy() { printf '%s' "$1" | V "cat > /var/db/atrium/$U/policy.new && mv /var/db/atrium/$U/policy.new /var/db/atrium/$U/policy.toml"; net $ROUTER; echo "  (policy written $(V 'date -u +%T' | tr -d '\r'))"; }
+lan() { V "jexec lanpeer nc -N -w 3 $1 $2 < /dev/null" 2>/dev/null | tr -d '\r'; }
+as() { V "su -m $1 -c 'nc -N -w 3 $2 $3 < /dev/null'" 2>/dev/null | tr -d '\r'; }
 jail_of() { V "jls name | grep '$(echo $1 | tr . _)\$' | head -1" | tr -d '\r'; }
 app_addr() { V "pfctl -a atrium/$1 -sr 2>/dev/null" | sed -n 's/.* from \(100\.64\.[0-9.]*\) to .*/\1/p' | head -1; }
 count() { V "grep -c -F '$1' $LOG" 2>/dev/null | tr -d '\r '; }
@@ -154,6 +155,8 @@ case "$AD" in
     *) bad "no app address in atrium/$J1" ;;
 esac
 check "nothing on 127.0.0.1:9000" "" "$(as $U 127.0.0.1 9000)"
+check "root on the host reaches the app's own address" "probe 8080" "$(V "nc -N -w 3 $AD 8080 < /dev/null" 2>/dev/null | tr -d '\r')"
+check "…another local user doesn't, on a port it doesn't listen on for them" "" "$(as $O "$AD" 8080)"
 
 echo "=== 2. this computer"
 policy "$(grant $A1 '')"
@@ -167,8 +170,18 @@ check "the LAN still can't reach 8080" "" "$(lan 192.168.77.1 8080)"
 echo "=== 3. this network"
 policy "$(grant $A1 "\"$HOME_NET\"")"
 settle
-check "lanpeer gets probe 8080" "probe 8080" "$(lan 192.168.77.1 8080)"
+R=$(lan 192.168.77.1 8080)
+if [ "$R" = "probe 8080" ]; then ok "lanpeer gets probe 8080"; else
+    bad "lanpeer got [$R]: $(V "pfctl -a atrium/$J1 -sn; pfctl -a atrium/$J1 -sr; pfctl -ss | grep -E '8080|9000'; jexec lanpeer nc -v -N -w 3 192.168.77.1 8080 < /dev/null 2>&1; date -u +%T; grep SetListen /var/log/atrium/jaild.log | tail -2; grep listen: $LOG | tail -6; grep -c networks /var/db/atrium/$U/policy.toml" | tr '\n' '|')"
+fi
 check "…not 9000" "" "$(lan 192.168.77.1 9000)"
+# One held connection from the LAN and one through the forwarder: what the
+# bar's "2 connections" is read from.
+V "daemon -f jexec lanpeer sh -c 'sleep 8 | nc 192.168.77.1 8080 > /dev/null'; daemon -f su -m $U -c 'sleep 8 | nc 127.0.0.1 9000 > /dev/null'"
+sleep 3
+check "jaild counts both connections" '{"kind":"listen_stats","connections":2}' \
+    "$(V "$B/jaild_ask '{\"kind\":\"listen_stats\",\"jail_name\":\"$J1\"}'" | tr -d '\r')"
+sleep 6
 check "…the rdr is from this network only" 1 "$(V "pfctl -a atrium/$J1 -sn" | grep -c "rdr on $LIF inet proto tcp from 192.168.77.0/24 to ($LIF) port = [a-z0-9-]* -> $AD port 8080")"
 
 echo "=== 4. the network changes"

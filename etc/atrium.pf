@@ -35,6 +35,12 @@ nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)
 # An app never reaches the host itself — any of the host's addresses. First,
 # so no per-app grant can undo it.
 block in quick on atrium inet from any to (self)
+# The host reaches an app's address only as root (jaild, including its
+# `listen` forwarder for the person's own processes, background-apps.md
+# §4.3): another local user, or a service, can't connect to an app's ports.
+# Forwarded traffic (another app, a LAN `listen`) isn't from (self).
+pass out quick on atrium inet proto { tcp udp } from (self) to 100.64.0.0/16 user root keep state
+block out quick on atrium inet proto { tcp udp } from (self) to 100.64.0.0/16
 # Each networked app's grants, rendered by jaild from structured grants
 # (network.md §0.1): consented peers, then that app's own block to
 # 100.64.0.0/16, then its outbound passes. All `quick`.

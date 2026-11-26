@@ -430,15 +430,16 @@ update that starts asking for either is asked about.
 - Base pf (`etc/atrium.pf`): `rdr-anchor "atrium/*"` (which covers
   atrium/vpn), and `block in quick on atrium_egress inet from any to
   100.64.0.0/16` after the anchors. Before this, a LAN neighbour routing
-  100.64.0.0/16 through the machine reached any app's ports. Still open,
-  for later: any local process can connect to an app's address on ports it
-  does not `listen` on (`pass all` from the host).
+  100.64.0.0/16 through the machine reached any app's ports. And the host
+  reaches an app's address over TCP or UDP only as root (`pass out … user
+  root`, then a block): before, any local process could connect to any
+  app's ports.
 - Network identity: atrium-net's `status` line for a Wi-Fi interface now
   carries `ssid=` and `secured=` (the saved entry has a credential).
   portcullisd (`listen_run.rs`) names the egress network `wifi-<ssid hex>`
   (secured only) or `wired-<router MAC>` (the ARP table), follows
   atrium-net's `subscribe` stream and re-renders every running listener on
-  each event (and each quiet minute). With no network, or one the grant
+  each event (and every 5 quiet seconds). With no network, or one the grant
   doesn't name, only this-computer ports stay.
 - The grant: `SetListen { app_id, persona, network, on, activation }` on
   the Apps page's path; `network` adds or removes the network the computer
@@ -450,5 +451,10 @@ update that starts asking for either is asked about.
   them; no page can reach the person's port. A typed
   `http://localhost:8080` doesn't open the person's server either (not
   built).
-- Not built: the bar's "3 connections" count and "Not reachable on this
-  network" line.
+- The bar's line under each server: "3 connections" (jaild's
+  `ListenStats`: the forwarder's live connections plus pf's established
+  states from a network) and "Not reachable on this network" (the person
+  allowed it on some network, not this one).
+- A router once named keeps its name while atrium-net reports the same
+  interface and router; any answer with no network forgets it. portcullisd
+  logs each change of the network it sees.

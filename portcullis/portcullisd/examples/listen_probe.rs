@@ -1,5 +1,6 @@
 //! A stand-in server for scripts/vm-listen-check.sh: answers "probe <port>"
-//! on every TCP connection to 8080 and 9000 (all addresses), then closes.
+//! on every TCP connection to 8080 and 9000 (all addresses), and holds it
+//! until the client closes.
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -16,7 +17,11 @@ fn main() {
                 }
             };
             for mut c in l.incoming().flatten() {
-                let _ = c.write_all(format!("probe {port}\n").as_bytes());
+                // Held until the client closes, so a check can count it.
+                std::thread::spawn(move || {
+                    let _ = c.write_all(format!("probe {port}\n").as_bytes());
+                    let _ = std::io::copy(&mut c, &mut std::io::sink());
+                });
             }
         }));
     }

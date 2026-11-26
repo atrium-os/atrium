@@ -64,6 +64,20 @@ pub fn menu(n: &BgShown) -> (Vec<MenuItem>, Vec<Option<BgAction>>) {
         let state = if a.paused { format!("{name}: stopped after crashing, retrying soon") } else { name.clone() };
         items.push(MenuItem::new(state).enabled(false).separated());
         acts.push(None);
+        // Its ports (background-apps.md §4.3): how busy, and where not.
+        let mut about = Vec::new();
+        match a.connections {
+            Some(1) => about.push("1 connection".to_string()),
+            Some(n) if n > 0 => about.push(format!("{n} connections")),
+            _ => {}
+        }
+        if a.not_on_this_network {
+            about.push("Not reachable on this network".into());
+        }
+        if !about.is_empty() {
+            items.push(MenuItem::new(about.join(" · ")).enabled(false));
+            acts.push(None);
+        }
         items.push(MenuItem::new(format!("Quit {name}")));
         acts.push(Some(BgAction::Quit { app_id: a.app_id.clone(), persona: a.persona.clone() }));
         if a.at_sign_in {
@@ -132,7 +146,8 @@ mod tests {
     use super::*;
 
     fn app(id: &str, name: &str, persona: Option<&str>, paused: bool, at_sign_in: bool) -> BackgroundApp {
-        BackgroundApp { app_id: id.into(), name: name.into(), persona: persona.map(String::from), paused, at_sign_in }
+        BackgroundApp { app_id: id.into(), name: name.into(), persona: persona.map(String::from), paused, at_sign_in,
+                        connections: None, not_on_this_network: false }
     }
 
     #[test]
@@ -152,6 +167,20 @@ mod tests {
             &BgAction::Quit { app_id: "org.x.srv".into(), persona: Some("work".into()) },
         ], "a manual app has no sign-in switch to turn off");
         assert_eq!(acts[0], None, "the heading does nothing");
+    }
+
+    #[test]
+    fn a_server_says_how_busy_it_is_and_where_it_isnt_reachable() {
+        let mut srv = app("org.x.srv", "Photo Server", None, false, true);
+        srv.connections = Some(3);
+        srv.not_on_this_network = true;
+        let (items, acts) = menu(&BgShown { apps: vec![srv], note: None });
+        assert_eq!(items.len(), acts.len());
+        let words: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
+        assert!(words.contains(&"3 connections · Not reachable on this network".to_string()), "{words:?}");
+        let quiet = app("org.x.clip", "Clipboard History", None, false, true);
+        let (items, _) = menu(&BgShown { apps: vec![quiet], note: None });
+        assert_eq!(items.len(), 4, "no line for an app with no ports");
     }
 
     #[test]

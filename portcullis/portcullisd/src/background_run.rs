@@ -165,7 +165,9 @@ pub fn list(shared: &Mutex<Tenants>, user: &str) -> Vec<portcullis_ipc::Backgrou
             m.resident().is_some_and(|r| r.start == portcullis_toml::ResidentStart::SignIn)
                 && policy.is_some_and(|p| p.background_allowed(&k.app_id, k.persona.as_deref(), &hash_manifest(t.as_bytes())))
         });
-        portcullis_ipc::BackgroundApp { app_id: k.app_id, name, persona: k.persona, paused: matches!(st, State::Paused(_)), at_sign_in }
+        let (connections, not_on_this_network) = crate::listen_run::bar_status(user, &k.app_id, k.persona.as_deref()).unwrap_or((None, false));
+        portcullis_ipc::BackgroundApp { app_id: k.app_id, name, persona: k.persona, paused: matches!(st, State::Paused(_)), at_sign_in,
+                                        connections, not_on_this_network }
     }).collect()
 }
 

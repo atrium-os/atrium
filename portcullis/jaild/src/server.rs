@@ -372,6 +372,19 @@ fn dispatch(
 
         Request::SetListen { jail_name, listen } =>
             (handle_set_listen(&jail_name, listen, dry_run, state, state_path), Vec::new()),
+
+        Request::ListenStats { jail_name } => {
+            let r = match state.routed_nets.iter().find(|n| n.jail_name == jail_name) {
+                None => Response::PolicyDenied { rule: "network.listen".into(), detail: format!("{jail_name} holds no network") },
+                Some(n) => {
+                    let lan: Vec<u16> = n.grants.iter().flat_map(|g| &g.listen)
+                        .filter(|l| matches!(l.from, crate::protocol::ListenFrom::Lan { .. })).map(|l| l.port).collect();
+                    let c = crate::listen::live(&jail_name) + crate::routed::lan_connections(n.slot, &lan);
+                    Response::ListenStats { connections: u32::try_from(c).unwrap_or(u32::MAX) }
+                }
+            };
+            (r, Vec::new())
+        }
     }
 }
 

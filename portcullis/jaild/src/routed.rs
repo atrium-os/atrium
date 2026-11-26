@@ -382,6 +382,22 @@ pub fn kill_inbound_states(slot: u32) {
     let _ = sh("pfctl", &["-k", "0.0.0.0/0", "-k", &app]);
 }
 
+/// pf's established flows to `app` on `port` from a network (`pfctl -ss`
+/// lines such as `all tcp 100.64.0.2:8080 (192.168.77.1:8080) <- 192.168.77.2:5012 ESTABLISHED:ESTABLISHED`).
+pub fn count_states(states: &str, app: &str, port: u16) -> usize {
+    let to = format!(" {app}:{port} (");
+    states.lines().filter(|l| l.contains(&to) && l.contains(" <- ") && l.contains("ESTABLISHED:ESTABLISHED")).count()
+}
+
+pub fn lan_connections(slot: u32, ports: &[u16]) -> usize {
+    if ports.is_empty() {
+        return 0;
+    }
+    let (_, app) = slot_addrs(slot);
+    let Ok(s) = sh("pfctl", &["-ss"]) else { return 0 };
+    ports.iter().map(|p| count_states(&s, &app, *p)).sum()
+}
+
 /// Whether the base ruleset evaluates the per-app anchors' translation
 /// rules (`rdr-anchor "atrium/*"`): without it a `Lan` listen would be a
 /// pass with no redirect to use it.
@@ -463,6 +479,16 @@ mod tests {
         let without = render_anchor("epair3a", "100.64.0.14", Some(&grants()));
         assert_eq!(a.lines().filter(|l| l.contains("epair3a")).collect::<Vec<_>>(),
                    without.lines().collect::<Vec<_>>(), "the app's own rules are unchanged");
+    }
+
+    #[test]
+    fn established_lan_flows_are_counted_per_app_and_port() {
+        let s = "all tcp 100.64.0.2:8080 (192.168.77.1:8080) <- 192.168.77.2:5012       ESTABLISHED:ESTABLISHED\n\
+                 all tcp 100.64.0.2:8080 (192.168.77.1:8080) <- 192.168.77.2:5013       FIN_WAIT_2:FIN_WAIT_2\n\
+                 all tcp 100.64.0.6:8080 (192.168.77.1:8080) <- 192.168.77.2:5014       ESTABLISHED:ESTABLISHED\n\
+                 all tcp 100.64.0.2:51000 -> 140.82.112.3:443       ESTABLISHED:ESTABLISHED\n";
+        assert_eq!(count_states(s, "100.64.0.2", 8080), 1);
+        assert_eq!(count_states(s, "100.64.0.2", 443), 0, "its own outbound flows aren't connections to it");
     }
 
     #[test]

@@ -162,6 +162,15 @@ pub fn set_listen(name: &str, listen: Vec<jaild::protocol::NetListen>) -> Result
     }
 }
 
+/// Connections reaching a running jail's `listen` ports now.
+pub fn listen_stats(name: &str) -> Option<u32> {
+    let mut client = connect().ok()?;
+    match client.send(&Request::ListenStats { jail_name: name.into() }).ok()? {
+        (Response::ListenStats { connections }, _) => Some(connections),
+        _ => None,
+    }
+}
+
 /// The live jid of a jail jaild made, or `None` when it is not running (or
 /// jaild does not know it).
 pub fn jid(name: &str) -> Option<i32> {

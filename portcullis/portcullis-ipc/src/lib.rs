@@ -940,6 +940,12 @@ pub struct BackgroundApp {
     /// The person's switch to open it at sign-in is on.
     #[serde(default)]
     pub at_sign_in: bool,
+    /// Connections reaching its `listen` ports now, when it has any open.
+    #[serde(default)]
+    pub connections: Option<u32>,
+    /// Its local-network ports are allowed, but not on this network.
+    #[serde(default)]
+    pub not_on_this_network: bool,
 }
 
 /// An app's background switch on Settings' Apps page.

@@ -28,6 +28,7 @@ const CONNECT: Duration = Duration::from_secs(5);
 struct Running {
     port: u16,
     stop: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
 }
 
 fn running() -> &'static Mutex<HashMap<String, Vec<Running>>> {
@@ -66,10 +67,11 @@ pub fn start(jail: &str, app: &str, listen: &[NetListen]) {
             continue;
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let (s, j, uid, who, port) = (stop.clone(), jail.to_string(), *owner_uid, owner.clone(), l.port);
-        std::thread::spawn(move || serve(lst, &j, SocketAddrV4::new(app, port), uid, &who, &s));
+        let live = Arc::new(AtomicUsize::new(0));
+        let (s, n, j, uid, who, port) = (stop.clone(), live.clone(), jail.to_string(), *owner_uid, owner.clone(), l.port);
+        std::thread::spawn(move || serve(lst, &j, SocketAddrV4::new(app, port), uid, &who, &s, n));
         log::info!("jaild: listen {jail}: 127.0.0.1:{port} for {owner}");
-        started.push(Running { port, stop });
+        started.push(Running { port, stop, live });
     }
     if !started.is_empty() {
         running().lock().unwrap_or_else(|e| e.into_inner()).insert(jail.into(), started);
@@ -87,8 +89,13 @@ pub fn stop(jail: &str) {
     }
 }
 
-fn serve(lst: TcpListener, jail: &str, to: SocketAddrV4, owner_uid: u32, owner: &str, stop: &AtomicBool) {
-    let live = Arc::new(AtomicUsize::new(0));
+/// Connections `jail`'s forwarders carry now.
+pub fn live(jail: &str) -> usize {
+    running().lock().unwrap_or_else(|e| e.into_inner()).get(jail)
+        .map(|v| v.iter().map(|r| r.live.load(Ordering::SeqCst)).sum()).unwrap_or(0)
+}
+
+fn serve(lst: TcpListener, jail: &str, to: SocketAddrV4, owner_uid: u32, owner: &str, stop: &AtomicBool, live: Arc<AtomicUsize>) {
     while !stop.load(Ordering::SeqCst) {
         let (c, peer) = match lst.accept() {
             Ok(x) => x,

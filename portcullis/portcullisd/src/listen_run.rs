@@ -57,7 +57,7 @@ fn iface_ok(i: &str) -> bool {
 
 /// The egress network from atrium-net's `status` lines. `gw_mac` finds a
 /// router's MAC (the ARP table).
-pub fn parse_status(lines: &[String], gw_mac: impl Fn(&str, &str) -> Option<String>) -> Option<Net> {
+pub fn parse_status(lines: &[String], mut gw_mac: impl FnMut(&str, &str) -> Option<String>) -> Option<Net> {
     for l in lines {
         let (verb, f) = fields(l);
         if verb != "iface" || f.get("egress") != Some(&"1") || f.get("state") != Some(&"bound") || f.get("link") != Some(&"up") {
@@ -86,8 +86,14 @@ pub fn parse_status(lines: &[String], gw_mac: impl Fn(&str, &str) -> Option<Stri
 /// The router's MAC on `iface`, as 12 lowercase hex, from the ARP table.
 fn arp_mac(iface: &str, router: &str) -> Option<String> {
     let r: std::net::Ipv4Addr = router.parse().ok()?;
-    let out = std::process::Command::new("/usr/sbin/arp").args(["-n", &r.to_string()]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    // Read to the end rather than `output()`: portcullisd reaps children on
+    // other threads, so the exit status can be gone; the table isn't.
+    let mut child = std::process::Command::new("/usr/sbin/arp").args(["-n", &r.to_string()])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+        .spawn().ok()?;
+    let mut text = String::new();
+    child.stdout.take()?.take(4096).read_to_string(&mut text).ok()?;
+    let _ = child.wait();
     // "? (192.168.1.1) at 52:55:0a:00:02:02 on vtnet0 expires in 1199 seconds [ethernet]"
     let line = text.lines().find(|l| l.contains(&format!(" on {iface} ")) || l.ends_with(&format!(" on {iface}")))?;
     let mut w = line.split_whitespace();
@@ -124,7 +130,36 @@ fn netd(req: &str) -> Option<Vec<String>> {
 /// The egress network now; `None` when atrium-net says there is none (or
 /// can't be asked): then no `local-network` port holds.
 pub fn current() -> Option<Net> {
-    parse_status(&netd("status")?, arp_mac)
+    // A router named once stays named while atrium-net keeps reporting the
+    // same interface and router: one missed ARP lookup (an entry being
+    // refreshed) mustn't close the person's ports. Any answer with no
+    // network (link down, lease lost) forgets it.
+    static KNOWN: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let n = netd("status").and_then(|l| parse_status(&l, |iface, router| {
+        match arp_mac(iface, router) {
+            Some(m) => {
+                *known = Some((iface.into(), router.into(), m.clone()));
+                Some(m)
+            }
+            None => known.as_ref().filter(|(i, r, _)| i == iface && r == router).map(|(_, _, m)| m.clone()),
+        }
+    }));
+    if n.is_none() {
+        *known = None;
+    }
+    drop(known);
+    // Said once per change: what every listener's ports now follow.
+    static SEEN: Mutex<Option<Option<Net>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.as_ref() != Some(&n) {
+        match &n {
+            Some(x) => eprintln!("portcullisd: listen: network now {} on {} ({})", x.id.as_deref().unwrap_or("unnamed"), x.iface, x.subnet),
+            None => eprintln!("portcullisd: listen: no network"),
+        }
+        *seen = Some(n.clone());
+    }
+    n
 }
 
 /// A running instance whose manifest asks for `listen`.
@@ -194,6 +229,22 @@ pub fn track(jail: &str, lo: ListenOf, applied: Vec<NetListen>) {
     tracked().lock().unwrap_or_else(|e| e.into_inner()).insert(jail.into(), (lo, applied));
 }
 
+/// For the bar: how many connections `user`'s `app_id` in `persona` has,
+/// and whether its local-network ports are off on the network the
+/// computer is on now although the person allowed them on some network.
+pub fn bar_status(user: &str, app_id: &str, persona: Option<&str>) -> Option<(Option<u32>, bool)> {
+    let (jail, lo, applied) = tracked().lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .find(|(_, (lo, _))| lo.user == user && lo.app_id == app_id && lo.persona.as_deref() == persona)
+        .map(|(j, (lo, a))| (j.clone(), lo.clone(), a.clone()))?;
+    let wants_lan = lo.ports.iter().any(|p| p.2)
+        && Policy::load(&Policy::user_path(user)).ok()
+            .and_then(|p| p.listen_grant(&lo.app_id, &lo.hash).map(|g| !g.networks.is_empty()))
+            .unwrap_or(false);
+    let lan_on = applied.iter().any(|l| matches!(l.from, ListenFrom::Lan { .. }));
+    let conns = (!applied.is_empty()).then(|| portcullisd::jaild_jail::listen_stats(&jail)).flatten();
+    Some((conns, wants_lan && !lan_on))
+}
+
 pub fn untrack(jail: &str) {
     tracked().lock().unwrap_or_else(|e| e.into_inner()).remove(jail);
 }
@@ -228,11 +279,12 @@ pub fn refresh(only: Option<(&str, &str)>) {
 
 /// Follow atrium-net: every event it sends (a lease, a lost lease, an
 /// egress change, a Wi-Fi state) re-checks the listeners at once, and so
-/// does a quiet minute. Runs for portcullisd's life.
+/// do 5 quiet seconds, so a missed event costs at most that. A check that
+/// changes nothing asks jaild nothing. Runs for portcullisd's life.
 pub fn watch() {
     std::thread::spawn(|| loop {
         if let Ok(mut s) = UnixStream::connect(NETD_SOCK) {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
             if s.write_all(b"subscribe\n").is_ok() {
                 let mut r = BufReader::new(s);
                 loop {

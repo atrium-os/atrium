@@ -120,6 +120,11 @@ pub enum Request {
     /// holds. An empty list removes every listen rule and forwarder.
     SetListen { jail_name: String, listen: Vec<NetListen> },
 
+    /// How many connections reach a running jail's `listen` ports now
+    /// (the forwarder's, and pf's established states from a network).
+    /// Answer: [`Response::ListenStats`].
+    ListenStats { jail_name: String },
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
 
@@ -697,6 +702,9 @@ impl Default for NetworkConfig {
 pub enum Response {
     /// A network allocated by [`Request::AllocateNet`].
     NetAllocated { epair_b: String, app_addr: String, host_addr: String },
+
+    /// Answer to [`Request::ListenStats`].
+    ListenStats { connections: u32 },
 
     /// Generic "your request succeeded with no payload" (Ping,
     /// RemoveJail).
