@@ -54,7 +54,7 @@ else
 	_log="-S -T atrium-fenestrad"
 fi
 
-command_args="-R 2 -P ${pidfile} ${_log} /usr/local/sbin/atrium-fenestrad \
+command_args="-f -R 2 -P ${pidfile} ${_log} /usr/local/sbin/atrium-fenestrad \
 	--frescod /atrium/sockets/fenestra/fenestra.sock \
 	--session /usr/local/bin/atrium-fenestra-session \
 	--mint-sock /var/run/fenestra/mint.sock \

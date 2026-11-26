@@ -1753,6 +1753,24 @@ root side's own; the unprivileged side can ask for a jail but not say what is in
 at most two (one more during a take-over). The root side ends with the other side. fenestrad is not
 yet in a jail of its own (it would need jaild to pass it the frescod link and mint socket). Without `--jaild` a session is a plain child (other systems, hosts without jaild).
 
+**fenestrad as a boot service.** `scripts/fenestra-service.sh` commissions a host once: the
+`_fenestra` user, `/atrium/sockets/fenestra` (owned `_frescod`, group `_fenestra`, 0750) where
+frescod serves the link, the binaries, and `fenestrad/etc/rc.d/atrium_fenestrad` enabled with
+the network viewers come from (`atrium_fenestrad_lan="IFACE SUBNET"`,
+`atrium_fenestrad_public_ip`; optional `_grace` and `_logfile`). Remote viewing stays off until
+that is done. rc runs fenestrad as root under daemon(8), which starts it again 2 s after it
+exits (frescod restarted or not up yet); mints come on `/var/run/fenestra/mint.sock`, the
+default `fenestra-shell` uses. frescod's services.d manifest names the link
+(`FRESCOD_FENESTRA_SOCK`, `FRESCOD_FENESTRA_UIDS=65057`, both on jaild's env allow-list); where
+the directory was never made frescod says so and serves no link. The two halves of fenestrad end
+together: the root side passes a stop to the unprivileged side and then takes down every session
+jail, and the unprivileged side dies with the root side (`PROC_PDEATHSIG_CTL`), so neither is
+left holding the mint socket or frescod's link. A socket left at the mint path by a fenestrad that
+died is removed; one that answers stops the new fenestrad. `FEN_SERVICE=1
+scripts/fenestra-desktop-vm.sh` (after `deploy-portcullis.sh`) commissions and starts the service,
+runs the whole per-app gate through it, kills each side in turn and checks the pair comes back
+whole, and checks a stop leaves no fenestrad and no session jail: 23/23.
+
 **The viewer's size and scale (§4.1), first step.** The viewer asks for a remote output of its
 window's size in device pixels and its scale (`Control::Output`, sides 64 to 8192, scale 0.5 to
 4.0; the windowed viewer on connect and as the window is resized, the headless one with
