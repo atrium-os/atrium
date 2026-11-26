@@ -587,6 +587,22 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         }
         o.extend_from_slice(b"/>");
     }
+    let scenarios = sh.scenarios();
+    if !scenarios.is_empty() {
+        o.extend_from_slice(b"<scenarios>");
+        for sc in scenarios {
+            let _ = write!(o, r#"<scenario name="{}" count="{}""#, crate::xml::esc(&sc.name), sc.cells.len());
+            if !sc.comment.is_empty() {
+                let _ = write!(o, r#" comment="{}""#, crate::xml::esc(&sc.comment));
+            }
+            o.extend_from_slice(b">");
+            for (r, c, v) in &sc.cells {
+                let _ = write!(o, r#"<inputCells r="{}" val="{}"/>"#, a1(*r, *c), crate::xml::esc(v));
+            }
+            o.extend_from_slice(b"</scenario>");
+        }
+        o.extend_from_slice(b"</scenarios>");
+    }
     if let Some(f) = &sh.filter {
         write_filter(&mut o, f, wb.date_system(), dxfs);
     }

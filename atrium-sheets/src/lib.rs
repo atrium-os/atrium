@@ -22,3 +22,6 @@ mod sheet_protection;
 pub mod tabs;
 pub mod validation;
 pub mod whatif;
+pub mod scenarios;
+pub mod series;
+pub mod audit;

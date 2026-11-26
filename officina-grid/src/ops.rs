@@ -108,6 +108,8 @@ pub enum GridOp {
     /// Iterative calculation on (with its settings) or off
     /// ([`crate::book::Workbook::set_iteration`]).
     Iteration(Option<crate::book::Iteration>),
+    /// A sheet's What-If scenarios, the whole list replaced.
+    Scenarios { sheet: u16, list: Vec<crate::scenario::Scenario> },
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -317,6 +319,12 @@ impl GridOp {
                 w.u16(*sheet);
                 w.u8(axis.index() as u8);
                 outline.encode(&mut w);
+                return w.into_bytes();
+            }
+            GridOp::Scenarios { sheet, list } => {
+                w.u8(29);
+                w.u16(*sheet);
+                crate::scenario::encode(list, &mut w);
                 return w.into_bytes();
             }
             GridOp::Iteration(it) => {
@@ -557,6 +565,14 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::HideSheet { sheet, hidden });
+        }
+        if kind == 29 {
+            let sheet = r.u16()?;
+            let list = crate::scenario::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Scenarios { sheet, list });
         }
         if kind == 28 {
             let it = match r.u8()? {
@@ -827,6 +843,13 @@ impl Op<Workbook> for GridOp {
                     }
                 }
                 GridOp::Outline { sheet, axis, outline }
+            }
+            GridOp::Scenarios { sheet, mut list } => {
+                match wb.sheets.get_mut(sheet as usize) {
+                    Some(sh) if crate::scenario::valid_list(&list) => std::mem::swap(&mut sh.scenarios, &mut list),
+                    _ => return GridOp::Batch(Vec::new()),
+                }
+                GridOp::Scenarios { sheet, list }
             }
             GridOp::Iteration(it) => {
                 let old = wb.iteration();

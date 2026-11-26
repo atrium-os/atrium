@@ -425,6 +425,8 @@ struct Seg {
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
     links: Vec<((u32, u32, u32, u32), Option<String>, Option<String>)>,
+    /// `<scenarios><scenario><inputCells>`.
+    scenarios: Vec<officina_grid::scenario::Scenario>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -684,6 +686,23 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     &mut seg.rep,
                 ));
             }
+            b"scenario" => {
+                use officina_grid::scenario::{Scenario, MAX_SCENARIOS};
+                if seg.scenarios.len() < MAX_SCENARIOS {
+                    let name = attr(&e, b"name")?.unwrap_or_default();
+                    seg.scenarios.push(Scenario { name, comment: attr(&e, b"comment")?.unwrap_or_default(), cells: Vec::new() });
+                } else {
+                    seg.rep.note(Kind::Dropped, "scenarios past the 256th on a sheet");
+                }
+            }
+            b"inputCells" => {
+                let at = attr(&e, b"r")?.as_deref().and_then(parse_a1);
+                let val = attr(&e, b"val")?.unwrap_or_default();
+                match (seg.scenarios.last_mut(), at) {
+                    (Some(sc), Some((r, c))) if sc.cells.len() < officina_grid::scenario::MAX_CELLS => sc.cells.push((r, c, val)),
+                    _ => seg.rep.note(Kind::Dropped, "scenario cells past Excel's 32, or unreadable"),
+                }
+            }
             b"mergeCell" => {
                 if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
                     if seg.merges.len() < officina_grid::merges::MAX_MERGES {
@@ -855,7 +874,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     continue;
                 }
             }
-            while let Some(seg) = waiting.remove(&next) {
+            while let Some(mut seg) = waiting.remove(&next) {
                 next += 1;
                 if failed.is_some() {
                     continue;
@@ -900,6 +919,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 }
                 if let Some(z) = seg.zoom {
                     wb.sheet_mut(s).zoom = z;
+                }
+                if !seg.scenarios.is_empty() && !wb.set_scenarios(s, seg.scenarios) {
+                    seg.rep.note(Kind::Dropped, "scenarios with no name, a name twice, no cells or a cell twice");
                 }
                 if let Some((f, from)) = seg.freeze {
                     wb.sheet_mut(s).freeze = f;

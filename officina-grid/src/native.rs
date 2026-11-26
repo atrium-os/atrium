@@ -67,6 +67,7 @@ pub const OUTLINES: u16 = 27;
 pub const HIDDEN_SHEETS: u16 = 28;
 pub const ZOOM: u16 = 29;
 pub const VIEW_HIDDEN: u16 = 30;
+pub const SCENARIOS: u16 = 31;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -191,6 +192,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         w.u16(sheet as u16);
         for outline in &sh.outlines { outline.encode(&mut w); }
         c.add(OUTLINES, &w.into_bytes())?;
+    }
+
+    for (sheet, sh) in wb.sheets.iter().enumerate() {
+        if sh.scenarios.is_empty() { continue; }
+        let mut w = Writer::new();
+        w.u16(sheet as u16);
+        crate::scenario::encode(&sh.scenarios, &mut w);
+        c.add(SCENARIOS, &w.into_bytes())?;
     }
 
     // Cells, renumbering the strings they use (the pool also holds texts no cell
@@ -607,6 +616,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         let cols = crate::outline::Outline::decode(&mut r, crate::shift::Axis::Cols)?;
         if !r.is_empty() { return Err(LoadError::Bad("trailing worksheet outline data")); }
         wb.sheet_mut(sheet).outlines = [rows, cols];
+    }
+
+    let mut with_scenarios = std::collections::BTreeSet::new();
+    for chunk in of(SCENARIOS) {
+        let mut r = Reader::new(c.chunk(chunk)?);
+        let sheet = r.u16()?;
+        if sheet as usize >= wb.sheet_count() || !with_scenarios.insert(sheet) {
+            return Err(LoadError::Bad("invalid or repeated worksheet scenarios"));
+        }
+        let list = crate::scenario::decode(&mut r)?;
+        if !r.is_empty() { return Err(LoadError::Bad("trailing scenario data")); }
+        wb.sheet_mut(sheet).scenarios = list;
     }
 
     let mut sheet_ids = of(SHEET_IDENTITIES);

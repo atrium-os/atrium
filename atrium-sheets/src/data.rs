@@ -192,6 +192,16 @@ pub enum DataCmd {
     AdvancedFilter,
     Consolidate,
     DataTable,
+    /// The Scenario Manager bar ([`crate::scenarios`]).
+    Scenarios,
+    /// Fill ▸ Series… (a bar) and Fill ▸ Justify ([`crate::series`]).
+    Series,
+    Justify,
+    /// Formula auditing ([`crate::audit`]): the next error, the source of
+    /// the error at the cursor, and the cursor's formula step by step (a bar).
+    ErrorChecking,
+    TraceError,
+    EvaluateFormula,
     /// Formulas at the cursor reading the cells last copied, one for each.
     PasteLink,
     /// The selection's text centred across its columns without merging
@@ -427,6 +437,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Headings").checked(wb.sheet(s).show_headings), Some(DataCmd::Headings)),
         (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()).separated(), Some(DataCmd::FillCopy)),
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
+        (MenuItem::new("Fill: Series…").enabled(nr > 1 || nc > 1), Some(DataCmd::Series)),
+        (MenuItem::new("Fill: Justify"), Some(DataCmd::Justify)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
         (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
         (MenuItem::new("Flash Fill").shortcut("Ctrl+E"), Some(DataCmd::FlashFill)),
@@ -510,11 +522,15 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Show Formulas").checked(d.show_formulas).shortcut("Ctrl+`"), Some(DataCmd::ShowFormulas)),
         (MenuItem::new("Go to Precedents").shortcut("Ctrl+[").enabled(wb.group_at(s, row, col).is_some()), Some(DataCmd::Precedents)),
         (MenuItem::new("Go to Dependents").shortcut("Ctrl+]"), Some(DataCmd::Dependents)),
+        (MenuItem::new("Error Checking"), Some(DataCmd::ErrorChecking)),
+        (MenuItem::new("Trace Error").enabled(matches!(wb.get(CellAddr::new(s, row, col)), Value::Err(_))), Some(DataCmd::TraceError)),
+        (MenuItem::new("Evaluate Formula…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::EvaluateFormula)),
         (MenuItem::new("Insert Function…").shortcut("Shift+F3"), Some(DataCmd::InsertFunction)),
         (MenuItem::new("Paste Name…").shortcut("F3").enabled(!paste_names(d).is_empty()), Some(DataCmd::PasteName)),
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
         (MenuItem::new("Calculate Sheet").shortcut("Shift+F9"), Some(DataCmd::CalculateSheet)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
+        (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
         (MenuItem::new("Data Table…").enabled(nr > 1 && nc > 1), Some(DataCmd::DataTable)),
         (MenuItem::new("Iterative Calculation…").checked(wb.iteration().is_some()), Some(DataCmd::Iteration)),
         (MenuItem::new("Subtotal…").enabled(some).separated(), Some(DataCmd::Subtotal)),
@@ -2952,7 +2968,8 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable | DataCmd::Scenarios | DataCmd::Series | DataCmd::ErrorChecking | DataCmd::TraceError | DataCmd::EvaluateFormula => Ok(String::new()),
+        DataCmd::Justify => crate::series::justify(d, sel),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

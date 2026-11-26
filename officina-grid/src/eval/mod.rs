@@ -9,6 +9,7 @@
 
 pub mod arrays;
 pub mod criteria;
+pub mod steps;
 pub mod dates;
 pub mod funcs;
 pub mod ifcache;

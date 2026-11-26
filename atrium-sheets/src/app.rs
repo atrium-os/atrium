@@ -1793,6 +1793,11 @@ impl Sheets {
                     TabCmd::SortDone => crate::data::custom_sort(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
                     TabCmd::AngleDone => crate::format::set_angle(&mut self.doc.borrow_mut(), g.selection(), &typed),
                     _ if self.splitting.get() == Some(crate::data::DataCmd::RemoveDuplicatesBy) => crate::data::remove_duplicates(&mut self.doc.borrow_mut(), g.selection(), g.cursor, Some(&typed)),
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::EvaluateFormula) => {
+                        let (step, say) = crate::whatif::evaluate_next(&self.doc.borrow(), g.cursor, &typed);
+                        self.split_text.set(TextEdit::new(&step));
+                        Err(say)
+                    }
                     _ if self.splitting.get().is_some_and(|k| k != crate::data::DataCmd::TextToColumnsAt) => {
                         let kind = self.splitting.get().unwrap_or(crate::data::DataCmd::TextToColumnsAt);
                         crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
@@ -1946,6 +1951,40 @@ impl Sheets {
     /// Ctrl+[ (`back`) and Ctrl+]: selects the first cell or area the
     /// cursor's formula reads, or the first formula reading the cursor's
     /// cell, preferring the sheet on screen; the status names them all.
+    /// Error Checking (to the next problem) or Trace Error (to the source
+    /// of the error at the cursor), the cursor moved there.
+    pub fn audit(&self, trace: bool) {
+        let (r, c) = self.grid.get_cloned().cursor;
+        let found = {
+            let d = self.doc.borrow();
+            if trace {
+                crate::audit::trace_error(&d.wb, officina_grid::CellAddr::new(d.sheet, r, c)).map(|path| {
+                    let to = *path.last().unwrap_or(&officina_grid::CellAddr::new(d.sheet, r, c));
+                    let names: Vec<String> = path.iter().map(|a| officina_grid::addr::a1(a.row, a.col)).collect();
+                    let why = match d.wb.get(to) {
+                        officina_grid::Value::Err(k) => crate::audit::reason(k),
+                        _ => "",
+                    };
+                    (to.sheet, (to.row, to.col), format!("Trace Error: {}; the source {why}.", names.join(" ← ")))
+                })
+            } else {
+                crate::audit::next_error(&d.wb, d.sheet, (r, c)).map(|(at, why)| (d.sheet, at, why)).ok_or_else(|| "Error Checking found no errors on this sheet.".to_string())
+            }
+        };
+        match found {
+            Ok((sheet, (r, c), say)) => {
+                self.show_sheet(sheet);
+                self.show_cell(r, c);
+                let mut g = self.grid.get_cloned();
+                g.anchor = (r, c);
+                g.cursor = (r, c);
+                self.grid.set(g);
+                self.set_status(say);
+            }
+            Err(why) => self.set_status(why),
+        }
+    }
+
     pub fn trace(&self, back: bool) {
         let (r, c) = self.grid.get_cloned().cursor;
         let (areas, own) = {
@@ -3906,7 +3945,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula)) => {
                     self.close_bars();
                     let g = self.grid.get_cloned();
                     let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));
@@ -4059,6 +4098,10 @@ impl Sheets {
                 }
                 Cmd::Pivot(c) => {
                     self.pivot_cmd(c);
+                    false
+                }
+                Cmd::Data(c @ (crate::data::DataCmd::ErrorChecking | crate::data::DataCmd::TraceError)) => {
+                    self.audit(c == crate::data::DataCmd::TraceError);
                     false
                 }
                 Cmd::Data(c @ (crate::data::DataCmd::Precedents | crate::data::DataCmd::Dependents)) => {
@@ -7257,6 +7300,37 @@ mod tests {
         let mut d = s.doc.borrow_mut();
         d.wb.recalc();
         d.wb.formatted(officina_grid::addr::CellAddr::new(d.sheet, r, c)).text.to_string()
+    }
+
+    #[test]
+    fn evaluate_formula_steps_in_the_bar_and_error_checking_moves_the_cursor() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"2,0\n");
+        s.doc.borrow_mut().type_into(0, 2, "=A1+A1*3");
+        s.doc.borrow_mut().type_into(1, 0, "=A1/B1");
+        s.doc.borrow_mut().wb.recalc();
+        select(&s, (0, 2), (0, 2));
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::EvaluateFormula));
+        s.take_cmds();
+        assert_eq!(s.split_text.get_cloned().text(), "=A1+A1*3");
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+            s.take_cmds();
+            seen.push(s.split_text.get_cloned().text().to_string());
+        }
+        assert_eq!(seen, ["=2+A1*3", "=2+2*3", "=2+6", "=8", "=A1+A1*3"]);
+        assert_eq!(s.splitting.get(), Some(DataCmd::EvaluateFormula), "the bar stays open");
+        assert!(s.doc.borrow().status.contains("Step 1 of 5"), "{}", s.doc.borrow().status);
+        // Error Checking finds the #DIV/0! in A2; Trace Error stays on it (its source).
+        select(&s, (0, 0), (0, 0));
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::ErrorChecking));
+        s.take_cmds();
+        assert_eq!(s.grid.get_cloned().cursor, (1, 0));
+        assert!(s.doc.borrow().status.contains("divides by zero"), "{}", s.doc.borrow().status);
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::TraceError));
+        s.take_cmds();
+        assert!(s.doc.borrow().status.starts_with("Trace Error: A2;"), "{}", s.doc.borrow().status);
     }
 
     #[test]

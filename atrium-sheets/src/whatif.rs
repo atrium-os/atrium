@@ -27,6 +27,9 @@ pub fn bar(kind: DataCmd) -> (&'static str, &'static str, &'static str, &'static
         DataCmd::AdvancedFilter => ("Criteria", "G1:H2, J1, unique", "Filter", "criteria range; a cell to copy to (else in place); unique"),
         DataCmd::Consolidate => ("Consolidate", "Sum; A1:B5, Sheet2!A1:B5; top, left", "Combine", "function; ranges; labels in the top row, left column"),
         DataCmd::DataTable => ("Inputs", "B1, B2", "Fill", "row input cell, column input cell (one may be empty)"),
+        DataCmd::EvaluateFormula => ("Evaluate", "", "Next", "each Next works out one more part, the leftmost innermost first"),
+        DataCmd::Series => ("Series", "linear 2, stop 100", "Fill", "linear, growth, date (day, weekday, month, year) or trend; the step; stop; rows or columns"),
+        DataCmd::Scenarios => ("Scenario", "add Best: B1=5, B2=7", "Run", "add NAME: cells, show NAME, delete NAME, or summary and the result cells"),
         _ => ("Split at", "comma, -+, fixed 3, 8", "Split", "a name or characters (+ after: runs count as one), fixed 3, 8 for widths, or empty to find one"),
     }
 }
@@ -39,6 +42,9 @@ pub fn start(d: &Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd) -> Stri
             None => format!("{}, {}", Iteration::DEFAULT.count, Iteration::DEFAULT.change),
         },
         DataCmd::Subtotal => subtotal_start(d, sel, cursor),
+        DataCmd::Scenarios => crate::scenarios::start(d, sel),
+        DataCmd::Series => "linear 1".into(),
+        DataCmd::EvaluateFormula => officina_grid::eval::steps::evaluate_steps(&d.wb, CellAddr::new(d.sheet, cursor.0, cursor.1)).and_then(|s| s.into_iter().next()).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -51,8 +57,23 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd, typed
         DataCmd::AdvancedFilter => advanced_filter(d, sel, cursor, typed),
         DataCmd::Consolidate => consolidate(d, cursor, typed),
         DataCmd::DataTable => data_table(d, sel, typed),
+        DataCmd::Scenarios => crate::scenarios::run(d, typed),
+        DataCmd::Series => crate::series::series(d, sel, typed),
+        DataCmd::EvaluateFormula => Err(evaluate_next(d, cursor, typed).1),
         _ => Err("Not a bar command.".into()),
     }
+}
+
+/// Evaluate Formula's next step after `shown`: (the step, what to say).
+/// After the last it starts over from the formula.
+pub fn evaluate_next(d: &Doc, cursor: (u32, u32), shown: &str) -> (String, String) {
+    let at = CellAddr::new(d.sheet, cursor.0, cursor.1);
+    let Some(steps) = officina_grid::eval::steps::evaluate_steps(&d.wb, at) else {
+        return (String::new(), format!("{} has no formula to evaluate.", a1(cursor.0, cursor.1)));
+    };
+    let i = steps.iter().position(|s| s == shown.trim()).map_or(0, |i| (i + 1) % steps.len());
+    let say = if i + 1 == steps.len() { format!("Step {} of {}: the value. Next starts over.", i + 1, steps.len()) } else { format!("Step {} of {}.", i + 1, steps.len()) };
+    (steps[i].clone(), say)
 }
 
 fn refused(d: &Doc) -> Option<String> {

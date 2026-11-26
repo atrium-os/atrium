@@ -605,6 +605,12 @@ pub(crate) fn shift_with_ids(
         if &moved != outline { ops.push(GridOp::Outline { sheet, axis, outline: moved }); }
     }
 
+    let scenarios = &wb.sheet(sheet).scenarios;
+    if !scenarios.is_empty() {
+        let moved = crate::scenario::shifted(scenarios, s);
+        if &moved != scenarios { ops.push(GridOp::Scenarios { sheet, list: moved }); }
+    }
+
     if let Some(inserted) = inserted {
         if inserted.iter().map(|r| i64::from(r.len)).sum::<i64>() != n.max(0) { return None; }
         let ids = wb.sheet(sheet).axis_ids[axis.index()].splice(at, (-n).max(0) as u32, inserted)?;
