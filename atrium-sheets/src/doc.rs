@@ -574,6 +574,12 @@ pub struct Doc {
     pub circling: bool,
     /// Data ▸ Show Formulas: cells with formulas show them as typed (not saved).
     pub show_formulas: bool,
+    /// Show All Comments: every comment's box shows, not only the one under
+    /// the pointer (not saved).
+    pub show_comments: bool,
+    /// Trace Precedents and Dependents' arrows ([`crate::arrows`]): not
+    /// saved, and gone after the next edit.
+    pub arrows: Vec<crate::arrows::Arrow>,
     /// The line and colour the plain border commands draw with (Format ▸
     /// Border Line and Border Colour); thick and double ones keep theirs.
     pub border_pen: (officina_grid::style::Line, Option<u32>),
@@ -628,7 +634,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, show_formulas: false, border_pen: (officina_grid::style::Line::Thin, None), clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, show_formulas: false, border_pen: (officina_grid::style::Line::Thin, None), clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None, show_comments: false, arrows: Vec::new() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -678,6 +684,8 @@ impl Doc {
 
     fn journal(&mut self, r: &Record) {
         self.edits += 1;
+        // Arrows show the formulas as they were.
+        self.arrows.clear();
         if let Some(a) = &mut self.autosave {
             if let Err(e) = a.append(r) {
                 self.status = format!("Autosave failed: {e}");

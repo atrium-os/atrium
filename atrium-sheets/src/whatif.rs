@@ -29,6 +29,8 @@ pub fn bar(kind: DataCmd) -> (&'static str, &'static str, &'static str, &'static
         DataCmd::DataTable => ("Inputs", "B1, B2", "Fill", "row input cell, column input cell (one may be empty)"),
         DataCmd::EvaluateFormula => ("Evaluate", "", "Next", "each Next works out one more part, the leftmost innermost first"),
         DataCmd::EditRanges => ("Edit ranges", "add Inputs: B2:B9, D1", "Set", "add TITLE: cells, delete TITLE, or list; they can be edited while the sheet is protected"),
+        DataCmd::DataForm => ("Record", "Qty = 5; Region = East", "Apply", "change fields; next, prev, delete; new Field = value; …; find Field = value, Qty > 10"),
+        DataCmd::QuickTotals => ("Totals", "sum below", "Add", "sum, average, count, percent or running; below or right"),
         DataCmd::CreateNames => ("Names from", "top, left", "Create", "where the labels are: top row, left column, bottom row, right column"),
         DataCmd::FillAcross => ("Fill to", "all", "Fill", "all, or sheet names; then contents or formats for only those"),
         DataCmd::Sparklines => ("Sparklines", "line B2:F9", "Draw", "line, column or winloss and the data; markers, color 00B050; or clear"),
@@ -51,6 +53,8 @@ pub fn start(d: &Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd) -> Stri
         DataCmd::Sparklines => crate::sparkbar::start(d, sel),
         DataCmd::FillAcross => "all".into(),
         DataCmd::CreateNames => crate::formulas::create_start(d, sel),
+        DataCmd::QuickTotals => "sum below".into(),
+        DataCmd::DataForm => form_start(d, cursor),
         DataCmd::EditRanges => crate::checks::ranges_start(d, sel),
         DataCmd::EvaluateFormula => officina_grid::eval::steps::evaluate_steps(&d.wb, CellAddr::new(d.sheet, cursor.0, cursor.1)).and_then(|s| s.into_iter().next()).unwrap_or_default(),
         _ => String::new(),
@@ -70,10 +74,27 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd, typed
         DataCmd::Sparklines => crate::sparkbar::run(d, sel, typed),
         DataCmd::FillAcross => crate::series::fill_across(d, sel, typed),
         DataCmd::CreateNames => crate::formulas::create_names(d, sel, typed),
+        DataCmd::QuickTotals => crate::dataform::quick_totals(d, sel, typed),
         DataCmd::EditRanges => crate::checks::edit_ranges(d, typed),
         DataCmd::EvaluateFormula => Err(evaluate_next(d, cursor, typed).1),
         _ => Err("Not a bar command.".into()),
     }
+}
+
+/// The Data Form bar's text for the record at the cursor: its fields as
+/// `Field = value; …`, formulas left out since they can't be typed.
+pub fn form_start(d: &Doc, cursor: (u32, u32)) -> String {
+    let Ok(f) = crate::dataform::open(d, cursor) else { return String::new() };
+    crate::dataform::fields(d, &f).into_iter().filter(|(_, _, formula)| !formula).map(|(n, v, _)| format!("{n} = {v}")).collect::<Vec<_>>().join("; ")
+}
+
+/// The Data Form's next state after `typed` at the cursor: the cursor's
+/// new place, the bar's new text, and what to say.
+pub fn form_next(d: &mut Doc, cursor: (u32, u32), typed: &str) -> Result<((u32, u32), String, String), String> {
+    let f = crate::dataform::open(d, cursor)?;
+    let (f, say) = crate::dataform::run(d, f, typed)?;
+    let at = (f.area.r0 + 1 + f.record.min(f.count().saturating_sub(1)), cursor.1.clamp(f.area.c0, f.area.c1));
+    Ok((at, form_start(d, at), say))
 }
 
 /// Evaluate Formula's next step after `shown`: (the step, what to say).

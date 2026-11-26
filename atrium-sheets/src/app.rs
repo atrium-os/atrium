@@ -1812,6 +1812,25 @@ impl Sheets {
                         self.split_text.set(TextEdit::new(&step));
                         Err(say)
                     }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::DataForm) => {
+                        // The form stays open on the record it moved to.
+                        let r = crate::whatif::form_next(&mut self.doc.borrow_mut(), g.cursor, &typed);
+                        match r {
+                            Ok((at, text, say)) => {
+                                self.show_cell(at.0, at.1);
+                                let mut g = self.grid.get_cloned();
+                                g.anchor = at;
+                                g.cursor = at;
+                                self.grid.set(g);
+                                let mut ed = TextEdit::new(&text);
+                                ed.select_all();
+                                self.split_text.set(ed);
+                                self.rev.set(self.rev.get().wrapping_add(1));
+                                Err(say)
+                            }
+                            Err(why) => Err(why),
+                        }
+                    }
                     _ if self.splitting.get().is_some_and(|k| k != crate::data::DataCmd::TextToColumnsAt) => {
                         let kind = self.splitting.get().unwrap_or(crate::data::DataCmd::TextToColumnsAt);
                         crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
@@ -4046,7 +4065,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals)) => {
                     self.close_bars();
                     let g = self.grid.get_cloned();
                     let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));

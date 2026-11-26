@@ -5207,6 +5207,17 @@ Review-tab tools, in the Data menu; `atrium-sheets/src/checks.rs`, with the list
 - Not built: Excel's Remove Hyperlinks was already here (Remove Links). Accessibility checking waits for alt text on pictures and charts.
 - Tests: `checks` unit tests (edit ranges opening cells on a protected sheet, refused while protected, moved by a row insert, saved; the inconsistent and omitted-cell rules, Ignore Error passing a cell over, Reset; an unlocked formula; Convert to Number; the inspector finding and deleting a hidden sheet, a hidden row and a hidden column, with undo), and `officina-convert/tests/sheetareas.rs` (`<protectedRanges>` with an Excel verifier and `<ignoredErrors>` round trips).
 
+### 16.147 Trace Precedents and Dependents arrows, Show All Comments, the Data Form and Quick totals (2026-11-26)
+
+Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` and `atrium-sheets/src/dataform.rs`, drawn as grid floats from `source.rs`.
+
+- **Trace Precedents** / **Trace Dependents**: arrows on the grid from each cell (or range, boxed) the cursor's formula reads to the cursor, or from the cursor to each formula reading it. Each use adds one more level, as Excel's does; a level adds nothing new says so. Arrows are blue, red when the source is an error value, and a source on another sheet is drawn as a sheet mark at the cell. At most 500 arrows. **Remove Arrows** clears them; any edit clears them too, since they would go stale. They are not saved, as in Excel.
+- **Show All Comments**: every comment and note on the sheet shown at once, not only the one pointed at (at most 200 drawn); a menu tick, kept for the window, not saved.
+- **Data Form…** (a bar on the list around the cursor, whose first row names the fields): the bar shows the record at the cursor as `Field = value; …` (formula fields left out, as they can't be typed). Changing values and pressing Apply sets them; `next` and `prev` step through the records; `new Field = value; …` adds a record under the list, carrying the record above's formulas into it, and refuses when the row under the list isn't empty; `delete` removes the record, the cells below moving up within the list; `find Region = East, Qty > 10` goes to the next matching record, wrapping (numbers compare by value, text without case, `=` on text matches its start, as Excel's criteria do). The cursor follows the record. At most 32 fields. Each change is one undo step.
+- **Quick Totals…** (Quick Analysis' Totals tab, a bar): `sum`, `average`, `count`, `percent` (each line's share of the whole selection, formatted `0.0%`) or `running` (totals so far across the lines), `below` (a row under the selection, one per column) or `right` (a column to its right, one per row). They are formulas; a cell in the way that isn't empty refuses the lot. At most 16,384 lines. One undo step.
+- Not built: alt text on pictures and charts, and with it the Accessibility Checker, since the picture and chart records are shared with printing (`print.rs`), whose thread owns them.
+- Tests: `arrows` (one level, then the next, an error source in red, a removed arrow set, edits clearing them), `dataform` (a field edit, finds by text start and by number with wrap, no such field, a new record, delete with undo; the bar's next/prev/delete moving the cursor; sum, percent and running totals below and right, a cell in the way).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

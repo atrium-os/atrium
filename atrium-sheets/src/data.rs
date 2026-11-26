@@ -225,6 +225,15 @@ pub enum DataCmd {
     InspectDocument,
     /// Fill ▸ Across Worksheets (a bar, [`crate::series::fill_across`]).
     FillAcross,
+    /// Trace Precedents and Dependents arrows, a level each time, and
+    /// Remove Arrows ([`crate::arrows`]); Show All Comments.
+    TracePrecedents,
+    TraceDependents,
+    RemoveArrows,
+    ShowComments,
+    /// The Data Form and Quick totals, both bars ([`crate::dataform`]).
+    DataForm,
+    QuickTotals,
     /// Formulas at the cursor reading the cells last copied, one for each.
     PasteLink,
     /// The selection's text centred across its columns without merging
@@ -546,6 +555,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Show Formulas").checked(d.show_formulas).shortcut("Ctrl+`"), Some(DataCmd::ShowFormulas)),
         (MenuItem::new("Go to Precedents").shortcut("Ctrl+[").enabled(wb.group_at(s, row, col).is_some()), Some(DataCmd::Precedents)),
         (MenuItem::new("Go to Dependents").shortcut("Ctrl+]"), Some(DataCmd::Dependents)),
+        (MenuItem::new("Trace Precedents").enabled(wb.group_at(s, row, col).is_some()), Some(DataCmd::TracePrecedents)),
+        (MenuItem::new("Trace Dependents"), Some(DataCmd::TraceDependents)),
+        (MenuItem::new("Remove Arrows").enabled(!d.arrows.is_empty()), Some(DataCmd::RemoveArrows)),
+        (MenuItem::new("Show All Comments").checked(d.show_comments), Some(DataCmd::ShowComments)),
         (MenuItem::new("Error Checking"), Some(DataCmd::ErrorChecking)),
         (MenuItem::new("Ignore Error").enabled(crate::audit::problem_at(wb, CellAddr::new(s, row, col)).is_some()), Some(DataCmd::IgnoreError)),
         (MenuItem::new("Reset Ignored Errors").enabled((0..wb.sheet_count() as u16).any(|x| !wb.sheet(x).ignored_errors().is_empty())), Some(DataCmd::ResetIgnored)),
@@ -566,6 +579,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
         (MenuItem::new("Protect Workbook Structure").checked(wb.structure_protected()), Some(DataCmd::ProtectWorkbook)),
         (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
+        (MenuItem::new("Data Form…"), Some(DataCmd::DataForm)),
+        (MenuItem::new("Quick Totals…").enabled(nr > 1 || nc > 1), Some(DataCmd::QuickTotals)),
         (MenuItem::new("Data Table…").enabled(nr > 1 && nc > 1), Some(DataCmd::DataTable)),
         (MenuItem::new("Iterative Calculation…").checked(wb.iteration().is_some()), Some(DataCmd::Iteration)),
         (MenuItem::new("Subtotal…").enabled(some).separated(), Some(DataCmd::Subtotal)),
@@ -1592,7 +1607,7 @@ pub const MAX_SHIFT_CELLS: u64 = 2_000_000;
 /// is used, in the selection's columns (down, up) or rows (right, left),
 /// cut and pasted along by the selection's height or width, as one step.
 /// Formulas reading the moved cells follow them, as a cut does.
-fn shift_cells(d: &mut Doc, sel: CellRange, cmd: DataCmd) -> Result<String, String> {
+pub(crate) fn shift_cells(d: &mut Doc, sel: CellRange, cmd: DataCmd) -> Result<String, String> {
     let s = d.sheet;
     let (er, ec) = d.wb.extent(s);
     let down = matches!(cmd, DataCmd::InsertCellsDown | DataCmd::DeleteCellsUp);
@@ -3071,7 +3086,14 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::AddWatch => crate::formulas::add_watches(d, sel),
         DataCmd::ApplyNames => crate::formulas::apply_names(d, sel),
         DataCmd::AutoOutline => crate::formulas::auto_outline(d, sel),
-        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument => Ok(String::new()),
+        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument | DataCmd::DataForm | DataCmd::QuickTotals => Ok(String::new()),
+        DataCmd::TracePrecedents => crate::arrows::trace_precedents(d, cursor),
+        DataCmd::TraceDependents => crate::arrows::trace_dependents(d, cursor),
+        DataCmd::RemoveArrows => crate::arrows::remove_arrows(d),
+        DataCmd::ShowComments => {
+            d.show_comments = !d.show_comments;
+            Ok(if d.show_comments { "Showing every comment and note.".into() } else { "Comments show when pointed at.".into() })
+        }
         DataCmd::IgnoreError => crate::checks::ignore_error(d, cursor),
         DataCmd::ResetIgnored => crate::checks::reset_ignored(d),
         DataCmd::ConvertToNumber => crate::checks::convert_to_number(d, sel),

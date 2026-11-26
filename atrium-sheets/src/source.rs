@@ -563,6 +563,8 @@ pub fn wrap_lines(text: &str, style: &pergola::TextStyle, w: f32, max: usize) ->
 
 /// Invalid cells ringed in the view, at most.
 pub const MAX_RINGS: usize = 2000;
+/// The most comments Show All Comments draws at once.
+pub const MAX_SHOWN_NOTES: usize = 200;
 
 impl SheetSource {
     /// A red ring around each cell in `view` whose value its validation rule
@@ -595,6 +597,90 @@ impl SheetSource {
             nodes.extend(ring.fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
         }
         Some(pergola::widgets::GridFloat { key: 1 << 58, at: [ox, oy, w, h], nodes: Rc::new(nodes), movable: false, pressable: false })
+    }
+
+    /// Trace Precedents and Dependents' arrows over the sheet on screen:
+    /// blue, red from an error, and black from or to another sheet (drawn
+    /// to a small sheet mark beside the cell); a box round cells read
+    /// together and a dot where each arrow starts.
+    fn trace_arrows(&self, view: [f64; 4]) -> Option<pergola::widgets::GridFloat> {
+        use pergola::shape::{Paint, PathData, Shape, Stroke};
+        let (arrows, sheet) = {
+            let d = self.doc.borrow();
+            (d.arrows.clone(), d.sheet)
+        };
+        let center = |r: u32, c: u32| ((self.col_left(c) + self.col_left(c + 1)) / 2.0, (self.row_top(r) + self.row_top(r + 1)) / 2.0);
+        // (from, to, colour, a box round the source).
+        let mut lines: Vec<((f64, f64), (f64, f64), Color, Option<[f64; 4]>, bool)> = Vec::new();
+        for a in &arrows {
+            let here_to = a.to.sheet == sheet;
+            let here_from = a.from.sheet == sheet;
+            if !here_to && !here_from {
+                continue;
+            }
+            let colour = if !(here_to && here_from) {
+                Color::rgba(0.1, 0.1, 0.1, 1.0)
+            } else if a.error {
+                Color::rgba(0.85, 0.1, 0.1, 1.0)
+            } else {
+                Color::rgba(0.1, 0.32, 0.85, 1.0)
+            };
+            let to = if here_to { center(a.to.row, a.to.col) } else { let (x, y) = center(a.from.r0, a.from.c0); (x + 60.0, y - 30.0) };
+            let (from, boxed) = if here_from {
+                let f = a.from;
+                let boxed = (f.r0 != f.r1 || f.c0 != f.c1).then(|| [self.col_left(f.c0), self.row_top(f.r0), self.col_left(f.c1 + 1), self.row_top(f.r1 + 1)]);
+                (center(f.r0, f.c0), boxed)
+            } else {
+                ((to.0 - 60.0, to.1 - 30.0), None)
+            };
+            lines.push((from, to, colour, boxed, !(here_to && here_from)));
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (f, t, _, b, _) in &lines {
+            for (x, y) in [*f, *t].into_iter().chain(b.iter().flat_map(|b| [(b[0], b[1]), (b[2], b[3])])) {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        let (x0, y0) = ((x0 - 10.0).max(0.0), (y0 - 10.0).max(0.0));
+        let (w, h) = ((x1 + 10.0 - x0).clamp(1.0, 20_000.0), (y1 + 10.0 - y0).clamp(1.0, 20_000.0));
+        if x0 > view[0] + view[2] || y0 > view[1] + view[3] || x0 + w < view[0] || y0 + h < view[1] {
+            return None;
+        }
+        let p = |(x, y): (f64, f64)| ((x - x0) as f32, (y - y0) as f32);
+        let mut nodes = Vec::new();
+        let mut add = |shape: Shape| nodes.extend(shape.fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
+        for (f, t, colour, boxed, other) in lines {
+            let (fx, fy) = p(f);
+            let (tx, ty) = p(t);
+            if let Some(b) = boxed {
+                let (bx0, by0) = p((b[0], b[1]));
+                let (bx1, by1) = p((b[2], b[3]));
+                add(Shape::new(PathData::rect(pergola::Rect::new(bx0, by0, bx1 - bx0, by1 - by0))).stroke(Stroke::new(Paint::Solid(colour), 1.5)));
+            }
+            if other {
+                // The other sheet's mark: a small sheet with a fold.
+                let (mx, my) = if boxed.is_none() && (fx, fy) != (tx, ty) { (fx, fy) } else { (tx, ty) };
+                add(Shape::new(PathData::rect(pergola::Rect::new(mx - 8.0, my - 6.0, 16.0, 12.0))).fill(Paint::Solid(Color::rgba(1.0, 1.0, 1.0, 1.0))).stroke(Stroke::new(Paint::Solid(colour), 1.0)));
+                add(Shape::new(PathData::new().move_to(mx - 5.0, my - 2.0).line_to(mx + 5.0, my - 2.0).move_to(mx - 5.0, my + 2.0).line_to(mx + 5.0, my + 2.0)).stroke(Stroke::new(Paint::Solid(colour), 1.0)));
+            }
+            add(Shape::new(PathData::ellipse(pergola::geom::Point::new(fx, fy), 2.5, 2.5)).fill(Paint::Solid(colour)));
+            let (dx, dy) = (tx - fx, ty - fy);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1.0 {
+                continue;
+            }
+            let (ux, uy) = (dx / len, dy / len);
+            let (bx, by) = (tx - 9.0 * ux, ty - 9.0 * uy);
+            add(Shape::new(PathData::new().move_to(fx, fy).line_to(bx, by)).stroke(Stroke::new(Paint::Solid(colour), 1.5)));
+            add(Shape::new(PathData::new().move_to(tx, ty).line_to(bx - 4.0 * uy, by + 4.0 * ux).line_to(bx + 4.0 * uy, by - 4.0 * ux).close()).fill(Paint::Solid(colour)));
+        }
+        Some(pergola::widgets::GridFloat { key: (1 << 56) | arrows.len() as u64, at: [x0, y0, w, h], nodes: Rc::new(nodes), movable: false, pressable: false })
     }
 
     /// A button at the right of [`Self::note_at`]'s cell when a validation
@@ -645,6 +731,31 @@ impl SheetSource {
     /// The comment of [`Self::note_at`]'s cell as a box beside the cell.
     fn note_float(&self) -> Option<pergola::widgets::GridFloat> {
         let (r, c) = self.note_at.get()?;
+        self.note_box(r, c, 1 << 62, false)
+    }
+
+    /// Show All Comments: each comment in `view` in its box beside its cell
+    /// (the one under the pointer is drawn by [`Self::note_float`]).
+    fn all_notes(&self, view: [f64; 4]) -> Vec<pergola::widgets::GridFloat> {
+        let cells: Vec<(u32, u32)> = {
+            let d = self.doc.borrow();
+            if !d.show_comments {
+                return Vec::new();
+            }
+            let (r0, c0) = (self.row_at(view[1].max(0.0)), self.col_at(view[0].max(0.0)));
+            let (r1, c1) = (self.row_at(view[1].max(0.0) + view[3]), self.col_at(view[0].max(0.0) + view[2]));
+            d.wb.comments(d.sheet).keys().copied().filter(|&(r, c)| (r0..=r1).contains(&r) && (c0.saturating_sub(4)..=c1).contains(&c)).take(MAX_SHOWN_NOTES).collect()
+        };
+        let hovered = self.note_at.get();
+        cells.into_iter().filter(|&at| Some(at) != hovered).filter_map(|(r, c)| {
+            let key = (1u64 << 57) | (u64::from(r) << 20) | u64::from(c & 0xF_FFFF);
+            self.note_box(r, c, key, true)
+        }).collect()
+    }
+
+    /// The box beside (`r`, `c`): its comment and, unless `comments_only`,
+    /// its link and its validation prompt.
+    fn note_box(&self, r: u32, c: u32, key: u64, comments_only: bool) -> Option<pergola::widgets::GridFloat> {
         let (comment, link, prompt) = {
             let d = self.doc.borrow();
             let k = d.wb.comment(d.sheet, r, c).cloned();
@@ -655,7 +766,7 @@ impl SheetSource {
                 let msg = (v.show_prompt && !v.prompt.is_empty()).then(|| (v.prompt.title.to_string(), v.prompt.text.to_string()));
                 (list || msg.is_some()).then_some((msg, list))
             });
-            (k, l, p)
+            if comments_only { (k, None, None) } else { (k, l, p) }
         };
         if comment.is_none() && link.is_none() && prompt.is_none() {
             return None;
@@ -735,7 +846,7 @@ impl SheetSource {
         };
         let x = self.col_left(c1 + 1) + 6.0;
         let y = self.row_top(r0);
-        Some(pergola::widgets::GridFloat { key: 1 << 62, at: [x, y, NOTE_W as f64, h as f64], nodes: std::rc::Rc::new(nodes), movable: false, pressable: false })
+        Some(pergola::widgets::GridFloat { key, at: [x, y, NOTE_W as f64, h as f64], nodes: std::rc::Rc::new(nodes), movable: false, pressable: false })
     }
 }
 
@@ -889,7 +1000,9 @@ impl GridSource for SheetSource {
     }
     fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
         let mut out = self.data_marks(view, theme);
+        out.extend(self.all_notes(view));
         out.extend(self.note_float());
+        out.extend(self.trace_arrows(view));
         out.extend(self.list_button(theme));
         out.extend(self.fill_button(theme));
         out.extend(self.invalid_rings(view));

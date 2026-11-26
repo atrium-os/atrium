@@ -28,3 +28,5 @@ pub mod audit;
 pub mod sparkbar;
 pub mod formulas;
 pub mod checks;
+pub mod arrows;
+pub mod dataform;
