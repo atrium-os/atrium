@@ -95,16 +95,22 @@ impl Drop for Bond {
     }
 }
 
+/// `name`, cut to at most [`MAX_NAME`] bytes without splitting a character.
+fn fit_name(name: &str) -> String {
+    let mut end = name.len().min(MAX_NAME);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct DecodeError(pub &'static str);
 
 impl Bond {
     /// The record for a finished pairing with the peer at `address`.
     pub fn from_pairing(p: &vinculum_smp::pairing::Bond, address: Address, classic: bool, paired_by: u32, name: &str) -> Bond {
-        let mut name = name.to_string();
-        while name.len() > MAX_NAME {
-            name.pop();
-        }
+        let name = fit_name(name);
         Bond {
             address,
             classic,
@@ -117,6 +123,11 @@ impl Bond {
             paired_by,
             name,
         }
+    }
+
+    /// Names the device, cut to [`MAX_NAME`] bytes on a character boundary.
+    pub fn set_name(&mut self, name: &str) {
+        self.name = fit_name(name);
     }
 
     /// Whether `addr` is a resolvable private address made from this bond's
@@ -146,7 +157,10 @@ impl Bond {
         v.extend_from_slice(&self.ltk);
         v.extend_from_slice(&self.peer_irk.unwrap_or([0; 16]));
         v.extend_from_slice(&self.paired_by.to_le_bytes());
-        let name = &self.name.as_bytes()[..self.name.len().min(MAX_NAME)];
+        // A name set by hand may be longer: cut it where `decode` reads
+        // it back as UTF-8.
+        let cut = fit_name(&self.name);
+        let name = cut.as_bytes();
         v.push(name.len() as u8);
         v.extend_from_slice(name);
         v

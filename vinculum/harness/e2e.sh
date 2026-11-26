@@ -26,7 +26,7 @@ bin=$(cargo metadata -q --manifest-path "$ws/Cargo.toml" --format-version 1 | py
 
 work=$(mktemp -d)
 rc_pid= peer_pid= hci_pid= d_pid=
-cleanup() { kill ${t_pid:-} ${w_pid:-} $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; [ -n "${VINCULUM_KEEP:-}" ] && echo "logs kept in $work" || rm -rf "$work"; }
+cleanup() { kill ${t_pid:-} ${w_pid:-} ${e_pid:-} $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; [ -n "${VINCULUM_KEEP:-}" ] && echo "logs kept in $work" || rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 
 "$venv/bin/python" -m rootcanal --hci_port "$port" --link_port $((port + 1)) \
@@ -201,10 +201,20 @@ for u in 458756 458757 458758; do
     grep -q "usage: $u, down: false" "$work/watch.log" || hid_ok=0
 done
 grep -q "Device {.*Bluetooth.*vendor: 4660, product: 22136" "$work/watch.log" || hid_ok=0
+# Paired by address, so unnamed: vinculumd asks the keyboard its name
+# (Remote Name Request) and stores it with the bond.
+i=0
+until ctl devices 2>/dev/null | grep -q '"VinculumKbd"'; do
+    i=$((i + 1)); [ $i -gt 50 ] && break
+    sleep 0.1
+done
+ctl devices >"$work/devices5.log" 2>&1 || true
+grep -q '"VinculumKbd"' "$work/devices5.log" || hid_ok=0
+grep -q 'named "VinculumKbd"' "$work/svc5.log" || hid_ok=0
 if [ $hid_ok -eq 1 ]; then
-    echo "ok   B3 Classic HID keyboard to tactusd, pair + keyboard-initiated reconnect"
+    echo "ok   B3 Classic HID keyboard to tactusd, pair + keyboard-initiated reconnect, name asked after pairing by address"
 else
-    echo "FAIL B3 Classic HID"; for f in ctl5 svc5 kbd tactus watch; do echo "--- $f"; cat "$work/$f.log"; done
+    echo "FAIL B3 Classic HID"; for f in ctl5 devices5 svc5 kbd tactus watch; do echo "--- $f"; cat "$work/$f.log"; done
     fails=$((fails + 1))
 fi
 kill $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
@@ -236,6 +246,8 @@ until ctl status 2>/dev/null | grep -q "ready: true"; do
     sleep 0.1
 done
 hogp_ok=1
+ctl watch 40 >"$work/events6.log" 2>&1 &
+e_pid=$!
 ctl pair VinculumMouse --yes >"$work/ctl6.log" 2>&1 || hogp_ok=0
 # No `connect`: vinculumd scans in the background for the bonded mouse and
 # reconnects when it advertises again.
@@ -248,14 +260,19 @@ done
 grep -q "Button {.*down: true" "$work/watch6.log" || hogp_ok=0
 grep -q "Device {.*Bluetooth.*vendor: 4660, product: 22136" "$work/watch6.log" || hogp_ok=0
 grep -q "battery 60%" "$work/svc6.log" || hogp_ok=0
+# The level reaches the control clients: in the device list while
+# connected, and as a Battery event to a client that is listening.
+ctl devices >"$work/devices6.log" 2>&1 || true
+grep -q "connected, battery 60%" "$work/devices6.log" || hogp_ok=0
+grep -q "battery .* 60%" "$work/events6.log" || hogp_ok=0
 if [ $hogp_ok -eq 1 ]; then
-    echo "ok   B4 HID-over-GATT mouse to tactusd, battery, automatic reconnect"
+    echo "ok   B4 HID-over-GATT mouse to tactusd, battery (log, device list, event), automatic reconnect"
 else
-    echo "FAIL B4 HOGP mouse"; for f in ctl6 svc6 mouse tactus6 watch6; do echo "--- $f"; cat "$work/$f.log"; done
+    echo "FAIL B4 HOGP mouse"; for f in ctl6 devices6 events6 svc6 mouse tactus6 watch6; do echo "--- $f"; cat "$work/$f.log"; done
     fails=$((fails + 1))
 fi
-kill $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
-wait $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
+kill $d_pid $peer_pid $t_pid $w_pid $e_pid 2>/dev/null || true
+wait $d_pid $peer_pid $t_pid $w_pid $e_pid 2>/dev/null || true
 d_pid= peer_pid=
 fi
 

@@ -141,6 +141,9 @@ pub struct Hid {
     tactus: Option<Tactus>,
     links: HashMap<u16, Link>,
     next_device: u64,
+    /// Battery levels that changed since the daemon last asked, for the
+    /// control clients.
+    battery_news: Vec<(Addr, u8)>,
 }
 
 fn monotonic_ns() -> u64 {
@@ -183,11 +186,21 @@ impl Hid {
             let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o660));
             l
         });
-        Hid { listener, allowed_uids, tactus: None, links: HashMap::new(), next_device: 1 }
+        Hid { listener, allowed_uids, tactus: None, links: HashMap::new(), next_device: 1, battery_news: Vec::new() }
     }
 
     pub fn enabled(&self) -> bool {
         self.listener.is_some()
+    }
+
+    /// The battery level the device on this link last reported.
+    pub fn battery(&self, handle: u16) -> Option<u8> {
+        self.links.get(&handle).and_then(|l| l.battery)
+    }
+
+    /// Battery levels that changed since the last call, oldest first.
+    pub fn take_battery_news(&mut self) -> Vec<(Addr, u8)> {
+        std::mem::take(&mut self.battery_news)
     }
 
     /// A bonded Classic link is encrypted: find out whether it is a HID
@@ -271,6 +284,9 @@ impl Hid {
                     l.record.product = dev.product;
                     l.record.version = dev.version;
                     l.battery = dev.battery;
+                    if let Some(p) = dev.battery {
+                        self.battery_news.push((l.addr, p));
+                    }
                     l.descriptor = Some(dev.report_map);
                     self.attach(handle);
                 }
@@ -279,6 +295,7 @@ impl Hid {
                     let Some(l) = self.links.get_mut(&handle) else { return };
                     if l.battery != Some(p) {
                         eprintln!("vinculumd: {}: battery {p}%", l.addr);
+                        self.battery_news.push((l.addr, p));
                     }
                     l.battery = Some(p);
                     if let Some(id) = l.device.as_ref().map(|d| d.id) {

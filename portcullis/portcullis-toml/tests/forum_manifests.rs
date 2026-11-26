@@ -78,3 +78,13 @@ fn the_bar_and_the_wm_hold_media_control() {
         assert_eq!(load(rel).capabilities.media_control, None, "{rel}");
     }
 }
+
+#[test]
+fn only_the_bar_of_forum_holds_bluetooth_control() {
+    // The bar's Bluetooth item: connected devices and their battery
+    // (bluetooth.md §13). Curia is the only other holder.
+    assert_eq!(load("forum-bar/atrium.toml").capabilities.bluetooth_control, Some(true));
+    for rel in ["forum-wm/atrium.toml", "forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.bluetooth_control, None, "{rel}");
+    }
+}

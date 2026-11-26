@@ -18,8 +18,9 @@
 # `--controller usb` takes the first Bluetooth controller libusb finds: the
 # jail's devfs shows only this device's nodes, so that is this one.
 #
-# sysfil "device" is log-only for now: libusb's USB_FS ioctls on the ugen
-# node still need to be learned before it enforces.
+# sysfil "usb-driver" (jaild.policy.toml) enforces: base plus libusb's ugen
+# ioctls (descriptors, configuration, transfers), never reset, power or
+# driver detach.
 
 [[rule]]
 name          = "vinculum-controller"
@@ -42,6 +43,6 @@ gid           = 65025
 jail          = "atrium-vinculum-hci-{usb}"
 root          = "/var/lib/atrium/jails/vinculum-hci-{usb}"
 devfs_ruleset = 25
-sysfil        = "device"
+sysfil        = "usb-driver"
 mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin",
                  "/usr/local/share/atrium/firmware/bluetooth", "/atrium/sockets/vinculum-hci"]

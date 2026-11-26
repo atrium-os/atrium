@@ -16,7 +16,9 @@ def fold(n, acc, depth=0):
             acc.setdefault(k, set()).update(prof[n][k])
     return acc
 acc = fold(sys.argv[2], {})
-mode = sys.argv[3] if len(sys.argv) > 3 else str(pol.get('mode', 2))
+# A profile's own mode may be stricter than the policy's (jaild-policy's
+# SysfilProfile::mode); an explicit mode argument wins, for learning.
+mode = sys.argv[3] if len(sys.argv) > 3 else str(max(pol.get('mode', 2), prof[sys.argv[2]].get('mode', 0)))
 out = [f'sysfil.mode={mode}']
 for k in ('syscalls', 'ioctls', 'sockopts', 'families'):
     if k in acc:

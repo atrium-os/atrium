@@ -103,6 +103,7 @@ fn print_event(e: &Event) {
             if *authenticated { "authenticated" } else { "unauthenticated" },
             if *keyboard_allowed { "allowed" } else { "not allowed" }
         ),
+        Event::Battery { address, percent } => println!("battery {address} {percent}%"),
         Event::PairingFailed { address, why } => println!("pairing {address} failed: {why}"),
         Event::Prompt { address, prompt } => println!("prompt {address}: {prompt:?}"),
         Event::Error { why } => println!("error: {why}"),
@@ -180,13 +181,14 @@ fn main() {
             if let Event::Devices { devices } = c.call(Request::Devices) {
                 for d in devices {
                     println!(
-                        "{} {:?} {}{}{}{}",
+                        "{} {:?} {}{}{}{}{}",
                         d.address,
                         d.name,
                         if d.authenticated { "authenticated" } else { "unauthenticated" },
                         if d.secure_connections { "" } else { ", weaker key (no Secure Connections)" },
                         if d.keyboard_allowed { ", keyboard allowed" } else { "" },
-                        if d.connected { ", connected" } else { "" }
+                        if d.connected { ", connected" } else { "" },
+                        d.battery.map_or(String::new(), |p| format!(", battery {p}%"))
                     );
                 }
             }
@@ -264,6 +266,15 @@ fn main() {
                 }
             }
         }
+        Some("watch") => {
+            // Events as they come (connections, battery levels), without
+            // being the pairing agent; for SECS seconds, or until it ends.
+            let mut c = Conn::open(&socket, false);
+            let end = args.get(1).map(|s| Instant::now() + Duration::from_secs(s.parse().unwrap_or_else(|_| die("watch [SECS]"))));
+            while let Some(e) = c.next(end) {
+                print_event(&e);
+            }
+        }
         Some("agent") => {
             let mut c = Conn::open(&socket, true);
             println!("pairing agent ready");
@@ -275,6 +286,6 @@ fn main() {
                 }
             }
         }
-        _ => die("usage: vinculum-ctl [-s SOCKET] status|power on|off|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|agent [--yes]"),
+        _ => die("usage: vinculum-ctl [-s SOCKET] status|power on|off|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|watch [SECS]|agent [--yes]"),
     }
 }

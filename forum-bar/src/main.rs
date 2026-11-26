@@ -17,6 +17,7 @@ use std::sync::Arc;
 mod background;
 mod network;
 mod vpn;
+mod bluetooth;
 mod status_panel;
 
 use forum_ctl::{Intent, PadInfo, Reply, StatusContent, StatusEntry, StatusItem};
@@ -130,6 +131,11 @@ struct BarView {
     vpn: Mutable<vpn::VpnShown>,
     vpn_open: Mutable<MenuState>,
     want_vpn: Mutable<Option<vpn::VpnAction>>,
+    /// The Bluetooth item (bluetooth.md §13): shown while a paired device
+    /// is connected, with its battery.
+    bt: Mutable<bluetooth::BtShown>,
+    bt_open: Mutable<MenuState>,
+    want_bt: Mutable<Option<bluetooth::BtAction>>,
     /// Running in the background (background-apps.md §3.2): shown while
     /// something does.
     bg: Mutable<background::BgShown>,
@@ -728,6 +734,25 @@ impl View for BarView {
                 ctx.place(button);
             }
         }
+        // Bluetooth (bluetooth.md §13): the connected devices with their
+        // battery levels, amber when one is low; the menu disconnects.
+        // Not there while nothing is connected.
+        {
+            let n = self.bt.get_cloned();
+            if n.shown() {
+                let (items, acts) = bluetooth::menu(&n);
+                let want = self.want_bt.clone();
+                let colour = if n.low() { t.warning_fg() } else { t.text_secondary() };
+                let button = MenuButton::new("Bluetooth", self.bt_open.clone(), items, move |i| {
+                    if let Some(Some(a)) = acts.get(i) {
+                        want.set(Some(a.clone()));
+                    }
+                })
+                .icon(phosphor::BLUETOOTH, 15.0, Some(colour))
+                .attached();
+                ctx.place(button);
+            }
+        }
         // Running in the background (background-apps.md §3.2): each app
         // with Quit, and "Don't open at sign-in". Not there while nothing is.
         {
@@ -1265,6 +1290,11 @@ fn main() -> std::io::Result<()> {
     let want_vpn = Mutable::with_dirty(None, dirty.clone());
     let (vpn_events, vpn_tx) = vpn::follow();
     let mut vpn_was_open = false;
+    let bt_shown = Mutable::with_dirty(bluetooth::BtShown::default(), dirty.clone());
+    let bt_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
+    let want_bt = Mutable::with_dirty(None, dirty.clone());
+    let (bt_events, bt_tx) = bluetooth::follow();
+    let mut bt_was_open = false;
     let bg_shown = Mutable::with_dirty(background::BgShown::default(), dirty.clone());
     let bg_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
     let want_bg = Mutable::with_dirty(None, dirty.clone());
@@ -1308,6 +1338,9 @@ fn main() -> std::io::Result<()> {
         vpn: vpn_shown.clone(),
         vpn_open: vpn_open.clone(),
         want_vpn: want_vpn.clone(),
+        bt: bt_shown.clone(),
+        bt_open: bt_open.clone(),
+        want_bt: want_bt.clone(),
         bg: bg_shown.clone(),
         bg_open: bg_open.clone(),
         want_bg: want_bg.clone(),
@@ -1526,6 +1559,29 @@ fn main() -> std::io::Result<()> {
                 vpn_shown.set(n);
             }
         }
+        // The Bluetooth item: devices, battery levels, picks from its menu.
+        {
+            let mut n = bt_shown.get_cloned();
+            while let Ok(m) = bt_events.try_recv() {
+                match m {
+                    bluetooth::BtMsg::Devices(v) => n.devices = v,
+                    bluetooth::BtMsg::Battery { address, percent } => n.battery(address, percent),
+                    bluetooth::BtMsg::Done(r) => n.note = r.err(),
+                }
+            }
+            let open = bt_open.get().open;
+            if open && !bt_was_open {
+                n.note = None;
+            }
+            bt_was_open = open;
+            if let Some(a) = want_bt.get_cloned() {
+                want_bt.set(None);
+                bluetooth::act(bt_tx.clone(), a);
+            }
+            if n != bt_shown.get_cloned() {
+                bt_shown.set(n);
+            }
+        }
         // Running in the background: the list, and picks from its menu.
         {
             let mut n = bg_shown.get_cloned();
@@ -1636,6 +1692,9 @@ mod tests {
             vpn: Mutable::new(vpn::VpnShown::default()),
             vpn_open: Mutable::new(MenuState::default()),
             want_vpn: Mutable::new(None),
+            bt: Mutable::new(bluetooth::BtShown::default()),
+            bt_open: Mutable::new(MenuState::default()),
+            want_bt: Mutable::new(None),
             bg: Mutable::new(background::BgShown::default()),
             bg_open: Mutable::new(MenuState::default()),
             want_bg: Mutable::new(None),

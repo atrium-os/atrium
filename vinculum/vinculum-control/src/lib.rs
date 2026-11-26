@@ -116,6 +116,9 @@ pub struct DeviceInfo {
     /// Whether the bond may carry keyboard reports (§7).
     pub keyboard_allowed: bool,
     pub connected: bool,
+    /// The battery level the device last reported (Battery Service), in
+    /// percent; None while not connected or when it has none.
+    pub battery: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +137,8 @@ pub enum Event {
     PairingFailed { address: Addr, why: String },
     Connected { address: Addr, encrypted: bool },
     Disconnected { address: Addr, reason: String },
+    /// A connected device reported a new battery level, in percent.
+    Battery { address: Addr, percent: u8 },
 }
 
 #[derive(Debug, PartialEq, Eq)]

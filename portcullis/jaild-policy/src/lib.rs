@@ -117,6 +117,11 @@ pub struct SysfilProfile {
     /// Profiles whose lists this one adds to, e.g. `["base"]`.
     #[serde(default)]
     pub include:  Vec<String>,
+    /// This class's `sysfil.mode` when it is stricter than `[sysfil] mode`:
+    /// a profile already learned enforces while the others still log. It
+    /// never loosens the policy-wide mode, and an included profile's mode
+    /// does not carry over.
+    pub mode:     Option<i32>,
     pub syscalls: Option<Vec<String>>,
     /// ioctl command numbers, as the kernel takes them (`0x4004667f`).
     pub ioctls:   Option<Vec<String>>,
@@ -168,11 +173,16 @@ impl SysfilPolicy {
         }
         let mut acc: [Option<std::collections::BTreeSet<String>>; 4] = Default::default();
         self.fold(name, &mut acc, &mut Vec::new())?;
+        let own = self.profiles.get(name).and_then(|p| p.mode);
+        if let Some(m) = own.filter(|m| !(1..=3).contains(m)) {
+            return Err(format!("sysfil profile {name:?}: mode {m} is not 1, 2 or 3"));
+        }
+        let mode = own.map_or(self.mode, |m| m.max(self.mode));
         let join = |s: &Option<std::collections::BTreeSet<String>>| {
             s.as_ref().map(|v| v.iter().cloned().collect::<Vec<_>>().join(","))
         };
         Ok(SysfilParams {
-            mode:     self.mode,
+            mode,
             syscalls: join(&acc[0]),
             ioctls:   join(&acc[1]),
             sockopts: join(&acc[2]),
@@ -809,6 +819,22 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_may_enforce_before_the_policy_does_but_never_loosen_it() {
+        let mut s = sysfil_sample();
+        s.mode = 1;
+        s.profiles.get_mut("net").unwrap().mode = Some(2);
+        assert_eq!(s.resolve("net").unwrap().mode, 2, "a learned profile enforces");
+        assert_eq!(s.resolve("base").unwrap().mode, 1, "the rest still log");
+        s.profiles.get_mut("base").unwrap().mode = Some(3);
+        assert_eq!(s.resolve("net").unwrap().mode, 2, "an included profile's mode does not carry over");
+        s.mode = 2;
+        s.profiles.get_mut("net").unwrap().mode = Some(1);
+        assert_eq!(s.resolve("net").unwrap().mode, 2, "a profile cannot turn enforcing back to logging");
+        s.profiles.get_mut("net").unwrap().mode = Some(0);
+        assert!(s.resolve("net").unwrap_err().contains("mode 0"));
+    }
+
+    #[test]
     fn shipped_sysfil_profiles_resolve() {
         let crate_dir = env!("CARGO_MANIFEST_DIR");
         let sample = std::path::Path::new(crate_dir).parent().unwrap().parent().unwrap()
@@ -843,6 +869,18 @@ mod tests {
         assert_eq!(share.families.as_deref(), Some("inet,inet6,unix"));
         assert!(!share.ioctls.unwrap().contains("0x40086481"), "share server asks disk geometry");
         assert!(!share.sockopts.unwrap().contains("0:4"), "share server sets IP_TTL");
+        // A USB driver jail (Bluetooth's vinculum-hci) enforces its learned
+        // list: libusb's transfers, never reset, power or driver detach.
+        let usb = p.sysfil.resolve("usb-driver").unwrap();
+        assert!(usb.mode >= 2, "usb-driver enforces");
+        let io = usb.ioctls.unwrap();
+        for need in ["0x800155c0", "0x400155c2", "0xc01055c5", "0xc018556f", "0x8010557f"] {
+            assert!(io.split(',').any(|i| i == need), "usb-driver lacks {need}");
+        }
+        for never in ["0x80045506", "0x8004557d", "0x80045580", "0x80045591"] {
+            assert!(!io.split(',').any(|i| i == never), "usb-driver allows {never}");
+        }
+        assert_eq!(usb.families.as_deref(), Some("unix"));
     }
 
     /// Parse the shipped sample at etc/jaild.policy.toml.

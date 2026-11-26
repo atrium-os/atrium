@@ -110,6 +110,9 @@ pub fn signal(rssi: i8) -> &'static str {
 /// One line on a paired device.
 pub fn device_line(d: &DeviceInfo) -> String {
     let mut s = if d.connected { "Connected".to_string() } else { "Not connected".to_string() };
+    if let (true, Some(p)) = (d.connected, d.battery) {
+        s.push_str(&format!(" · battery {p}%"));
+    }
     if !d.authenticated {
         s.push_str(" · paired without a code check");
     }
@@ -261,6 +264,11 @@ impl BtPage {
                 self.done_pairing(address);
             }
             Event::Connected { .. } | Event::Disconnected { .. } => self.ask(Request::Devices),
+            Event::Battery { address, percent } => {
+                if let Some(d) = self.devices.as_mut().and_then(|v| v.iter_mut().find(|d| d.address == address || d.identity == Some(address))) {
+                    d.battery = Some(percent);
+                }
+            }
         }
     }
 
@@ -367,7 +375,7 @@ mod tests {
     }
 
     fn dev(n: u8, connected: bool) -> DeviceInfo {
-        DeviceInfo { address: a(n), identity: None, name: format!("Dev{n}"), authenticated: true, secure_connections: true, keyboard_allowed: true, connected }
+        DeviceInfo { address: a(n), identity: None, name: format!("Dev{n}"), authenticated: true, secure_connections: true, keyboard_allowed: true, connected, battery: None }
     }
 
     fn page() -> BtPage {
@@ -480,6 +488,8 @@ mod tests {
         assert_eq!(p.take_wants(), vec![Request::Devices]);
         p.apply(Event::Devices { devices: vec![dev(1, true)] });
         assert_eq!(device_line(&p.devices.as_ref().unwrap()[0]), "Connected");
+        p.apply(Event::Battery { address: a(1), percent: 60 });
+        assert_eq!(device_line(&p.devices.as_ref().unwrap()[0]), "Connected · battery 60%");
         p.forget(a(1));
         assert!(p.take_wants().is_empty());
         p.forget(a(1));

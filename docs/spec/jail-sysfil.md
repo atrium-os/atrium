@@ -312,7 +312,7 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | overhead under 1%, HVF (Mac, arm64) | outside filtered jails: **passes** (patched vs stock within ±0.5% on every operation). Inside a filtered jail, at fbsd 09e74dabf: null +1.9% (+1.5 ns), sockopt +1.9%, ioctl +4.3%. At fbsd 302660e88 (bitmap test inline in `syscallenter`, open-coded list searches): **null +0.65% (+0.5 ns), nullio +0.42%, sockopt +1.05% (+1.2 ns), ioctl +2.8% (+2.8 ns, noise floor 1–2%)**, unfiltered path still within noise. **Final at fbsd 62c6fd2a9: null +0.5%, nullio +0.9%, sockopt +0.2%; ioctl ≈1–2% (+1.9% vs host, +1.5% vs open jail), at this host's ioctl noise floor rather than cleanly under 1%; accepted.** Tables below |
 | overhead under 1%, KVM (R9700, amd64) | skipped (Shankar, 2026-11-10): the HVF result is within noise |
 | Navigator, Fresco, Tessera benchmarks with the filter | pending |
-| shipped `policy.sysfil.mode` | **1 (log only)** until the profiles have been run against the real apps (Pergola apps, Fresco renderers, Lyra clients, the player, Nuntius); then 2 |
+| shipped `policy.sysfil.mode` | **1 (log only)** until the profiles have been run against the real apps (Pergola apps, Fresco renderers, Lyra clients, the player, Nuntius); then 2. A profile may set its own `mode`, stricter only, to enforce once it is learned while the rest still log: `usb-driver` (Vinculum's driver jail, libusb's ugen ioctls) enforces from 2026-11-26 |
 | jail(8) man page section | pending |
 
 **HVF latency (arm64, Apple M4 Max, QEMU 10.2 `-accel hvf -cpu host`, fbsd 09e74dabf against

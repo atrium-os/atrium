@@ -224,3 +224,15 @@ fn duplicate_bonds_for_one_device_are_both_dropped() {
     assert_eq!(keep.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![[3u8; 16]]);
     assert_eq!(drop, vec![[1u8; 16], [2u8; 16]]);
 }
+
+#[test]
+fn a_long_name_is_cut_on_a_character_boundary_and_reads_back() {
+    let mut b = bond(1);
+    // 63 ASCII bytes, then a three-byte character that would cross 64.
+    b.name = format!("{}€", "a".repeat(63));
+    let back = Bond::decode(&b.encode()).expect("a name cut mid-character would not decode");
+    assert_eq!(back.name, "a".repeat(63));
+    b.set_name(&"é".repeat(40));
+    assert_eq!(b.name.len(), 64);
+    assert_eq!(Bond::decode(&b.encode()).unwrap().name, "é".repeat(32));
+}

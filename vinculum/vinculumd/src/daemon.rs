@@ -89,6 +89,10 @@ struct Daemon {
     names_wanted: VecDeque<Addr>,
     names_asked: HashSet<Addr>,
     naming: Option<Addr>,
+    /// Classic bonds without a name (paired by address): asked for it
+    /// once each while connected, before any scan's devices.
+    bond_names_wanted: VecDeque<Addr>,
+    bond_names_asked: HashSet<Addr>,
     inquired: HashMap<Addr, (i8, u32)>,
     /// Our LE connection attempt in flight, and when we give up on it.
     le_connecting: Option<(Addr, Option<u64>)>,
@@ -259,6 +263,9 @@ impl Daemon {
             self.hid.start(&mut self.host, handle, a, incoming, &name, kb, now);
         } else {
             self.hid.start_le(&mut self.host, handle, a, &name, kb, now);
+            for (address, percent) in self.hid.take_battery_news() {
+                self.broadcast(&Event::Battery { address, percent });
+            }
         }
     }
 
@@ -332,24 +339,7 @@ impl Daemon {
                 }
                 None => Event::Error { why: "not connected".into() },
             },
-            Request::Devices => Event::Devices {
-                devices: self
-                    .bonds
-                    .iter()
-                    .map(|(_, b)| {
-                        let a = from_keys(b.address);
-                        DeviceInfo {
-                            address: a,
-                            identity: b.identity.map(from_keys),
-                            name: b.name.clone(),
-                            authenticated: b.authenticated,
-                            secure_connections: b.secure_connections,
-                            keyboard_allowed: policy::keyboard_allowed(b),
-                            connected: self.conns.values().any(|x| vinculum_keys::find([b], &keys_addr(*x)).is_some()),
-                        }
-                    })
-                    .collect(),
-            },
+            Request::Devices => Event::Devices { devices: self.device_list() },
             Request::Remove { address } => match self.bond_for(address) {
                 Some(k) => {
                     let (id, b) = self.bonds.remove(k);
@@ -425,21 +415,91 @@ impl Daemon {
     /// Request) with the inquiry paused, then the inquiry goes on.
     fn update_inquiry(&mut self) {
         // An LE-only controller has no inquiry; its users' scans are LE alone.
-        let free = self.host.is_ready() && !self.host.info().le_only() && !self.off && self.user_scan && self.pending_pair.is_none() && self.naming.is_none();
-        let want = free && self.names_wanted.is_empty();
+        let radio = self.host.is_ready() && !self.host.info().le_only() && !self.off && self.pending_pair.is_none() && self.naming.is_none();
+        let free = radio && self.user_scan;
+        let want = free && self.names_wanted.is_empty() && self.bond_names_wanted.is_empty();
         if want != self.inquiring {
             let now = self.now();
             self.host.inquiry(want, now);
             // A cancelled inquiry sends no Inquiry Complete.
             self.inquiring = want;
         }
-        if free && !self.inquiring {
-            if let Some(a) = self.names_wanted.pop_front() {
+        if radio && !self.inquiring {
+            let next = match self.bond_names_wanted.pop_front() {
+                Some(a) => Some(a),
+                None if free => self.names_wanted.pop_front(),
+                None => None,
+            };
+            if let Some(a) = next {
                 self.naming = Some(a);
                 let now = self.now();
                 self.host.remote_name(peer(a), now);
             }
         }
+    }
+
+    /// A connected Classic bond with no name (paired by address, §13):
+    /// ask the device for it, once per run.
+    fn want_bond_name(&mut self, a: Addr) {
+        let Some(k) = self.bond_for(a) else { return };
+        let b = &self.bonds[k].1;
+        if !b.classic || !b.name.trim().is_empty() || self.bond_names_asked.len() >= 64 || !self.bond_names_asked.insert(a) {
+            return;
+        }
+        self.bond_names_wanted.push_back(a);
+        self.update_inquiry();
+    }
+
+    /// A Classic device told us its name: an unnamed bond takes it. The
+    /// renamed record is stored before the old one is deleted, so a
+    /// failure leaves a bond either way.
+    fn name_bond(&mut self, a: Addr, name: &str, now: u64) {
+        let Some(k) = self.bond_for(a) else { return };
+        if !self.bonds[k].1.classic || !self.bonds[k].1.name.trim().is_empty() || name.trim().is_empty() {
+            return;
+        }
+        let mut rec = self.bonds[k].1.clone();
+        rec.set_name(name.trim());
+        match self.store.store(&rec) {
+            Ok(id) => {
+                let old_id = std::mem::replace(&mut self.bonds[k], (id, rec)).0;
+                if let Err(e) = self.store.delete(&old_id) {
+                    eprintln!("vinculumd: removing the unnamed bond: {e}");
+                    if matches!(e, vinculum_keys::Error::Io(_)) {
+                        self.reconcile_store(now);
+                    }
+                }
+                eprintln!("vinculumd: {a}: named {:?}", self.bonds[k].1.name);
+                self.broadcast(&Event::Devices { devices: self.device_list() });
+            }
+            Err(e) => {
+                eprintln!("vinculumd: storing the name of {a}: {e}");
+                if matches!(e, vinculum_keys::Error::Io(_)) {
+                    self.reconcile_store(now);
+                }
+            }
+        }
+    }
+
+    /// The paired devices as the control clients see them.
+    fn device_list(&self) -> Vec<DeviceInfo> {
+        self.bonds
+            .iter()
+            .map(|(_, b)| {
+                let a = from_keys(b.address);
+                let handle = self.conns.iter().find(|(_, x)| vinculum_keys::find([b], &keys_addr(**x)).is_some()).map(|(h, _)| *h);
+                DeviceInfo {
+                    address: a,
+                    identity: b.identity.map(from_keys),
+                    name: b.name.clone(),
+                    authenticated: b.authenticated,
+                    secure_connections: b.secure_connections,
+                    keyboard_allowed: policy::keyboard_allowed(b),
+                    connected: handle.is_some(),
+                    battery: handle.and_then(|h| self.hid.battery(h)),
+                }
+            })
+            .collect()
     }
 
     /// One LE connection attempt at a time; the scan pauses meanwhile.
@@ -612,6 +672,9 @@ impl Daemon {
                 // handed to anyone on a link (§7).
                 if cid == vinculum_gatt::ATT_CID {
                     self.hid.on_att(&mut self.host, handle, &payload, now);
+                    for (address, percent) in self.hid.take_battery_news() {
+                        self.broadcast(&Event::Battery { address, percent });
+                    }
                 }
             }
             HostEvent::CommandFailed { op, status } if op.contains("RemoteNameRequest") => {
@@ -673,6 +736,7 @@ impl Daemon {
                         self.broadcast(&Event::Paired { address: a, authenticated, keyboard_allowed });
                         if classic {
                             self.update_page_scan();
+                            self.want_bond_name(a);
                         }
                         self.update_scan();
                         self.start_hid(handle);
@@ -701,6 +765,9 @@ impl Daemon {
             HostEvent::Encrypted { handle, .. } => {
                 if let Some(&a) = self.conns.get(&handle) {
                     self.broadcast(&Event::Connected { address: a, encrypted: true });
+                }
+                if let Some(&a) = self.conns.get(&handle) {
+                    self.want_bond_name(a);
                 }
                 // A fresh pairing starts HID once its bond is stored.
                 if !self.pairing.contains(&handle) {
@@ -750,6 +817,7 @@ impl Daemon {
                 }
                 if let Some(n) = name {
                     self.names.insert(a, n.clone());
+                    self.name_bond(a, &n, now);
                     if let (true, Some(&(rssi, class))) = (self.user_scan, self.inquired.get(&a)) {
                         self.broadcast(&Event::Found { address: a, name: Some(n), rssi, class_of_device: Some(class) });
                     }
@@ -861,6 +929,8 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         names_wanted: VecDeque::new(),
         names_asked: HashSet::new(),
         naming: None,
+        bond_names_wanted: VecDeque::new(),
+        bond_names_asked: HashSet::new(),
         inquired: HashMap::new(),
         le_connecting: None,
         pending_pair: None,

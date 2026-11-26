@@ -2109,7 +2109,7 @@ mod tests {
             p.connected();
             p.apply(Event::Ok);
             p.apply(Event::Status { ready: true, powered: true, address: Some(Addr { bytes: [0, 0x1B, 0xDC, 1, 2, 3], random: false }), scanning: true, pairable: true, agents: 1, connections: 1 });
-            p.apply(Event::Devices { devices: vec![DeviceInfo { address: a(1), identity: None, name: "Keys".into(), authenticated: true, secure_connections: true, keyboard_allowed: true, connected: true }] });
+            p.apply(Event::Devices { devices: vec![DeviceInfo { address: a(1), identity: None, name: "Keys".into(), authenticated: true, secure_connections: true, keyboard_allowed: true, connected: true, battery: None }] });
             p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -70, class_of_device: None });
             p.pair(a(2));
             p.apply(Event::Prompt { address: a(2), prompt: vinculum_control::Prompt::Confirm { number: Some(42) } });

@@ -104,7 +104,7 @@ mod tests {
         let p = plan(d, &v, &["ugen0.3".into(), "usb/0.3.0".into()]).unwrap();
         assert_eq!(p.name, "atrium-vinculum-hci-0-3-0");
         assert_eq!(p.path, "/var/lib/atrium/jails/vinculum-hci-0-3-0");
-        assert_eq!((p.devfs_ruleset, p.sysfil.as_str(), p.uid, p.gid), (25, "device", 65025, 65025));
+        assert_eq!((p.devfs_ruleset, p.sysfil.as_str(), p.uid, p.gid), (25, "usb-driver", 65025, 65025));
         assert_eq!(p.devfs_grants, ["ugen0.3", "usb/0.3.0"]);
         assert_eq!(p.exec, "/usr/local/bin/atrium-vinculum-hci");
         assert_eq!(&p.argv[..3], ["atrium-vinculum-hci", "--controller", "usb"]);

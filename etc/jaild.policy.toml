@@ -982,6 +982,40 @@ ioctls = [
     "0x41705570",   # USB_GET_DEVICEINFO (u2f(4): vendor, product, name)
 ]
 
+# USB driver jails that drive their device through libusb on its ugen node
+# (bluetooth.md §8): Vinculum's vinculum-hci, one per Bluetooth controller.
+# base plus the libusb20 ugen backend's calls for what vinculum-hci does
+# (enumerate, descriptors, configuration, the driver query, transfers,
+# clear-stall), read from FreeBSD's lib/libusb/libusb20_ugen20.c with sizes
+# from sys/dev/usb/usb_ioctl.h (LP64; the same on arm64 and amd64). Left
+# out on purpose: USB_DEVICEENUMERATE (reset), USB_SET_POWER_MODE,
+# USB_IFACE_DRIVER_DETACH/ATTACH (dispensatord detaches the base driver),
+# port enable/disable, templates, quirks, streams. Enforced ahead of the
+# policy-wide mode: a jail that tries anything else gets EPERM.
+[sysfil.profiles.usb-driver]
+include = ["base"]
+mode    = 2
+ioctls = [
+    "0x8010557f",   # USB_READ_DIR (on /dev/usbctl: the device list)
+    "0x4004557e",   # USB_GET_PLUGTIME
+    "0x40125569",   # USB_GET_DEVICE_DESC
+    "0x41705570",   # USB_GET_DEVICEINFO
+    "0x40235586",   # USB_GET_DEV_PORT_PATH
+    "0xc020556d",   # USB_GET_FULL_DESC (configuration descriptors)
+    "0x40045564",   # USB_GET_CONFIG
+    "0x80045565",   # USB_SET_CONFIG (a device left unconfigured)
+    "0x8004557c",   # USB_IFACE_DRIVER_ACTIVE
+    "0xc018556f",   # USB_DO_REQUEST (string descriptors)
+    "0x801055c3",   # USB_FS_INIT
+    "0x800155c4",   # USB_FS_UNINIT
+    "0xc01055c5",   # USB_FS_OPEN
+    "0x800155c6",   # USB_FS_CLOSE
+    "0x800155c0",   # USB_FS_START
+    "0x800155c1",   # USB_FS_STOP
+    "0x400155c2",   # USB_FS_COMPLETE
+    "0x800155c7",   # USB_FS_CLEAR_STALL_SYNC
+]
+
 # The removable-storage FUSE server, atrium-capsa-fuse (device-assignment.md
 # §4.6): it holds the partition and /dev/fuse, both opened by jaild, asks the
 # partition's geometry, then enters Capsicum. No sockets are ever opened.
