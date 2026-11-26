@@ -486,6 +486,11 @@ fn main() {
                         Err(e) => {
                             eprintln!("vinculumd: storing the bond: {e}");
                             ok = false;
+                            // A lost reply may have left the item stored.
+                            let keep: Vec<_> = bonds.iter().map(|(id, _)| *id).collect();
+                            if let Err(e) = store.forget_unknown(&keep) {
+                                eprintln!("vinculumd: checking the key store after a failed store: {e}");
+                            }
                         }
                     }
                     host.disconnect(handle, now());

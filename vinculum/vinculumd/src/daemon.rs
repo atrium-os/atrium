@@ -100,6 +100,10 @@ struct Daemon {
     incoming: HashSet<u16>,
     hid: Hid,
     t0: Instant,
+    /// A store's reply was lost and the clean-up of what it may have left
+    /// failed too: when to try that clean-up again. An orphan for a new
+    /// device has no duplicate to catch it at the next start.
+    store_dirty_at: Option<u64>,
 }
 
 fn addr(p: Peer) -> Addr {
@@ -149,6 +153,23 @@ pub(crate) fn getuid() -> u32 {
 impl Daemon {
     fn now(&self) -> u64 {
         self.t0.elapsed().as_millis() as u64
+    }
+
+    /// Deletes stored bonds we do not hold (after a store whose reply was
+    /// lost); on failure tries again in 30 s.
+    fn reconcile_store(&mut self, now: u64) {
+        let keep: Vec<_> = self.bonds.iter().map(|(id, _)| *id).collect();
+        self.store_dirty_at = match self.store.forget_unknown(&keep) {
+            Ok(0) => None,
+            Ok(n) => {
+                eprintln!("vinculumd: removed {n} bond(s) left by a failed store");
+                None
+            }
+            Err(e) => {
+                eprintln!("vinculumd: could not check the key store after a failed store: {e}; trying again in 30 s");
+                Some(now + 30_000)
+            }
+        };
     }
 
     fn agents(&self) -> usize {
@@ -638,12 +659,7 @@ impl Daemon {
                         // hold, so a pairing reported failed is not honoured
                         // after a restart.
                         if matches!(e, vinculum_keys::Error::Io(_)) {
-                            let keep: Vec<_> = self.bonds.iter().map(|(id, _)| *id).collect();
-                            match self.store.forget_unknown(&keep) {
-                                Ok(0) => {}
-                                Ok(n) => eprintln!("vinculumd: removed {n} bond(s) left by a failed store"),
-                                Err(e2) => eprintln!("vinculumd: could not check the key store after a failed store: {e2}"),
-                            }
+                            self.reconcile_store(now);
                         }
                         self.broadcast(&Event::PairingFailed { address: a, why: format!("key store: {e}") });
                         self.host.disconnect(handle, now);
@@ -827,6 +843,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         incoming: HashSet::new(),
         hid,
         t0: Instant::now(),
+        store_dirty_at: None,
     };
     let trace = std::env::var_os("VINCULUM_TRACE").is_some();
     let mut dec = Decoder::new();
@@ -851,8 +868,11 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         }
         d.clients.retain(|c| !c.dead);
         let now = d.now();
+        if d.store_dirty_at.is_some_and(|t| now >= t) {
+            d.reconcile_store(now);
+        }
         let le_deadline = d.le_connecting.and_then(|(_, t)| t);
-        let next = [d.host.deadline(), d.pairable.deadline(), d.hid.deadline(), le_deadline].into_iter().flatten().min();
+        let next = [d.host.deadline(), d.pairable.deadline(), d.hid.deadline(), le_deadline, d.store_dirty_at].into_iter().flatten().min();
         let wait_ms = next.map_or(-1, |n| n.saturating_sub(now).min(60_000) as i32);
         let mut fds = vec![link.fd(), listener.as_raw_fd()];
         fds.extend(d.clients.iter().map(|c| c.sock.as_raw_fd()));
