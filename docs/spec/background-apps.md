@@ -249,30 +249,58 @@ action above has a command, with the same rules as the GUI.
 
 **How a command proves it is the person.** Nothing runs as the person
 (homes.md §1), so a command typed in the Terminal runs in a workspace
-or an app console, as that jail's uid. Reads need no proof: portcullisd
-resolves the caller's owner through the launch registry and shows only
-that person's apps (`list`, `log`). Changes need the same proof as the
-GUI's press, so an app or a script can't approve itself:
+or an app console, as that jail's uid. Anything that writes to that pty
+can say anything (a script, `cat` of a file, a remote ssh session), so
+the caller proves nothing. The defense is a press that is bound to one
+exact request and shown by the system, not by the Terminal:
 
-- **In the Terminal**, the command asks the Terminal with OSC 7770, the
-  same way `pkg` and `make run` ask in a workspace today
-  (dev-tools-plan.md M4). The Terminal shows "proj asks: let Photo
-  Server run in the background" with Allow and Cancel, and sends the
-  request with the activation of that press, or of Enter in its own
-  window (frescod's `APPROVE` purpose, Curia §13). It gets that one verb
-  through a new restricted capability, `background-grants`, which only
-  the Terminal holds. Every change goes this way, including `disallow`
-  and `quit`. The GUI's Off and Quit need no press, but there the
-  caller is Curia or forum-wm, never an arbitrary process.
-- **Outside the Terminal** (a script, a workspace job), a change is
-  refused with the reason: "run it in the Terminal, or allow it in
-  Settings". Read commands work everywhere.
-- **The host shell** (homes.md §6, root behind Sigillum) can do all of
-  it for any person: `portcullis --user alice background allow …`. That
-  is the administration and recovery path, not daily use.
+- **Reads** (`list`, `log`) are answered only to workspace and console
+  uids, Curia and forum-wm, for the person who owns that jail (from the
+  launch registry). An ordinary app's uid gets nothing, so an app can't
+  fingerprint the person's background apps or open ports.
+- **Changes that grant** (`background allow`, `listen allow`) send only a
+  structured request: the verb, app id, persona, port and network. In a
+  workspace, the command passes it to the Terminal with OSC 7770 (the
+  path `pkg` and `make run` use today, dev-tools-plan.md M4). The Terminal
+  forwards the fields untouched, and never shows text from the OSC.
+  The pane's owning jail ("proj") comes from stoad, never from the
+  sequence.
+- **portcullisd turns the fields into a confirm sheet.** It checks them,
+  builds the words itself (the app's name from the installed manifest,
+  the persona's name, the port and the network), and asks a **system
+  confirm sheet**. That sheet is a small jailed service with its own uid,
+  like opifex-sheet, prelum-sheet and share-sheet, and it is the only
+  uid portcullisd takes approvals from. The sheet says "proj asks: let
+  Photo Server run in the background in Work" with Allow and Cancel.
+  Neither button is the default, both stay inert for 500 ms after the
+  sheet shows, and Enter does nothing until one has focus. So a person
+  typing their next command can't approve by accident.
+- **The press is spent for that one request.** portcullisd hands the sheet
+  a fresh nonce with the request. The sheet's press (frescod's `PROMPT`
+  purpose, in its own window) comes back with that nonce. portcullisd
+  writes the grant only if the nonce matches the request it built, and
+  uses the nonce up. A compromised Terminal can forward a different
+  request, but the sheet then shows that request's true words. It can't
+  spend a press it didn't get, because the press lands on the sheet, not
+  on the Terminal. So the Terminal needs no grant capability at all.
+- **Persona.** The request's persona defaults to the persona of the jail
+  the command runs in. Asking for another persona works only through the
+  sheet, which names it ("…in Personal, asked from Work"), so a Work
+  workspace can't quietly grant in Personal.
+- **Asks are rate-limited** per pane and per person: one open sheet at a
+  time, and at most 5 a minute. Extras are refused with the reason.
+- **Changes that only reduce** (`disallow`, `quit`) need no press when
+  they come from the owner's own workspace or console uids, as the GUI's
+  Off and Quit need none. They can only take away.
+- **The host shell** (homes.md §6, root behind Sigillum) can do it all
+  for any person: `portcullis --user alice background allow …`. Each such
+  change is logged, and the person is told at their next sign-in that
+  the administrator changed their grant (a Praeco notice).
 
-Every command takes `--json` for scripts. Its words and refusals are
-the GUI's, from one table in `portcullis-ipc`, so the two never drift.
+Every command takes `--json` for scripts. A script can run every read,
+and every change that only reduces. A change that grants always waits
+for the person at the sheet. Its words and refusals are the GUI's, from
+one table in `portcullis-ipc`, so the two never drift.
 
 ## 6. What changes where
 
@@ -289,7 +317,8 @@ the GUI's, from one table in `portcullis-ipc`, so the two never drift.
 | `opifex-sheet`, launch prompt | words for both asks |
 | SDK | `status-item` and `server` templates; `cargo atrium check` warns on a `listen` with no `[resources]` |
 | `portcullis` CLI | `background list/allow/disallow/quit/log` and `listen list/allow/disallow`, `--json`, `--user` for root (§5a) |
-| Terminal (stoa-term) | the OSC 7770 ask for those changes, sent with the press's activation; the `background-grants` capability |
+| Terminal (stoa-term) | forwards the OSC 7770 ask's fields untouched, with the pane's jail from stoad |
+| a system confirm sheet (new, opifex-sheet's pattern) | shows portcullisd's words for one request and returns its press with the nonce; portcullisd takes approvals only from its uid |
 | Artifex | the templates in New project; the Package card lines |
 
 No app-specific code goes into portcullisd. Both verbs are generic and
@@ -317,9 +346,11 @@ read only the manifest and the person's grant.
    for the same port. On this computer, another user's process and a page
    in Navigator are refused, and the person's own process gets through.
    Each step ships its CLI verbs with it (§5a), and each VM check drives
-   the CLI as well as the GUI: a change from the Terminal with Allow,
-   the same change refused from a workspace script, and a read from
-   both.
+   the CLI as well as the GUI: a change from the Terminal confirmed on
+   the sheet; a forged OSC asking for another app shows that app's true
+   name and is cancelled; Enter typed just after the sheet appears
+   approves nothing; an app's uid gets no read; a Work workspace asking
+   for Personal sees "Personal" on the sheet.
 5. **B5 templates and Artifex.** Both templates, Artifex's New project
    and Package card, the sheet's words; vm-templates-check and
    vm-artifex-check gain one section each.
@@ -350,7 +381,7 @@ read only the manifest and the person's grant.
 | G5 | Should `listen` be allowed per network, with a café Wi-Fi never reached and open Wi-Fi refused? | Yes: per saved network, open networks refused (§4.2) |
 | G6 | Should ports be 1024+ only, with no internet reach? | Yes for v1 (§8) |
 | G7 | Templates: Rust first, C after? | Yes |
-| G8 | Should every change from the CLI be confirmed with a press in the Terminal, and refused from scripts, with root's host shell able to do it for anyone? | Yes (§5a) |
+| G8 | Should a CLI change that grants be confirmed on a system sheet with portcullisd's own words, while one that only takes away needs no press, and root can act for anyone with a notice? | Yes (§5a) |
 
 ### Review
 
@@ -383,3 +414,26 @@ findings. All nine are folded in above:
 
 The reviewer found nothing in §6 that needs app-specific code in
 portcullisd.
+
+§5a (the CLI, 4ac8db0b8) had a second review on 2026-11-26. It found a
+self-approval path, now closed:
+
+1. High: the words and the press weren't bound to the request, so a
+   forged OSC could say one thing and grant another. Now only fields are
+   forwarded, and portcullisd builds the words and binds the press to a
+   one-time nonce.
+2. High: a compromised Terminal could have spent any press in its
+   window. Now the press lands on a system confirm sheet, and the
+   Terminal holds no grant capability.
+3. High: Enter could approve. Now there is no default button, the
+   buttons are inert for 500 ms, and asks are rate-limited.
+4. Medium: reads let any app fingerprint the person. Now reads go only
+   to workspace and console uids, Curia and forum-wm.
+5. Medium: a Work workspace could grant in Personal. Now the persona
+   defaults to the caller's, and the sheet names any other.
+6. Medium: "scripts are refused" was unenforceable. The spec now says
+   the defense is the bound press.
+7. Low: the host shell's changes were silent. Now they are logged, and
+   the person gets a notice at their next sign-in.
+8. Low (optional, taken): `disallow` and `quit` from the owner's own
+   jails need no press.
