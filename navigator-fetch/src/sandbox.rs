@@ -125,6 +125,15 @@ pub fn enter() -> io::Result<Net> {
     }
 }
 
+/// Enter capability mode with no casper at all: for the local-server
+/// fetcher (background-apps.md §4.4), which is handed connected sockets
+/// and must dial nothing. Irreversible for this process.
+pub fn enter_bare() -> io::Result<()> {
+    // SAFETY: cap_enter takes no arguments and only changes this process's mode.
+    if unsafe { cap_enter() } != 0 { return Err(err("cap_enter")) }
+    Ok(())
+}
+
 /// Whether this process is in capability mode — asked of the kernel.
 pub fn in_capability_mode() -> bool {
     let mut m = 0u32;

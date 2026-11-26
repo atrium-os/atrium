@@ -136,6 +136,8 @@ pub struct Live {
     next: u32,
     /// `Activate` ids, and whether the press asked to open beside.
     activations: HashMap<u32, bool>,
+    /// The app serving each local page asked for, until its `Opened`.
+    local_apps: HashMap<u32, String>,
     pub dark: bool,
     pub budget: usize,
     /// The Unrecorded jars of open trails: one that goes (its trail
@@ -322,6 +324,7 @@ impl Live {
                 started: false,
                 next: 1,
                 activations: HashMap::new(),
+                local_apps: HashMap::new(),
                 dark: false,
                 budget,
                 jars: HashSet::new(),
@@ -796,6 +799,12 @@ impl Live {
                         child.island_sources = sources;
                     }
                 }
+                Event::LocalServer { id, app } => {
+                    // Kept until its Opened (which resets the page's facts).
+                    if self.children.iter().any(|c| c.asked == Some(id)) && self.local_apps.len() < 64 {
+                        self.local_apps.insert(id, app);
+                    }
+                }
                 Event::Opened { id, url, title, insecure, ticket, ms: took, saved, from, knows, asked, note } => {
                     let Some(i) = self.children.iter().position(|c| c.asked == Some(id)) else { continue };
                     eprintln!("navigator-ui: opened {url} in {took} ms ({from:?}{})", if knows { ", the site knowing you" } else { "" });
@@ -825,6 +834,9 @@ impl Live {
                     let key = c.key;
                     c.url = url.clone();
                     s.opened(key, &url, &title, insecure, &saved, c.replayed);
+                    if let Some(app) = self.local_apps.remove(&id) {
+                        s.local_server(key, &app);
+                    }
                     if self.shown == Some(key) {
                         s.live = Some(LivePage::Shown(url));
                     }
@@ -1376,6 +1388,7 @@ impl Live {
                     send(&mut self.w, &Request::Activate { id, page, href, jar });
                 }
                 Out::Forget { jar, url } => send(&mut self.w, &Request::Forget { jar, url: Some(url) }),
+                Out::Typed { url } => send(&mut self.w, &Request::Typed { url }),
                 Out::Moved { keys } => {
                     // The pages' children follow them to their new trail.
                     let to = |k: Key| keys.iter().find(|(o, _)| *o == k).map(|(_, n)| *n);

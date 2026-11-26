@@ -53,6 +53,7 @@ use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTE
 
 mod background_run;
 mod listen_run;
+mod local_port;
 mod calendar;
 mod crypta;
 mod console;
@@ -1143,6 +1144,18 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ The caller's own persona (personas.md §3): from the launch
          * registry by the PEER UID, its colour from the owner's policy. */
+        /* ★ Your own server in Navigator (background-apps.md §4.4): by the
+         * PEER UID only, socket after the answer. */
+        if let Request::OpenLocalPort { port } = req {
+            match local_port::open(uid, &load_registry(), port) {
+                Ok((resp, sock)) => {
+                    write_response(&mut writer, &resp)?;
+                    portcullis_ipc::send_fds(&mut writer, &[sock.as_raw_fd()])?;
+                }
+                Err(message) => write_response(&mut writer, &Response::Error { message })?,
+            }
+            continue;
+        }
         if matches!(req, Request::Persona) {
             let reg = load_registry();
             let resp = match (reg.persona(uid), reg.resolve(uid)) {
@@ -4807,7 +4820,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::SetListen { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::SetListen { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona | Request::OpenLocalPort { .. }
         | Request::ShareTargets | Request::SetShareTargets { .. }
 
         | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. }

@@ -373,6 +373,8 @@ fn dispatch(
         Request::SetListen { jail_name, listen } =>
             (handle_set_listen(&jail_name, listen, dry_run, state, state_path), Vec::new()),
 
+        Request::ListenTarget { jail_name, port } => (listen_target(state, &jail_name, port), Vec::new()),
+
         Request::ListenStats { jail_name } => {
             let r = match state.routed_nets.iter().find(|n| n.jail_name == jail_name) {
                 None => Response::PolicyDenied { rule: "network.listen".into(), detail: format!("{jail_name} holds no network") },
@@ -1398,6 +1400,21 @@ fn handle_set_listen(jail: &str, listen: Vec<crate::protocol::NetListen>, dry_ru
     state.routed_nets[i].grants = Some(g);
     if let Err(e) = state.save(state_path) { warn!("jaild: state save after SetListen: {e}"); }
     Response::Ok
+}
+
+/// Where `jail`'s this-computer `port` is, while its rule is loaded.
+fn listen_target(state: &PersistentState, jail: &str, port: u16) -> Response {
+    let deny = |detail: String| Response::PolicyDenied { rule: "network.listen".into(), detail };
+    let Some(n) = state.routed_nets.iter().find(|n| n.jail_name == jail) else {
+        return deny(format!("{jail} holds no network"));
+    };
+    let on = n.grants.iter().flat_map(|g| &g.listen)
+        .any(|l| l.port == port && !l.udp && matches!(l.from, crate::protocol::ListenFrom::ThisComputer { .. }));
+    if !on {
+        return deny(format!("{jail} has no this-computer rule for port {port}"));
+    }
+    let (_, app) = crate::routed::slot_addrs(n.slot);
+    Response::ListenTarget { addr: format!("{app}:{port}") }
 }
 
 /// Destroy a jail's epair and free its /30, if it holds one. Idempotent.
@@ -2458,5 +2475,26 @@ mod core_tests {
         assert!(cores_allowed(Some(&develop), false), "a workspace");
         assert!(!cores_allowed(Some(&app(true)), true), "a filtered jail never");
         assert!(!cores_allowed(Some(&develop), true));
+    }
+}
+
+#[cfg(test)]
+mod listen_target_tests {
+    use super::listen_target;
+    use crate::protocol::{ListenFrom, NetGrants, NetListen, Response};
+    use crate::state::{PersistentState, RoutedNet};
+
+    #[test]
+    fn only_a_loaded_this_computer_tcp_port_is_named() {
+        let g = |listen: Vec<NetListen>| NetGrants { app_key: "0123456789abcdef".into(), listen, ..NetGrants::default() };
+        let mine = NetListen { port: 8080, udp: false, from: ListenFrom::ThisComputer { owner_uid: 1001, owner: "ada".into() } };
+        let lan = NetListen { port: 9000, udp: false, from: ListenFrom::Lan { iface: "vtnet0".into(), subnet: "192.168.1.0/24".into() } };
+        let mut st = PersistentState::default();
+        st.routed_nets.push(RoutedNet { jail_name: "a".into(), slot: 3, epair_a: "epair3a".into(), tables: vec![], grants: Some(g(vec![mine, lan])) });
+        st.routed_nets.push(RoutedNet { jail_name: "b".into(), slot: 4, epair_a: "epair4a".into(), tables: vec![], grants: None });
+        assert!(matches!(listen_target(&st, "a", 8080), Response::ListenTarget { addr } if addr == "100.64.0.14:8080"));
+        for (j, p) in [("a", 9000), ("a", 8081), ("b", 8080), ("c", 8080)] {
+            assert!(matches!(listen_target(&st, j, p), Response::PolicyDenied { .. }), "{j}:{p} must be refused");
+        }
     }
 }

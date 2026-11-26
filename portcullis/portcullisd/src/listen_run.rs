@@ -245,6 +245,16 @@ pub fn bar_status(user: &str, app_id: &str, persona: Option<&str>) -> Option<(Op
     Some((conns, wants_lan && !lan_on))
 }
 
+/// The running instance of `user`'s, in `persona`, whose this-computer
+/// `port` is applied now: its jail and app id.
+pub fn local_target(user: &str, persona: Option<&str>, port: u16) -> Option<(String, String)> {
+    tracked().lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .find(|(_, (lo, applied))| lo.user == user
+            && lo.persona.as_deref().unwrap_or(PERSONAL) == persona.unwrap_or(PERSONAL)
+            && applied.iter().any(|l| l.port == port && !l.udp && matches!(l.from, ListenFrom::ThisComputer { .. })))
+        .map(|(j, (lo, _))| (j.clone(), lo.app_id.clone()))
+}
+
 pub fn untrack(jail: &str) {
     tracked().lock().unwrap_or_else(|e| e.into_inner()).remove(jail);
 }

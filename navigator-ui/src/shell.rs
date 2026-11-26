@@ -461,6 +461,9 @@ pub enum LivePage {
 /// A request for navigatord the shell can't send itself.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Out {
+    /// The person typed, or opened from a bookmark or history, this local
+    /// address (background-apps.md §4.4).
+    Typed { url: String },
     /// A link pressed in the page (the href as the page spells it).
     /// `jar`: the trail's, where a consent control's press keeps its
     /// cookies (§6.2).
@@ -552,8 +555,13 @@ pub fn presence_height(s: &Shell) -> f32 {
 /// A page about to be opened by navigatord: its title is its host until
 /// navigatord names it, and its light is what its scheme earns (§6.5).
 pub fn live_spec(url: &str) -> PageSpec {
-    let insecure = url.starts_with("http:");
     let host = crate::trail::host(url).to_string();
+    if navigator_control::local::parse(url).is_some() {
+        // Your own server: it never crosses a network (background-apps.md §4.4).
+        let facts = Facts { local: Some(String::new()), ..Facts::green("Your computer: one of your own apps serves this page") };
+        return PageSpec { url: url.into(), title: host, search: None, facts, media: Media::None };
+    }
+    let insecure = url.starts_with("http:");
     let conn = if insecure { "Not private: http, anyone on the path can read and change it" } else { "Private: https" };
     let facts = Facts { insecure, ..Facts::green(conn) }.settle();
     PageSpec { url: url.into(), title: host, search: None, facts, media: Media::None }
@@ -681,9 +689,18 @@ impl Shell {
             if replayed {
                 facts.tier = crate::trail::Tier::Replayed;
             }
-            facts.insecure |= insecure;
+            facts.insecure |= insecure && facts.local.is_none();
             p.facts = facts.settle();
             p.saved = navigator_control::is_address(saved).then(|| saved.to_string());
+        }
+    }
+
+    /// navigatord named the app serving the page (your own server, §4.4).
+    pub fn local_server(&mut self, key: (u64, PageId), app: &str) {
+        if let Some(p) = self.store.page_by_key_mut(key.0, key.1) {
+            if p.facts.local.is_some() {
+                p.facts.local = Some(app.to_string());
+            }
         }
     }
 
@@ -932,8 +949,17 @@ impl Shell {
             None => return,
         };
         self.end_edit();
+        self.typed(&url);
         let spec = self.spec(&url);
         self.store.follow(spec);
+    }
+
+    /// The person started a navigation to `url` themselves: navigatord is
+    /// told, so a local address may open their own server (§4.4).
+    fn typed(&mut self, url: &str) {
+        if navigator_control::local::parse(url).is_some() {
+            self.outbox.push(Out::Typed { url: url.to_string() });
+        }
     }
 
     pub fn take_suggestion(&mut self, s: &Suggestion, _now: f64) {
@@ -944,6 +970,7 @@ impl Shell {
                 self.store.trail_mut().go(*page);
             }
             Source::Kept | Source::History => {
+                self.typed(&s.url);
                 let spec = self.spec(&s.url);
                 self.store.follow(spec);
             }
@@ -2645,6 +2672,10 @@ pub fn popover_actions(s: &Shell) -> Vec<PopoverAction> {
 
 /// The popover's connection line.
 pub fn popover_connection(f: &Facts, site: &str) -> String {
+    if let Some(app) = &f.local {
+        let by = if app.is_empty() { "one of your own apps".to_string() } else { format!("{app}, one of your own apps") };
+        return format!("Your computer. {by} serves this page; it doesn't cross a network.");
+    }
     if f.insecure { "Not private. Anyone on this network can read or change this page.".to_string() } else { format!("{} to {site}.", f.connection) }
 }
 
@@ -2686,6 +2717,34 @@ mod tests {
 
     fn shell() -> Shell {
         Shell::new(fake::store(), 1280.0, 696.0)
+    }
+
+    #[test]
+    fn a_typed_local_address_is_your_own_server() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(false);
+        s.enter("localhost:8080/app");
+        assert_eq!(s.outbox, vec![Out::Typed { url: "http://localhost:8080/app".into() }], "navigatord is told it was typed");
+        let p = s.store.trail().page().unwrap();
+        assert_eq!(p.url, "http://localhost:8080/app");
+        assert!(!p.facts.insecure && p.facts.local.is_some(), "your computer, not \"Not private\"");
+        let key = s.shown_key().unwrap();
+        s.opened(key, "http://localhost:8080/app", "My app", false, "", false);
+        s.local_server(key, "Photo Server");
+        let p = s.store.trail().page().unwrap();
+        assert_eq!(p.facts.local.as_deref(), Some("Photo Server"));
+        assert!(popover_connection(&p.facts, "localhost").starts_with("Your computer. Photo Server"));
+        // A link in a page is navigatord's to decide, never a typed address.
+        s.outbox.clear();
+        s.link_pressed("http://localhost:9090/");
+        assert!(matches!(s.outbox.as_slice(), [Out::Activate { .. }]));
+        s.follow_link("http://localhost:9090/", false);
+        assert!(!s.outbox.iter().any(|o| matches!(o, Out::Typed { .. })));
+        // A web address is no grant.
+        s.outbox.clear();
+        s.enter("https://atlas.example/");
+        assert!(s.outbox.is_empty());
     }
 
     #[test]

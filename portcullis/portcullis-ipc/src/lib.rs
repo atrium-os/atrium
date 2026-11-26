@@ -675,6 +675,13 @@ pub enum Request {
         #[serde(default)]
         activation: Option<[u8; 16]>,
     },
+    /// ★ A connected socket to the caller's person's own server on
+    /// `port` (background-apps.md §4.4): a `this-computer` listen port of
+    /// one of that person's apps in the caller's persona, running now and
+    /// allowed. Only an app holding `navigator-broker` may ask; the person
+    /// and persona come from the caller's uid. Answer: `LocalPort`, then
+    /// the socket (one descriptor), or `Error`.
+    OpenLocalPort { port: u16 },
     /// ★ Settings' Links section (opening-links.md §4.4): each link scheme
     /// an installed app takes, those apps, and the person's default.
     /// `app-grants` only, about the person that app belongs to. Answer:
@@ -1243,6 +1250,10 @@ pub enum Response {
     WorkbookVersion { generation: Option<u64> },
     WorkbookBookmark { bookmark: Option<WorkbookBookmark> },
     PendingWorkbooks { books: Vec<PendingWorkbook> },
+    /// OpenLocalPort → the app serving the port (its id and name) and the
+    /// address the socket that follows is connected to (`ip:port`), which
+    /// the asker checks against the socket's peer.
+    LocalPort { app_id: String, app_name: String, addr: String },
     /// A download saved: the name it has, and its folder in words
     /// ("Downloads", "Work's Downloads").
     Downloaded { name: String, place: String },

@@ -25,8 +25,22 @@
 //!
 //! ★ It enters capability mode BEFORE reading its first request, so no URL a
 //! caller sends is ever handled by a process that can open a file.
+//!
+//! ★ Started on a Unix socket instead of a pipe, it is the fetcher for the
+//! person's own server (background-apps.md §4.4, `navigator_fetch::local`):
+//! capability mode with no casper at all, so it can dial nothing; each
+//! request brings the one connected socket it may use.
 
 use navigator_fetch::{addr::Policy, tls_config, Conversation};
+
+/// Our stdin, when it is a Unix socket: navigatord's channel for the
+/// local-server fetcher. A pipe (the web fetcher's) has no peer.
+fn local_channel() -> Option<std::os::unix::net::UnixStream> {
+    use std::os::fd::AsFd;
+    let fd = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+    let s = std::os::unix::net::UnixStream::from(fd);
+    s.peer_addr().is_ok().then_some(s)
+}
 #[cfg(target_os = "freebsd")]
 use navigator_fetch::fetch;
 
@@ -51,6 +65,10 @@ fn main() {
         Err(e) => { eprintln!("navigator-fetchd: {trust}: {e}"); std::process::exit(1) }
     };
     eprintln!("navigator-fetchd: ★ UNCONFINED, for testing: no sandbox");
+    if let Some(chan) = local_channel() {
+        if let Err(e) = navigator_fetch::local::serve(&chan) { eprintln!("navigator-fetchd: local: {e}"); std::process::exit(1) }
+        return;
+    }
     let (workers, reuse) = navigator_fetch::serve_options(&args);
     let conv = Conversation::new(&navigator_fetch::Direct, tls, policy).with_reuse(reuse);
     navigator_fetch::serve_with(&conv, workers, navigator_fetch::peek_window_option(&args),
@@ -61,6 +79,16 @@ fn main() {
 fn main() {
     use navigator_fetch::sandbox;
     let args: Vec<String> = std::env::args().collect();
+    if let Some(chan) = local_channel() {
+        if let Err(e) = sandbox::enter_bare() { eprintln!("navigator-fetchd: sandbox: {e}"); std::process::exit(1) }
+        if !sandbox::in_capability_mode() {
+            eprintln!("navigator-fetchd: kernel reports NOT in capability mode — refusing to serve");
+            std::process::exit(1);
+        }
+        eprintln!("navigator-fetchd: serving your own server's sockets; no network of its own");
+        if let Err(e) = navigator_fetch::local::serve(&chan) { eprintln!("navigator-fetchd: local: {e}"); std::process::exit(1) }
+        return;
+    }
     let trust = args.iter().position(|a| a == "--trust").and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| "/etc/ssl/cert.pem".into());
     let gate = args.iter().any(|a| a == "--gate");

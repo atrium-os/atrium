@@ -17,6 +17,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 url = "2"
 libc = "0.2"
 nuntius = { path = "../nuntius" }
+atrium-fdpass = { path = "../atrium-fdpass" }
 
 [[bin]]
 name = "nuntiusd"

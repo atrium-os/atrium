@@ -36,5 +36,10 @@ serde_json = { version = "1", features = ["raw_value"] }
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent crate
 # must repeat the patch.
+atrium-fdpass = { path = "../atrium-fdpass" }
+
+[dev-dependencies]
+navigator-fetch = { path = "../navigator-fetch" }
+
 [patch.crates-io]
 pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

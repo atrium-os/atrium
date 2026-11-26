@@ -125,6 +125,12 @@ pub enum Request {
     /// Answer: [`Response::ListenStats`].
     ListenStats { jail_name: String },
 
+    /// Where to reach a running jail's `this-computer` listen `port`
+    /// (background-apps.md §4.4): its own jail address, only while a
+    /// this-computer rule for that port is loaded. Answer:
+    /// [`Response::ListenTarget`].
+    ListenTarget { jail_name: String, port: u16 },
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
 
@@ -705,6 +711,9 @@ pub enum Response {
 
     /// Answer to [`Request::ListenStats`].
     ListenStats { connections: u32 },
+
+    /// Answer to [`Request::ListenTarget`]: `ip:port` in the jail.
+    ListenTarget { addr: String },
 
     /// Generic "your request succeeded with no payload" (Ping,
     /// RemoveJail).

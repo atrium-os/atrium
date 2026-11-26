@@ -1022,7 +1022,10 @@ fn where_at_rest(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let end = g.keep.x() - em(6.0);
     let body = |c: Color, w: Weight| sans(type_size::SM, w, c);
     let mut runs: Vec<(String, TextStyle)> = vec![];
-    if p.facts.insecure {
+    if let Some(app) = &p.facts.local {
+        let chip = if app.is_empty() { "Your computer".to_string() } else { format!("Your computer · {app}") };
+        runs.push((chip, body(t.text_secondary(), Weight::Semibold)));
+    } else if p.facts.insecure {
         runs.push(("Not private".into(), body(t.warning_fg(), Weight::Semibold)));
     }
     let (before, domain, after) = trail::split_address(&p.url);

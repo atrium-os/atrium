@@ -9,6 +9,7 @@
 pub mod addr;
 pub mod dns;
 pub mod http;
+pub mod local;
 pub mod youtube;
 pub mod nuntius;
 pub mod prefetch;

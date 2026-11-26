@@ -2472,6 +2472,7 @@ dependencies = [
 name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "navigator-control",
  "nuntius",
@@ -2600,6 +2601,7 @@ name = "navigatord"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-fdpass",
  "atrium-open",
  "fresco-client",
  "fresco-protocol",
@@ -2610,6 +2612,7 @@ dependencies = [
  "navigator-backend",
  "navigator-control",
  "navigator-cookies",
+ "navigator-fetch",
  "navigator-live-origins",
  "navigator-media",
  "navigator-prerender",

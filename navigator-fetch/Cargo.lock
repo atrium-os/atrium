@@ -376,6 +376,7 @@ name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-fdpass",
  "libc",
  "navigator-control",
  "nuntius",

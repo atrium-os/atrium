@@ -246,6 +246,11 @@ pub enum Request {
     /// The text Tabula gave for a live page's paste (`Event::LivePaste`,
     /// I6.4), for the live page at `url`.
     LivePasted { url: String, text: String },
+    /// The person typed `url` in the address bar, or opened it from a
+    /// bookmark or history (background-apps.md §4.4): the next `Open` of
+    /// exactly that address may reach their own server if it is a local
+    /// one. Sent only by the address bar, never for a link. No answer.
+    Typed { url: String },
 }
 
 /// The longest WebAuthn options a `Credential` carries (the page's own
@@ -485,6 +490,10 @@ pub enum Event {
     /// (`window.open`, a `target=_blank` link, I6.2): the UI opens it beside the
     /// page in its trail, in the document lane, and the page runs on.
     LiveOpenBeside { from: String, url: String },
+    /// The address is your own server (background-apps.md §4.4): the page
+    /// that `Open` with this `id` opens is served by `app`, one of your
+    /// apps on this computer. Sent before `Opened`; the UI's chip names it.
+    LocalServer { id: u32, app: String },
 }
 
 /// The longest refusal a [`Event::LiveRefused`] names.
@@ -752,6 +761,7 @@ mod parts_tests {
         write_frame(&mut buf, &Request::SaveTrails { part: p[0].to_string(), last: true }).unwrap();
     }
 }
+pub mod local;
 pub mod video;
 pub mod youtube;
 pub mod youtube_media;

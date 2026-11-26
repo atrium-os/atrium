@@ -28,6 +28,11 @@ pub fn parse(input: &str) -> Option<Entry> {
     if lower.starts_with("https://") || lower.starts_with("http://") {
         return Some(Entry::Address(s.into()));
     }
+    // Your own server (background-apps.md §4.4) is plain http, on this
+    // computer; the one parser decides what counts.
+    if let Some(l) = navigator_control::local::parse(&format!("http://{s}")) {
+        return Some(Entry::Address(l.url()));
+    }
     let host_end = s.find(['/', '?', '#']).unwrap_or(s.len());
     let host = &s[..host_end];
     let host_only = host.rsplit_once(':').map_or(host, |(h, port)| {
@@ -134,7 +139,10 @@ mod tests {
         assert_eq!(parse("  "), None);
         assert_eq!(parse("atlas.example/wiki"), Some(Entry::Address("https://atlas.example/wiki".into())));
         assert_eq!(parse("http://old.example"), Some(Entry::Address("http://old.example".into())));
-        assert_eq!(parse("localhost:8080/x"), Some(Entry::Address("https://localhost:8080/x".into())));
+        assert_eq!(parse("localhost:8080/x"), Some(Entry::Address("http://localhost:8080/x".into())));
+        assert_eq!(parse("127.0.0.1:9000"), Some(Entry::Address("http://127.0.0.1:9000/".into())));
+        assert_eq!(parse("localhost"), Some(Entry::Address("https://localhost".into())), "no port: not your own server");
+        assert_eq!(parse("127.0.0.2:8080"), Some(Entry::Address("https://127.0.0.2:8080".into())), "not the one parser's");
         assert_eq!(parse("10.0.0.1"), Some(Entry::Address("https://10.0.0.1".into())));
         assert_eq!(parse("roman atrium"), Some(Entry::Search("roman atrium".into())));
         assert_eq!(parse("impl"), Some(Entry::Search("impl".into())));

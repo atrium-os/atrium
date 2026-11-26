@@ -539,8 +539,7 @@ update that starts asking for either is asked about.
 - Navigator: its engines are app jails with their own network stack, so
   127.0.0.1 there is their own and the host's addresses are blocked to
   them; no page can reach the person's port. A typed
-  `http://localhost:8080` doesn't open the person's server either (not
-  built).
+  `http://localhost:8080` opens it through B6 (below).
 - The bar's line under each server: "3 connections" (jaild's
   `ListenStats`: the forwarder's live connections plus pf's established
   states from a network) and "Not reachable on this network" (the person
@@ -548,3 +547,58 @@ update that starts asking for either is asked about.
 - A router once named keeps its name while atrium-net reports the same
   interface and router; any answer with no network forgets it. portcullisd
   logs each change of the network it sees.
+
+**B6 (2026-11-26).** Your own server in Navigator, as §4.4, with these
+differences:
+- **One parser**, `navigator_control::local`: `http://` with `localhost`,
+  `127.0.0.1` or `[::1]` and a port (no leading zero), an optional path
+  and query; the fragment is dropped. The address bar (`where_field`),
+  navigatord and fetchd all use it. A typed `localhost:8080` becomes
+  `http://localhost:8080/`; without a port it is a web address as before.
+- **Typed.** The address bar sends `Request::Typed { url }` before the
+  page opens (Enter, a bookmark or history suggestion). navigatord holds
+  at most 16 such grants per UI connection for 30 s, each spent by the one
+  `Open` of that address. A link is granted only from a page of the same
+  local origin (navigatord's own record of the page, on `Activate`).
+  Anything else gets "Your own server opens only from an address you
+  type".
+- **The socket.** portcullisd's `OpenLocalPort { port }` takes the person
+  and persona from the caller's uid; the caller's installed manifest must
+  hold `navigator-broker`. The port must be applied now, as a
+  this-computer port, to a running instance of that person in that
+  persona (`listen_run::local_target`). jaild's `ListenTarget` names the
+  jail's own address only while that rule is loaded. **portcullisd
+  connects, not jaild**: jaild serves one request at a time, so a 5 s
+  connect there would stall every launch; portcullisd is root on the
+  host, which the base rules let through, and is threaded. The answer is
+  `LocalPort { app_id, app_name, addr }` and the socket; navigatord checks
+  the socket's peer is `addr`.
+- **The fetcher.** navigator-fetchd started on a Unix socket (not a pipe)
+  is the local fetcher: capability mode with no casper, so it can't dial
+  or resolve. Each request is one message, `G <url>\n`, carrying one
+  socket; it speaks one HTTP/1.1 exchange and closes it. A redirect to the
+  same origin comes back as `redirect` for navigatord to follow with a new
+  socket (at most 5); a redirect elsewhere is refused.
+- **Limits.** One page's requests go one at a time, so a page holds one
+  socket at once (well under 8); at most 256 requests a page. Per persona,
+  portcullisd hands out at most 32 sockets in any 10 s, a rate rather
+  than a count of open sockets, since portcullisd can't see when
+  navigatord closes one without holding a copy that would keep it open.
+- **No state kept.** Local pages open with no cookies at all (each request
+  is anonymous), are never written to the page store and never served
+  from the cache, so another app taking the port later starts with
+  nothing, and :8080 and :9090 share nothing. A per-(app, port) cookie jar
+  is not built. Live pages run only for HTTPS pages (D12), so a local page
+  shows in the document lane: its scripts run in the converter, not live,
+  and there is no storage for it to keep.
+- **The chip.** `Event::LocalServer { id, app }` before `Opened`; the
+  address bar shows "Your computer · Photo Server" where an http page
+  says "Not private", and the popover says the page doesn't cross a
+  network. frescod's strip shows the origin, `http://localhost:8080`.
+- Host tests: the parser (`navigator-control`), the local fetcher's
+  exchange, redirects and refusals (`navigator-fetch`), navigatord's
+  grants and origin check (`local_server.rs`), the address bar and chip
+  (`navigator-ui`), portcullisd's rate, jaild's `ListenTarget`. VM check
+  `scripts/vm-local-server-check.sh`: the server side end to end, with a
+  stand-in for navigatord (`examples/local_port_ask`).
+

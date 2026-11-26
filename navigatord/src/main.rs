@@ -59,6 +59,7 @@ mod live_frames;
 mod live_idb;
 mod live_storage;
 mod live_remembered;
+mod local_server;
 mod press;
 mod settings;
 mod worker;
@@ -535,6 +536,9 @@ enum Upstream {
     /// The sign-in window's fetcher; the first navigation is a form's POST
     /// of these bytes when there are any.
     Portal(Arc<portal::Portal>, Option<Vec<u8>>),
+    /// The person's own server (background-apps.md §4.4): sockets from
+    /// portcullisd, held to the page's origin.
+    Local(Box<local_server::LocalUp>),
 }
 
 impl Upstream {
@@ -574,6 +578,17 @@ impl Upstream {
             Upstream::Portal(p, _) => match ask {
                 Ask::Fetch(u) => p.fetch(u, None, None),
                 Ask::Peek { url, start, len } => p.fetch(url, Some((start, len)), None),
+            },
+            Upstream::Local(l) => match ask {
+                Ask::Fetch(u) => l.fetch(u),
+                Ask::Peek { url, start, len } => match l.fetch(url) {
+                    Reply::Ok { status, rest, body } => {
+                        let b = body[start.min(body.len())..(start + len).min(body.len())].to_vec();
+                        let fin = rest.splitn(3, ' ').nth(2).unwrap_or(url).to_string();
+                        Reply::Ok { status, rest: format!("0 {} {fin}", b.len()), body: b }
+                    }
+                    e => e,
+                },
             },
             Upstream::Fixtures(dir) => {
                 let url = ask.url();
@@ -615,6 +630,7 @@ impl Upstream {
             },
             Upstream::Cookied { .. } => (self.reply(Ask::Fetch(url)), vec![]),
             Upstream::Portal(p, form) => (p.fetch(url, None, form.take()), vec![]),
+            Upstream::Local(l) => (l.fetch(url), vec![]),
         }
     }
 }
@@ -668,6 +684,18 @@ fn instance() -> String {
 }
 
 fn upstream(cfg: &Config, inst: &str) -> Result<Upstream, String> {
+    upstream_for(cfg, inst, None)
+}
+
+/// [`upstream`]; for `page`, a local address, the person's own server's.
+fn upstream_for(cfg: &Config, inst: &str, page: Option<&str>) -> Result<Upstream, String> {
+    if let Some(url) = page.filter(|u| ctl::local::parse(u).is_some()) {
+        if cfg.portal.is_some() || cfg.vpn.is_some() {
+            return Err("a sign-in window doesn't open your own servers".into());
+        }
+        let spec = cfg.fetchd.as_ref().ok_or("no fetcher")?;
+        return local_server::LocalUp::start(url, spec, &format!("f{inst}")).map(|l| Upstream::Local(Box::new(l)));
+    }
     if let Some(p) = &cfg.portal {
         return Ok(Upstream::Portal(p.clone(), None));
     }
@@ -724,7 +752,7 @@ fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64
         if cfg.vpn.is_some() {
             return Err("the VPN sign-in needs its courier jar".into());
         }
-        let mut up = upstream(cfg, &inst)?;
+        let mut up = upstream_for(cfg, &inst, Some(url))?;
         if let Upstream::Portal(_, body) = &mut up {
             if form.as_ref().is_some_and(|f| f.2.is_some()) {
                 return Err("a password from Arca's field goes only through Arca's couriers".into());
@@ -1191,6 +1219,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     // connection only.
     let waiting = Arc::new(Mutex::new(files::Waiting::default()));
     let mut handed: Vec<String> = Vec::new();
+    // Local addresses the person started a navigation to (§4.4).
+    let mut typed = local_server::Typed::default();
     // Save and hand-offs: the press, spent with frescod as a press on a
     // window of the UI's connection: ours when we opened it over the chrome
     // channel (navigator-ui.md §2.3a), else the UI's own.
@@ -1599,6 +1629,16 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     send(&w, &Event::Failed { id, url: String::new(), why: "not an address".into() });
                     continue;
                 }
+                // ★ Your own server (background-apps.md §4.4): only as a
+                // navigation the person started, spent by this one Open;
+                // never from the cache or the store, never with cookies.
+                let own = ctl::local::parse(&url).is_some();
+                if own && !typed.take(&url, Instant::now()) {
+                    eprintln!("navigatord: {url}: a local address not typed by the person; refused");
+                    send(&w, &Event::Failed { id, url: url.clone(), why: "Your own server opens only from an address you type".into() });
+                    continue;
+                }
+                let (saved, knows, fresh) = if own { (None, false, true) } else { (saved, knows, fresh) };
                 widget = None;
                 // Opening another page leaves this one, and its live engine.
                 live = None;
@@ -1710,7 +1750,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                         Ok(Got::NeedsCookies(failed)) => Err(failed),
                                         Ok(Got::Page(p)) => {
                                             let mut st = state.lock().unwrap();
-                                            let p = Arc::new(st.stored(p));
+                                            // Your own server's pages are never written to the store.
+                                            let p = Arc::new(if own { p } else { st.stored(p) });
                                             st.keep(p.clone(), &url);
                                             Ok((p, Source::Fetched))
                                         }
@@ -1787,6 +1828,9 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                     return;
                                 }
                             }
+                            if let Some(app) = own.then(|| local_server::app_of(&p.url)).flatten() {
+                                send(&w, &Event::LocalServer { id, app });
+                            }
                             send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, asked, note });
                             if !p.insecure && runs_live_unasked(&cfg, &p.url, jar) {
                                 send(&w, &Event::LiveRemembered { url: p.url.clone() });
@@ -1808,6 +1852,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 });
             }
+            Request::Typed { url } => typed.grant(&url, Instant::now()),
             Request::Activate { id, page, href, jar } => {
                 let p = state.lock().unwrap().page(&page);
                 let action = match p {
@@ -1822,6 +1867,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                     a => a,
                 };
+                // A link within your own server's page may open its origin.
+                if let LinkAction::Navigate { url, .. } = &action {
+                    if local_server::same_origin_link(&page, url) {
+                        typed.grant(url, Instant::now());
+                    }
+                }
                 if let LinkAction::Handoff { url, .. } = &action {
                     if handed.len() >= 32 {
                         handed.remove(0);

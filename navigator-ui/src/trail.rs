@@ -46,6 +46,9 @@ pub struct Facts {
     pub reasons: Vec<String>,
     /// The connection line (§6.5 popover; §5.7 status bar).
     pub connection: String,
+    /// Your own server (background-apps.md §4.4): the app serving it, once
+    /// navigatord names it (empty until then).
+    pub local: Option<String>,
 }
 
 impl Facts {
@@ -58,7 +61,7 @@ impl Facts {
     }
 
     pub fn green(connection: &str) -> Self {
-        Facts { tier: Tier::Static, live_parts: vec![], light: Light::Green, insecure: false, reasons: vec![], connection: connection.into() }
+        Facts { tier: Tier::Static, live_parts: vec![], light: Light::Green, insecure: false, reasons: vec![], connection: connection.into(), local: None }
     }
 
     /// The light the facts earn by §6.5's rules: red wins, then amber for

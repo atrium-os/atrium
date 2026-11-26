@@ -162,6 +162,20 @@ pub fn set_listen(name: &str, listen: Vec<jaild::protocol::NetListen>) -> Result
     }
 }
 
+/// Where a running jail's this-computer listen `port` is (`ip:port`),
+/// while jaild has its rule loaded.
+pub fn listen_target(name: &str, port: u16) -> Result<String, String> {
+    let mut client = connect()?;
+    match client.send(&Request::ListenTarget { jail_name: name.into(), port }) {
+        Ok((Response::ListenTarget { addr }, _)) => Ok(addr),
+        Ok((other, fd)) => {
+            drop(fd.map(|f| owned(vec![f])));
+            Err(refusal(other))
+        }
+        Err(e) => Err(format!("jaild: {e}")),
+    }
+}
+
 /// Connections reaching a running jail's `listen` ports now.
 pub fn listen_stats(name: &str) -> Option<u32> {
     let mut client = connect().ok()?;
