@@ -3,7 +3,8 @@
 Status: **proposed 2026-11-26, nothing built.** Shankar asked for "a remote compositor, which
 can display the same scenegraph coming through the network", with research into what goes
 wrong with RDP, VNC and the rest, and whether we can get low latency and high quality remote
-viewing. Decisions are in §17. Owner: a new Fenestra thread (spec), the Fresco thread
+viewing. Decisions are in §17. Reviewed adversarially by the review thread on 2026-11-26; its
+findings are folded in (§21). Owner: a new Fenestra thread (spec), the Fresco thread
 (frescod and renderer changes), Forum (the viewer's window and the host's indicator).
 
 *Fenestra* is Latin for a window, the opening in a wall you look through into another room.
@@ -349,14 +350,21 @@ independent streams, so a large image upload in one window never delays typing i
 
 ### 5.4 Content-addressed blobs and the viewer's cache
 
-- Blobs (images, atlas pages, fill geometry blocks, font files) are sent once and referenced by
-  SHA-256 hash. The viewer verifies every hash on arrival (H2) and refuses a mismatch.
+- Blobs (images, glyph atlas pages, fill geometry blocks) are sent once and referenced by
+  SHA-256 hash. The viewer verifies every hash on arrival (H2) and refuses a mismatch, and
+  re-hashes any blob it reads back from its disk cache before use.
+- **Glyph atlases are textures, and travel as textures.** As built, a `GlyphRun` node points at
+  an R8 atlas the *app* rasterised and uploaded, grown by texture region updates
+  (`frescod/src/render_backend.rs`); the renderer never receives fonts. So the stream carries
+  atlas pages and their region updates like any other texture, and the viewer needs no font
+  files. The cost is one atlas page per font and size the app uses (sent once, then only new
+  glyphs' regions); region updates compress well with zstd.
 - **Possession, not global dedup** (aqueduct.md §6.6): the viewer keeps a separate cache per
-  (host identity, persona) and tells the host only which of *that host's* blobs it holds. A
-  host cannot probe for blobs another host sent, and the viewer never says "I have H" for a hash
-  it did not receive from that host. One exception: the **system font files** are public,
-  version-pinned and identical on every Atrium machine; the handshake exchanges the font set's
-  manifest hash, and a matching set costs nothing to sync.
+  (host, persona), where the host is identified by its **verified SSH host key** (the key sshd
+  proved during the mint, not a name or address), and tells the host only which of *that
+  host's* blobs it holds. A host cannot probe for blobs another host sent, and the viewer never
+  says "I have H" for a hash it did not receive from that host. There is no cross-host
+  exception.
 - The cache holds pictures of the person's documents, so on disk it is **personal data at
   rest** and lives in the viewing persona's key group (AGENTS.md at-rest rule), in the Fenestra
   app's overlay, encrypted with the persona. A viewer without that directory (a kiosk, a guest)
@@ -390,8 +398,8 @@ For an input that changes the screen (a click, a key):
 | Compose and scan out | next vblank | next vblank (VRR where available) |
 
 Ranges for pixel streaming are typical published figures, not our measurements; ours are to be
-measured in R2 and R6 on real links (TCG timings are never product numbers). The point is
-structural: Fenestra removes the encode and decode stages and their buffers, and it sends
+measured in R2 and R6 on real links (TCG timings are never product numbers). Until then the
+Fenestra column is **structural, not a number to quote**: Fenestra removes the encode and decode stages and their buffers, and it sends
 small payloads, so on a given link its click-to-photon time is RTT plus app time plus about one
 frame.
 
@@ -522,17 +530,21 @@ Encoders are large C codebases and the GPU copy path touches the driver, so `fen
 encodes itself. Each encoded region gets a `fenestra-enc` instance in a one-shot jail (the
 renderer's pattern): input from a sealed memfd ring, output a byte stream to `fenestrad`, no
 network, no files, a memory and CPU limit. Decoders on the viewer are the player's decoder
-worker bundle, same jail shape. Licences: dav1d (BSD-2), libvpx (BSD-3), SVT-AV1
-(BSD-3-Clause-Clear), rav1e (BSD-2), zstd (BSD); all pass `scripts/licence-audit.py`'s policy,
-and patent posture follows atrium-player.md §4 (royalty-free codecs native, H.264 through
+worker bundle, same jail shape. Licences: dav1d (BSD-2), libvpx (BSD-3), rav1e (BSD-2),
+zstd (BSD) are plainly permissive. SVT-AV1 is BSD-3-Clause-Clear plus the AOM patent licence,
+which `scripts/licence-audit.py` may not list; it is added only after the audit is run on the
+real dependency tree and Shankar accepts that pairing (rav1e is the default encoder until then).
+Patent posture follows atrium-player.md §4 (royalty-free codecs native, H.264 through
 Hospes only).
 
 ## 8. Transport, bandwidth and congestion
 
 ### 8.1 One QUIC connection
 
-QUIC (RFC 9000) over UDP, through a permissive Rust stack (quinn with rustls; both MIT or
-Apache-2.0, audited by `licence-audit.py` before adding):
+QUIC (RFC 9000) over UDP, through a permissive Rust stack: quinn with rustls (MIT or
+Apache-2.0). rustls needs a crypto provider, chosen on purpose: aws-lc-rs carries
+OpenSSL/SSLeay-licensed code, and ring's licence (ISC plus OpenSSL-derived parts) also needs
+checking; the choice is made by running `licence-audit.py` on the real tree in R0 (decision 12):
 
 - **Reliable streams** for each window's scene stream, for blob uploads (lower priority), for
   control (outputs, clipboard offers, session events).
@@ -601,10 +613,21 @@ relay as the fallback when direct UDP fails.
   produced alongside the usage; the host uses it when the session is set to "viewer layout".
   This is what people expect from a laptop with a different layout than the workstation.
 - Input becomes ordinary host input in frescod, injected as from a Tactus device with the
-  session's device ids. It is routed by the host's compositor-owned geometry (H7), and real
-  presses from a full-input session mint activation tokens (tabula.md §2) exactly as local
-  presses do: a remote person is the person (aqueduct-remote.md §1). A view-only session sends
-  no input at all; the viewer's frescod does not even forward it.
+  session's device ids. It is routed by the host's compositor-owned geometry (H7). A view-only
+  session sends no input at all; the viewer's frescod does not even forward it.
+- **Remote presses are not local presses for everything.** frescod tags every input event with
+  its source (seat or a session id). Presses from a full-input session mint activation tokens
+  (tabula.md §2) for ordinary purposes (paste, open, pick a file), since a remote person is the
+  person (aqueduct-remote.md §1). They do **not** satisfy the purposes that grant authority:
+  Arca approvals, Curia and Portcullis grant sheets (`background allow`, `listen allow`, app
+  permissions), the unlock sheet, Fenestra's own host settings, and pairing. Those need either
+  a press on the host's own seat or a security-key touch through Sigillum on the viewer (a FIDO
+  assertion relayed to the host's sigillumd, bound to that sheet). A stolen viewer key then
+  gives the session's use, but not the power to widen it.
+- **A scoped session's input stays in scope.** For `scope = "app:<id>"` or `"window:<id>"`,
+  frescod routes the session's input only to windows in scope; it never reaches system sheets,
+  chrome, the WM or windows outside the scope, even if one is on top. Anything else is dropped
+  and counted.
 - Every input record is fixed-size, bounded and rate-limited (at most one pointer motion per
   viewer frame, a key-event cap per second); `fenestrad` drops a viewer that exceeds the caps.
 - Local shortcuts on the viewer (switch away, release the keyboard, leave full screen) are
@@ -622,7 +645,11 @@ relay as the fallback when direct UDP fails.
   viewer to host), both on by default for a full session, both off for a restricted one. Only
   formats Tabula already handles cross, as CAS blobs; nothing is offered until the person
   pastes (the paste on one side asks the other side for the bytes), so the clipboard is not
-  streamed. This is the channel Check Point used against RDP clients, so the viewer's Tabula
+  streamed. **Viewer to host** is the dangerous direction (a compromised host could claim a
+  paste at any time and pull whatever the person copied on the viewer): the viewer releases its
+  clipboard bytes only within a short window (one second) after it forwarded a paste gesture
+  (the paste shortcut or a press on a paste control) to that session, once per gesture. Host to
+  viewer needs a paste gesture on the viewer, as for any app. This is the channel Check Point used against RDP clients, so the viewer's Tabula
   treats remote clipboard data like any untrusted input and paths are never interpreted.
 - **Files.** Not a Fenestra feature. Drag and drop of files between viewer and host goes
   through Scrinium's picker on the receiving side (a press there chooses where it lands), never
@@ -639,7 +666,7 @@ relay as the fallback when direct UDP fails.
 |---|---|---|
 | Network attacker | Read, change, replay, drop packets | QUIC TLS 1.3, keys bound to the SSH handoff (§11.2); content hashes (H2) |
 | **Hostile host** (a compromised workstation or cloud desktop you connect to) | Send any bytes on any stream | Every parser of host bytes runs in a zero-capability jail: renderer (full validator, H9), decoders, `fenestra-net` (framing only). Budgets (F4h) and cost limits (H6) per remote client. Remote content is marked and confined (§11.5). Clipboard and files only by the viewer person's press. |
-| **Hostile viewer** (a stolen laptop with a valid key, a compromised viewer) | Send input and acks; see what the session shows | Session capabilities (view-only, app, window scope); input bounded (§9); `fenestrad` parses only fixed-size records; tokens expire and can be revoked from the host (§11.6); the host shows that it is being viewed (§11.4). A compromised viewer sees what the session displays; that is inherent (aqueduct-remote.md §1). |
+| **Hostile viewer** (a stolen laptop with a valid key, a compromised viewer) | Send input and acks; see what the session shows | Session capabilities (view-only, app, window scope); input bounded (§9); `fenestrad` parses only fixed-size records; tokens expire and can be revoked from the host (§11.6); authority-granting sheets need a seat press or a security-key touch, and scoped input stays in scope (§9); the host shows that it is being viewed (§11.4). A compromised viewer sees what the session displays; that is inherent (aqueduct-remote.md §1). |
 | A hostile app on the host | Draw anything in its own windows | Unchanged from local: H1–H8. Remote outputs do not give it more: it cannot learn that it is being viewed remotely beyond its output's properties (decision 9). |
 | Another user or persona on the host | Try to view or join a session that is not theirs | Sessions are minted by the session's own user over SSH (§11.2); `fenestrad` maps a session to exactly one seat session and persona. |
 
@@ -649,20 +676,41 @@ relay as the fallback when direct UDP fails.
   runs `ssh host aqueduct-shell mint fresco ...`, sshd authenticates the person with their
   key (from the viewer's Arca SSH agent: the key is used, never read, arca.md), and the mint
   returns `{address, port, session id, K_sess, caps, expiry}` inside the SSH channel.
-- **Binding the QUIC connection to the mint.** The QUIC handshake uses TLS 1.3 with an
-  external pre-shared key derived from `K_sess` (HKDF-SHA-256, label `"fenestra quic psk"`), in
-  PSK-with-ECDHE mode so the session still gets forward secrecy. No certificates, no PKI, no
-  trust-on-first-use prompt: a network attacker cannot complete the handshake without breaking
-  SSH, and `K_sess` itself never crosses the QUIC wire. `fenestrad` stores only `H(K_sess)`
-  (aqueduct-remote.md §6) and holds the PSK in memory for the session's life.
+- **Binding the QUIC connection to the mint.** rustls does not offer external TLS 1.3 PSKs,
+  so the binding uses **raw public keys** (RFC 7250) pinned through the SSH channel instead.
+  At mint time `fenestrad` makes a fresh Ed25519 key pair for the session (in memory only) and
+  the mint returns its public key; the viewer makes its own and sends its public key in the
+  mint request, inside SSH. The QUIC handshake is then ordinary TLS 1.3 (ECDHE, forward secret)
+  with both sides presenting raw public keys, and each side accepts exactly the key pinned
+  through SSH and nothing else. No certificates, no PKI, no trust-on-first-use prompt: a network
+  attacker cannot get a key pinned without breaking SSH. The first application message is
+  `SESSION_HANDSHAKE` with `AuthMethod::SshHandoff` (aqueduct-remote.md §3): an HMAC with
+  `K_sess` over a server nonce and the TLS exporter value, so the token is tied to this exact
+  connection. **0-RTT is off** on both ends, so no input can be replayed from early data.
 - **Pairing without SSH (R9).** For a viewer that is not set up for SSH (a phone, a tablet),
   pairing mints a device key in the viewer's Arca and registers its public half on the host
   through a code shown on the host's own screen and typed on the viewer (or a QR code); the host
   keeps paired device keys per persona in Arca, revocable in Curia and `fenestra devices`.
   Paired devices mint the same session token; the PSK binding is unchanged.
-- **Reconnect** within the token's expiry presents the session id and a proof of `K_sess` (a
-  fresh QUIC handshake with the same PSK); after expiry the viewer re-mints over SSH. The
-  session on the host is never lost on expiry, only the credential.
+- **What `fenestrad` keeps.** Per session: `H(K_sess)` to check handshake proofs
+  (aqueduct-remote.md §6), the two pinned public keys, and its session private key, all in
+  memory only. `K_sess` itself is not stored.
+- **Reconnect** within the token's expiry is a new QUIC handshake with the same pinned keys and
+  a fresh `K_sess` proof; after expiry the viewer re-mints over SSH. If `fenestrad` restarts,
+  its session keys are gone with it, so the viewer re-mints over SSH and resumes from version 0
+  (§12); the apps and the session on the host are not affected. The session on the host is
+  never lost on expiry or restart, only the credential.
+- **The mint is checked, not trusted.** `fenestrad` takes a mint request only from
+  `aqueduct-shell` on its local socket, reads the caller's uid by `getpeereid`, and mints only
+  for a seat or headless session owned by that uid, in the persona that session runs; a uid
+  with no such session gets a refusal. A headless session needs its persona's key group
+  unlocked (the same gap as background-apps.md G11: a session that cannot reach its key group
+  is not offered for viewing until it can).
+- **Bounds.** At most 4 viewers per session and 16 sessions per host (Curia settings, refused
+  past that). Per viewer, the renderer keeps at most one acked version per window and a diff
+  backlog bounded by the window's own scene budget (F4h); a viewer whose unacked data passes
+  64 MiB, or that has not acked for 30 s while data waits, is dropped and must reconnect
+  (from version 0).
 
 ### 11.3 Jails, uids and grants
 
@@ -801,13 +849,14 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
    (transport.md's sketch). *Recommend yes.* Apps keep no network, the session survives the
    viewer leaving, apps draw at the viewer's scale for free, and the validated canonical scene
    is the only thing that crosses.
-2. **Whole desktop first (R3), rootless second (R4).** *Recommend yes.* Whole desktop needs no
+2. **Whole desktop first (R2), rootless second (R4).** *Recommend yes.* Whole desktop needs no
    change to the viewer's Forum and proves the stream; rootless is the nicer daily experience
    and comes right after.
-3. **When a viewer attaches to a session that also has a local seat, keep the local screen
-   live and show the indicator**, rather than locking it as Windows RDP does. *Recommend: live
-   by default, with a per-host setting to lock the local screen while viewed.* Live is what you
-   want for your own two machines; lock is what you want for an office machine.
+3. **When a viewer attaches to a session that also has a local seat, blank the host's local
+   screen** (lock screen with the "being viewed" indicator and a Disconnect, §11.4), with
+   showing it live as a per-host opt-in. *Recommend: blank by default.* Otherwise anyone at the
+   host's desk watches the remote person's work, which they may not know; live is easy to turn
+   on for your own two machines.
 4. **Viewer-scrollable SCROLL groups (§6.3), built in frescod so local scrolling benefits
    too.** *Recommend yes,* in R5. It is the biggest perceived-latency win after the cursor.
 5. **Typing prediction through edit hints (§6.5): not in v1; R7 for Pergola plain-text fields
@@ -822,14 +871,17 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
    yes.*
 9. **Apps are not told that an output is remote** (they see its scale, size and refresh like
    any monitor). *Recommend yes:* nothing an app should do differently depends on it, and
-   telling them invites apps that behave differently when watched. The one exception is the
-   player's passthrough choice (decision 6), which frescod offers and the player takes without
-   learning why.
+   telling them invites apps that behave differently when watched. The one exception is
+   the player's passthrough choice (decision 6): frescod offering compressed passthrough for a
+   window *does* tell the player that window is on a remote output. That is a named exception,
+   limited to apps holding the media-player role.
 10. **Viewer cache on disk in the persona's key group, 1 GiB default, with a switch for memory
     only.** *Recommend yes.* Reconnects and repeat sessions are near free with it.
 11. **A dropped viewer keeps its outputs for 2 minutes** before windows move home.
     *Recommend yes.*
-12. **QUIC (quinn + rustls) rather than TCP or Stoa's raw envelope.** *Recommend yes,* subject
+12. **QUIC (quinn + rustls with raw public keys pinned over SSH) rather than TCP or Stoa's raw
+    envelope**, with the rustls crypto provider (aws-lc-rs or ring) picked by the licence audit
+    in R0. *Recommend yes,* subject
     to the licence audit of the crates and their dependencies.
 13. **The name Fenestra** (`fenestrad`, `fenestra-net`, `fenestra`). *Recommend yes;* NAMING.md
     gets the row once accepted.
@@ -895,3 +947,19 @@ VM runs only with the coordinator's go.
 - K. Winstein, H. Balakrishnan, *Mosh: An Interactive Remote Shell for Mobile Clients*, USENIX
   ATC 2012: https://mosh.org/mosh-paper.pdf
 - RFC 9000 (QUIC), RFC 9221 (QUIC datagrams), RFC 8446 §2.2 (TLS 1.3 PSK with (EC)DHE).
+
+## 21. Review log
+
+2026-11-26, review thread, on ff028ac. All folded in:
+
+- High: rustls has no external TLS 1.3 PSK; the binding is now raw public keys pinned over SSH
+  plus a `K_sess` proof tied to the TLS exporter, 0-RTT off (§11.2). Remote presses no longer
+  satisfy authority-granting sheets, and scoped input cannot leave its scope (§9). Viewer
+  clipboard released only right after a forwarded paste gesture (§10). Glyph text travels as
+  app-made atlas textures, not fonts (§5.4).
+- Medium: mint checks caller uid, session owner and persona; headless needs the key group
+  (§11.2). Licence questions on aws-lc-rs, ring and SVT-AV1 made explicit (§7.4, §8.1,
+  decision 12). Viewer, session and backlog bounds (§11.2). Cache keyed by the verified SSH host
+  key and re-hashed from disk (§5.4). Local screen blanked by default while viewed (decision 3).
+- Low: what `fenestrad` stores and reconnect after its restart (§11.2); passthrough named as
+  decision 9's exception; §6.1 marked as structural, not a measurement.
