@@ -459,31 +459,12 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
     for (id, x, y, _, _, _, _) in placed {
         let Some(v) = windows.get(&id) else { continue };
         let Some((w, h, px, _)) = v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached() else { continue };
-        for row in 0..h as i64 {
-            let dy = i64::from(y) + row;
-            if dy < 0 || dy >= i64::from(sh) {
-                continue;
-            }
-            for col in 0..w as i64 {
-                let dx = i64::from(x) + col;
-                if dx < 0 || dx >= i64::from(sw) {
-                    continue;
-                }
-                let s = px[(row * i64::from(w) + col) as usize];
-                let d = &mut out[(dy * i64::from(sw) + dx) as usize];
-                *d = over(s, *d);
-            }
-        }
+        blit(&mut out, (sw, sh), &px, (w, h), (i64::from(x), i64::from(y)), over);
     }
     drop(windows);
     if let Some(c) = chrome {
         let (w, h, px) = chrome_pixels(views, &c, (sw, sh));
-        for row in 0..h as usize {
-            for col in 0..w as usize {
-                let d = &mut out[row * sw as usize + col];
-                *d = over(px[row * w as usize + col], *d);
-            }
-        }
+        blit(&mut out, (sw, sh), &px, (w, h), (0, 0), over);
     }
     let mut bytes = Vec::with_capacity(out.len() * 4);
     for p in &out {
@@ -492,6 +473,25 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
     let sha = fresco_scene_server::cas::store::CasStore::hash(&bytes);
     let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
     Some(((sw, sh, out), hex))
+}
+
+/// Composites `src` (`w`x`h`) into `dst` (`dw`x`dh`) with its top left at
+/// `at`, each pixel through `f(source, destination)`. Only the rows and
+/// columns the two share are walked, so a window placed far off costs
+/// nothing; a buffer shorter than its size draws nothing.
+pub(crate) fn blit(dst: &mut [u32], (dw, dh): (u32, u32), src: &[u32], (w, h): (u32, u32), (ox, oy): (i64, i64), f: impl Fn(u32, u32) -> u32) {
+    if src.len() < w as usize * h as usize || dst.len() < dw as usize * dh as usize {
+        return;
+    }
+    let (x0, x1) = (ox.max(0), (ox + i64::from(w)).min(i64::from(dw)));
+    let (y0, y1) = (oy.max(0), (oy + i64::from(h)).min(i64::from(dh)));
+    for dy in y0..y1 {
+        let (sr, dr) = (((dy - oy) * i64::from(w)) as usize, (dy * i64::from(dw)) as usize);
+        for dx in x0..x1 {
+            let d = &mut dst[dr + dx as usize];
+            *d = f(src[sr + (dx - ox) as usize], *d);
+        }
+    }
 }
 
 pub(crate) fn over(s: u32, d: u32) -> u32 {
@@ -515,6 +515,21 @@ pub(crate) fn over(s: u32, d: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blit_draws_only_where_the_two_overlap() {
+        let mut dst = vec![0u32; 4 * 3];
+        let src: Vec<u32> = (1..=6).collect();
+        // A 3x2 source at (-1, 2): its right two columns of the top row.
+        blit(&mut dst, (4, 3), &src, (3, 2), (-1, 2), |s, _| s);
+        assert_eq!(dst, [0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0]);
+        // Far off either way, or a source shorter than its size: nothing.
+        let before = dst.clone();
+        blit(&mut dst, (4, 3), &src, (3, 2), (i64::from(i32::MAX), 0), |s, _| s);
+        blit(&mut dst, (4, 3), &src, (8192, 8192), (-8000, -8000), |s, _| s);
+        blit(&mut dst, (4, 3), &src, (3, 3), (0, 0), |s, _| s);
+        assert_eq!(dst, before);
+    }
 
     #[test]
     fn the_desktop_has_the_hosts_background_and_chrome_on_top() {

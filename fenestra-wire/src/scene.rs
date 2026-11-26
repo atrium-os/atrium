@@ -301,7 +301,9 @@ impl Control {
                     let at = 14 + i * 25;
                     let kind = *b.get(at + 24).ok_or_else(bad)?;
                     let p = (u32_at(at)?, u32_at(at + 4)? as i32, u32_at(at + 8)? as i32, side(u32_at(at + 12)?)?, side(u32_at(at + 16)?)?, u32_at(at + 20)?, kind);
-                    if windows.iter().any(|q| q.0 == p.0) {
+                    // Within a screen's reach either way, so offsets between
+                    // two placed windows never overflow an i32.
+                    if windows.iter().any(|q| q.0 == p.0) || p.1.unsigned_abs() > MAX_SIDE || p.2.unsigned_abs() > MAX_SIDE {
                         return Err(bad());
                     }
                     // A top-level window has no parent; a slot's or pop-up's

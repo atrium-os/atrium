@@ -183,9 +183,16 @@ fn scene_framing_round_trips_and_refuses() {
         vec![(2, 0, 0, 1, 1, 0, 0), (3, 0, 0, 1, 1, 2, 2), (4, 0, 0, 1, 1, 3, 1)],
         vec![(2, 0, 0, 1, 1, 0, 0), (3, 0, 0, 1, 1, 2, 0)],
         vec![(2, 0, 0, 1, 1, 0, 3)],
+        // A two-kind duplicate, and positions past a screen's reach.
+        vec![(2, 0, 0, 1, 1, 0, 0), (2, 0, 0, 1, 1, 2, 1)],
+        vec![(2, 65537, 0, 1, 1, 0, 0)],
+        vec![(2, 0, i32::MIN, 1, 1, 0, 0)],
     ] {
         assert!(Control::decode(&Control::Layout { screen: (9, 9), desktop: false, windows: w.clone() }.encode()).is_err(), "{w:?}");
     }
+    // The edge of a screen's reach either way is taken.
+    let edge = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, -65536, 65536, 1, 1, 0, 0)] };
+    assert_eq!(Control::decode(&edge.encode()).unwrap(), edge);
     // A viewer's output: in range, or refused.
     let o = Control::Output { width: 1600, height: 900, scale_milli: 2000 };
     assert_eq!(Control::decode(&o.encode()).unwrap(), o);

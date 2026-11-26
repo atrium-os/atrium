@@ -373,6 +373,11 @@ impl Rec {
                     if p.width == 0 || p.height == 0 || p.width > MAX_SCREEN || p.height > MAX_SCREEN {
                         return Err(Refused("window size"));
                     }
+                    // Within a screen's reach either way, so offsets between
+                    // two placed windows never overflow an i32.
+                    if p.x.unsigned_abs() > MAX_SCREEN || p.y.unsigned_abs() > MAX_SCREEN {
+                        return Err(Refused("window position"));
+                    }
                     // A top-level window has no parent; a slot's or pop-up's is
                     // a top-level window placed before it.
                     let parent_ok = match kind {

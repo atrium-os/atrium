@@ -49,6 +49,25 @@ struct Win {
     asked: Option<((u32, u32), std::time::Instant)>,
 }
 
+/// How far from its parent's window a pop-up may sit, pixels.
+const POPUP_REACH: i64 = 16;
+
+/// A pop-up's size here: the host's, each side at most twice its
+/// parent's (a menu may run past its window's bottom, never cover a
+/// screen).
+fn popup_size((w, h): (u32, u32), (pw, ph): (u32, u32)) -> (u32, u32) {
+    (w.min(pw.saturating_mul(2)).max(1), h.min(ph.saturating_mul(2)).max(1))
+}
+
+/// A pop-up's offset from its parent's top left: the host's, clamped so
+/// the pop-up (`size`) overlaps the parent (`(x, y, w, h)` on the host's
+/// screen) or sits within [`POPUP_REACH`] of it.
+fn popup_offset((x, y): (i32, i32), (w, h): (u32, u32), (px, py, pw, ph): (i32, i32, u32, u32)) -> (i64, i64) {
+    let rx = i64::from(x) - i64::from(px);
+    let ry = i64::from(y) - i64::from(py);
+    (rx.clamp(-i64::from(w) - POPUP_REACH, i64::from(pw) + POPUP_REACH), ry.clamp(-i64::from(h) - POPUP_REACH, i64::from(ph) + POPUP_REACH))
+}
+
 /// How long a local resize waits for the host's answer before the host's
 /// size wins.
 const RESIZE_WAIT: Duration = Duration::from_secs(2);
@@ -113,14 +132,19 @@ impl App {
         }
     }
 
-    /// Where a pop-up at `(x, y)` on the host's screen goes on this one:
-    /// its parent's window here, at the same offset from the parent as on
-    /// the host, under the parent's strip.
-    fn popup_position(&self, parent: u32, x: i32, y: i32, placed: &[fenestra_wire::scene::Placed]) -> Option<PhysicalPosition<i32>> {
+    /// Where a pop-up at `(x, y)` on the host's screen, `size` as
+    /// [`popup_size`] gives it, goes on this one: its parent's window
+    /// here, at the same offset from the parent as on the host, under the
+    /// parent's strip. The offset is clamped so the pop-up overlaps the
+    /// parent or lies within [`POPUP_REACH`] of it: a host can't put an
+    /// undecorated window anywhere else on this screen (§11.5).
+    fn popup_position(&self, parent: u32, (x, y): (i32, i32), size: (u32, u32), placed: &[fenestra_wire::scene::Placed]) -> Option<PhysicalPosition<i32>> {
         let p = placed.iter().find(|p| p.0 == parent)?;
         let win = self.wins.values().find(|w| w.host == Some(parent))?;
         let at = win.w.inner_position().ok()?;
-        Some(PhysicalPosition::new(at.x + (x - p.1), at.y + Self::strip(&win.w) as i32 + (y - p.2)))
+        let (rx, ry) = popup_offset((x, y), size, (p.1, p.2, p.3, p.4));
+        let to = |base: i32, v: i64| i32::try_from(i64::from(base) + v).ok();
+        Some(PhysicalPosition::new(to(at.x, rx)?, to(at.y, i64::from(Self::strip(&win.w)) + ry)?))
     }
 
     /// The local windows the host's layout calls for: the desktop's, or
@@ -159,7 +183,9 @@ impl App {
                         continue;
                     }
                     if kind == placed_kind::POPUP {
-                        let at = self.popup_position(parent, x, y, &placed);
+                        let Some(of) = placed.iter().find(|p| p.0 == parent) else { continue };
+                        let (pw, ph) = popup_size((pw, ph), (of.3, of.4));
+                        let at = self.popup_position(parent, (x, y), (pw, ph), &placed);
                         match self.wins.values_mut().find(|w| w.host == Some(id)) {
                             Some(win) => {
                                 if win.size != (pw, ph) {
@@ -253,26 +279,30 @@ impl App {
                 let me = placed.iter().find(|p| p.0 == host).copied();
                 let mut layers = vec![(host, 0i64, 0i64)];
                 if let Some(me) = me {
-                    layers.extend(placed.iter().filter(|p| p.6 == placed_kind::SLOT && p.5 == host).map(|p| (p.0, i64::from(p.1 - me.1), i64::from(p.2 - me.2))));
+                    layers.extend(placed.iter().filter(|p| p.6 == placed_kind::SLOT && p.5 == host).map(|p| (p.0, i64::from(p.1) - i64::from(me.1), i64::from(p.2) - i64::from(me.2))));
                 }
+                let below = (size.width, size.height.saturating_sub(strip));
+                let body = buf.get_mut((strip.min(size.height) * size.width) as usize..).unwrap_or_default();
                 for (i, (id, ox, oy)) in layers.into_iter().enumerate() {
                     let v = views.windows.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
                     let Some((w, h, px, _)) = v.and_then(|v| v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached()) else { continue };
-                    for y in 0..i64::from(h) {
-                        let dy = oy + y;
-                        if dy < 0 || dy >= i64::from(size.height.saturating_sub(strip)) {
-                            continue;
-                        }
-                        let row = ((i64::from(strip) + dy) * i64::from(size.width)) as usize;
-                        for x in 0..i64::from(w) {
-                            let dx = ox + x;
-                            if dx < 0 || dx >= i64::from(size.width) {
-                                continue;
+                    // The window itself as it is; a slot over it.
+                    if i == 0 {
+                        crate::blit(body, below, &px, (w, h), (ox, oy), |s, _| s & 0x00ff_ffff);
+                    } else {
+                        crate::blit(body, below, &px, (w, h), (ox, oy), |s, d| crate::over(s, d | 0xff00_0000) & 0x00ff_ffff);
+                    }
+                }
+                if win.popup_of.is_some() {
+                    // A pop-up's edge in the host's colour, so it never
+                    // passes for one of this screen's own (§11.5).
+                    let e = (win.w.scale_factor().round() as u32).max(1);
+                    let (ww, wh) = (size.width, size.height);
+                    for y in 0..wh {
+                        for x in 0..ww {
+                            if x < e || y < e || x + e >= ww || y + e >= wh {
+                                buf[(y * ww + x) as usize] = strip_colour;
                             }
-                            let s = px[(y * i64::from(w) + x) as usize];
-                            let d = &mut buf[row + dx as usize];
-                            // The window itself as it is; a slot over it.
-                            *d = if i == 0 { s } else { crate::over(s, *d | 0xff00_0000) } & 0x00ff_ffff;
                         }
                     }
                 }
@@ -481,7 +511,23 @@ fn fit(s: (u32, u32), w: (u32, u32)) -> (u32, u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{fit, popup_offset, popup_size, POPUP_REACH};
+
+    #[test]
+    fn a_pop_up_stays_by_its_parent_and_no_larger_than_twice_it() {
+        let parent = (100, 50, 900, 600);
+        // The host's offset where it is near the parent.
+        assert_eq!(popup_offset((656, 50), (383, 696), parent), (556, 0));
+        assert_eq!(popup_offset((90, 40), (20, 20), parent), (-10, -10));
+        // Far off, or at the ends of an i32: pulled back to touching
+        // distance, with no overflow.
+        assert_eq!(popup_offset((i32::MAX, i32::MIN), (383, 696), parent), (900 + POPUP_REACH, -696 - POPUP_REACH));
+        assert_eq!(popup_offset((i32::MIN, i32::MAX), (10, 10), (i32::MAX, i32::MIN, 1, 1)), (-10 - POPUP_REACH, 1 + POPUP_REACH));
+        // A menu past its window's bottom keeps its size; a screen-sized
+        // one is cut to twice its parent.
+        assert_eq!(popup_size((383, 696), (900, 600)), (383, 696));
+        assert_eq!(popup_size((8192, 8192), (300, 200)), (600, 400));
+    }
 
     #[test]
     fn fit_keeps_the_aspect_and_centres() {

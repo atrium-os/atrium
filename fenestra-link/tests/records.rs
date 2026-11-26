@@ -12,6 +12,7 @@ fn samples() -> Vec<Rec> {
         Rec::End { window: 1, ticket: 9, now: None },
         Rec::Layout { screen: (1280, 720), desktop: true, windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480, parent: 0, kind: 0 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 2 }] },
         Rec::Layout { screen: (1, 1), desktop: false, windows: vec![] },
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: -65536, y: 65536, width: 1, height: 1, parent: 0, kind: 0 }] },
         Rec::Output { width: 1600, height: 900, scale_milli: 2000 },
         Rec::Output { width: 64, height: 8192, scale_milli: 500 },
         Rec::Chrome(fenestra_link::chrome::Chrome::from_rects([10, 128, 140], (1280, 26), [([0.0, 0.0, 1280.0, 24.0], [0.08, 0.08, 0.1, 1.0], 0.0)]).unwrap()),
@@ -91,6 +92,10 @@ fn hostile_records_are_refused() {
         Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 0 }, Placed { window: 3, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 2 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1, parent: 3, kind: 1 }] }.encode(),
         Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 0 }, Placed { window: 3, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 0 }] }.encode(),
         Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 3 }] }.encode(),
+        // A two-kind duplicate, and positions past a screen's reach.
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 0 }, Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 1 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 65537, y: 0, width: 1, height: 1, parent: 0, kind: 0 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: i32::MIN, width: 1, height: 1, parent: 0, kind: 0 }] }.encode(),
         Rec::Layout { screen: (0, 9), desktop: false, windows: vec![] }.encode(),
         Rec::Output { width: 63, height: 900, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 9000, scale_milli: 1000 }.encode(),
