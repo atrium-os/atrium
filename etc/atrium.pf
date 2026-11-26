@@ -25,7 +25,11 @@ nat-anchor "atrium/vpn"
 # A persona's tunnel (vpn.md §5.5): its apps' DNS, wherever they send it,
 # goes to the tunnel's servers (rdr pass, so the host block below never
 # sees it). The apps are in table <atrium_fib_N>, kept by jaild.
-rdr-anchor "atrium/vpn"
+#
+# Each app's anchor also holds its `listen` redirects from the networks the
+# person allowed (background-apps.md §4.3): `rdr`, not `rdr pass`, so the
+# filter below still sees them. "atrium/*" covers atrium/vpn too.
+rdr-anchor "atrium/*"
 nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)
 
 # An app never reaches the host itself — any of the host's addresses. First,
@@ -37,6 +41,11 @@ block in quick on atrium inet from any to (self)
 anchor "atrium/*"
 # Everything else from an app: denied — including other apps.
 block in quick on atrium
+# Nothing from the network reaches an app's address except a `listen`
+# pass in its anchor above (a LAN neighbour could otherwise route
+# 100.64.0.0/16 through this machine). Replies to the app's own flows
+# match their state before any rule.
+block in quick on atrium_egress inet from any to 100.64.0.0/16
 # An app's own address never leaves by the egress: replies for a jail that
 # is gone (a VPN engine's, after down) would otherwise follow the default
 # route out un-NATed (vpn.md §5.4, seen in the V2 gate).

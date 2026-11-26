@@ -392,6 +392,46 @@ impl Policy {
         })
     }
 
+    /// Allow or stop allowing `app_id`'s `listen` ports for the manifest
+    /// hashing to `hash`, in `persona` (one persona owns its ports).
+    /// `network`: `None` is the grant itself (this computer; off drops it
+    /// all); `Some(id)` adds or removes one network for `local-network`
+    /// (on creates the grant if needed). A grant for another manifest or
+    /// persona is replaced, never merged. Returns whether anything changed.
+    pub fn set_listen(&mut self, app_id: &str, persona: &str, hash: &str, network: Option<&str>, on: bool) -> Result<bool, String> {
+        if !self.has_persona(if persona == PERSONAL { None } else { Some(persona) }) {
+            return Err(format!("{persona}: not one of your personas"));
+        }
+        if let Some(n) = network {
+            if n.is_empty() || n.len() > 80 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b':') {
+                return Err(format!("{n:?} is not a network's identity"));
+            }
+        }
+        if !on {
+            let Some(g) = self.listen.get_mut(app_id) else { return Ok(false) };
+            return Ok(match network {
+                None => self.listen.remove(app_id).is_some(),
+                Some(n) => g.networks.remove(n),
+            });
+        }
+        let fresh = |hash: &str| ListenGrant {
+            manifest_hash: hash.into(), granted_at: now_iso8601(), persona: persona.into(), networks: BTreeSet::new(),
+        };
+        let mut changed = false;
+        let g = self.listen.entry(app_id.into()).or_insert_with(|| { changed = true; fresh(hash) });
+        if g.manifest_hash != hash || g.persona != persona {
+            *g = fresh(hash);
+            changed = true;
+        }
+        if let Some(n) = network {
+            if !g.networks.contains(n) && g.networks.len() >= MAX_LISTEN_NETWORKS {
+                return Err(format!("already allowed on {MAX_LISTEN_NETWORKS} networks; take one away first"));
+            }
+            changed |= g.networks.insert(n.into());
+        }
+        Ok(changed)
+    }
+
     /// Forget every background and listen grant for `app_id` (its access
     /// was removed, or it was uninstalled).
     pub fn forget_app(&mut self, app_id: &str) {
@@ -1015,6 +1055,29 @@ pub fn decide(
 }
 
 // ── tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod listen_grant_tests {
+    use super::*;
+
+    #[test]
+    fn a_listen_grant_holds_for_its_manifest_and_persona_and_takes_networks() {
+        let mut p = Policy::default();
+        assert_eq!(p.set_listen("a.b", PERSONAL, "h1", None, true), Ok(true));
+        assert_eq!(p.set_listen("a.b", PERSONAL, "h1", Some("wifi-686f6d65"), true), Ok(true));
+        assert_eq!(p.set_listen("a.b", PERSONAL, "h1", Some("wifi-686f6d65"), true), Ok(false));
+        assert!(p.listen_grant("a.b", "h1").is_some_and(|g| g.networks.contains("wifi-686f6d65")));
+        assert!(p.listen_grant("a.b", "h2").is_none(), "another manifest");
+        assert_eq!(p.set_listen("a.b", PERSONAL, "h2", None, true), Ok(true));
+        assert!(p.listen_grant("a.b", "h2").is_some_and(|g| g.networks.is_empty()), "networks don't carry over");
+        assert!(p.set_listen("a.b", PERSONAL, "h2", Some("wifi x"), true).is_err());
+        assert!(p.set_listen("a.b", "work", "h2", None, true).is_err(), "not a persona");
+        p.set_listen("a.b", PERSONAL, "h2", Some("wired-525500000001"), true).unwrap();
+        assert_eq!(p.set_listen("a.b", PERSONAL, "h2", Some("wired-525500000001"), false), Ok(true));
+        assert_eq!(p.set_listen("a.b", PERSONAL, "h2", None, false), Ok(true));
+        assert!(p.listen.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {

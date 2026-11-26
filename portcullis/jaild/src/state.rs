@@ -65,6 +65,9 @@ pub struct RoutedNet {
     /// withdrawn on release (network.md §0.1).
     #[serde(default)]
     pub tables:    Vec<String>,
+    /// The grants its anchor was rendered from, for `SetListen`.
+    #[serde(default)]
+    pub grants:    Option<crate::protocol::NetGrants>,
 }
 
 impl PersistentState {

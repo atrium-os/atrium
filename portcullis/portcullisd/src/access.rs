@@ -4,7 +4,7 @@
 
 use std::io;
 
-use portcullis_ipc::{AccessBy, AccessEntry, BackgroundAccess};
+use portcullis_ipc::{AccessBy, AccessEntry, BackgroundAccess, ListenAccess, ListenPort};
 use portcullis_policy::{compute_delta, decide, GrantSource, Policy};
 use portcullis_toml::{Manifest, ResidentStart};
 
@@ -43,6 +43,20 @@ pub fn entry(m: &Manifest, hash: &str, user: &Policy, system: Result<&Policy, &i
             allowed_in: user.background_personas(&m.app.id, hash),
             stale: user.background.get(&m.app.id).is_some_and(|g| g.manifest_hash != hash),
         }),
+        listen: (!m.listen().is_empty()).then(|| {
+            let g = user.listen_grant(&m.app.id, hash);
+            ListenAccess {
+                ports: m.listen().iter().map(|l| ListenPort {
+                    port: l.port, udp: l.proto == portcullis_toml::Proto::Udp,
+                    local_network: l.from == portcullis_toml::ListenFrom::LocalNetwork,
+                }).collect(),
+                persona: g.map(|g| g.persona.clone()),
+                networks: g.map(|g| g.networks.iter().cloned().collect()).unwrap_or_default(),
+                stale: user.listen.get(&m.app.id).is_some_and(|g| g.manifest_hash != hash),
+                here: None,
+                here_why: None,
+            }
+        }),
         id,
         name,
         by,
@@ -60,6 +74,21 @@ pub fn may_set_background(e: &AccessEntry, on: bool) -> Option<String> {
     }
     if on && e.by.is_none() {
         return Some(format!("allow {} first: it asks for more than it has", e.name));
+    }
+    None
+}
+
+/// Why Settings may not turn `e`'s listen switch on, or `None`. Like the
+/// background switch: an app that asks, and runs as it is.
+pub fn may_set_listen(e: &AccessEntry, on: bool, network: bool) -> Option<String> {
+    let Some(l) = &e.listen else {
+        return Some(format!("{} doesn't ask to be reached on a port", e.name));
+    };
+    if on && e.by.is_none() {
+        return Some(format!("allow {} first: it asks for more than it has", e.name));
+    }
+    if on && network && !l.ports.iter().any(|p| p.local_network) {
+        return Some(format!("{} only takes connections from this computer", e.name));
     }
     None
 }

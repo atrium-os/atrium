@@ -188,9 +188,62 @@ pub fn validate_grants(g: &crate::protocol::NetGrants) -> Result<(), String> {
         if !valid_key(&p.app_key) || p.port == 0 { return Err(format!("peer {p:?} is malformed")) }
     }
     if g.inbound.contains(&0) { return Err("inbound port 0".into()) }
+    validate_listen(&g.listen)?;
     if let Some(t) = &g.tag {
         if t.is_empty() || t.len() > 31 || !t.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
             return Err(format!("tag {t:?} is not 1-31 of A-Z and _"));
+        }
+    }
+    Ok(())
+}
+
+/// The most ports one app may serve (portcullis-toml's `MAX_LISTEN`).
+pub const MAX_LISTEN: usize = 4;
+
+/// An interface name pf and ifconfig take: a letter, then letters and
+/// digits, at most 15 (IFNAMSIZ - 1).
+fn valid_iface(i: &str) -> bool {
+    !i.is_empty() && i.len() <= 15 && i.as_bytes()[0].is_ascii_lowercase()
+        && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// A person's login name as it reaches the registry: plain and short.
+fn valid_owner(o: &str) -> bool {
+    !o.is_empty() && o.len() <= 32
+        && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
+pub fn validate_listen(l: &[crate::protocol::NetListen]) -> Result<(), String> {
+    use crate::protocol::ListenFrom;
+    if l.len() > MAX_LISTEN {
+        return Err(format!("{} listen ports; at most {MAX_LISTEN}", l.len()));
+    }
+    for (i, x) in l.iter().enumerate() {
+        if x.port < 1024 {
+            return Err(format!("listen port {} is below 1024", x.port));
+        }
+        if l[..i].iter().any(|y| y.port == x.port && y.udp == x.udp) {
+            return Err(format!("listen port {} twice", x.port));
+        }
+        match &x.from {
+            ListenFrom::Lan { iface, subnet } => {
+                if !valid_iface(iface) {
+                    return Err(format!("listen iface {iface:?} is not an interface name"));
+                }
+                // A network's own subnet, never "anywhere".
+                let len = subnet.split_once('/').and_then(|(_, n)| n.parse::<u8>().ok());
+                if !valid_cidr(subnet) || len.is_none_or(|n| n < 8) {
+                    return Err(format!("listen subnet {subnet:?} is not an IPv4 network of /8 or narrower"));
+                }
+            }
+            ListenFrom::ThisComputer { owner_uid, owner } => {
+                if x.udp {
+                    return Err("listen from this computer is TCP only".into());
+                }
+                if *owner_uid == 0 || !valid_owner(owner) {
+                    return Err(format!("listen owner {owner:?} ({owner_uid}) is not a person"));
+                }
+            }
         }
     }
     Ok(())
@@ -221,6 +274,17 @@ fn host_resolvers() -> Vec<String> {
 /// 0/0 outbound worked.)
 pub fn render_anchor(ea: &str, app: &str, g: Option<&crate::protocol::NetGrants>) -> String {
     let mut r = String::new();
+    // Translation first (pf wants it before filtering): devices on an
+    // allowed network reach the app's port on the host's own address there.
+    // `rdr`, not `rdr pass`, so the pass below still applies.
+    let listen = g.map(|g| g.listen.as_slice()).unwrap_or_default();
+    for l in listen {
+        if let crate::protocol::ListenFrom::Lan { iface, subnet } = &l.from {
+            let p = if l.udp { "udp" } else { "tcp" };
+            r.push_str(&format!("rdr on {iface} inet proto {p} from {subnet} to ({iface}) port {port} -> {app} port {port}\n",
+                port = l.port));
+        }
+    }
     let tag = g.and_then(|g| g.tag.as_deref()).map(|t| format!(" tag {t}")).unwrap_or_default();
     let pass = |proto: &str, to: &str, port: Option<u16>| {
         let proto = if proto.is_empty() { String::new() } else { format!(" proto {proto}") };
@@ -248,6 +312,26 @@ pub fn render_anchor(ea: &str, app: &str, g: Option<&crate::protocol::NetGrants>
             }
         }
     }
+    for l in listen {
+        match &l.from {
+            crate::protocol::ListenFrom::Lan { iface, subnet } => {
+                let port = l.port;
+                if l.udp {
+                    r.push_str(&format!("pass in quick on {iface} inet proto udp from {subnet} to {app} port {port} keep state (max 256)\n"));
+                } else {
+                    r.push_str(&format!("pass in quick on {iface} inet proto tcp from {subnet} to {app} port {port} flags S/SA \
+                                         keep state (max-src-conn 16, max-src-conn-rate 30/10, max 256)\n"));
+                }
+            }
+            // From this computer, only jaild's own forwarder (root) may
+            // reach the port; any other local process is refused here.
+            crate::protocol::ListenFrom::ThisComputer { .. } => {
+                let port = l.port;
+                r.push_str(&format!("pass out quick on {ea} inet proto tcp from (self) to {app} port {port} user root keep state\n"));
+                r.push_str(&format!("block out quick on {ea} inet proto tcp from (self) to {app} port {port}\n"));
+            }
+        }
+    }
     r
 }
 
@@ -256,6 +340,23 @@ pub fn render_anchor(ea: &str, app: &str, g: Option<&crate::protocol::NetGrants>
 pub fn apply_grants(jail: &str, ea: &str, slot: u32, g: Option<&crate::protocol::NetGrants>)
     -> io::Result<Vec<String>>
 {
+    load_anchor(jail, ea, slot, g)?;
+    let (_, app) = slot_addrs(slot);
+    let mut tables = Vec::new();
+    if let Some(g) = g {
+        for p in &g.inbound {
+            let t = consent_table(&g.app_key, *p);
+            sh("pfctl", &["-t", &t, "-T", "add", &app])?;
+            tables.push(t);
+        }
+        crate::listen::start(jail, &app, &g.listen);
+    }
+    Ok(tables)
+}
+
+/// Load (or replace) the app's anchor from `g`. pfctl -f swaps the anchor's
+/// rules in one transaction.
+pub fn load_anchor(jail: &str, ea: &str, slot: u32, g: Option<&crate::protocol::NetGrants>) -> io::Result<()> {
     let (_, app) = slot_addrs(slot);
     let text = render_anchor(ea, &app, g);
     let mut child = Command::new("pfctl").args(["-a", &format!("atrium/{jail}"), "-f", "-"])
@@ -270,15 +371,27 @@ pub fn apply_grants(jail: &str, ea: &str, slot: u32, g: Option<&crate::protocol:
         return Err(io::Error::other(format!("pfctl anchor atrium/{jail}: {}",
             String::from_utf8_lossy(&out.stderr).trim())));
     }
-    let mut tables = Vec::new();
-    if let Some(g) = g {
-        for p in &g.inbound {
-            let t = consent_table(&g.app_key, *p);
-            sh("pfctl", &["-t", &t, "-T", "add", &app])?;
-            tables.push(t);
-        }
+    Ok(())
+}
+
+/// Kill the states of flows TO the app from anywhere (a dropped listen
+/// rule must not leave its connections open). The app's own outbound
+/// states are keyed from its address and stay.
+pub fn kill_inbound_states(slot: u32) {
+    let (_, app) = slot_addrs(slot);
+    let _ = sh("pfctl", &["-k", "0.0.0.0/0", "-k", &app]);
+}
+
+/// Whether the base ruleset evaluates the per-app anchors' translation
+/// rules (`rdr-anchor "atrium/*"`): without it a `Lan` listen would be a
+/// pass with no redirect to use it.
+pub fn listen_loaded() -> Result<(), String> {
+    let nat = sh("pfctl", &["-s", "nat"]).map_err(|e| format!("pfctl -s nat: {e}"))?;
+    if nat.lines().any(|l| l.trim() == "rdr-anchor \"atrium/*\" all") {
+        Ok(())
+    } else {
+        Err("pf has no rdr-anchor \"atrium/*\"; load etc/atrium.pf".into())
     }
-    Ok(tables)
 }
 
 /// Undo [`apply_grants`]: withdraw the address from every consent table,
@@ -290,6 +403,7 @@ pub fn apply_grants(jail: &str, ea: &str, slot: u32, g: Option<&crate::protocol:
 /// the pool, and states keyed on the old app's address would otherwise match
 /// the next app given that address. Best-effort; the jail is gone either way.
 pub fn release_grants(jail: &str, slot: u32, tables: &[String]) {
+    crate::listen::stop(jail);
     let (_, app) = slot_addrs(slot);
     for t in tables {
         let _ = sh("pfctl", &["-t", t, "-T", "delete", &app]);
@@ -325,7 +439,62 @@ mod tests {
             inbound: vec![8080],
             no_resolver: false,
             tag: None,
+            listen: Vec::new(),
         }
+    }
+
+    fn lan(port: u16) -> crate::protocol::NetListen {
+        crate::protocol::NetListen { port, udp: false,
+            from: crate::protocol::ListenFrom::Lan { iface: "vtnet0".into(), subnet: "192.168.1.0/24".into() } }
+    }
+
+    /// The redirect comes first and only from the allowed network's subnet;
+    /// its pass is rate-limited; nothing else moves.
+    #[test]
+    fn a_lan_listen_is_an_rdr_from_its_subnet_and_a_limited_pass() {
+        let mut g = grants(); g.listen = vec![lan(8080)];
+        let a = render_anchor("epair3a", "100.64.0.14", Some(&g));
+        let lines: Vec<&str> = a.lines().collect();
+        assert_eq!(lines[0], "rdr on vtnet0 inet proto tcp from 192.168.1.0/24 to (vtnet0) port 8080 -> 100.64.0.14 port 8080");
+        let last = lines.last().unwrap();
+        assert!(last.starts_with("pass in quick on vtnet0 inet proto tcp from 192.168.1.0/24 to 100.64.0.14 port 8080 flags S/SA"), "{a}");
+        assert!(last.contains("max-src-conn-rate"), "{a}");
+        assert!(!a.contains("rdr pass"));
+        let without = render_anchor("epair3a", "100.64.0.14", Some(&grants()));
+        assert_eq!(a.lines().filter(|l| l.contains("epair3a")).collect::<Vec<_>>(),
+                   without.lines().collect::<Vec<_>>(), "the app's own rules are unchanged");
+    }
+
+    #[test]
+    fn this_computer_lets_only_the_forwarder_through() {
+        let mut g = grants();
+        g.listen = vec![crate::protocol::NetListen { port: 9000, udp: false,
+            from: crate::protocol::ListenFrom::ThisComputer { owner_uid: 1077, owner: "alice".into() } }];
+        let a = render_anchor("epair3a", "100.64.0.14", Some(&g));
+        assert!(!a.contains("rdr"), "{a}");
+        assert!(a.contains("pass out quick on epair3a inet proto tcp from (self) to 100.64.0.14 port 9000 user root keep state\n\
+                            block out quick on epair3a inet proto tcp from (self) to 100.64.0.14 port 9000\n"), "{a}");
+    }
+
+    #[test]
+    fn listen_values_are_tokens_or_refused() {
+        let ok = |l: Vec<crate::protocol::NetListen>| { let mut g = grants(); g.listen = l; validate_grants(&g) };
+        assert!(ok(vec![lan(8080)]).is_ok());
+        assert!(ok(vec![lan(80)]).is_err(), "low port");
+        assert!(ok(vec![lan(8080), lan(8080)]).is_err(), "twice");
+        assert!(ok(vec![lan(8080), lan(8081), lan(8082), lan(8083), lan(8084)]).is_err(), "too many");
+        let mut bad = lan(8080);
+        for (iface, subnet) in [("vtnet0; pass", "192.168.1.0/24"), ("vtnet0", "0.0.0.0/0"),
+                                ("vtnet0", "192.168.1.0/24 port 22"), ("", "10.0.0.0/8"), ("Vtnet0", "10.0.0.0/8")] {
+            bad.from = crate::protocol::ListenFrom::Lan { iface: iface.into(), subnet: subnet.into() };
+            assert!(ok(vec![bad.clone()]).is_err(), "{iface:?} {subnet:?}");
+        }
+        let me = |uid, owner: &str, udp| crate::protocol::NetListen { port: 9000, udp,
+            from: crate::protocol::ListenFrom::ThisComputer { owner_uid: uid, owner: owner.into() } };
+        assert!(ok(vec![me(1077, "alice", false)]).is_ok());
+        assert!(ok(vec![me(0, "root", false)]).is_err());
+        assert!(ok(vec![me(1077, "alice", true)]).is_err(), "udp");
+        assert!(ok(vec![me(1077, "al ice", false)]).is_err());
     }
 
     /// ★ Structure, not trust: peers first (tables only), then the app->app

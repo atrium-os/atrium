@@ -408,3 +408,47 @@ atrium new --list`. `cargo atrium check`'s consent lines and the install
 sheet carry the background and listen words; opifex counts
 `background:<start>` and `listen:<port>:<from>` as capabilities, so an
 update that starts asking for either is asked about.
+
+**B4 (2026-11-26).**
+- jaild: `NetGrants.listen` (`NetListen { port, udp, from }`, `from` =
+  `Lan { iface, subnet }` or `ThisComputer { owner_uid, owner }`), every
+  value a validated token. A `Lan` port is an `rdr` from the network's own
+  subnet on that interface to the app, then a pass for that flow with
+  `max-src-conn 16, max-src-conn-rate 30/10`. `SetListen { jail_name,
+  listen }` swaps a running jail's anchor in one pfctl transaction and cuts
+  flows to the app when a rule goes. One owner per host port: a second jail
+  asking for a port another holds is refused ("port 8080 is in use by …";
+  portcullisd decides what to show).
+- **This computer is a forwarder, not an rdr.** The base rules `set skip
+  on lo0`, and a loopback rdr could not tell one local user from another.
+  jaild listens on 127.0.0.1:port for the app (`jaild/src/listen.rs`), asks
+  the kernel which uid opened each connection (`net.inet.tcp.getcred`), and
+  lets through only the person's login uid and their own apps' uids from
+  the launch registry. The app's anchor lets only root (the forwarder)
+  connect to that port from the host. TCP only; 16 connections; 5 minutes
+  idle.
+- Base pf (`etc/atrium.pf`): `rdr-anchor "atrium/*"` (which covers
+  atrium/vpn), and `block in quick on atrium_egress inet from any to
+  100.64.0.0/16` after the anchors. Before this, a LAN neighbour routing
+  100.64.0.0/16 through the machine reached any app's ports. Still open,
+  for later: any local process can connect to an app's address on ports it
+  does not `listen` on (`pass all` from the host).
+- Network identity: atrium-net's `status` line for a Wi-Fi interface now
+  carries `ssid=` and `secured=` (the saved entry has a credential).
+  portcullisd (`listen_run.rs`) names the egress network `wifi-<ssid hex>`
+  (secured only) or `wired-<router MAC>` (the ARP table), follows
+  atrium-net's `subscribe` stream and re-renders every running listener on
+  each event (and each quiet minute). With no network, or one the grant
+  doesn't name, only this-computer ports stay.
+- The grant: `SetListen { app_id, persona, network, on, activation }` on
+  the Apps page's path; `network` adds or removes the network the computer
+  is on now; an open network is refused with the reason. On needs the
+  APPROVE press. Curia's Apps page has the two switches; the network one
+  says it's a guard against mistakes, not against someone on that network.
+- Navigator: its engines are app jails with their own network stack, so
+  127.0.0.1 there is their own and the host's addresses are blocked to
+  them; no page can reach the person's port. A typed
+  `http://localhost:8080` doesn't open the person's server either (not
+  built).
+- Not built: the bar's "3 connections" count and "Not reachable on this
+  network" line.

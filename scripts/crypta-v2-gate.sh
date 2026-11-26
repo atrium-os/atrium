@@ -75,7 +75,7 @@ run)
     "$V" "install -m 755 $G/atrium-portcullisd-jclient /usr/local/bin/atrium-portcullisd-jclient
         mkdir -p /var/db/atrium/$PERSON
         printf '[personas.work]\ncolour = \"orange\"\nvpn = \"work\"\n' > /var/db/atrium/$PERSON/policy.toml"
-    "$V" 'pfctl -sn' | grep -q 'rdr-anchor "atrium/vpn"' && ok "pf base rules carry rdr-anchor atrium/vpn" || fail "no rdr-anchor"
+    "$V" 'pfctl -sn' | grep -Eq 'rdr-anchor "atrium/(vpn|\*)"' && ok "pf base rules reach atrium/vpn's rdr" || fail "no rdr-anchor"
 
     echo "== a Work profile: full tunnel, scoped to the persona"
     PRIV=$(python3 -c 'import os,base64; print(base64.b64encode(os.urandom(32)).decode())')

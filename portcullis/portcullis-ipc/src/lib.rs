@@ -660,6 +660,21 @@ pub enum Request {
         #[serde(default)]
         activation: Option<[u8; 16]>,
     },
+    /// ★ Let `app_id`'s `listen` ports through for `persona`, or stop
+    /// (background-apps.md §4.2). `network` false: the grant itself (this
+    /// computer; off takes it all away). `network` true: the network the
+    /// computer is on now, for `local-network` ports; an open Wi-Fi network
+    /// is refused. `app-grants` only; on needs the APPROVE press, off none.
+    /// Answer: `Ok`.
+    SetListen {
+        app_id:     String,
+        persona:    String,
+        #[serde(default)]
+        network:    bool,
+        on:         bool,
+        #[serde(default)]
+        activation: Option<[u8; 16]>,
+    },
     /// ★ Settings' Links section (opening-links.md §4.4): each link scheme
     /// an installed app takes, those apps, and the person's default.
     /// `app-grants` only, about the person that app belongs to. Answer:
@@ -906,6 +921,9 @@ pub struct AccessEntry {
     /// background-apps.md §3.2), and where the person lets it.
     #[serde(default)]
     pub background: Option<BackgroundAccess>,
+    /// Its `listen` ports, when it asks for any.
+    #[serde(default)]
+    pub listen: Option<ListenAccess>,
 }
 
 /// One row of the bar's "Running in the background" list.
@@ -938,6 +956,36 @@ pub struct BackgroundAccess {
     pub stale: bool,
 }
 
+
+/// An app's `listen` ports on Settings' Apps page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenAccess {
+    pub ports: Vec<ListenPort>,
+    /// The persona whose instance gets them, while allowed.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// The networks `local-network` ports hold on.
+    #[serde(default)]
+    pub networks: Vec<String>,
+    /// The person had allowed it for an older manifest.
+    #[serde(default)]
+    pub stale: bool,
+    /// The network the computer is on now, as a grant names it.
+    #[serde(default)]
+    pub here: Option<String>,
+    /// Why the network now can't be allowed (open Wi-Fi, none).
+    #[serde(default)]
+    pub here_why: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenPort {
+    pub port: u16,
+    #[serde(default)]
+    pub udp: bool,
+    /// `from = "local-network"`; otherwise this computer.
+    pub local_network: bool,
+}
 
 /// A credential the person can grant to the selected workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

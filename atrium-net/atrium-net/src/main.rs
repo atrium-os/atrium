@@ -1969,6 +1969,16 @@ mod imp {
                 }
                 if i.wifi {
                     l = l.with("wifi", 1);
+                    // The joined network, and whether its saved entry has a
+                    // credential: what a per-network grant names
+                    // (background-apps.md §4.2). An open network can't be
+                    // told from a copy of it, so `secured=0` grants nothing.
+                    if let Some(w) = self.wifi.as_ref().filter(|w| w.state() == "up") {
+                        if let Some(ssid) = w.ssid() {
+                            let secured = w.saved.profiles.iter().any(|p| p.ssid == ssid && !p.open);
+                            l = l.with_hex("ssid", ssid).with("secured", u8::from(secured));
+                        }
+                    }
                 }
                 if k.is_some() && k == self.dot1x.port {
                     l = l.with("dot1x", self.dot1x.state.word());

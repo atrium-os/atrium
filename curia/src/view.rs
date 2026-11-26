@@ -1333,6 +1333,32 @@ impl CuriaView {
                             y += em(40.0);
                         }
                     }
+                    // Its ports (background-apps.md §4.2): this computer,
+                    // then the network the computer is on now.
+                    let rows = apps::listen_rows(e);
+                    if !rows.is_empty() {
+                        y += em(8.0);
+                    }
+                    for r in rows {
+                        text(ctx, em(40.0), y + em(16.0), &r.words, type_size::SM, Weight::Regular, t.text_primary());
+                        let state = match (busy, r.on, &r.blocked) {
+                            (true, _, _) => "Changing…".to_string(),
+                            (false, true, _) => "On".into(),
+                            (false, false, Some(why)) => format!("Off: {why}"),
+                            (false, false, None) if r.network => "Off. A network is known by its saved Wi-Fi entry or its router: a guard against mistakes, not against someone on it".into(),
+                            (false, false, None) => "Off".into(),
+                        };
+                        text(ctx, em(40.0), y + em(32.0), &state, type_size::XS, Weight::Regular, t.text_secondary());
+                        let lab = if r.on { "Turn off" } else { "Turn on" };
+                        let bx = pw - em(12.0) - width(lab, type_size::SM, Weight::Medium) - em(24.0);
+                        let (pg, id, net, on) = (self.apps.clone(), e.id.clone(), r.network, r.on);
+                        let enabled = p.busy.is_none() && (r.on || r.blocked.is_none());
+                        button(ctx, bx, y + em(5.0), lab, Look::Secondary, enabled, move || {
+                            let token = pergola::clipboard::current_activation();
+                            with_apps(&pg, |a| a.set_listen(&id, net, !on, token))
+                        });
+                        y += em(40.0);
+                    }
                     line(ctx, &mut y, &e.id, t.text_tertiary());
                     y += em(8.0);
                 }
@@ -2053,7 +2079,7 @@ mod tests {
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
-        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted, settings: false, background: None };
+        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted, settings: false, background: None, listen: None };
         with_apps(&v.apps, |p| {
             p.apply(Got::List(Ok(vec![
                 e("org.atrium.player", "Player", Some(AccessBy::You), vec![], Some("2026-11-15T09:00:00Z".into()), vec![]),

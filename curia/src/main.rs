@@ -526,6 +526,14 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                 }
                 Got::Done { app_id, result: r }
             }
+            Want::SetListen { app_id, persona, network, on, activation } => {
+                let r = done(ask(&Request::SetListen { app_id: app_id.clone(), persona, network, on, activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: {app_id}'s ports{}: {}", if network { " on this network" } else { "" }, if on { "on" } else { "off" }),
+                    Err(e) => eprintln!("curia: {app_id}'s ports: {e}"),
+                }
+                Got::Done { app_id, result: r }
+            }
             Want::Remove { app_id } => {
                 let r = done(ask(&Request::RemoveAccess { app_id: app_id.clone() }));
                 match &r {

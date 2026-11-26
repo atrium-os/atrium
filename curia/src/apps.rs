@@ -39,6 +39,7 @@ pub enum Want {
     /// Turn `app_id`'s background switch in `persona` on or off. On carries
     /// the press; off needs none.
     SetBackground { app_id: String, persona: String, on: bool, activation: Option<[u8; 16]> },
+    SetListen { app_id: String, persona: String, network: bool, on: bool, activation: Option<[u8; 16]> },
     /// Make `app` the default for `scheme` links; `None`: ask each time.
     SetLink { scheme: String, app: Option<String>, activation: [u8; 16] },
     /// The share sheet's order and hidden apps, all of them.
@@ -211,6 +212,62 @@ pub fn background_words(e: &AccessEntry, persona: &str, in_persona: bool) -> Opt
 /// `e` may run in the background in `persona` now.
 pub fn background_on(e: &AccessEntry, persona: &str) -> bool {
     e.background.as_ref().is_some_and(|b| b.allowed_in.iter().any(|p| p == persona))
+}
+
+/// One of an app's port switches (background-apps.md §4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenRow {
+    /// The network switch (devices on the network the computer is on now);
+    /// otherwise the app's own switch.
+    pub network: bool,
+    pub words: String,
+    pub on: bool,
+    /// Why it can't be turned on here, when it can't.
+    pub blocked: Option<String>,
+}
+
+fn ports(v: &[u16]) -> String {
+    let p: Vec<String> = v.iter().map(u16::to_string).collect();
+    match p.len() {
+        1 => format!("port {}", p[0]),
+        _ => format!("ports {}", p.join(", ")),
+    }
+}
+
+/// The port switches for `e`: its own (this computer, and the leave the
+/// network switch needs), then the network one when a port is for the
+/// local network.
+pub fn listen_rows(e: &AccessEntry) -> Vec<ListenRow> {
+    let Some(l) = &e.listen else { return Vec::new() };
+    let mine: Vec<u16> = l.ports.iter().filter(|p| !p.local_network).map(|p| p.port).collect();
+    let lan: Vec<u16> = l.ports.iter().filter(|p| p.local_network).map(|p| p.port).collect();
+    let allowed = l.persona.is_some();
+    let mut v = vec![ListenRow {
+        network: false,
+        words: if mine.is_empty() {
+            format!("Let {} take connections", e.name)
+        } else {
+            format!("Let your own programs on this computer connect to {} on {}", e.name, ports(&mine))
+        },
+        on: allowed,
+        blocked: None,
+    }];
+    if !lan.is_empty() {
+        let here_on = l.here.as_ref().is_some_and(|h| l.networks.contains(h));
+        v.push(ListenRow {
+            network: true,
+            words: format!("Let devices on this network connect to {} on {}", e.name, ports(&lan)),
+            on: here_on,
+            blocked: if l.here.is_none() { Some(l.here_why.clone().unwrap_or_else(|| "This network can't be allowed".into())) } else { None },
+        });
+    }
+    v
+}
+
+/// The persona whose instance gets `e`'s ports: the one already allowed,
+/// else Personal.
+pub fn listen_persona(e: &AccessEntry) -> String {
+    e.listen.as_ref().and_then(|l| l.persona.clone()).unwrap_or_else(|| "personal".into())
 }
 
 /// What Allow would give, or why it can't be offered.
@@ -568,6 +625,33 @@ impl AppsPage {
         self.wants.push(Want::SetBackground { app_id: id.into(), persona: persona.into(), on, activation: activation.filter(|_| on) });
     }
 
+    /// Turn one of `id`'s port switches to `on` (see [`listen_rows`]).
+    pub fn set_listen(&mut self, id: &str, network: bool, on: bool, activation: Option<[u8; 16]>) {
+        let Some(e) = self.find(id) else { return };
+        let Some(row) = listen_rows(e).into_iter().find(|r| r.network == network) else { return };
+        if self.busy.is_some() || row.on == on {
+            return;
+        }
+        if on && e.by.is_none() {
+            self.note = Some((id.into(), format!("Allow {} first", e.name)));
+            return;
+        }
+        if on {
+            if let Some(why) = row.blocked {
+                self.note = Some((id.into(), why));
+                return;
+            }
+            if activation.is_none() {
+                self.note = Some((id.into(), "Press Turn on with the pointer or Enter".into()));
+                return;
+            }
+        }
+        let persona = listen_persona(e);
+        self.busy = Some(id.into());
+        self.note = None;
+        self.wants.push(Want::SetListen { app_id: id.into(), persona, network, on, activation: activation.filter(|_| on) });
+    }
+
     /// Remove: the first press asks, the second takes the grant away.
     pub fn remove(&mut self, id: &str) {
         if self.busy.is_some() || !self.find(id).is_some_and(can_remove) {
@@ -653,6 +737,7 @@ mod tests {
             restricted: restricted.iter().map(|s| s.to_string()).collect(),
             settings: false,
             background: None,
+            listen: None,
         }
     }
 
@@ -916,5 +1001,29 @@ mod tests {
         assert_eq!(p.wants, vec![Want::SetColour { name: "work".into(), colour: "red".into(), activation: [3; 16] }]);
         p.remove_persona("school", Some([2; 16]));
         assert_eq!(p.persona_confirm, None, "not one of hers");
+    }
+
+    #[test]
+    fn port_switches_say_where_from_and_need_the_press() {
+        use portcullis_ipc::{ListenAccess, ListenPort};
+        let mut row = e("org.x.srv", Some(AccessBy::You), &[], true, &[]);
+        row.name = "Photo Server".into();
+        row.listen = Some(ListenAccess {
+            ports: vec![ListenPort { port: 8080, udp: false, local_network: true }, ListenPort { port: 9000, udp: false, local_network: false }],
+            persona: None, networks: vec![], stale: false, here: Some("wifi-486f6d65".into()), here_why: None,
+        });
+        let rows = listen_rows(&row);
+        assert_eq!(rows[0].words, "Let your own programs on this computer connect to Photo Server on port 9000");
+        assert_eq!(rows[1].words, "Let devices on this network connect to Photo Server on port 8080");
+        assert!(!rows[0].on && !rows[1].on);
+        let mut p = AppsPage::default();
+        p.apply(Got::List(Ok(vec![row.clone()])));
+        p.set_listen("org.x.srv", true, true, None);
+        assert!(p.take_wants().is_empty(), "no press, nothing asked");
+        p.set_listen("org.x.srv", true, true, Some([2; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetListen { app_id: "org.x.srv".into(), persona: "personal".into(), network: true, on: true, activation: Some([2; 16]) }]);
+        let mut open = row;
+        if let Some(l) = open.listen.as_mut() { l.here = None; l.here_why = Some("open Wi-Fi networks can't be allowed".into()); }
+        assert_eq!(listen_rows(&open)[1].blocked.as_deref(), Some("open Wi-Fi networks can't be allowed"));
     }
 }

@@ -369,6 +369,9 @@ fn dispatch(
             release_routed(&jail_name, state, state_path);
             (Response::Ok, Vec::new())
         }
+
+        Request::SetListen { jail_name, listen } =>
+            (handle_set_listen(&jail_name, listen, dry_run, state, state_path), Vec::new()),
     }
 }
 
@@ -1284,6 +1287,11 @@ fn handle_allocate_net(
             return Response::PolicyDenied { rule: "network.routed.fib".into(), detail };
         }
     }
+    if let Some(g) = grants {
+        if let Err(detail) = listen_ok(state, jail_name, &g.listen) {
+            return Response::PolicyDenied { rule: "network.listen".into(), detail };
+        }
+    }
     if state.routed_nets.iter().any(|n| n.jail_name == jail_name) {
         return Response::PolicyDenied { rule: "network.routed.duplicate".into(),
             detail: format!("{jail_name} already holds a network; ReleaseNet it first") };
@@ -1311,12 +1319,72 @@ fn handle_allocate_net(
         }
     };
     state.routed_nets.push(crate::state::RoutedNet {
-        jail_name: jail_name.into(), slot, epair_a: a.clone(), tables,
+        jail_name: jail_name.into(), slot, epair_a: a.clone(), tables, grants: grants.cloned(),
     });
     if let Err(e) = state.save(state_path) { warn!("jaild: state save after AllocateNet: {e}"); }
     let (host_addr, app_addr) = crate::routed::slot_addrs(slot);
     info!("jaild: AllocateNet {jail_name}: slot {slot} {a}/{b} {app_addr}/30 via {host_addr}");
     Response::NetAllocated { epair_b: b, app_addr, host_addr }
+}
+
+/// `listen` is well formed, pf can redirect for it, and no other jail
+/// holds one of its host ports (one owner per port, background-apps.md §4.3).
+fn listen_ok(state: &PersistentState, jail: &str, listen: &[crate::protocol::NetListen]) -> Result<(), String> {
+    if listen.is_empty() {
+        return Ok(());
+    }
+    crate::routed::validate_listen(listen)?;
+    if listen.iter().any(|l| matches!(l.from, crate::protocol::ListenFrom::Lan { .. })) {
+        crate::routed::listen_loaded()?;
+    }
+    for l in listen {
+        let holder = state.routed_nets.iter().filter(|n| n.jail_name != jail).find(|n| {
+            n.grants.as_ref().is_some_and(|g| g.listen.iter().any(|x| x.port == l.port && x.udp == l.udp))
+        });
+        if let Some(h) = holder {
+            return Err(format!("port {} is in use by {}", l.port, h.jail_name));
+        }
+    }
+    Ok(())
+}
+
+/// Replace a running jail's listen rules (and forwarders). The anchor is
+/// swapped in one pfctl transaction; flows to the app are cut when a rule
+/// goes, so a connection never outlives the grant or the network.
+fn handle_set_listen(jail: &str, listen: Vec<crate::protocol::NetListen>, dry_run: bool,
+                     state: &mut PersistentState, state_path: &Path) -> Response {
+    let Some(i) = state.routed_nets.iter().position(|n| n.jail_name == jail) else {
+        return Response::PolicyDenied { rule: "network.listen".into(), detail: format!("{jail} holds no network") };
+    };
+    let Some(mut g) = state.routed_nets[i].grants.clone() else {
+        return Response::PolicyDenied { rule: "network.listen".into(),
+            detail: format!("{jail} has outbound-anywhere grants; listen needs a [capabilities.network] table") };
+    };
+    if let Err(detail) = listen_ok(state, jail, &listen) {
+        return Response::PolicyDenied { rule: "network.listen".into(), detail };
+    }
+    if dry_run {
+        return Response::Ok;
+    }
+    let shrank = g.listen.iter().any(|l| !listen.contains(l));
+    g.listen = listen;
+    let n = &state.routed_nets[i];
+    let (slot, ea) = (n.slot, n.epair_a.clone());
+    if let Err(e) = crate::routed::load_anchor(jail, &ea, slot, Some(&g)) {
+        // Fail closed: what we can't render, we don't leave half-loaded.
+        crate::listen::stop(jail);
+        crate::routed::kill_inbound_states(slot);
+        return Response::SyscallFailed { name: "pfctl".into(), errno: e.raw_os_error().unwrap_or(-1), msg: e.to_string() };
+    }
+    if shrank {
+        crate::routed::kill_inbound_states(slot);
+    }
+    let (_, app) = crate::routed::slot_addrs(slot);
+    crate::listen::start(jail, &app, &g.listen);
+    info!("jaild: SetListen {jail}: {} port(s)", g.listen.len());
+    state.routed_nets[i].grants = Some(g);
+    if let Err(e) = state.save(state_path) { warn!("jaild: state save after SetListen: {e}"); }
+    Response::Ok
 }
 
 /// Destroy a jail's epair and free its /30, if it holds one. Idempotent.
@@ -1421,6 +1489,9 @@ fn create_routed(
     if let Some(f) = fib {
         routed::valid_fib(f).map_err(|detail| JaildError::PolicyViolation { rule: "network.routed.fib", detail })?;
     }
+    if let Some(g) = grants {
+        listen_ok(state, &req.name, &g.listen).map_err(|detail| JaildError::PolicyViolation { rule: "network.listen", detail })?;
+    }
     let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
@@ -1448,7 +1519,7 @@ fn create_routed(
         }
     };
     state.routed_nets.push(crate::state::RoutedNet {
-        jail_name: req.name.clone(), slot, epair_a: a.clone(), tables,
+        jail_name: req.name.clone(), slot, epair_a: a.clone(), tables, grants: grants.cloned(),
     });
     if let Err(e) = state.save(state_path) { warn!("jaild: state save after routed net: {e}"); }
     let (host, app) = routed::slot_addrs(slot);

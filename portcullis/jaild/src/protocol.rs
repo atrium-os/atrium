@@ -114,6 +114,12 @@ pub enum Request {
     /// the epair, free the /30. Idempotent.
     ReleaseNet { jail_name: String },
 
+    /// Replace the `listen` part of a running jail's grants (the network
+    /// changed, the person allowed or took back a port, or it was quit).
+    /// Refused for a jail with no grants, and for a host port another jail
+    /// holds. An empty list removes every listen rule and forwarder.
+    SetListen { jail_name: String, listen: Vec<NetListen> },
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
 
@@ -941,6 +947,32 @@ pub struct NetGrants {
     /// tunnel. Uppercase letters and `_`, at most 31.
     #[serde(default)]
     pub tag: Option<String>,
+    /// Ports it serves to people (background-apps.md §4.3), as the person
+    /// allowed them: from a network they allowed it on, or from their own
+    /// processes on this computer. Replaced whole by [`Request::SetListen`].
+    #[serde(default)]
+    pub listen: Vec<NetListen>,
+}
+
+/// One port an app serves, and from where.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NetListen {
+    pub port: u16,
+    #[serde(default)]
+    pub udp:  bool,
+    pub from: ListenFrom,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ListenFrom {
+    /// Devices on the network `iface` is on: an `rdr` from `subnet` to the
+    /// app, and a rate-limited pass for that flow.
+    Lan { iface: String, subnet: String },
+    /// The person's own processes on this computer: a forwarder on
+    /// 127.0.0.1 that lets through `owner_uid` and the uids of `owner`'s
+    /// apps (the launch registry), nobody else. TCP only.
+    ThisComputer { owner_uid: u32, owner: String },
 }
 
 /// An outbound destination, already resolved: an IPv4 CIDR (`a.b.c.d/n`).

@@ -1633,7 +1633,7 @@ mod tests {
         use crate::protocol::{NetDest, NetGrants, NetworkConfig};
         let p = load_sample_policy();
         let grants = |outbound: Vec<NetDest>| NetGrants {
-            app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true, tag: None,
+            app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true, tag: None, listen: vec![],
         };
         let printer = || vec![NetDest { cidr: "192.168.1.20/32".into(), port: Some(631), udp: false }];
         let worker = |name: &str, exe: &str, uid: u32, net: NetworkConfig| {
@@ -1689,7 +1689,7 @@ mod tests {
         let p = load_sample_policy();
         let grants = |outbound: Vec<NetDest>, tag: Option<&str>| NetGrants {
             app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true,
-            tag: tag.map(str::to_string),
+            tag: tag.map(str::to_string), listen: vec![],
         };
         let gw = || vec![NetDest { cidr: "198.51.100.51/32".into(), port: Some(51820), udp: true }];
         let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g), fib: None };

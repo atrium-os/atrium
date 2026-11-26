@@ -52,6 +52,7 @@ use portcullis_ipc::{
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
 mod background_run;
+mod listen_run;
 mod calendar;
 mod crypta;
 mod console;
@@ -89,6 +90,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     // A debug run doesn't outlive portcullisd: no stale "debugging" tag.
     dev::clear_debugging();
+    listen_run::watch();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1093,7 +1095,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &resp)?;
             continue;
         }
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings | Request::PersonaVpns) {
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::SetListen { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings | Request::PersonaVpns) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -3024,6 +3026,16 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
         Request::Access => {
             let mut apps: Vec<_> = launch::installed_texts().iter().map(|(_, t, m)| row(t, m, &tp.policy)).collect();
             access::sort(&mut apps);
+            if apps.iter().any(|a| a.listen.as_ref().is_some_and(|l| l.ports.iter().any(|p| p.local_network))) {
+                let here = listen_run::current();
+                for l in apps.iter_mut().filter_map(|a| a.listen.as_mut()) {
+                    l.here = here.as_ref().and_then(|n| n.id.clone());
+                    l.here_why = match &here {
+                        Some(n) => n.why.map(String::from),
+                        None => Some("this computer isn't on a network".into()),
+                    };
+                }
+            }
             eprintln!("portcullisd: access -> {caller} (uid {uid}) for {owner}: {} app(s)", apps.len());
             Response::Access { apps }
         }
@@ -3111,6 +3123,49 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                     Ok(()) => {
                         eprintln!("portcullisd: {owner} {} {app_id} in the background in {persona} (from {caller})",
                                   if on { "allowed" } else { "stopped allowing" });
+                        Response::Ok
+                    }
+                    Err(e) => refuse(format!("save: {e}")),
+                },
+                Err(why) => refuse(why),
+            }
+        }
+        Request::SetListen { app_id, persona, network, on, activation } => {
+            let Some((tree, t, m)) = launch::installed_texts().into_iter().find(|(_, _, m)| m.app.id == app_id) else {
+                return refuse(format!("{app_id} is not installed"));
+            };
+            let hash = hash_manifest(t.as_bytes());
+            if let Some(why) = access::may_set_listen(&row(&t, &m, &tp.policy), on, network) {
+                return refuse(why);
+            }
+            let here = if network {
+                match listen_run::current() {
+                    Some(listen_run::Net { id: Some(id), .. }) => Some(id),
+                    Some(n) => return refuse(n.why.unwrap_or("this network can't be allowed").into()),
+                    None => return refuse("this computer isn't on a network".into()),
+                }
+            } else {
+                None
+            };
+            if on {
+                if let Err(why) = manifest_trust::verify(&tree, &t) {
+                    return refuse(why);
+                }
+                // Last of the checks: a refusal above doesn't spend the press.
+                let token = activation.unwrap_or(fresco_protocol::activation::NONE);
+                if let Err(why) = opens::spend_press_for(&opens::activation_socket(), token, uid, fresco_protocol::activation::purpose::APPROVE) {
+                    return refuse(why);
+                }
+            }
+            match tp.policy.set_listen(&app_id, &persona, &hash, here.as_deref(), on) {
+                Ok(false) => Response::Ok,
+                Ok(true) => match tp.policy.save(&tp.policy_path.clone()) {
+                    Ok(()) => {
+                        eprintln!("portcullisd: {owner} {} {app_id}'s ports {} in {persona} (from {caller})",
+                                  if on { "allowed" } else { "stopped allowing" },
+                                  here.as_deref().map_or("from this computer".to_string(), |n| format!("on {n}")));
+                        drop(s);
+                        listen_run::refresh(Some((&owner, &app_id)));
                         Response::Ok
                     }
                     Err(e) => refuse(format!("save: {e}")),
@@ -4752,7 +4807,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::SetListen { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
         | Request::ShareTargets | Request::SetShareTargets { .. }
 
         | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. }

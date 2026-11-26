@@ -544,6 +544,7 @@ fn launch_inner(
     let manifest = Manifest::from_str(&text)
         .map_err(|e| LaunchError::Failed("manifest",
                  format!("parse error: {e}")))?;
+    let listen_of = crate::listen_run::ListenOf::of(user, &manifest, &text, persona);
     let calendar_window = if app_id == crate::calendar::APP {
         if manifest.app.id != app_id {
             return Err(LaunchError::Failed("signature", "Calendar bundle ID mismatch".into()));
@@ -624,6 +625,7 @@ fn launch_inner(
         syscall_class: portcullis_jail::sysfil_class(&manifest.capabilities),
         app_data: None,
         rctl: background_rctl(&manifest)?,
+        listen_of,
     };
     let debug_tree = match &debug {
         Some(_) => Some(debug_tree().map_err(|e| LaunchError::Failed("debug", e))?),
@@ -764,7 +766,7 @@ fn launch_inner(
             ensure_mountpoints(&setup_jc)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             let setup_run = AppRun {
-                debug: false, inspect: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), rctl: None, ..app_run.clone()
+                debug: false, inspect: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), rctl: None, listen_of: None, ..app_run.clone()
             };
             /* The setup's output goes to the daemon's. */
             let setup_exit = run_one_jail(&setup_jc, &jail_path, None, Vec::new(), &setup_run, None, None)
@@ -1284,6 +1286,8 @@ pub struct AppRun {
     /// (background-apps.md §3.1), which jaild applies before the jail
     /// exists or refuses to create it.
     pub rctl: Option<jaild::protocol::RctlLimits>,
+    /// Its `listen` ports, when the manifest asks for any (background-apps.md §4).
+    pub listen_of: Option<crate::listen_run::ListenOf>,
 }
 
 /// A background app's `[resources]` as rctl ceilings; `None` for any other
@@ -1378,9 +1382,17 @@ fn run_one_jail(
     /* ★★ A `full` network is jaild's (network.md §0): it builds the epair
      * with the app's derived MAC from the request, and releases it with the
      * jail. The app's finer grants (network.md §0.1), hostnames resolved now. */
-    let grants = match &jc.routed_net_spec {
+    let mut grants = match &jc.routed_net_spec {
         Some((id, spec)) => portcullis_oneshot::net_grants(spec, id).map_err(fail("network"))?,
         None => None,
+    };
+    /* The ports the person let through, from where, on the network now. */
+    let listen = match (&run.listen_of, grants.as_mut()) {
+        (Some(lo), Some(g)) => {
+            g.listen = crate::listen_run::now(lo);
+            Some((lo.clone(), g.listen.clone()))
+        }
+        _ => None,
     };
     if jc.needs_routed_net.is_some() {
         /* Names resolve through the host's resolvers, over NAT. Written into
@@ -1408,12 +1420,16 @@ fn run_one_jail(
     let _ = umount_silent(&jail_path.join("dev"));
     let running = portcullisd::jaild_jail::create_with(req, stdio, extra).map_err(fail("jail"))?
         .ok_or_else(|| LaunchError::Failed("jail", "jaild started no entry".into()))?;
+    if let Some((lo, applied)) = listen {
+        crate::listen_run::track(&jc.name, lo, applied);
+    }
     let status = match (recovery_start, refresh_uid) {
         (Some(start), _) => wait_for_recovery(&running, &jc.name, start),
         (_, Some(uid)) => wait_for_files(&running, &jc.name, uid),
         _ => running.wait(),
     };
     drop(running);
+    crate::listen_run::untrack(&jc.name);
     /* The jail ended with its entry; this drops jaild's record and, for a
      * networked jail, its epair. */
     if let Err(e) = portcullisd::jaild_jail::remove(&jc.name) {

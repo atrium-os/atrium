@@ -149,6 +149,19 @@ pub fn remove(name: &str) -> Result<(), String> {
     }
 }
 
+/// Replace a running jail's `listen` rules (background-apps.md §4.3).
+pub fn set_listen(name: &str, listen: Vec<jaild::protocol::NetListen>) -> Result<(), String> {
+    let mut client = connect()?;
+    match client.send(&Request::SetListen { jail_name: name.into(), listen }) {
+        Ok((Response::Ok, _)) => Ok(()),
+        Ok((other, fd)) => {
+            drop(fd.map(|f| owned(vec![f])));
+            Err(refusal(other))
+        }
+        Err(e) => Err(format!("jaild: {e}")),
+    }
+}
+
 /// The live jid of a jail jaild made, or `None` when it is not running (or
 /// jaild does not know it).
 pub fn jid(name: &str) -> Option<i32> {
