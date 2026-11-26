@@ -461,9 +461,11 @@ typing corpus as mosh did.
 
 The host does not pace frames to any display (a remote output has no vblank on the host). Each
 window's renderer sends when its app ends a frame and the transport has room (§8.2); the viewer
-composes on its own vblank. Frame callbacks to the app (when to draw next) are driven by the
-viewer's acks, so an app animating by itself draws at the rate the viewer actually displays,
-not faster: the app never produces frames that would be skipped.
+composes on its own vblank. Frame callbacks to the app (when to draw next) run at the
+viewer's reported refresh rate, limited by how many of that window's frames are unacked: up to
+the number that fit in one round trip at the current send rate (at least 2). So an app animating
+by itself draws at the rate the viewer displays, not faster, and a long RTT does **not** cut it
+to one frame per round trip; only a link that cannot carry the frames slows it.
 
 ## 7. Content that cannot travel as a scene
 
@@ -601,6 +603,25 @@ v1: an address or name the person types (`fenestra connect host`), over SSH (§1
 hosts the person has paired appear in the Fenestra app through mDNS on the local network
 (discovery only; no trust from it), and Concursus (concursus.md) for hosts behind NAT, with its
 relay as the fallback when direct UDP fails.
+
+### 8.6 Bad networks, case by case
+
+The design's answer to a bad link is that **the viewer never waits for the network to stay
+usable, and the host never builds a backlog**. Each case below says what the person sees.
+Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet.
+
+| Condition | What Fenestra does | What the person sees |
+|---|---|---|
+| **High RTT** (100 to 300 ms, satellite 600 ms) | Cursor, animations, video pacing, viewer scrolling (§6.3), rootless window management are local. In whole-desktop mode a window drag is **predicted**: the viewer moves the window locally from the placement it already has and the host's WM confirms or corrects it one RTT later. Frame callbacks are not tied to acks (§6.6). Pointer motion coalesced, not queued. | Moving, scrolling, hovering the cursor feel local. A click that needs the app costs one RTT plus app time; typing costs one RTT until R7's prediction. |
+| **Low bandwidth** (256 kbit/s to 2 Mbit/s) | Scene traffic is small and goes first (§8.2). On first connect: window structure and on-screen glyph atlases first, image previews next, full images and off-screen blobs last (§5.5). Encoded regions step down the ladder (§8.3); below their floor (a set bitrate, default 300 kbit/s per region) a video region shows its last frame with a lossless refresh every few seconds and a "paused on slow link" badge, and resumes when the rate allows. Audio drops to 24 kbit/s Opus before video loses more. | Text and UI stay exact and current; images sharpen as they arrive; video degrades, then pauses, never smears the text around it. |
+| **Loss and jitter** (Wi-Fi, mobile: 1 to 10 % loss, 30 ms jitter) | Reliable streams retransmit, but state sync means a lost record is usually superseded by the next difference anyway (§5.2). Acks are sent redundantly (each carries the last few). Video and surface datagrams carry forward error correction sized from measured loss; the viewer reports lost frames so the encoder sends an intra refresh or switches reference frames instead of waiting for a keyframe. Pointer datagrams: latest wins. Congestion control is delay-based, so random loss is not read as congestion. No playout buffer for surfaces; video layers keep the player's own small buffer. | Occasional late UI updates by one RTT; video holds or drops a frame rather than freezing for seconds. |
+| **Sudden drop** (seconds to minutes) | Keepalive every 250 ms; after 1 s of silence the viewer marks the remote area stale (dimmed, "reconnecting" with a timer) and keeps the last frames. **Input typed or clicked while disconnected is not queued and not replayed later**: it is discarded and the overlay says so (decision 14). The host keeps the remote outputs for the grace period (§12) and the apps see nothing. | A frozen, clearly marked screen, not a frozen-looking live one; no surprise burst of old keystrokes on reconnect. |
+| **Reconnect** | First QUIC connection migration (same connection, new path); if that fails, a new handshake with the same pinned keys while the token is valid (no SSH needed), resuming each window from its acked version with the blob cache intact, so a reconnect costs the difference, typically kilobytes. Retries back off 0.25, 0.5, 1, 2, 4 s, then every 5 s, bounded by the token's expiry; after expiry, one SSH re-mint (which may prompt for the key). | The screen comes back current within about one RTT of the link returning. |
+| **Address change** (Wi-Fi to wired, roaming between access points, NAT rebinding) | QUIC connection migration, path validation, congestion state reset for the new path. | Usually nothing; at worst a short "reconnecting". |
+| **Flapping link** | Degrade ladder steps down at once and up only after 10 s of stable rate (hysteresis). Grace period means windows never move home on a flap. A reconnect never resends full state when acked versions are valid. | Quality settles instead of oscillating. |
+| **Bufferbloat** (a full upload elsewhere on the same link) | Delay-based congestion control keeps bytes in flight near the bandwidth-delay product; Fenestra itself never adds a queue. RTT rise is the signal to step down. | Latency stays near the base RTT instead of growing to seconds. |
+| **UDP blocked** (some corporate and hotel networks) | Fallback: the session's streams run over TLS over TCP to the same port family (or through the SSH connection itself as a last resort), with media datagrams turned into a single latest-frame-wins stream. Head-of-line blocking returns, so the stats panel says "TCP fallback". Concursus's relay (R9) covers networks that allow only 443. | Works, with more latency under loss; marked. |
+| **Tiny uplink** (asymmetric mobile) | The viewer sends only input, acks and stats: a few kbit/s. | No effect. |
 
 ## 9. Input
 
@@ -885,6 +906,10 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
     to the licence audit of the crates and their dependencies.
 13. **The name Fenestra** (`fenestrad`, `fenestra-net`, `fenestra`). *Recommend yes;* NAMING.md
     gets the row once accepted.
+14. **Input made while the link is down is discarded, not replayed on reconnect** (§8.6).
+    *Recommend yes.* Replaying keystrokes and clicks into a screen the person could not see is
+    how you delete the wrong thing; mosh replays because a terminal line is forgiving, a GUI is
+    not.
 
 ## 18. Out of scope, and honest limits
 
@@ -911,7 +936,7 @@ VM runs only with the coordinator's go.
 |---|---|---|
 | R0 | This spec reviewed and decided. QUIC crates licence-audited. | review thread sign-off |
 | R1 | Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
-| R2 | `fenestrad` and `fenestra-net` with QUIC, SSH-handoff PSK, remote outputs in frescod, whole-desktop mode with a session window on the viewer, input, cursor, stats. Two cloud VMs on one host network with `netem` delay and loss. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150 ms added RTT, 3 runs each |
+| R2 | `fenestrad` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode with a session window on the viewer, input, cursor, stats. Two cloud VMs on one host network with `netem` delay and loss. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
 | R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |
 | R5 | Viewer-scrollable SCROLL groups in frescod (local and remote), Pergola ScrollView and Navigator documents set the flag. | `scroll_bench` locally; scroll latency at 150 ms RTT in the R2 rig |
