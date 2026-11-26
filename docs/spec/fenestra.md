@@ -754,6 +754,52 @@ Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet
   visibly remote. The viewer's own lock screen and sheets are never shown without first leaving
   the remote area, and they appear only after the secure attention key or a local event.
 
+### 9.1 Input devices on the viewer
+
+The viewer's own Tactus owns every device plugged into the viewer (USB, Bluetooth through
+Vinculum, the built-in trackpad); Fenestra never redirects a raw USB or HID device to the host.
+The viewer decodes each device locally and forwards **typed events** in Tactus's own shapes
+(atrium-input.md §4), which the host's frescod injects as a virtual Tactus device per viewer
+device. The host never parses a HID descriptor from the viewer, and the viewer never lets the
+host write raw output reports.
+
+| Device | Decoded on the viewer | Sent to the host | Back from the host | Notes |
+|---|---|---|---|---|
+| **Mouse** | Pointer stage (acceleration with the viewer's settings), buttons, high-resolution wheel (`value_120`) | Absolute position in the window (normal use), coalesced to one per viewer frame; buttons and wheel as events, never dropped | cursor shape | Under **pointer lock** (a game or 3D modeller on the host asked, after a press, atrium-input.md §4.1) the viewer hides its cursor and sends raw relative deltas, **summed, never dropped**, at up to 1000 Hz in datagrams with a sequence number, so no motion is lost to coalescing. The secure attention key (§9) and the usual Escape always release the lock on the viewer itself. |
+| **Trackpad** (built-in or external) | Contacts, palm rejection, taps, two-finger scroll with phases, pinch, swipes, all in the viewer's Tactus | Scroll deltas with phases, `MAGNIFY` pinches, clicks; momentum is computed on the viewer | — | With viewer-scrollable groups (§6.3) the scroll and its fling run entirely on the viewer. Three- and four-finger swipes are the viewer's own system gestures; in "send keys to host" full screen they go to the host's WM instead. |
+| **Keyboard** | HID usages, modifiers, repeat | Usages (and keysym in "viewer layout", §9) | LED state (caps lock) | Key repeat is generated on the host from press and release, so a dropped release cannot leave a key repeating: the viewer resends the full set of held keys with every key datagram, and the host releases anything missing from it. |
+| **Gamepad** | Descriptor decode, `PadLayout`, buttons, axes, hat | `PadLayout` once on attach; then a **full state snapshot** (all buttons and axes) per change, latest wins, sequence numbered, up to 250 Hz | rumble: typed effects (strength, duration), bounded | A pad appears on the host as a remote pad in Forum's controller menu (fresco-capabilities.md C5) and follows the usual claim rules: exclusive only while the app is focused, the person can take it back. A lost snapshot is harmless, the next one carries the whole state. |
+| **Racing wheel, pedals, flight stick, HOTAS** | Same as gamepads (HID axes at full resolution, 16-bit) | Full-state snapshots, up to 1000 Hz for wheels | **force feedback as effects**, not as raw reports | Force feedback is latency-critical, so the host sends *effect descriptions* (HID PID shapes: constant, spring, damper, friction, periodic, with gain and duration) and the **viewer's driver plays them on the device locally**. A spring or damper therefore reacts to the wheel at local speed; only changes of effect parameters cross the network. A constant force the game updates per frame is RTT-delayed, which is fine on a LAN and noticeable on a WAN (§18). The viewer caps every effect's strength and duration to a per-device limit the person sets, so a host can't drive a wheel harder than allowed. Device settings (rotation range, deadzones) stay on the viewer. |
+| **Pen tablet** (later, with Tactus pen support) | Pressure, tilt, eraser, proximity | Typed pen events, not coalesced while the pen is down (strokes need every sample) | — | Absolute mapping to the remote window or the whole session, the person's choice. |
+| **Touchscreen** (later, Tactus touch is deferred) | Contacts | Typed touch events | — | — |
+
+How devices are offered to the host:
+
+- **Keyboard and pointer** go to the session that has focus on the viewer, as for any local
+  window. They need no extra step.
+- **Gamepads, wheels and other game controllers** are offered per device, the first time a
+  remote app asks for a pad: the viewer shows "Use <device> with <host>?" once, remembered per
+  host. A controller in use by a local app on the viewer is not taken away.
+- **Hot-plug** on the viewer sends attach and detach; the host's virtual device appears and
+  goes with it, and the host app sees an ordinary connect or disconnect. A dropped connection
+  detaches nothing during the grace period, but sends no input (§8.6); the host releases all
+  held buttons and centres axes the moment the link is lost, so a car does not keep
+  accelerating.
+- Only the **controlling viewer's** devices are forwarded; view-only viewers forward none.
+
+Timing and bounds:
+
+- Every input datagram carries the viewer's timestamp; the host maps it to its own clock with
+  an offset estimated from acks, so apps that use event times (gesture velocity, rhythm games)
+  see consistent intervals.
+- Each class has a rate cap (pointer motion 1 per viewer frame unlocked, 1000 Hz locked;
+  gamepads 250 Hz; wheels 1000 Hz; keys 100 per second), at most 8 forwarded devices per viewer
+  and 4 game controllers. Over a cap, `fenestra-session` coalesces (state snapshots) or drops the
+  viewer (event floods), §11.10.
+- Effects sent back to the viewer are fixed-size records (at most 16 active effects per device,
+  bounded parameters), parsed in `fenestra-net` and checked again by the viewer's Tactus before
+  any output report is built.
+
 ## 10. Audio, clipboard, files
 
 - **Audio.** Lyra on the host gains a remote sink per session (lyra-external-device.md is the
