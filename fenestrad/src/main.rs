@@ -10,7 +10,9 @@
 //!   so sessions cannot see or answer each other's; the `Data` and `End`
 //!   that answer one go back only to the session that asked;
 //! - `Changed` and `Layout` go to every session;
-//! - frescod is told the session is on while any session wants it.
+//! - frescod is told the session is on while any session wants it;
+//! - a session's viewer input goes to frescod (bounded and rate-limited by
+//!   the session and again by frescod).
 //!
 //! Each peer may send only its own side's records, and a session whose
 //! queue fills (it stopped reading) is ended, never waited on. In R2
@@ -119,7 +121,7 @@ impl Relay {
                         Relay::to_session(&mut t, id, Rec::End { window, ticket: theirs, now });
                     }
                 }
-                Rec::Session { .. } | Rec::Want { .. } => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) => unreachable!("from_broker() refused it"),
             }
             // A session ended for not reading may have been the one on.
             self.sync_on(&mut t);
@@ -155,6 +157,12 @@ impl Relay {
                     t.tickets.insert(ours, (id, ticket));
                     drop(t);
                     if let Err(e) = self.to_frescod(&Rec::Want { window, ticket: ours, base }) {
+                        die(format!("frescod: {e}"));
+                    }
+                }
+                Rec::Input(i) => {
+                    drop(t);
+                    if let Err(e) = self.to_frescod(&Rec::Input(i)) {
                         die(format!("frescod: {e}"));
                     }
                 }

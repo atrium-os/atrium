@@ -110,7 +110,20 @@ pub enum Control {
     /// Host, whole-desktop sessions (§3.4): the screen's size and where
     /// its windows are, bottom to top.
     Layout { screen: (u32, u32), windows: Vec<Placed> },
+    /// Viewer: input, in the host screen's pixels (whole desktop, §9).
+    Input(Input),
 }
+
+/// A viewer's input event (§9).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input {
+    Key { usage: u16, pressed: bool, modifiers: u8 },
+    Motion { x: f32, y: f32 },
+    Button { button: u8, pressed: bool },
+    Scroll { dx: f32, dy: f32 },
+}
+
+impl Eq for Input {}
 
 impl Control {
     pub fn encode(&self) -> Vec<u8> {
@@ -129,6 +142,29 @@ impl Control {
                 b.push(2);
                 b.extend_from_slice(&w.to_le_bytes());
             }
+            Control::Input(i) => match *i {
+                Input::Key { usage, pressed, modifiers } => {
+                    b.push(4);
+                    b.extend_from_slice(&usage.to_le_bytes());
+                    b.push(pressed as u8);
+                    b.push(modifiers);
+                }
+                Input::Motion { x, y } => {
+                    b.push(5);
+                    b.extend_from_slice(&x.to_le_bytes());
+                    b.extend_from_slice(&y.to_le_bytes());
+                }
+                Input::Button { button, pressed } => {
+                    b.push(6);
+                    b.push(button);
+                    b.push(pressed as u8);
+                }
+                Input::Scroll { dx, dy } => {
+                    b.push(7);
+                    b.extend_from_slice(&dx.to_le_bytes());
+                    b.extend_from_slice(&dy.to_le_bytes());
+                }
+            },
             Control::Layout { screen, windows } => {
                 b.push(3);
                 b.extend_from_slice(&screen.0.to_le_bytes());
@@ -172,6 +208,32 @@ impl Control {
                 Ok(Control::Resume(w))
             }
             Some(2) if b.len() == 5 => Ok(Control::Closed(u32_at(1)?)),
+            Some(4) if b.len() == 5 => {
+                let pressed = match b[3] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad()),
+                };
+                Ok(Control::Input(Input::Key { usage: u16::from_le_bytes([b[1], b[2]]), pressed, modifiers: b[4] }))
+            }
+            Some(5) | Some(7) if b.len() == 9 => {
+                let (x, y) = (f32::from_bits(u32_at(1)?), f32::from_bits(u32_at(5)?));
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(bad());
+                }
+                Ok(Control::Input(if b[0] == 5 { Input::Motion { x, y } } else { Input::Scroll { dx: x, dy: y } }))
+            }
+            Some(6) if b.len() == 3 => {
+                let pressed = match b[2] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad()),
+                };
+                if !(1..=5).contains(&b[1]) {
+                    return Err(bad());
+                }
+                Ok(Control::Input(Input::Button { button: b[1], pressed }))
+            }
             Some(3) => {
                 let side = |v: u32| if (1..=MAX_SIDE).contains(&v) { Ok(v) } else { Err(bad()) };
                 let screen = (side(u32_at(1)?)?, side(u32_at(5)?)?);

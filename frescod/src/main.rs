@@ -264,7 +264,7 @@ fn main() -> std::io::Result<()> {
             b.serve_chrome(Path::new(&p))?;
         }
         if let Ok(p) = std::env::var("FRESCOD_FENESTRA_SOCK") {
-            b.serve_fenestra(Path::new(&p), fenestra_uids()?)?;
+            b.serve_fenestra(Path::new(&p), fenestra_uids()?, ev_tx.clone())?;
         }
     }
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
@@ -1374,7 +1374,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
             b.serve_chrome(Path::new(&p))?;
         }
         if let Ok(p) = std::env::var("FRESCOD_FENESTRA_SOCK") {
-            b.serve_fenestra(Path::new(&p), fenestra_uids()?)?;
+            b.serve_fenestra(Path::new(&p), fenestra_uids()?, ev_tx.clone())?;
         }
     }
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {

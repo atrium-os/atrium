@@ -21,6 +21,9 @@ use fresco_render_core::record;
 use fresco_render_core::stream::{self, Reader};
 use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 
+/// Where the viewer's input comes from (a window's events, or a script).
+pub type Inputs = Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<scene::Input>>>;
+
 /// Most remote windows one viewer holds.
 pub const MAX_WINDOWS: usize = scene::MAX_RESUME;
 const CHUNK: usize = 64 * 1024;
@@ -73,9 +76,20 @@ impl Views {
 
 /// Take one connection's streams until it ends. Errors from the host's
 /// side of the protocol end the connection (the host is not trusted).
-pub async fn run(hc: HostConn, views: Arc<Views>) -> Result<(), WireError> {
+pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), WireError> {
     let (mut control, mut control_in) = hc.control.split();
     control.send(&Msg::App(Control::Resume(views.resume()).encode())).await?;
+    // The person's input, to the host on the control stream. What came
+    // while no connection was up is dropped, never replayed (§8.6): it was
+    // meant for a screen the person could not see.
+    let sending = async move {
+        let mut rx = input.lock().await;
+        while rx.try_recv().is_ok() {}
+        while let Some(i) = rx.recv().await {
+            control.send(&Msg::App(Control::Input(i).encode())).await?;
+        }
+        std::future::pending::<Result<(), WireError>>().await
+    };
     let conn = hc.conn.clone();
     let closing = {
         let views = views.clone();
@@ -90,7 +104,7 @@ pub async fn run(hc: HostConn, views: Arc<Views>) -> Result<(), WireError> {
                         Control::Layout { screen, windows } => {
                             *views.layout.lock().unwrap_or_else(|e| e.into_inner()) = Some((screen, windows));
                         }
-                        Control::Resume(_) => return Err(WireError::Protocol("resume from the host")),
+                        Control::Resume(_) | Control::Input(_) => return Err(WireError::Protocol("a viewer's message from the host")),
                     },
                     Ok(_) => return Err(WireError::Protocol("unexpected control message")),
                     // The host ending the session is an end, not an error.
@@ -121,6 +135,7 @@ pub async fn run(hc: HostConn, views: Arc<Views>) -> Result<(), WireError> {
     tokio::select! {
         r = closing => r,
         r = streams => r,
+        r = sending => r,
     }
 }
 

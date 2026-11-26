@@ -15,10 +15,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 
-use fenestra_link::{Placed, Rec};
+use fenestra_link::{Input, Placed, Rec};
+use fresco_scene_server::window::{Compositor, DisplayEvent};
 use fresco_split::chan::Shm;
 use fresco_split::Msg;
 
@@ -31,6 +32,9 @@ pub(super) const STREAM_SLOT_BYTES: usize = 4 << 20;
 const LINK_QUEUE: usize = 4096;
 /// Wants outstanding at one renderer.
 const MAX_TICKETS: usize = 256;
+/// Input events a second from the link, and the burst it may save up.
+const INPUT_PER_S: f64 = 2000.0;
+const INPUT_BURST: f64 = 400.0;
 
 #[derive(Default)]
 pub(super) struct Link {
@@ -50,7 +54,8 @@ pub(super) struct RStream {
 
 impl Broker {
     /// Listen for fenestrad on `path`.
-    pub fn serve_fenestra(self: &Arc<Self>, path: &std::path::Path, uids: Vec<u32>) -> io::Result<()> {
+    /// Viewers' input goes to `sink` as frescod's own devices' does.
+    pub fn serve_fenestra(self: &Arc<Self>, path: &std::path::Path, uids: Vec<u32>, sink: Sender<DisplayEvent>) -> io::Result<()> {
         if std::fs::symlink_metadata(path).is_ok_and(|m| {
             use std::os::unix::fs::FileTypeExt;
             m.file_type().is_socket()
@@ -83,9 +88,9 @@ impl Broker {
                     log::warn!("frescod: a second fenestra link refused");
                     continue;
                 }
-                let me = me.clone();
+                let (me, sink) = (me.clone(), sink.clone());
                 let _ = std::thread::Builder::new().name("frescod-fenestra".into()).spawn(move || {
-                    let why = me.fenestra(s);
+                    let why = me.fenestra(s, &sink);
                     log::info!("frescod: fenestra link ended: {why}");
                     me.end_link();
                 });
@@ -94,7 +99,7 @@ impl Broker {
         Ok(())
     }
 
-    fn fenestra(self: &Arc<Self>, s: UnixStream) -> String {
+    fn fenestra(self: &Arc<Self>, s: UnixStream, sink: &Sender<DisplayEvent>) -> String {
         let (tx, rx) = mpsc::sync_channel::<Rec>(LINK_QUEUE);
         let (Ok(mut w), Ok(mut r)) = (s.try_clone(), s.try_clone()) else { return "cannot clone the socket".into() };
         {
@@ -111,6 +116,8 @@ impl Broker {
                 }
             }
         });
+        let mut inputs = super::Bucket::new(INPUT_PER_S, INPUT_BURST);
+        let mut modifiers = 0u8;
         loop {
             let rec = match fenestra_link::read(&mut r) {
                 Ok(Some(rec)) if !rec.from_broker() => rec,
@@ -121,6 +128,14 @@ impl Broker {
             match rec {
                 Rec::Session { on } => self.set_remote(on),
                 Rec::Want { window, ticket, base } => self.want(window, ticket, base),
+                Rec::Input(i) => {
+                    // A flood only slows this link (its socket fills).
+                    inputs.take();
+                    if !self.remote_on() {
+                        continue;
+                    }
+                    remote_input(&self.comp, sink, i, &mut modifiers);
+                }
                 _ => unreachable!("from_broker() covers the rest"),
             }
         }
@@ -295,4 +310,35 @@ impl Broker {
         drop(f);
         self.to_fenestra(rec);
     }
+}
+
+/// Route one viewer input event as frescod's input injector routes its
+/// own: the same cursor, hit-test and focus. Remote input mints no
+/// activation token (fenestra.md §11: what a remote press may authorise is
+/// decided separately).
+fn remote_input(comp: &Arc<Mutex<Compositor>>, sink: &Sender<DisplayEvent>, i: Input, modifiers: &mut u8) {
+    use crate::injector_reader::{cursor_here, cursor_to, focused_window};
+    let ev = match i {
+        Input::Motion { x, y } => {
+            let (w, h, _) = crate::screen::get();
+            let (lx, ly, target) = cursor_to(comp, x.min(w.max(1) as f32 - 1.0), y.min(h.max(1) as f32 - 1.0));
+            DisplayEvent::InputPointerMotion { window_id: target, x: lx, y: ly }
+        }
+        Input::Button { button, pressed } => {
+            let (lx, ly, target) = cursor_here(comp);
+            if pressed && button == 1 {
+                comp.lock().unwrap().press_focus(target as u16);
+            }
+            DisplayEvent::InputPointerButton { window_id: target, x: lx, y: ly, button, pressed, modifiers: *modifiers, activation: [0; 16] }
+        }
+        Input::Key { usage, pressed, modifiers: m } => {
+            *modifiers = m;
+            DisplayEvent::InputKey { window_id: focused_window(comp), hid_usage: usage, pressed, modifiers: m, activation: [0; 16], repeat: false }
+        }
+        Input::Scroll { dx, dy } => {
+            let (_, _, target) = cursor_here(comp);
+            DisplayEvent::InputPointerScroll { window_id: target, dx, dy, phase: 0 }
+        }
+    };
+    let _ = sink.send(ev);
 }

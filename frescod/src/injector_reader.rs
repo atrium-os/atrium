@@ -125,13 +125,13 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
 
 /// Set the cursor to `(x, y)`, hit-test, return `(local_x, local_y, target)` —
 /// the same critical-section shape `tactus_client` uses.
-fn cursor_to(comp: &Arc<Mutex<Compositor>>, x: f32, y: f32) -> (f32, f32, u32) {
+pub(crate) fn cursor_to(comp: &Arc<Mutex<Compositor>>, x: f32, y: f32) -> (f32, f32, u32) {
     let mut g = comp.lock().unwrap();
     g.cursor = (x, y);
     hit(&g, x, y)
 }
 
-fn cursor_here(comp: &Arc<Mutex<Compositor>>) -> (f32, f32, u32) {
+pub(crate) fn cursor_here(comp: &Arc<Mutex<Compositor>>) -> (f32, f32, u32) {
     let g = comp.lock().unwrap();
     let (x, y) = g.cursor;
     hit(&g, x, y)
@@ -143,7 +143,7 @@ fn hit(g: &Compositor, x: f32, y: f32) -> (f32, f32, u32) {
 }
 
 /// The focused window (or the topmost non-screen window), mirroring `tactus_client`.
-fn focused_window(comp: &Arc<Mutex<Compositor>>) -> u32 {
+pub(crate) fn focused_window(comp: &Arc<Mutex<Compositor>>) -> u32 {
     comp.lock().unwrap().keyboard_window()
 }
 

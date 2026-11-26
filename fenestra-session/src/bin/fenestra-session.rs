@@ -75,7 +75,7 @@ async fn run(link: std::os::unix::net::UnixStream, dir: PathBuf, bind: String) {
                         let stats = Arc::new(ViewerStats::default());
                         let r = serve(hc, src, wake, stats.clone()).await;
                         eprintln!(
-                            "fenestra-session: viewer {conn} gone ({}): frames {} wholes {} bytes {} acks {} resumed {} resent {}",
+                            "fenestra-session: viewer {conn} gone ({}): frames {} wholes {} bytes {} acks {} resumed {} resent {} inputs {} dropped {}",
                             r.err().map_or("closed".to_string(), |e| e.to_string()),
                             stats.frames.load(std::sync::atomic::Ordering::Relaxed),
                             stats.wholes.load(std::sync::atomic::Ordering::Relaxed),
@@ -83,6 +83,8 @@ async fn run(link: std::os::unix::net::UnixStream, dir: PathBuf, bind: String) {
                             stats.acks.load(std::sync::atomic::Ordering::Relaxed),
                             stats.resumed.load(std::sync::atomic::Ordering::Relaxed),
                             stats.resent.load(std::sync::atomic::Ordering::Relaxed),
+                            stats.inputs.load(std::sync::atomic::Ordering::Relaxed),
+                            stats.inputs_dropped.load(std::sync::atomic::Ordering::Relaxed),
                         );
                     });
                 }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use fenestra_link::{Rec, HEADER};
-use fenestra_wire::scene::{Control, Placed};
+use fenestra_wire::scene::{Control, Input, Placed};
 use fenestra_wire::WireError;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -134,7 +134,7 @@ impl LinkSource {
                     }
                     let _ = p.done.send(Ok(now.map(|v| (p.bytes, v))));
                 }
-                Rec::Session { .. } | Rec::Want { .. } => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) => unreachable!("from_broker() refused it"),
             }
         }
     }
@@ -166,6 +166,26 @@ impl Source for LinkSource {
         };
         self.out.send(Rec::Want { window: win, ticket, base }).await.map_err(|_| WireError::Protocol("the link ended"))?;
         rx.await.map_err(|_| WireError::Protocol("the link ended"))?
+    }
+
+    /// Input goes on to frescod in the host screen's pixels: a pointer
+    /// off the screen is moved onto its edge, input before any layout (or
+    /// past the link's queue) is dropped.
+    fn input(&self, i: Input) {
+        let Some((w, h)) = self.state.lock().ok().and_then(|st| st.screen) else { return };
+        let clamp = |v: f32, side: u32| v.clamp(0.0, side.saturating_sub(1) as f32);
+        let i = match i {
+            Input::Key { usage, pressed, modifiers } => fenestra_link::Input::Key { usage, pressed, modifiers },
+            Input::Motion { x, y } => fenestra_link::Input::Motion { x: clamp(x, w), y: clamp(y, h) },
+            Input::Button { button, pressed } => fenestra_link::Input::Button { button, pressed },
+            Input::Scroll { dx, dy } => {
+                let m = fenestra_link::MAX_SCROLL;
+                fenestra_link::Input::Scroll { dx: dx.clamp(-m, m), dy: dy.clamp(-m, m) }
+            }
+        };
+        if self.out.try_send(Rec::Input(i)).is_err() {
+            log::warn!("fenestra-session: the link is full; input dropped");
+        }
     }
 
     fn layout(&self) -> Option<(u64, Control)> {

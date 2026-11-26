@@ -172,4 +172,16 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&twice.encode()).is_err());
     let zero = Control::Layout { screen: (9, 9), windows: vec![(2, 0, 0, 0, 1)] };
     assert!(Control::decode(&zero.encode()).is_err());
+    use fenestra_wire::scene::Input;
+    for i in [
+        Input::Key { usage: 0x28, pressed: true, modifiers: 2 },
+        Input::Motion { x: 12.5, y: 700.0 },
+        Input::Button { button: 1, pressed: false },
+        Input::Scroll { dx: 0.0, dy: -120.0 },
+    ] {
+        assert_eq!(Control::decode(&Control::Input(i).encode()).unwrap(), Control::Input(i));
+    }
+    assert!(Control::decode(&Control::Input(Input::Motion { x: f32::INFINITY, y: 0.0 }).encode()).is_err());
+    assert!(Control::decode(&Control::Input(Input::Button { button: 0, pressed: true }).encode()).is_err());
+    assert!(Control::decode(&[4, 1, 0, 2, 0]).is_err());
 }

@@ -1,4 +1,4 @@
-use fenestra_link::{read, Placed, Rec, HEADER, MAX_DATA, MAX_LAYOUT};
+use fenestra_link::{read, Input, Placed, Rec, HEADER, MAX_DATA, MAX_LAYOUT};
 
 fn samples() -> Vec<Rec> {
     vec![
@@ -12,6 +12,12 @@ fn samples() -> Vec<Rec> {
         Rec::End { window: 1, ticket: 9, now: None },
         Rec::Layout { screen: (1280, 720), windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1 }] },
         Rec::Layout { screen: (1, 1), windows: vec![] },
+        Rec::Input(Input::Key { usage: 0x04, pressed: true, modifiers: 0x02 }),
+        Rec::Input(Input::Key { usage: 0xffff, pressed: false, modifiers: 0xff }),
+        Rec::Input(Input::Motion { x: 640.5, y: 0.0 }),
+        Rec::Input(Input::Button { button: 1, pressed: true }),
+        Rec::Input(Input::Button { button: 5, pressed: false }),
+        Rec::Input(Input::Scroll { dx: 0.0, dy: -120.0 }),
     ]
 }
 
@@ -74,6 +80,15 @@ fn hostile_records_are_refused() {
         Rec::Layout { screen: (9, 9), windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1 }] }.encode(),
         Rec::Data { window: 1, ticket: 0, bytes: vec![] }.encode(),
         Rec::Layout { screen: (0, 9), windows: vec![] }.encode(),
+        Rec::Input(Input::Motion { x: f32::NAN, y: 0.0 }).encode(),
+        Rec::Input(Input::Motion { x: -1.0, y: 0.0 }).encode(),
+        Rec::Input(Input::Button { button: 6, pressed: true }).encode(),
+        Rec::Input(Input::Scroll { dx: 0.0, dy: 1e9 }).encode(),
+        {
+            let mut b = Rec::Input(Input::Key { usage: 4, pressed: true, modifiers: 0 }).encode();
+            b[8] = 9;
+            b
+        },
     ];
     for b in bad {
         assert!(read(&mut std::io::Cursor::new(b)).is_err());

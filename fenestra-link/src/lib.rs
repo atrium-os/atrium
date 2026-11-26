@@ -48,11 +48,33 @@ pub enum Rec {
     /// (`None`: the window is not there).
     End { window: u32, ticket: u32, now: Option<Version> },
     Layout { screen: (u32, u32), windows: Vec<Placed> },
+    /// fenestrad → frescod: the viewer's input, in the host screen's
+    /// pixels, routed as frescod routes its own input devices'.
+    Input(Input),
 }
+
+/// A viewer's input event (fenestra.md §9).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Input {
+    /// HID usage, pressed, HID modifier byte.
+    Key { usage: u16, pressed: bool, modifiers: u8 },
+    /// The pointer to `(x, y)` on the host's screen.
+    Motion { x: f32, y: f32 },
+    /// Button 1 (primary) to 5, at the pointer.
+    Button { button: u8, pressed: bool },
+    /// Scroll at the pointer, in pixels.
+    Scroll { dx: f32, dy: f32 },
+}
+
+impl Eq for Input {}
+
+/// The most a scroll may move in one event, pixels.
+pub const MAX_SCROLL: f32 = 10_000.0;
 
 mod kind {
     pub const SESSION: u32 = 1;
     pub const WANT: u32 = 2;
+    pub const INPUT: u32 = 3;
     pub const CHANGED: u32 = 0x10;
     pub const DATA: u32 = 0x11;
     pub const END: u32 = 0x12;
@@ -133,6 +155,15 @@ impl Rec {
                 let (flag, a, b) = version(*now);
                 Head { kind: END, window: *window, ticket: *ticket, flag, a, b, len: 0 }
             }
+            Rec::Input(i) => {
+                let (sub, flag, a, b) = match *i {
+                    Input::Key { usage, pressed, modifiers } => (1, pressed as u32, u64::from(usage) | u64::from(modifiers) << 16, 0),
+                    Input::Motion { x, y } => (2, 0, u64::from(x.to_bits()), u64::from(y.to_bits())),
+                    Input::Button { button, pressed } => (3, pressed as u32, u64::from(button), 0),
+                    Input::Scroll { dx, dy } => (4, 0, u64::from(dx.to_bits()), u64::from(dy.to_bits())),
+                };
+                Head { kind: INPUT, window: 0, ticket: sub, flag, a, b, len: 0 }
+            }
             Rec::Layout { screen, windows } => {
                 for p in windows {
                     payload.extend_from_slice(&p.window.to_le_bytes());
@@ -157,7 +188,7 @@ impl Rec {
         let max = match h.kind {
             kind::DATA => MAX_DATA,
             kind::LAYOUT => MAX_LAYOUT * PLACED,
-            kind::SESSION | kind::WANT | kind::CHANGED | kind::END => 0,
+            kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT => 0,
             _ => return Err(Refused("unknown kind")),
         };
         if len > max {
@@ -207,6 +238,45 @@ impl Rec {
                 Rec::Data { window: window(h.window)?, ticket: h.ticket, bytes: payload.to_vec() }
             }
             END => Rec::End { window: window(h.window)?, ticket: h.ticket, now: ver(&h)? },
+            INPUT => {
+                unused(h.window == 0)?;
+                let f32_of = |v: u64| -> Result<f32, Refused> {
+                    let v = u32::try_from(v).map_err(|_| Refused("unused field not zero"))?;
+                    let f = f32::from_bits(v);
+                    if f.is_finite() { Ok(f) } else { Err(Refused("non-finite input")) }
+                };
+                Rec::Input(match h.ticket {
+                    1 => {
+                        unused(h.a >> 24 == 0 && h.b == 0)?;
+                        Input::Key { usage: h.a as u16, pressed: flag(h.flag)?, modifiers: (h.a >> 16) as u8 }
+                    }
+                    2 => {
+                        unused(h.flag == 0)?;
+                        let (x, y) = (f32_of(h.a)?, f32_of(h.b)?);
+                        let range = 0.0..MAX_SCREEN as f32;
+                        if !range.contains(&x) || !range.contains(&y) {
+                            return Err(Refused("pointer off any screen"));
+                        }
+                        Input::Motion { x, y }
+                    }
+                    3 => {
+                        unused(h.b == 0)?;
+                        if !(1..=5).contains(&h.a) {
+                            return Err(Refused("button out of range"));
+                        }
+                        Input::Button { button: h.a as u8, pressed: flag(h.flag)? }
+                    }
+                    4 => {
+                        unused(h.flag == 0)?;
+                        let (dx, dy) = (f32_of(h.a)?, f32_of(h.b)?);
+                        if dx.abs() > MAX_SCROLL || dy.abs() > MAX_SCROLL {
+                            return Err(Refused("scroll too large"));
+                        }
+                        Input::Scroll { dx, dy }
+                    }
+                    _ => return Err(Refused("unknown input")),
+                })
+            }
             LAYOUT => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0)?;
                 let side = |v: u64| if (1..=u64::from(MAX_SCREEN)).contains(&v) { Ok(v as u32) } else { Err(Refused("screen size")) };

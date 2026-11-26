@@ -30,6 +30,9 @@ use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 
 /// A viewer whose unacknowledged bytes pass this is dropped (§11.2).
 pub const MAX_UNACKED: u64 = 64 << 20;
+/// Input events a second one viewer may send, and the burst it may save.
+pub const INPUT_PER_S: f64 = 1000.0;
+pub const INPUT_BURST: f64 = 300.0;
 /// How long the host waits for a viewer's resume message.
 pub const RESUME_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -109,6 +112,9 @@ pub trait Source: Send + Sync + 'static {
     fn layout(&self) -> Option<(u64, scene::Control)> {
         None
     }
+    /// A viewer's input, already bounded and rate-limited by [`serve`].
+    /// The simulator has nowhere to send it.
+    fn input(&self, _i: scene::Input) {}
 }
 
 impl Source for Mutex<HostScene> {
@@ -134,6 +140,9 @@ pub struct ViewerStats {
     pub resumed: AtomicU64,
     /// Of those, the ones sent whole anyway (its versions were unknown).
     pub resent: AtomicU64,
+    /// Input events passed on, and dropped past the budget.
+    pub inputs: AtomicU64,
+    pub inputs_dropped: AtomicU64,
 }
 
 struct Out {
@@ -165,15 +174,38 @@ pub async fn serve<S: Source>(
     };
     let (mut control, mut control_in) = hc.control.split();
     let (ended_tx, mut ended) = tokio::sync::oneshot::channel::<Result<(), WireError>>();
-    tokio::spawn(async move {
-        // The viewer says nothing more on control in R2: anything but its
-        // end is a protocol error.
-        let r = match control_in.recv().await {
-            Ok(_) => Err(WireError::Protocol("unexpected control message")),
-            Err(_) => Ok(()),
-        };
-        let _ = ended_tx.send(r);
-    });
+    {
+        let (host, stats) = (host.clone(), stats.clone());
+        tokio::spawn(async move {
+            // After its resume the viewer sends only input; anything else
+            // is a protocol error. Input past the budget is dropped.
+            let mut budget = INPUT_BURST;
+            let mut last = tokio::time::Instant::now();
+            let r = loop {
+                match control_in.recv().await {
+                    Ok(Msg::App(b)) => match Control::decode(&b) {
+                        Ok(Control::Input(i)) => {
+                            let now = tokio::time::Instant::now();
+                            budget = (budget + now.duration_since(last).as_secs_f64() * INPUT_PER_S).min(INPUT_BURST);
+                            last = now;
+                            if budget >= 1.0 {
+                                budget -= 1.0;
+                                stats.inputs.fetch_add(1, Ordering::Relaxed);
+                                host.input(i);
+                            } else {
+                                stats.inputs_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(_) => break Err(WireError::Protocol("unexpected control message")),
+                        Err(e) => break Err(e),
+                    },
+                    Ok(_) => break Err(WireError::Protocol("unexpected control message")),
+                    Err(_) => break Ok(()),
+                }
+            };
+            let _ = ended_tx.send(r);
+        });
+    }
     let mut held: BTreeMap<u32, (u64, u64)> = resume.into_iter().map(|(w, e, v)| (w, (e, v))).collect();
     stats.resumed.store(held.len() as u64, Ordering::Relaxed);
     let mut outs: BTreeMap<u32, Out> = BTreeMap::new();

@@ -12,7 +12,8 @@
 #
 # Checks: the viewer gets windows and a layout; every window's interior on
 # the viewer's desktop is pixel-equal to frescod's own screen, after a click
-# and typing injected on the host changed it; an idle screen
+# and typing sent from the viewer changed it, and again after more typing
+# sent once the viewer had reconnected; an idle screen
 # sends no scene bytes; a reconnect resumes (the session's log: nothing
 # resent whole); no stream errors; the session outlives its viewer.
 #
@@ -21,7 +22,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop 10
+gate_begin fenestra-desktop 12
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
@@ -62,7 +63,7 @@ done
 
 echo "=== host"
 g "cd $G && env FRESCOD_SPLIT=1 FRESCOD_RENDERER_LAUNCHER=unconfined FRESCOD_RENDERER_BIN=$D/fresco-renderer \
-    FRESCOD_HEADLESS_PNG=$G/screen FRESCOD_SOCK=$G/fresco.sock FRESCOD_WM_SOCK=$G/wm.sock FRESCOD_INPUT_SOCK=$G/inject.sock \
+    FRESCOD_HEADLESS_PNG=$G/screen FRESCOD_SOCK=$G/fresco.sock FRESCOD_WM_SOCK=$G/wm.sock \
     FRESCOD_FENESTRA_SOCK=$G/fenestra.sock daemon -f -o $G/frescod.log $D/frescod </dev/null"
 i=0; while [ $i -lt 90 ] && ! g "test -S $G/fresco.sock && test -S $G/fenestra.sock"; do sleep 2; i=$((i+1)); done
 g "test -S $G/fenestra.sock" || { g "tail -20 $G/frescod.log"; gate_abort "frescod did not open the fenestra link"; }
@@ -79,7 +80,31 @@ echo "=== session"
 W=$(mktemp -d "${TMPDIR:-/tmp}/fenestra-desktop.XXXXXX")
 mkdir -p "$W/mint"
 RUN="${RUN_SECS:-150}"
-"$VIEW" --headless --mint-dir "$W/mint" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" \
+# The viewer's input, seconds from its start (it connects within ~10 s): a
+# click on a cell and "123" Enter; it reconnects at 70 s; then right arrow
+# and "45" Enter; nothing from 120 s.
+cat >"$W/input.txt" <<'EOF'
+45 MOVE 300 200
+45.2 BTN 1 1
+45.3 BTN 1 0
+48 KEY 30 1
+48.1 KEY 30 0
+49 KEY 31 1
+49.1 KEY 31 0
+50 KEY 32 1
+50.1 KEY 32 0
+51 KEY 40 1
+51.1 KEY 40 0
+85 KEY 79 1
+85.1 KEY 79 0
+86 KEY 33 1
+86.1 KEY 33 0
+87 KEY 34 1
+87.1 KEY 34 0
+88 KEY 40 1
+88.1 KEY 40 0
+EOF
+"$VIEW" --headless --input "$W/input.txt" --mint-dir "$W/mint" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" \
     --reconnect-after 70 --idle-after 120 >"$W/view.log" 2>&1 &
 VP=$!
 i=0; while [ $i -lt 50 ] && [ ! -s "$W/mint/viewer.pub" ]; do sleep 0.2; i=$((i+1)); done
@@ -88,19 +113,16 @@ g "cd $G && daemon -f -o $G/fenestrad.log $D/fenestrad --frescod $G/fenestra.soc
 i=0; while [ $i -lt 60 ] && ! g "test -s $G/mint/mint"; do sleep 1; i=$((i+1)); done
 get "$G/mint/mint" "$W/mint/mint.tmp" && mv "$W/mint/mint.tmp" "$W/mint/mint" || gate_abort "no mint from the session"
 
-inj() { g "printf '%s\\n' \"$1\" | nc -N -U $G/inject.sock" >/dev/null; }
-sleep 40
+sleep 15
 g "cp $G/screen.png $G/before.png"
-# A click on a cell and "123" Enter typed on the host, then a reconnect at
-# 70 s, then nothing from 120 s.
-key() { inj "KEY $1 1 0"; inj "KEY $1 0 0"; sleep 1; }
-inj "MOVE 300 200"; inj "BTN 1 1"; inj "BTN 1 0"; sleep 4
-key 30; key 31; key 32; key 40
-sleep 20
+sleep 50
+g "cp $G/screen.png $G/middle.png"
+sleep 45
 g "cp $G/screen.png $G/after.png"
 wait $VP
 get "$G/after.png" "$W/host.png"
 get "$G/before.png" "$W/host-before.png"
+get "$G/middle.png" "$W/host-middle.png"
 g "cat $G/fenestrad.log" >"$W/fenestrad.log" 2>&1
 g "tail -50 $G/frescod.log" >"$W/frescod.log" 2>&1
 cat "$W/view.log"
@@ -140,10 +162,13 @@ EOF
 }
 cmp=$(compare "$W/host.png")
 check "every window equal to frescod's own screen" equal "$cmp"
-# The positive control: the screen before the typing is not what the
-# viewer ended with, so the comparison sees the typed cell.
-check "the typing reached the viewer (its desktop differs from the screen before it)" yes "$(compare "$W/host-before.png" | grep -q differ && echo yes || echo no)"
-check "the host screen changed with the input" yes "$(cmp -s "$W/host.png" "$W/host-before.png" && echo no || echo yes)"
+# The positive control: the screen before the last typing is not what the
+# viewer ended with, so the comparison sees a typed cell.
+check "the typing reached the viewer (its desktop differs from the screen before it)" yes "$(compare "$W/host-middle.png" | grep -q differ && echo yes || echo no)"
+check "the viewer's input changed the host's screen" yes "$(cmp -s "$W/host-middle.png" "$W/host-before.png" && echo no || echo yes)"
+check "input sent after the reconnect changed it again" yes "$(cmp -s "$W/host.png" "$W/host-middle.png" && echo no || echo yes)"
+ins=$(grep 'viewer [0-9] gone' "$W/fenestrad.log" | sed 's/.*inputs \([0-9]*\) dropped \([0-9]*\).*/\1:\2/' | tr '\n' ' ')
+check "the session passed on every input event, on both connections, none dropped" "11:0 8:0 " "$ins"
 grep 'fenestra-session' "$W/fenestrad.log" | tail -5
 check "the viewer reconnected" yes "$(grep -c 'connected to' "$W/view.log" | awk '{ print ($1 >= 2) ? "yes" : "no (" $1 ")" }')"
 r2=$(grep 'viewer 2 gone' "$W/fenestrad.log" | sed 's/.*resumed \([0-9]*\) resent \([0-9]*\).*/\1 \2/')
