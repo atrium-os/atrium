@@ -32,6 +32,9 @@ pub const GRANTS_MAX: usize = 16;
 pub const REDIRECTS_MAX: usize = 5;
 /// Requests one page may make of the server (the page and its resources).
 pub const REQUESTS_MAX: usize = 256;
+/// Requests one live run (§4.5) may make; portcullisd's rate bounds them
+/// in time.
+pub const LIVE_REQUESTS_MAX: usize = 4096;
 /// The longest answer head line from the fetcher.
 const HEAD_MAX: usize = 64 + navigator_control::URL_MAX;
 
@@ -98,6 +101,18 @@ fn apps() -> &'static Mutex<HashMap<Origin, String>> {
 pub fn app_of(url: &str) -> Option<String> {
     let l = local::parse(url)?;
     apps().lock().unwrap_or_else(|e| e.into_inner()).get(&l.origin).cloned()
+}
+
+/// The jar the stores of the persona's own trails' local pages use: those
+/// stores are in memory like an Unrecorded trail's (the `Some` jar), under
+/// a jar no trail has.
+pub const PERSONAL_LOCAL_STORES: u64 = u64::MAX;
+
+/// The in-memory store of a live page of your own server (§4.5): per
+/// (trail jar, app, origin), named so no web site's store can be it (a
+/// site has no spaces).
+pub fn store_key(jar: Option<u64>, app_id: &str, origin: Origin) -> crate::live_storage::Key {
+    crate::live_storage::Key { jar: Some(jar.unwrap_or(PERSONAL_LOCAL_STORES)), site: format!("local {app_id} {}", origin.spell()) }
 }
 
 /// The most cookies one jar keeps, and the most jars kept.
@@ -217,6 +232,9 @@ pub struct LocalUp {
     /// The trail's jar (`None` for Personal).
     jar: Option<u64>,
     requests: usize,
+    requests_max: usize,
+    /// The app portcullisd said served the last request: its id and name.
+    app: Option<(String, String)>,
     /// The fetcher's jail, kept while the channel is.
     _worker: Option<crate::worker::Worker>,
 }
@@ -225,7 +243,7 @@ impl LocalUp {
     /// For the page at `url` (a local address), with a fetcher on `chan`.
     pub fn new(url: &str, jar: Option<u64>, chan: UnixStream, open: Opener, worker: Option<crate::worker::Worker>) -> Result<LocalUp, String> {
         let page = local::parse(url).ok_or("not one of your own server's addresses")?;
-        Ok(LocalUp { page, chan, open, jar, requests: 0, _worker: worker })
+        Ok(LocalUp { page, chan, open, jar, requests: 0, requests_max: REQUESTS_MAX, app: None, _worker: worker })
     }
 
     /// A fetcher started on a new socket pair, and portcullisd's sockets.
@@ -236,36 +254,86 @@ impl LocalUp {
         LocalUp::new(url, jar, ours, Box::new(open_port), Some(w))
     }
 
+    /// For a live run (§4.5): its larger request count.
+    pub fn live(mut self) -> LocalUp {
+        self.requests_max = LIVE_REQUESTS_MAX;
+        self
+    }
+
+    /// The page's origin.
+    pub fn origin(&self) -> Origin {
+        self.page.origin
+    }
+
+    /// The app that served the last request (id, name).
+    pub fn app(&self) -> Option<&(String, String)> {
+        self.app.as_ref()
+    }
+
+    /// The trail's jar.
+    pub fn jar(&self) -> Option<u64> {
+        self.jar
+    }
+
+    /// A GET for a live page: status, content type token, body, and the
+    /// address that answered.
+    pub fn get(&mut self, url: &str) -> Result<(u16, String, Vec<u8>, String), String> {
+        self.request(url, None).map(|(s, k, b, at, _)| (s, k, b, at))
+    }
+
+    /// A live page's POST of `body` as `kind`. A 301, 302 or 303 answer is
+    /// followed as a GET; a 307 or 308, which would send the body again, is
+    /// refused.
+    pub fn post(&mut self, url: &str, kind: &str, body: &[u8]) -> Result<(u16, String, Vec<u8>, String), String> {
+        self.request(url, Some((kind, body))).map(|(s, k, b, at, _)| (s, k, b, at))
+    }
+
     /// `url` fetched through the fetcher, as a converter's fetch is answered.
     pub fn fetch(&mut self, url: &str) -> Reply {
-        match self.fetch_inner(url) {
+        match self.request(url, None) {
             Ok((status, _kind, body, at, redirects)) => Reply::Ok { status, rest: format!("{redirects} {} {at}", body.len()), body },
             Err(e) => Reply::Err(e),
         }
     }
 
-    fn fetch_inner(&mut self, url: &str) -> Result<(u16, String, Vec<u8>, String, usize), String> {
+    fn request(&mut self, url: &str, mut post: Option<(&str, &[u8])>) -> Result<(u16, String, Vec<u8>, String, usize), String> {
         let mut at = self.check(url)?;
+        if let Some((kind, body)) = post {
+            if kind.is_empty() || kind.len() > POST_TYPE_MAX || !kind.bytes().all(|b| (0x20..0x7f).contains(&b)) || body.len() > POST_MAX {
+                return Err("a POST out of shape".into());
+            }
+        }
         for redirects in 0..=REDIRECTS_MAX {
-            if self.requests >= REQUESTS_MAX {
-                return Err(format!("more than {REQUESTS_MAX} requests to your own server from one page"));
+            if self.requests >= self.requests_max {
+                return Err(format!("more than {} requests to your own server from one page", self.requests_max));
             }
             self.requests += 1;
             let (sock, app_id, app) = (self.open)(at.origin.port)?;
-            apps().lock().unwrap_or_else(|e| e.into_inner()).insert(at.origin, app);
+            apps().lock().unwrap_or_else(|e| e.into_inner()).insert(at.origin, app.clone());
+            self.app = Some((app_id.clone(), app));
             // The jar is the app's that portcullisd says serves the port now.
             let key: JarKey = (self.jar, app_id, at.origin);
-            let mut msg = format!("G {}\n", at.url());
+            let mut msg = format!("{} {}\n", if post.is_some() { "P" } else { "G" }, at.url()).into_bytes();
             if let Some(c) = cookie_header(&key, &at.path, Instant::now()) {
-                msg.push_str(&format!("C {c}\n"));
+                msg.extend_from_slice(format!("C {c}\n").as_bytes());
             }
-            atrium_fdpass::send(self.chan.as_raw_fd(), msg.as_bytes(), &[sock.as_raw_fd()]).map_err(|e| format!("fetcher: {e}"))?;
+            if let Some((kind, body)) = post {
+                msg.extend_from_slice(format!("T {kind}\nB {}\n", body.len()).as_bytes());
+                msg.extend_from_slice(body);
+            }
+            atrium_fdpass::send(self.chan.as_raw_fd(), &msg, &[sock.as_raw_fd()]).map_err(|e| format!("fetcher: {e}"))?;
             drop(sock);
             let (answer, set) = self.answer()?;
             keep_cookies(&key, set, Instant::now());
             match answer {
                 Answer::Ok { status, kind, body } => return Ok((status, kind, body, at.url(), redirects)),
-                Answer::Redirect(to) => at = self.check(&to)?,
+                Answer::Redirect(status, to) => {
+                    if post.is_some() && matches!(status, 307 | 308) {
+                        return Err("your server asked for the POST again elsewhere".into());
+                    }
+                    post = None;
+                    at = self.check(&to)?;
+                }
             }
         }
         Err("too many redirects on your own server".into())
@@ -302,8 +370,9 @@ impl LocalUp {
             return Err(why.to_string());
         }
         if let Some(rest) = head.strip_prefix("redirect ") {
-            let to = rest.split_once(' ').map(|(_, u)| u).ok_or("fetcher: a bad redirect")?;
-            return Ok((Answer::Redirect(to.to_string()), set));
+            let (status, to) = rest.split_once(' ').ok_or("fetcher: a bad redirect")?;
+            let status = status.parse::<u16>().map_err(|_| "fetcher: a bad redirect")?;
+            return Ok((Answer::Redirect(status, to.to_string()), set));
         }
         let f: Vec<&str> = head.strip_prefix("ok ").ok_or("fetcher: a bad answer")?.splitn(4, ' ').collect();
         let (Some(status), Some(kind), Some(len)) = (f.first().and_then(|s| s.parse::<u16>().ok()), f.get(1), f.get(2).and_then(|l| l.parse::<usize>().ok())) else {
@@ -321,8 +390,13 @@ impl LocalUp {
 
 enum Answer {
     Ok { status: u16, kind: String, body: Vec<u8> },
-    Redirect(String),
+    Redirect(u16, String),
 }
+
+/// The fetcher's POST bounds (navigator-fetch's `local::POST_MAX` and
+/// `POST_TYPE_MAX`), mirrored here.
+const POST_MAX: usize = 32 * 1024;
+const POST_TYPE_MAX: usize = 128;
 
 /// The fetcher's own bounds, mirrored here (it is a separate process).
 fn navigator_fetch_timeout() -> Duration { Duration::from_secs(30) }
@@ -451,6 +525,53 @@ mod tests {
         forget(Some(7001), None);
         up.fetch(&format!("{base}/home"));
         assert_eq!(heard.lock().unwrap().as_slice(), &["-", "sid=1", "-", "-"]);
+    }
+
+    #[test]
+    fn a_live_pages_post_goes_to_its_origin_and_a_redirect_after_it_is_a_get() {
+        let reqs = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let r = reqs.clone();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for reply in ["HTTP/1.1 303 See Other\r\nLocation: /done\r\nContent-Length: 0\r\n\r\n",
+                          "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\n\r\nok",
+                          "HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n"] {
+                let (mut c, _) = l.accept().unwrap();
+                let mut b = [0u8; 4096];
+                let n = c.read(&mut b).unwrap_or(0);
+                r.lock().unwrap().push(String::from_utf8_lossy(&b[..n]).to_string());
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || navigator_fetch::local::serve(&theirs));
+        let open: Opener = Box::new(move |_| Ok((TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?, "org.test.a".into(), "A".into())));
+        let base = format!("http://localhost:{port}");
+        let mut up = LocalUp::new(&format!("{base}/"), None, ours, open, None).unwrap().live();
+        let (status, kind, body, at) = up.post(&format!("{base}/api"), "application/json", b"{\"n\":1}").unwrap();
+        assert_eq!((status, kind.as_str(), body.as_slice(), at), (200, "text/html", &b"ok"[..], format!("{base}/done")));
+        assert!(up.post(&format!("{base}/api"), "application/json", b"{}").unwrap_err().contains("POST again"), "a 307 would resend the body");
+        assert!(up.post("http://localhost:1/api", "text/plain", b"x").is_err(), "another origin, before any socket");
+        assert!(up.post(&format!("{base}/api"), "a\nb", b"x").is_err(), "a type out of shape");
+        assert!(up.post(&format!("{base}/api"), "text/plain", &vec![b'x'; POST_MAX + 1]).is_err(), "over the bound");
+        assert_eq!(up.app().map(|a| a.0.as_str()), Some("org.test.a"));
+        let seen = reqs.lock().unwrap();
+        assert!(seen[0].starts_with("POST /api HTTP/1.1\r\n") && seen[0].ends_with("{\"n\":1}") && seen[0].contains("Content-Type: application/json\r\n"), "{}", seen[0]);
+        assert!(seen[1].starts_with("GET /done HTTP/1.1\r\n"), "the 303 is followed as a GET");
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn a_live_local_pages_stores_are_its_apps_and_its_ports_in_memory() {
+        let o = |port| Origin { host: local::Host::Localhost, port };
+        let a = store_key(None, "org.test.a", o(9000));
+        assert_eq!(a.jar, Some(PERSONAL_LOCAL_STORES), "the persona's own trails' stores are in memory too");
+        assert_ne!(a, store_key(None, "org.test.b", o(9000)), "another app on the port");
+        assert_ne!(a, store_key(None, "org.test.a", o(9090)), "another port");
+        assert_ne!(a, store_key(Some(3), "org.test.a", o(9000)), "an Unrecorded trail");
+        assert!(crate::live_storage::Key::of(None, "http://localhost:9000/").is_none_or(|k| k != a), "no web page's store is it");
+        assert!(a.site.contains(' '), "no site has a space");
     }
 
     #[test]

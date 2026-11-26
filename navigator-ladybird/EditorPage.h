@@ -117,7 +117,8 @@ public:
     // window, as with a blocked popup.
     bool page_did_propose_new_window(URL::URL const& url) override
     {
-        if (!island_scene || url.scheme() != "https"sv) {
+        // http only for your own server's page; navigatord decides (§4.5).
+        if (!island_scene || (url.scheme() != "https"sv && url.scheme() != "http"sv)) {
             warnln("live page: new window for {} refused", url.serialize());
             return true;
         }

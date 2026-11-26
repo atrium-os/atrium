@@ -1220,7 +1220,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     let waiting = Arc::new(Mutex::new(files::Waiting::default()));
     let mut handed: Vec<String> = Vec::new();
     // Local addresses the person started a navigation to (§4.4).
-    let mut typed = local_server::Typed::default();
+    let typed = Arc::new(Mutex::new(local_server::Typed::default()));
     // Save and hand-offs: the press, spent with frescod as a press on a
     // window of the UI's connection: ours when we opened it over the chrome
     // channel (navigator-ui.md §2.3a), else the UI's own.
@@ -1635,7 +1635,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 // navigation the person started, spent by this one Open;
                 // never from the cache or the store, never with cookies.
                 let own = ctl::local::parse(&url).is_some();
-                if own && !typed.take(&url, Instant::now()) {
+                if own && !typed.lock().unwrap_or_else(|e| e.into_inner()).take(&url, Instant::now()) {
                     eprintln!("navigatord: {url}: a local address not typed by the person; refused");
                     send(&w, &Event::Failed { id, url: url.clone(), why: "Your own server opens only from an address you type".into() });
                     continue;
@@ -1854,7 +1854,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 });
             }
-            Request::Typed { url } => typed.grant(&url, Instant::now()),
+            Request::Typed { url } => typed.lock().unwrap_or_else(|e| e.into_inner()).grant(&url, Instant::now()),
             Request::Activate { id, page, href, jar } => {
                 let p = state.lock().unwrap().page(&page);
                 let action = match p {
@@ -1872,7 +1872,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 // A link within your own server's page may open its origin.
                 if let LinkAction::Navigate { url, .. } = &action {
                     if local_server::same_origin_link(&page, url) {
-                        typed.grant(url, Instant::now());
+                        typed.lock().unwrap_or_else(|e| e.into_inner()).grant(url, Instant::now());
                     }
                 }
                 if let LinkAction::Handoff { url, .. } = &action {
@@ -2067,12 +2067,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     if let Err(why) = spend(press) { return Err(format!("\0{why}")); }
                     live = None;
                     widget = None;
-                    start_live(&cfg, &w, window, page, press, rect, cookies.clone(), jar, &waiting)
+                    start_live(&cfg, &w, window, page, press, rect, cookies.clone(), jar, &waiting, &typed)
                 })();
                 match result {
                     Ok(l) => {
                         live_origin = origin(&l.url);
-                        if remember && !jar.unrecorded() && cfg.vpn.is_none() {
+                        // Your own server's origin is never remembered: the
+                        // app on a port can change (§4.5).
+                        if remember && !jar.unrecorded() && cfg.vpn.is_none() && ctl::local::parse(&l.url).is_none() {
                             match live_remembered().lock().unwrap().remember(&l.url) {
                                 Ok(()) => send(&w, &Event::LiveRemembered { url: l.url.clone() }),
                                 Err(why) => eprintln!("navigatord: remembering a live origin: {why}"),
@@ -2103,7 +2105,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     let window = window.ok_or("no window to run it in")?;
                     live = None;
                     widget = None;
-                    start_live(&cfg, &w, window, page, [0; 16], rect, cookies.clone(), jar, &waiting)
+                    start_live(&cfg, &w, window, page, [0; 16], rect, cookies.clone(), jar, &waiting, &typed)
                 })();
                 match result {
                     Ok(l) => {
@@ -3039,11 +3041,25 @@ mod island_metadata_tests {
 /// Its requests go through the trail's `jar` in Arca when navigatord has
 /// one (I6.3, D9), else the plain fetcher.
 fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4],
-              cookies: Option<Cookies>, jar: Jar, waiting: &Arc<Mutex<files::Waiting>>) -> Result<live_page::Live, String> {
+              cookies: Option<Cookies>, jar: Jar, waiting: &Arc<Mutex<files::Waiting>>,
+              typed: &Arc<Mutex<local_server::Typed>>) -> Result<live_page::Live, String> {
+    let limen = cfg.limen.as_deref().ok_or("no Limen service")?;
+    let tell = Arc::new(LiveTell { w: w.clone(), from: page.clone(), waiting: waiting.clone(), typed: typed.clone() });
+    // ★ Your own server's page (background-apps.md §4.5): every request
+    // through the local fetcher to its one origin, stores in memory.
+    if ctl::local::parse(&page).is_some() {
+        if cfg.portal.is_some() || cfg.vpn.is_some() {
+            return Err("a sign-in window doesn't open your own servers".into());
+        }
+        let spec = cfg.fetchd.as_ref().ok_or("no fetcher")?;
+        let up = local_server::LocalUp::start(&page, jar_id(jar), spec, &format!("f{}", instance()))?.live();
+        let local = live_page::LocalLive::new(up, &page);
+        let storage: Box<dyn live_page::LocalStorage + Send> = Box::new(local.stores());
+        return live_page::Live::start(limen, window, page, press, rect, cfg.clone(), None, Some(local), Some(storage), tell);
+    }
     let storage = live_page::JarStores { stores: live_stores(), idb: live_idb(), jar: jar_id(jar) };
     let jar = cookies.map(|c| live_page::LiveJar::open(c, &page, jar_id(jar))).transpose()?;
-    let tell = Arc::new(LiveTell { w: w.clone(), from: page.clone(), waiting: waiting.clone() });
-    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar, Some(storage), tell)
+    live_page::Live::start(limen, window, page, press, rect, cfg.clone(), jar, None, Some(Box::new(storage)), tell)
 }
 
 /// The ids navigatord gives the files a live page offers (I6.4): the top
@@ -3055,13 +3071,34 @@ struct LiveTell {
     w: Arc<Mutex<UnixStream>>,
     from: String,
     waiting: Arc<Mutex<files::Waiting>>,
+    /// The connection's typed grants (§4.4).
+    typed: Arc<Mutex<local_server::Typed>>,
+}
+
+impl LiveTell {
+    /// A live page of your own server led to another of its pages (§4.5):
+    /// the UI's Open of it is granted, as a link within the origin is.
+    fn grant_own(&self, url: &str) {
+        if local_server::same_origin_link(&self.from, url) {
+            self.typed.lock().unwrap_or_else(|e| e.into_inner()).grant(url, Instant::now());
+        }
+    }
 }
 
 impl live_page::Tell for LiveTell {
     fn started(&self, origin: String) { send(&self.w, &Event::LiveStarted { url: self.from.clone(), origin }); }
-    fn navigate(&self, url: String) { send(&self.w, &Event::LiveNavigate { from: self.from.clone(), url }); }
-    fn url_changed(&self, url: String) { send(&self.w, &Event::LiveUrlChanged { from: self.from.clone(), url }); }
-    fn open_beside(&self, url: String) { send(&self.w, &Event::LiveOpenBeside { from: self.from.clone(), url }); }
+    fn navigate(&self, url: String) {
+        self.grant_own(&url);
+        send(&self.w, &Event::LiveNavigate { from: self.from.clone(), url });
+    }
+    fn url_changed(&self, url: String) {
+        self.grant_own(&url);
+        send(&self.w, &Event::LiveUrlChanged { from: self.from.clone(), url });
+    }
+    fn open_beside(&self, url: String) {
+        self.grant_own(&url);
+        send(&self.w, &Event::LiveOpenBeside { from: self.from.clone(), url });
+    }
     fn file(&self, f: live_page::Offered) {
         let id = LIVE_FILE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | 1 << 31;
         let (size, origin) = (f.bytes.len() as u64, origin(&f.url).unwrap_or_default());

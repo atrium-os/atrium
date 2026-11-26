@@ -3,11 +3,13 @@
 //! It dials nothing. navigatord hands it, with each request, one TCP
 //! socket portcullisd connected to the app; this speaks one HTTP/1.1
 //! exchange on it and closes it. A request is one message on the channel
-//! (a Unix socket that is the fetcher's stdin): `G <url>\n`, then
-//! optionally `C <cookie header>\n` (navigatord's jar for this app and
-//! port), with exactly one descriptor riding on it. The URL must be a
-//! local address by the one parser (`navigator_control::local`), else
-//! nothing is sent.
+//! (a Unix socket that is the fetcher's stdin): `G <url>\n` (a GET) or
+//! `P <url>\n` (a live page's POST, §4.5), then optionally
+//! `C <cookie header>\n` (navigatord's jar for this app and port), and for
+//! a POST `T <content type>\n` and `B <length>\n` followed by that many
+//! body bytes (at most [`POST_MAX`]), with exactly one descriptor riding
+//! on the message. The URL must be a local address by the one parser
+//! (`navigator_control::local`), else nothing is sent.
 //!
 //! Answers, on the same channel: first, for each `Set-Cookie` the server
 //! sent that is well formed, `cookie <path> <max-age or -> <name>=<value>\n`
@@ -26,9 +28,16 @@ use navigator_control::local::{self, cookie_octet, path_ok, token, Local, SetCoo
 
 /// The longest cookie header navigatord sends.
 pub const COOKIE_MAX: usize = 8192;
-/// The longest request message: `G `, an address, the newline, and a
-/// cookie line.
-pub const REQUEST_MAX: usize = 2 + navigator_control::URL_MAX + 1 + 2 + COOKIE_MAX + 1;
+/// The longest POST body: a live page's script, under Nuntius's bound.
+pub const POST_MAX: usize = nuntius_body_max();
+/// The longest content type a POST names.
+pub const POST_TYPE_MAX: usize = 128;
+/// The longest request head: `G `, an address, the newline, a cookie line,
+/// and a POST's type and length lines.
+pub const REQUEST_MAX: usize = 2 + navigator_control::URL_MAX + 1 + 2 + COOKIE_MAX + 1 + 2 + POST_TYPE_MAX + 1 + 2 + 8 + 1;
+
+/// Nuntius's POST bound (32 KiB), which a live page's body already met.
+const fn nuntius_body_max() -> usize { 32 * 1024 }
 /// RFC 6265 §5.1.4's default path for a request to `path`.
 fn default_path(path: &str) -> String {
     let p = path.split_once('?').map_or(path, |(p, _)| p);
@@ -96,35 +105,95 @@ pub enum Answer {
     Err(String),
 }
 
-/// A request message's address and cookie header, or why it is refused.
-pub fn parse_request(msg: &[u8]) -> Result<(Local, Option<String>), String> {
-    let text = std::str::from_utf8(msg).map_err(|_| "not text")?;
-    let text = text.strip_suffix('\n').ok_or("not a request")?;
-    let (first, cookie) = match text.split_once('\n') {
-        Some((a, c)) => (a, Some(c.strip_prefix("C ").ok_or("not a request")?)),
-        None => (text, None),
-    };
-    let url = first.strip_prefix("G ").ok_or("not a request")?;
-    if let Some(c) = cookie {
-        // name=value pairs joined by "; ", nothing else.
-        if c.len() > COOKIE_MAX || c.split("; ").any(|p| !p.split_once('=').is_some_and(|(n, v)| token(n) && v.bytes().all(cookie_octet))) {
-            return Err("a cookie header out of shape".into());
+/// A request: its address, the jar's cookie header, and for a POST its
+/// content type and body length.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    pub local: Local,
+    pub cookie: Option<String>,
+    pub post: Option<(String, usize)>,
+}
+
+/// A request message's head, and how many of its bytes the head took (a
+/// POST's body follows), or why it is refused.
+pub fn parse_head(msg: &[u8]) -> Result<(Request, usize), String> {
+    // Up to the last head line: for a POST the `B` line, else the message.
+    let mut lines = Vec::new();
+    let mut at = 0;
+    while at < msg.len() && lines.len() < 4 {
+        let end = msg[at..].iter().position(|&b| b == b'\n').ok_or("not a request")? + at;
+        let line = std::str::from_utf8(&msg[at..end]).map_err(|_| "not text")?;
+        at = end + 1;
+        lines.push(line);
+        if line.starts_with("B ") {
+            break;
         }
     }
-    let l = local::parse(url).ok_or_else(|| "not one of your own server's addresses".to_string())?;
-    Ok((l, cookie.map(String::from)))
+    let mut it = lines.into_iter();
+    let first = it.next().ok_or("not a request")?;
+    let (post, url) = match (first.strip_prefix("G "), first.strip_prefix("P ")) {
+        (Some(u), _) => (false, u),
+        (_, Some(u)) => (true, u),
+        _ => return Err("not a request".into()),
+    };
+    let mut cookie = None;
+    let mut kind = None;
+    let mut len = None;
+    for line in it {
+        if let Some(c) = line.strip_prefix("C ").filter(|_| cookie.is_none() && kind.is_none()) {
+            // name=value pairs joined by "; ", nothing else.
+            if c.len() > COOKIE_MAX || c.split("; ").any(|p| !p.split_once('=').is_some_and(|(n, v)| token(n) && v.bytes().all(cookie_octet))) {
+                return Err("a cookie header out of shape".into());
+            }
+            cookie = Some(c.to_string());
+        } else if let Some(t) = line.strip_prefix("T ").filter(|_| post && kind.is_none()) {
+            if t.is_empty() || t.len() > POST_TYPE_MAX || !t.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                return Err("a content type out of shape".into());
+            }
+            kind = Some(t.to_string());
+        } else if let Some(n) = line.strip_prefix("B ").filter(|_| kind.is_some()) {
+            let n = n.parse::<usize>().ok().filter(|n| *n <= POST_MAX).ok_or("a body length out of bounds")?;
+            len = Some(n);
+        } else {
+            return Err("not a request".into());
+        }
+    }
+    let post = match (post, kind, len) {
+        (false, None, None) => None,
+        (true, Some(k), Some(n)) => Some((k, n)),
+        _ => return Err("not a request".into()),
+    };
+    if post.is_none() && at != msg.len() {
+        return Err("not a request".into());
+    }
+    let local = local::parse(url).ok_or_else(|| "not one of your own server's addresses".to_string())?;
+    Ok((Request { local, cookie, post }, at))
+}
+
+/// A GET request message's address and cookie header, or why it is refused.
+pub fn parse_request(msg: &[u8]) -> Result<(Local, Option<String>), String> {
+    match parse_head(msg)? {
+        (Request { local, cookie, post: None }, _) => Ok((local, cookie)),
+        _ => Err("not a request".into()),
+    }
 }
 
 /// One exchange for `l` on `sock`, closed after; `cookie` is sent as the
-/// request's `Cookie` header.
-pub fn exchange(mut sock: TcpStream, l: &Local, cookie: Option<&str>) -> Answer {
+/// request's `Cookie` header, and `post` (content type, body) makes it a
+/// POST from the page's own origin.
+pub fn exchange(mut sock: TcpStream, l: &Local, cookie: Option<&str>, post: Option<(&str, &[u8])>) -> Answer {
     let _ = sock.set_read_timeout(Some(crate::TIMEOUT));
     let _ = sock.set_write_timeout(Some(crate::TIMEOUT));
     let cookie = cookie.map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
+    let (method, body_head, body) = match post {
+        Some((kind, body)) => ("POST", format!("Origin: {}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n", l.origin.spell(), body.len()), body),
+        None => ("GET", String::new(), &[][..]),
+    };
     // One write, as the web fetcher's.
-    let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: atrium-navigator-fetch/0.1\r\nAccept: */*\r\n\
-                       Accept-Encoding: identity\r\n{cookie}Connection: close\r\n\r\n", l.path, l.origin.host_header());
-    if let Err(e) = sock.write_all(req.as_bytes()) {
+    let mut req = format!("{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: atrium-navigator-fetch/0.1\r\nAccept: */*\r\n\
+                       Accept-Encoding: identity\r\n{cookie}{body_head}Connection: close\r\n\r\n", l.path, l.origin.host_header()).into_bytes();
+    req.extend_from_slice(body);
+    if let Err(e) = sock.write_all(&req) {
         return Answer::Err(format!("send: {e}"));
     }
     let r = match crate::http::read_response_capped(&mut sock, None) {
@@ -167,7 +236,8 @@ pub fn write_answer(out: &mut impl Write, a: &Answer) -> io::Result<()> {
 
 /// Serve requests on `chan` until it closes or a message is malformed.
 pub fn serve(chan: &std::os::unix::net::UnixStream) -> io::Result<()> {
-    let mut buf = vec![0u8; REQUEST_MAX];
+    use std::io::Read;
+    let mut buf = vec![0u8; REQUEST_MAX + POST_MAX];
     loop {
         let got = atrium_fdpass::recv(chan.as_raw_fd(), &mut buf, 1)?;
         if got.n == 0 {
@@ -177,8 +247,22 @@ pub fn serve(chan: &std::os::unix::net::UnixStream) -> io::Result<()> {
         let (Some(fd), true) = (fds.pop(), fds.is_empty()) else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a request without its socket"));
         };
-        let answer = match parse_request(&buf[..got.n]) {
-            Ok((l, cookie)) => exchange(tcp(fd)?, &l, cookie.as_deref()),
+        let answer = match parse_head(&buf[..got.n]) {
+            Ok((req, head)) => match &req.post {
+                None => exchange(tcp(fd)?, &req.local, req.cookie.as_deref(), None),
+                Some((kind, len)) => {
+                    // The body: what came with the head, then the rest, read
+                    // whole (a stream may split one message).
+                    let have = got.n - head;
+                    if have > *len {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "a body longer than it said"));
+                    }
+                    let mut body = buf[head..got.n].to_vec();
+                    body.resize(*len, 0);
+                    (&*chan).read_exact(&mut body[have..])?;
+                    exchange(tcp(fd)?, &req.local, req.cookie.as_deref(), Some((kind, &body)))
+                }
+            },
             Err(why) => Answer::Err(why),
         };
         write_answer(&mut &*chan, &answer)?;
@@ -303,6 +387,56 @@ mod tests {
         assert!(parse_request(b"G http://localhost:8080/\nC a=1\r\nX: y\n").is_err());
         assert!(parse_request(b"G http://localhost:8080/\nX a=1\n").is_err());
         assert!(parse_request(b"G http://localhost:8080/\nC a b\n").is_err());
+    }
+
+    #[test]
+    fn a_post_carries_its_type_and_body_even_split_and_is_checked() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut head = vec![];
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h == "\r\n" { break }
+                head.push(h.trim().to_string());
+            }
+            let len: usize = head.iter().find_map(|h| h.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+            let mut body = vec![0; len];
+            r.read_exact(&mut body).unwrap();
+            c.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+            (head, String::from_utf8(body).unwrap())
+        });
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let fetchd = std::thread::spawn(move || serve(&theirs));
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // The head and the body's start in one message, the rest after.
+        let msg = format!("P http://localhost:{port}/api/items\nC s=1\nT application/json\nB 7\n{{\"a");
+        atrium_fdpass::send(ours.as_raw_fd(), msg.as_bytes(), &[s.as_raw_fd()]).unwrap();
+        drop(s);
+        (&ours).write_all(b"\":1}").unwrap();
+        let mut r = BufReader::new(&ours);
+        let mut head = String::new();
+        r.read_line(&mut head).unwrap();
+        assert_eq!(head, format!("ok 201 application/json 2 http://localhost:{port}/api/items\n"));
+        let (seen, body) = srv.join().unwrap();
+        assert_eq!(seen[0], "POST /api/items HTTP/1.1");
+        assert!(seen.contains(&format!("Origin: http://localhost:{port}")) && seen.contains(&"Content-Type: application/json".to_string()) && seen.contains(&"Cookie: s=1".to_string()), "{seen:?}");
+        assert_eq!(body, "{\"a\":1}");
+        drop(r);
+        drop(ours);
+        fetchd.join().unwrap().unwrap();
+        // Heads out of shape.
+        let max = POST_MAX + 1;
+        for bad in ["P http://localhost:1/\nB 1\n", "P http://localhost:1/\nT a/b\n", "G http://localhost:1/\nT a/b\nB 1\n",
+                    "P http://localhost:1/\nT a\rb\nB 1\n", "P http://localhost:1/\nT a/b\nB x\n", "P http://127.0.0.2:1/\nT a/b\nB 0\n"] {
+            assert!(parse_head(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(parse_head(format!("P http://localhost:1/\nT a/b\nB {max}\n").as_bytes()).is_err(), "over the bound");
+        let (req, at) = parse_head(b"P http://localhost:1/x\nT text/plain;charset=UTF-8\nB 2\nhi").unwrap();
+        assert_eq!((req.post, at), (Some(("text/plain;charset=UTF-8".into(), 2)), 54));
     }
 
     #[test]

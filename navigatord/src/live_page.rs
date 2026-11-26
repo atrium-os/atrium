@@ -44,6 +44,15 @@ pub fn scope(page: &str, url: &str) -> Result<(), &'static str> {
     if url.len() > navigator_control::URL_MAX || !navigator_control::clean(url, navigator_control::URL_MAX) {
         return Err("the address is out of shape");
     }
+    // ★ Your own server's page (background-apps.md §4.5): its one origin,
+    // in the one spelling the local parser gives, and nothing else.
+    if let Some(home) = navigator_control::local::parse(page) {
+        return match navigator_control::local::parse(url) {
+            Some(l) if l.origin == home.origin && l.url() == url => Ok(()),
+            Some(l) if l.origin == home.origin => Err("the address is not in its normal spelling"),
+            _ => Err("a page of your own server reaches only its own origin"),
+        };
+    }
     let page = url::Url::parse(page).ok().filter(|u| u.scheme() == "https").ok_or("the page is not an HTTPS page")?;
     let target = url::Url::parse(url).map_err(|_| "not an address")?;
     if target.scheme() != "https" || !target.username().is_empty() || target.password().is_some() || target.fragment().is_some() {
@@ -244,6 +253,108 @@ impl Resources for LiveJar {
     fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<Got, String> {
         let f = navigator_cookies::Fetch::script_post(url, &self.host, content_type, body.to_vec()).from_origin(&self.origin);
         Self::answer(self.cookies.lock().unwrap().fetch_once(self.view, &f))
+    }
+}
+
+/// A live page of your own server (background-apps.md §4.5): every
+/// request through the local fetcher and portcullisd's sockets, held to the
+/// page's origin by [`crate::local_server::LocalUp`], its cookies the
+/// in-memory jar of (trail jar, app, origin). No Arca, no network.
+#[derive(Clone)]
+pub struct LocalLive {
+    up: Arc<Mutex<crate::local_server::LocalUp>>,
+    /// The page itself, already fetched by a form's answer, kept for this
+    /// run so it is not asked for twice.
+    first: Arc<Mutex<Option<Got>>>,
+}
+
+impl LocalLive {
+    pub fn new(up: crate::local_server::LocalUp, url: &str) -> LocalLive {
+        let first = unstash(up.jar(), url);
+        LocalLive { up: Arc::new(Mutex::new(up)), first: Arc::new(Mutex::new(first)) }
+    }
+
+    fn up(&self) -> std::sync::MutexGuard<'_, crate::local_server::LocalUp> {
+        self.up.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A form the page submitted (I6.3), as a POST to its own server; the
+    /// page that answers is kept for the run that shows it. Returns that
+    /// page's address.
+    pub fn submit(&self, url: &str, body: &[u8]) -> Result<String, String> {
+        let mut up = self.up();
+        let (status, kind, answer, at) = up.post(url, "application/x-www-form-urlencoded", body)?;
+        if answer.len() > navigator_prerender::fetch::LIVE_RESOURCE_MAX {
+            return Err("the answer is too big".into());
+        }
+        stash(up.jar(), &at, Got::new(status, kind, answer));
+        Ok(at)
+    }
+
+    /// Its stores (I6.3, I6.7): in memory, per (trail jar, app, origin).
+    pub fn stores(&self) -> LocalStores {
+        LocalStores { stores: crate::live_stores(), idb: crate::live_idb(), up: self.clone() }
+    }
+}
+
+impl Resources for LocalLive {
+    fn get(&mut self, url: &str, first: bool) -> Result<Got, String> {
+        if first {
+            if let Some(a) = self.first.lock().unwrap_or_else(|e| e.into_inner()).take() { return Ok(a); }
+        }
+        let (status, kind, body, _) = self.up().get(url)?;
+        if body.len() > navigator_prerender::fetch::LIVE_RESOURCE_MAX { return Err("the answer is too big".into()); }
+        Ok(Got::new(status, kind, body))
+    }
+
+    fn post(&mut self, url: &str, content_type: &str, body: &[u8]) -> Result<Got, String> {
+        let (status, kind, body, _) = self.up().post(url, content_type, body)?;
+        if body.len() > navigator_prerender::fetch::LIVE_RESOURCE_MAX { return Err("the answer is too big".into()); }
+        Ok(Got::new(status, kind, body))
+    }
+}
+
+/// A live page of your own server's stores: in memory only, one per
+/// (trail jar, app that serves it, origin), so another app on the port, or
+/// another port, starts with none.
+pub struct LocalStores {
+    stores: Arc<Mutex<crate::live_storage::Stores>>,
+    idb: Arc<Mutex<crate::live_idb::Stores>>,
+    up: LocalLive,
+}
+
+impl LocalStores {
+    /// The store of `page`, when it is the run's origin and the app is known.
+    fn key(&self, page: &str) -> Result<crate::live_storage::Key, String> {
+        let up = self.up.up();
+        let l = navigator_control::local::parse(page).filter(|l| l.origin == up.origin()).ok_or("not this page's origin")?;
+        let (app, _) = up.app().ok_or("no app has answered yet")?;
+        Ok(crate::local_server::store_key(up.jar(), app, l.origin))
+    }
+}
+
+impl LocalStorage for LocalStores {
+    fn load(&mut self, page: &str) -> Result<Vec<u8>, String> {
+        let key = self.key(page)?;
+        Ok(self.stores.lock().unwrap().load(&key))
+    }
+    fn apply(&mut self, page: &str, batch: &[u8]) -> Result<(), String> {
+        let key = self.key(page)?;
+        self.stores.lock().unwrap().apply(&key, batch)
+    }
+    fn load_idb(&mut self, page: &str, cache: bool) -> Result<Vec<u8>, String> {
+        let key = self.key(page)?;
+        Ok(self.idb.lock().unwrap().load_kind(&key, if cache { crate::live_idb::Kind::Cache } else { crate::live_idb::Kind::Idb }))
+    }
+    fn apply_idb(&mut self, page: &str, part: &[u8], cache: bool) -> Result<(), String> {
+        let key = self.key(page)?;
+        self.idb.lock().unwrap().apply_kind(&key, if cache { crate::live_idb::Kind::Cache } else { crate::live_idb::Kind::Idb }, part)
+    }
+    fn used(&mut self, page: &str) -> Option<(u64, u64)> {
+        let key = self.key(page).ok()?;
+        let kept = self.stores.lock().unwrap().used(&key);
+        let indexed = self.idb.lock().unwrap().used(&key);
+        Some(((kept + indexed) as u64, STORED_MAX))
     }
 }
 
@@ -702,8 +813,13 @@ pub fn with_reporter_for(html: &[u8], frame: bool) -> Vec<u8> {
 /// address in its normal spelling, without credentials, of any origin
 /// (another origin opens in the document lane). `None` refuses it.
 pub fn navigation(page: Option<&str>, to: &str) -> Option<String> {
-    page?;
+    let page = page?;
     if !navigator_control::clean(to, navigator_control::URL_MAX) { return None; }
+    // From your own server's page: within its origin, in the one spelling
+    // (§4.5); to anywhere else, only an https address, as from any page.
+    if let (Some(home), Some(l)) = (navigator_control::local::parse(page), navigator_control::local::parse(to)) {
+        return (l.origin == home.origin && l.url() == to).then(|| to.to_string());
+    }
     let u = url::Url::parse(to).ok()?;
     (u.scheme() == "https" && u.username().is_empty() && u.password().is_none() && u.as_str() == to).then(|| to.to_string())
 }
@@ -907,7 +1023,7 @@ fn tell_picked(connection: &mut Parent, embed: u64, answer: &limen::web_island::
 /// The serve loop's hooks for a running page.
 struct RunHooks {
     delivered: std::sync::mpsc::Sender<String>,
-    storage: Option<JarStores>,
+    storage: Option<Box<dyn LocalStorage + Send>>,
     tell: Arc<dyn Tell>,
     /// The APIs told already, each once.
     apis: std::collections::HashSet<limen::web_island::Api>,
@@ -944,7 +1060,7 @@ impl Hooks for RunHooks {
         self.mail.lock().unwrap().from_page(to.ok_or("from the page, a message names its frame")?, target, data)
     }
     fn messages(&mut self) -> Vec<u8> { self.mail.lock().unwrap().take_for_page() }
-    fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.storage.as_mut().map(|s| s as &mut dyn LocalStorage) }
+    fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.storage.as_mut().map(|s| s.as_mut() as &mut dyn LocalStorage) }
     fn stored(&mut self, page: &str) {
         if let Some(u) = self.storage.as_mut().and_then(|s| s.used(page)) {
             // Told only when it changed.
@@ -1112,7 +1228,8 @@ impl Live {
         rect: [u32; 4],
         cfg: Arc<crate::Config>,
         jar: Option<LiveJar>,
-        storage: Option<JarStores>,
+        local: Option<LocalLive>,
+        storage: Option<Box<dyn LocalStorage + Send>>,
         tell: Arc<dyn Tell>,
     ) -> Result<Self, String> {
         scope(&url, &url).map_err(|why| format!("this page can't run live: {why}"))?;
@@ -1140,6 +1257,8 @@ impl Live {
         let page = url.clone();
         let (delivered_tx, delivered) = std::sync::mpsc::channel::<String>();
         let forms = jar.clone();
+        let local_forms = local.clone();
+        let local_serve = local;
         let closing = jar.clone();
         let picked = Arc::new(Mutex::new(None));
         let asks = Arc::new(Mutex::new(VecDeque::new()));
@@ -1147,9 +1266,10 @@ impl Live {
         let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone(), printed: None,
                                    asks: asks.clone(), mail: mail.clone(), told_usage: None };
         std::thread::spawn(move || {
-            let result = match jar {
-                Some(mut jar) => serve(channel, &page, &mut jar, &mut hooks),
-                None => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, &mut hooks)),
+            let result = match (jar, local_serve) {
+                (_, Some(mut local)) => serve(channel, &page, &mut local, &mut hooks),
+                (Some(mut jar), None) => serve(channel, &page, &mut jar, &mut hooks),
+                (None, None) => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, &mut hooks)),
             };
             match &result {
                 Ok(s) => eprintln!("navigatord: live page served {} requests, {} bytes, {} refused", s.requests, s.bytes, s.refused.len()),
@@ -1273,6 +1393,14 @@ impl Live {
                         // through its jar off this thread; the page that
                         // answers opens as the next trail entry.
                         Some(Report::Submit { url: to, body }) => match (page.as_deref().map(|p| scope(p, to)), &forms) {
+                            (Some(Ok(())), _) if local_forms.is_some() => {
+                                let (local, to, body, tell) = (local_forms.clone(), to.to_string(), body.to_vec(), tell.clone());
+                                std::thread::spawn(move || match local.map(|l| l.submit(&to, &body)) {
+                                    Some(Ok(at)) => tell.navigate(at),
+                                    Some(Err(why)) => eprintln!("navigatord: a live page's form to your own server failed: {why}"),
+                                    None => {}
+                                });
+                            }
                             (Some(Ok(())), Some(jar)) => {
                                 let (jar, to, body, tell) = (jar.clone(), to.to_string(), body.to_vec(), tell.clone());
                                 std::thread::spawn(move || match jar.submit(&to, &body) {
@@ -1471,6 +1599,78 @@ mod tests {
         assert!(memory_moved(Some((70 << 20, cap)), (71 << 20, cap)));
         assert!(memory_moved(Some((70 << 20, cap)), (69 << 20, cap)), "down too");
         assert!(memory_moved(Some((70 << 20, cap)), (70 << 20, Some(256 << 20))), "a new cap");
+    }
+
+    #[test]
+    fn your_own_servers_live_page_reaches_its_one_origin_only() {
+        let page = "http://localhost:9000/app/";
+        assert_eq!(scope(page, "http://localhost:9000/app.js"), Ok(()));
+        assert_eq!(scope(page, "http://localhost:9000/api/items?x=1"), Ok(()));
+        for bad in ["http://localhost:9090/app.js", "http://127.0.0.1:9000/app.js", "http://[::1]:9000/", "https://localhost:9000/",
+                    "https://cdn.example/lib.js", "http://LOCALHOST:9000/app.js", "http://localhost:9000/a#x", "http://example.com/"] {
+            assert!(scope(page, bad).is_err(), "{bad}");
+        }
+        assert!(scope("https://app.example/", "http://localhost:9000/").is_err(), "a web page never reaches your server");
+        assert_eq!(navigation(Some(page), "http://localhost:9000/next").as_deref(), Some("http://localhost:9000/next"));
+        assert_eq!(navigation(Some(page), "https://example.com/").as_deref(), Some("https://example.com/"), "the web, in the document lane");
+        assert_eq!(navigation(Some(page), "http://localhost:9090/"), None, "another port is another app's");
+        assert_eq!(navigation(Some("https://app.example/"), "http://localhost:9000/"), None, "a web page never navigates to it");
+        assert_eq!(address_change(Some(page), "http://localhost:9000/route/1").as_deref(), Some("http://localhost:9000/route/1"));
+        assert_eq!(address_change(Some(page), "http://localhost:9090/route"), None);
+    }
+
+    #[test]
+    fn your_own_servers_live_page_is_served_through_the_local_fetcher() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+        let h = heard.clone();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut b = [0u8; 4096];
+                let n = c.read(&mut b).unwrap_or(0);
+                let req = String::from_utf8_lossy(&b[..n]).to_string();
+                h.lock().unwrap().push(req.lines().next().unwrap_or("").to_string());
+                let (kind, body) = match req.split(' ').nth(1).unwrap_or("") {
+                    "/" => ("text/html", "<p>local"),
+                    "/app.js" => ("text/javascript", "x=2"),
+                    _ => ("application/json", "{\"saved\":true}"),
+                };
+                let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        let (fours, ftheirs) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || navigator_fetch::local::serve(&ftheirs));
+        let open: crate::local_server::Opener = Box::new(move |p| {
+            assert_eq!(p, port, "only the page's own port");
+            Ok((std::net::TcpStream::connect(("127.0.0.1", p)).map_err(|e| e.to_string())?, "org.test.a".into(), "A".into()))
+        });
+        let page = format!("http://localhost:{port}/");
+        let up = crate::local_server::LocalUp::new(&page, None, fours, open, None).unwrap().live();
+        let mut local = LocalLive::new(up, &page);
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let p = page.clone();
+        let server = std::thread::spawn(move || serve(ours, &p, &mut local, &mut Seen::default()));
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, LIVE_PAGE)).unwrap();
+        let (head, body1, _) = body(&mut c);
+        assert_eq!(head, Some((200, page.clone(), Some("text/html".into()))));
+        assert_eq!(body1, with_reporter(b"<p>local"));
+        c.open(Open::get(2, &format!("http://localhost:{port}/app.js"))).unwrap();
+        assert_eq!(body(&mut c).1, b"x=2");
+        let mut post = Open::get(3, &format!("http://localhost:{port}/api/save"));
+        post.method = Method::Post;
+        post.body = Some(nuntius::Body { content_type: "application/json".into(), bytes: b"{}".to_vec() });
+        c.open(post).unwrap();
+        assert_eq!(body(&mut c).1, b"{\"saved\":true}", "a script's POST to its own server");
+        for (id, away) in [(4, "http://localhost:1/x".to_string()), (5, "https://example.com/x".into()), (6, format!("http://127.0.0.1:{port}/x"))] {
+            c.open(Open::get(id, &away)).unwrap();
+            assert_eq!(body(&mut c).2, Some(ErrorCode::Policy), "{away}");
+        }
+        drop(c);
+        server.join().unwrap().unwrap();
+        assert_eq!(heard.lock().unwrap().as_slice(), ["GET / HTTP/1.1", "GET /app.js HTTP/1.1", "POST /api/save HTTP/1.1"], "nothing else reached it");
     }
 
     #[test]

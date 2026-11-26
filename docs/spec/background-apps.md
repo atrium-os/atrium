@@ -296,6 +296,48 @@ outliving the server, persona not person, "typed" per navigation and only
 from the chrome), four medium and three low; all folded in above. Verdict:
 sound once the high ones were in.
 
+### 4.5 Your own server's page live (B7, accepted 2026-11-26)
+
+§4.4 shows your own server's page in the document lane: its scripts run
+once in the converter and stop. Most local servers have script front ends
+(a photo library, a dev server, a notebook), so Shankar accepted running
+them live too (2026-11-26, "build it"), with stores in memory first. This
+relaxes "live code only on HTTPS pages" (navigator-islands.md D12) for
+this one case only.
+
+- **Which pages.** A page of `http://localhost:PORT`, `127.0.0.1` or
+  `[::1]` that this window opened under §4.4's rules (typed, or followed
+  within the origin). "Run this page live" in the tier popover asks "Run
+  this page live? Its scripts run in a jail of their own and reach only
+  Photo Server on this computer." There is no "Always for this site": the
+  app on a port can change, so a local origin is never remembered (D8).
+- **Its network.** The engine is the same jailed engine as for any live
+  page. Every request it makes (a GET, a script's POST, a form) goes to
+  navigatord, which serves only the page's one origin in the local
+  parser's spelling. Each request is a new `OpenLocalPort` socket through
+  the local fetcher, with the in-memory cookie jar of (trail jar, app,
+  origin). Another port, another loopback spelling, `https`, the web and
+  anything else are refused before a socket is asked for. A web page's
+  live run never reaches a local address. Links and `window.open` to
+  another origin go to the document lane as from any live page; the
+  same-origin ones are granted for the window's next Open.
+- **POST.** The local fetcher takes `P <url>` with `T <type>` and
+  `B <length>` and the body (at most 32 KiB, Nuntius's bound), and sends
+  it with `Origin` set to the page's origin. A 301, 302 or 303 after a
+  POST is followed as a GET; a 307 or 308, which would send the body
+  again, is refused.
+- **Stores.** `localStorage`, IndexedDB and the Cache API are kept in
+  navigatord's memory per (trail jar, app that answered, origin): another
+  app on the port or another port starts with none, an Unrecorded trail's
+  go with its jar, and all of them go when Navigator closes. Keeping them
+  at rest in the persona's key group is a later step.
+- **Limits.** A live run makes at most 4096 requests. portcullisd's rate
+  for `OpenLocalPort` is 128 sockets per (person, persona) in any 10 s
+  (it was 32 for document-lane pages only). Frames of other origins,
+  WebSocket and EventSource are not available: the engine's network is
+  request and answer only, as for every live page. Service workers,
+  WebAuthn and the other APIs every live page is refused stay refused.
+
 ## 5. The SDK and Artifex
 
 - **Templates.** `cargo atrium new --template status-item` makes a bar app
@@ -581,7 +623,7 @@ differences:
   socket (at most 5); a redirect elsewhere is refused.
 - **Limits.** One page's requests go one at a time, so a page holds one
   socket at once (well under 8); at most 256 requests a page. Per persona,
-  portcullisd hands out at most 32 sockets in any 10 s, a rate rather
+  portcullisd hands out at most 32 sockets in any 10 s (128 from B7), a rate rather
   than a count of open sockets, since portcullisd can't see when
   navigatord closes one without holding a copy that would keep it open.
 - **Cookies, per app and port.** The fetcher passes on each well-formed
@@ -623,3 +665,44 @@ differences:
   first on-screen run showed a respawned page child being refused without
   this. Another window or a new connection starts with none.
 
+**B7 (2026-11-26).** Your own server's page live, as §4.5. Built on
+the host; the engine builds only on the Mac, so the live run itself is
+not yet checked in a VM.
+
+- **navigatord.** `start_live` starts a local run for a local page:
+  `LocalUp::start(...).live()` (at most 4096 requests) wrapped in
+  `live_page::LocalLive`, which serves the engine's GETs and POSTs
+  (`Resources`) and a form (`submit`, its answer stashed for the next run
+  as the jar's is). `scope` holds a local page to its one origin in the
+  parser's spelling; `navigation` and `address_change` allow the same
+  origin and, from a local page, otherwise only https as before. The
+  stores are `LocalStores`: `live_storage`/`live_idb` keys from
+  `local_server::store_key(jar, app, origin)`, always a `Some` jar
+  (`PERSONAL_LOCAL_STORES` for the persona's own trails) so they stay in
+  memory, and a site with a space no web site has. A local origin is
+  never remembered. `LiveTell` grants the window's next Open of a
+  same-origin page the live run led to (navigate, address change, new
+  window), so the shared `Typed` is an `Arc<Mutex<_>>` per connection.
+- **The local fetcher.** `P`/`T`/`B` requests (`parse_head`, body at most
+  32 KiB, read whole when a stream splits it), sent with `Origin`.
+  `LocalUp::post` follows 301/302/303 as a GET and refuses 307/308.
+- **portcullisd.** `PER_WINDOW` 128. The VM check's burst is now 60
+  asks from one process (`local_port_ask burst`), each getting a socket:
+  portcullisd holds at most 64 connections per uid, and under TCG it
+  answers too slowly to reach 128 in 10 s, so the bound is the host test.
+  `scripts/vm-local-server-check.sh` 37/37 (SCREEN=0) on the amd64 cloud VM.
+- **Navigator UI.** `offers_live` takes a local page navigatord named
+  (`shown_local`); `Prompt::RunPageLive` carries `local: Some(app)`, never
+  `recorded`, and its words say the scripts reach only that app.
+- **Engine.** `live-page.patch` asks navigatord for http as well as https
+  (navigatord decides); `navigator_live_page` takes a local page's
+  address; `page_did_propose_new_window` passes http on.
+- Host tests: `your_own_servers_live_page_reaches_its_one_origin_only`,
+  `your_own_servers_live_page_is_served_through_the_local_fetcher` (the
+  real fetcher and a real server through `serve`), `a_live_pages_post_...`
+  and `a_live_local_pages_stores_...` (navigatord), `a_post_carries_its_
+  type_and_body_even_split_and_is_checked` (navigator-fetch),
+  `your_own_servers_page_is_offered_live_only_once_navigatord_named_its_app`
+  (navigator-ui).
+- Not checked yet: the engine build with these patches and a live run of
+  a local page on the Mac VM.

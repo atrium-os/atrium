@@ -1741,6 +1741,10 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),
             ("over http: anyone on the network can read it".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
+        Prompt::RunPageLive { site, local: Some(_), .. } => (ph::LIGHTNING, vec![
+            ("Run this page live?".into(), body(t.text_primary(), Weight::Semibold)),
+            (format!("Its scripts run in a jail of their own and reach only {site} on this computer."), body(t.text_secondary(), Weight::Regular)),
+        ]),
         Prompt::RunPageLive { site, .. } => (ph::LIGHTNING, vec![
             ("Run this page live?".into(), body(t.text_primary(), Weight::Semibold)),
             (format!("Its scripts run in a jail of their own and can send what you type here to {site}'s sites."), body(t.text_secondary(), Weight::Regular)),

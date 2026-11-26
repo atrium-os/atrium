@@ -176,7 +176,10 @@ pub enum Prompt {
     /// the page's registrable site, which its scripts may reach (D12).
     /// `recorded`: the trail is recorded, so the person may choose to run
     /// the site live every time (D8); an Unrecorded trail only asks.
-    RunPageLive { site: String, recorded: bool },
+    /// `local`: the page is your own server's, served by this app
+    /// (background-apps.md §4.5); its scripts reach only that server, and
+    /// it is never run live every time.
+    RunPageLive { site: String, recorded: bool, local: Option<String> },
     Widget { runnable: bool, key: u32, src: String, origin: String, rect: [f32; 4] },
     WidgetUnload { key: u32, start: navigator_control::Press, query: u32, origin: String },
     WidgetFailed { key: u32, failure: navigator_control::WidgetFailure },

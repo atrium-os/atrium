@@ -1001,10 +1001,19 @@ impl Shell {
 
     /// Whether the tier popover offers "Run this page live" (I6.1): live
     /// pages are on, the page on screen is an HTTPS page from navigatord,
-    /// and it isn't running live already.
+    /// or your own server's page navigatord named its app for (§4.5), and
+    /// it isn't running live already.
     pub fn offers_live(&self) -> bool {
         self.live_pages && self.live.is_some() && self.history.is_none() && self.live_run.is_none()
-            && self.shown_url().is_some_and(|u| u.starts_with("https://"))
+            && self.shown_url().is_some_and(|u| u.starts_with("https://") || self.shown_local().is_some())
+    }
+
+    /// The app serving the page on screen, when it is your own server's
+    /// (navigatord said so, and the address is one of the local ones).
+    fn shown_local(&self) -> Option<String> {
+        let p = self.store.trail().page()?;
+        navigator_control::local::parse(&p.url)?;
+        p.facts.local.clone()
     }
 
     /// The popover's "Run this page live": ask in the prompt row, whose
@@ -1013,14 +1022,21 @@ impl Shell {
     pub fn offer_live(&mut self, now: f64) -> bool {
         if !self.offers_live() { return false; }
         let Some(url) = self.shown_url() else { return false };
-        let site = crate::trail::site(&url).to_string();
+        let local = self.shown_local();
+        let site = match &local {
+            Some(app) if !app.is_empty() => app.clone(),
+            Some(_) => "your own server".to_string(),
+            None => crate::trail::site(&url).to_string(),
+        };
         self.popover = false;
         if let Some(page) = self.store.trail_mut().page_mut() {
             page.prompts.dismissed.retain(|k| k != "run-page-live");
             page.prompts.last_ms = None;
         }
-        let recorded = !self.store.trail().jar().unrecorded();
-        self.ask(Prompt::RunPageLive { site, recorded }, now)
+        // Your own server's page is never run live every time: the app on
+        // a port can change.
+        let recorded = !self.store.trail().jar().unrecorded() && local.is_none();
+        self.ask(Prompt::RunPageLive { site, recorded, local }, now)
     }
 
     /// navigatord said the page at `url` is of an origin the persona runs
@@ -2748,6 +2764,35 @@ mod tests {
     }
 
     #[test]
+    fn your_own_servers_page_is_offered_live_only_once_navigatord_named_its_app() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.store.new_trail(false);
+        s.enter("localhost:9000/");
+        let key = s.shown_key().unwrap();
+        s.opened(key, "http://localhost:9000/", "Photos", false, "", false);
+        s.live = Some(LivePage::Shown("http://localhost:9000/".into()));
+        s.live_pages = true;
+        s.local_server(key, "Photo Server");
+        assert!(s.offers_live());
+        s.outbox.clear();
+        assert!(s.offer_live(0.0));
+        let asked = s.store.trail().page().unwrap().asked.clone().unwrap();
+        assert_eq!(asked.prompt, Prompt::RunPageLive { site: "Photo Server".into(), recorded: false, local: Some("Photo Server".into()) },
+                   "named by its app, and never every time");
+        assert_eq!(asked.prompt.answers(), &["Not now", "Run live"]);
+        assert!(s.answer_pressed(1, 700.0, Some([5; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: "http://localhost:9000/".into(), press: [5; 16], jar: navigator_control::Jar::Personal, remember: false }));
+        assert!(crate::ax::prompt_text(&asked.prompt).contains("reach only Photo Server on this computer"));
+        // A plain http page of the web is never offered.
+        let mut w = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        w.store.new_trail(false);
+        w.enter("http://example.com/");
+        w.live = Some(LivePage::Shown("http://example.com/".into()));
+        w.live_pages = true;
+        assert!(!w.offers_live());
+    }
+
+    #[test]
     fn a_live_trail_follows_what_navigatord_decides() {
         let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
         s.live = Some(LivePage::Loading(String::new()));
@@ -3425,7 +3470,7 @@ mod tests {
         assert!(!s.popover);
         assert!(s.outbox.is_empty());
         let asked = s.store.trail().page().unwrap().asked.clone().unwrap();
-        assert_eq!(asked.prompt, Prompt::RunPageLive { site: "app.example".into(), recorded: true });
+        assert_eq!(asked.prompt, Prompt::RunPageLive { site: "app.example".into(), recorded: true, local: None });
         // "Not now", then asked again from the popover: the person's choice.
         assert!(s.answer_pressed(0, 600.0, Some([1; 16])));
         assert!(s.outbox.is_empty() && s.live_run.is_none());

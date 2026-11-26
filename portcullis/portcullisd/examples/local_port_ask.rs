@@ -2,6 +2,9 @@
 //! scripts/vm-local-server-check.sh (background-apps.md §4.4).
 //!
 //!   local_port_ask <port>                      ask portcullisd for a socket
+//!   local_port_ask burst <n> <port>            n asks at once; prints how
+//!                                              many got a socket and how
+//!                                              many the rate refused
 //!   local_port_ask <port> <fetchd> <url> [<cookie header>]
 //!                                              and fetch <url> on it through
 //!                                              navigator-fetchd started on a
@@ -43,6 +46,27 @@ fn ask(port: u16) -> Result<(String, String, TcpStream), String> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    // `burst <n> <port>`: n asks at once from n threads; prints how many
+    // got a socket and how many the rate refused.
+    if a.get(1).map(String::as_str) == Some("burst") {
+        let (Some(n), Some(port)) = (a.get(2).and_then(|n| n.parse::<usize>().ok()), a.get(3).and_then(|p| p.parse::<u16>().ok())) else {
+            eprintln!("usage: local_port_ask burst <n> <port>");
+            std::process::exit(2);
+        };
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let asks: Vec<_> = (0..n).map(|_| {
+            let gate = gate.clone();
+            std::thread::spawn(move || { gate.wait(); ask(port).map(|_| ()) })
+        }).collect();
+        let got: Vec<Result<(), String>> = asks.into_iter().map(|t| t.join().unwrap_or(Err("panicked".into()))).collect();
+        let ok = got.iter().filter(|r| r.is_ok()).count();
+        let rate = got.iter().filter(|r| r.as_ref().is_err_and(|w| w.contains("more than"))).count();
+        println!("{ok} {rate}");
+        for why in got.iter().filter_map(|r| r.as_ref().err()).filter(|w| !w.contains("more than")).take(3) {
+            eprintln!("burst: {why}");
+        }
+        return;
+    }
     let Some(port) = a.get(1).and_then(|p| p.parse::<u16>().ok()) else {
         eprintln!("usage: local_port_ask <port> [<fetchd> <url>]");
         std::process::exit(2);

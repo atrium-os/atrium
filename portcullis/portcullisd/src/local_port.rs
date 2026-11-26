@@ -18,8 +18,9 @@ use portcullis_ipc::Response;
 
 /// How long a connect to the app may take.
 pub const CONNECT: Duration = Duration::from_secs(5);
-/// Sockets one persona may be handed in [`WINDOW`].
-pub const PER_WINDOW: usize = 32;
+/// Sockets one persona may be handed in [`WINDOW`]: each request of a
+/// page is its own socket, and a live page (§4.5) makes many.
+pub const PER_WINDOW: usize = 128;
 pub const WINDOW: Duration = Duration::from_secs(10);
 
 /// The asks a persona made in the last [`WINDOW`]: true when one more fits.

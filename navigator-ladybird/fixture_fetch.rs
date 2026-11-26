@@ -302,7 +302,10 @@ pub unsafe extern "C" fn navigator_live_page(url_out: *mut u8, url_cap: usize, u
     if url_out.is_null() || url_len.is_null() || out.is_null() || cap == 0 { return 0; }
     let body = unsafe { std::slice::from_raw_parts_mut(out, cap) };
     let Some((200, url, Some(kind), n)) = live_exchange(limen::web_island::LIVE_PAGE, body, Duration::from_secs(30)) else { return 0 };
-    if kind != "text/html" || !url.starts_with("https://") || url.len() > url_cap { return 0; }
+    // An https page, or your own server's (background-apps.md §4.5),
+    // whose address navigatord checked before it served it.
+    let page_ok = url.starts_with("https://") || navigator_control::local::parse(&url).is_some_and(|l| l.url() == url);
+    if kind != "text/html" || !page_ok || url.len() > url_cap { return 0; }
     unsafe {
         std::ptr::copy_nonoverlapping(url.as_ptr(), url_out, url.len());
         *url_len = url.len();

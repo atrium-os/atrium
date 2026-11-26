@@ -30,7 +30,7 @@
 #      Server, a frame is kept;
 #   3. the port it serves but doesn't declare, another app, another
 #      persona, another person and a plain process are refused, and a
-#      persona gets at most 32 sockets in 10 s;
+#      burst of 60 asks each gets a socket (the 128 in 10 s rate is a host test);
 #   4. the web fetcher still can't reach 127.0.0.1 or localhost;
 #   5. lcsrv quits: the next ask is refused.
 set -u
@@ -262,10 +262,12 @@ has "Navigator in another persona is refused" "$(ask _lcnavw 9000)" "refused: No
 has "another person's Navigator is refused" "$(ask _lcnavo 9000)" "refused: Nothing of yours is serving port 9000"
 has "the person's own login uid (not a launched app) is refused" "$(ask $U 9000)" "refused: open local port: the caller is not a launched app"
 sleep 11
-# 40 at once: past the 32nd in the window, each is refused (asks are slow
-# under TCG, so they go in parallel to land in one window).
-N=$(V "i=0; while [ \$i -lt 40 ]; do su -m _lcnav -c '$B/local_port_ask 9000' > $B/burst.\$i 2>&1 & i=\$((i+1)); done; wait; cat $B/burst.* | grep -c 'more than 32 in 10 s'; rm -f $B/burst.*" | tr -d '\r ')
-case "$N" in ''|0) bad "no ask past 32 in 10 s was refused" ;; *) ok "asks past 32 in 10 s are refused ($N of 40)" ;; esac
+# 60 at once from one process (under portcullisd's 64 connections per
+# uid): each gets a socket. The 128 in 10 s bound is the host test
+# local_port::a_persona_gets_at_most_its_window (portcullisd answers a few
+# a second under TCG, too slow to reach it here).
+N=$(V "su -m _lcnav -c '$B/local_port_ask burst 60 9000' 2>$B/burst.err" | tr -d '\r')
+[ "$N" = "60 0" ] && ok "60 asks at once each get a socket" || bad "burst: [$N] $(V "cat $B/burst.err")"
 has "jaild names lcsrv's address for its this-computer port" "$(jt "$J" 9000)" '"kind":"listen_target","addr":"100.64.'
 has "…not for a port it has no rule for" "$(jt "$J" 9090)" '"kind":"policy_denied"'
 check "portcullisd logged whose socket it was" 1 "$(V "grep -c 'OpenLocalPort 9000 for $U (personal) -> $A at 100.64' $LOG | awk '{print (\$1>0)}'" | tr -d '\r ')"

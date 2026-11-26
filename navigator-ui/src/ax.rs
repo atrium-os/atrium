@@ -131,6 +131,7 @@ pub fn prompt_text(p: &Prompt) -> String {
         Prompt::Widget { origin, runnable: true, .. } => format!("Start live widget from {origin}?"),
         Prompt::Widget { origin, .. } => format!("Live widget from {origin} is unavailable"),
         Prompt::RunLive => "Open inbox.example in a live window using its cookies?".into(),
+        Prompt::RunPageLive { site, local: Some(_), .. } => format!("Run this page live? Its scripts run on this computer, in a jail, and reach only {site} on this computer. What it keeps goes when Navigator closes."),
         Prompt::RunPageLive { site, .. } => format!("Run this page live? Its scripts run on this computer, in a jail, and can send what you type here to {site}'s sites. Its sign-in is kept for next time."),
         Prompt::FetchAgain => "This page could not be restored and will be fetched again".into(),
         Prompt::PasteTooLong => "Nothing was pasted: a live page takes at most 16 KB at once".into(),
