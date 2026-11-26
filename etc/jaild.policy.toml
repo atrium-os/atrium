@@ -995,6 +995,9 @@ ioctls = [
 # that tries anything else gets EPERM.
 [sysfil.profiles.usb-driver]
 include = ["base"]
+# eventfd(2): FreeBSD's libusb_init makes its event fd with it (libc's
+# eventfd is __specialfd(SPECIALFD_EVENTFD)); found enforcing on the Mac.
+syscalls = ["__specialfd"]
 ioctls = [
     "0x8010557f",   # USB_READ_DIR (on /dev/usbctl: the device list)
     "0x4004557e",   # USB_GET_PLUGTIME
