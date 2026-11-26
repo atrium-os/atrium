@@ -14,3 +14,5 @@ fresco-protocol     = { path = "../fresco-protocol" }
 aqueduct            = { path = "../aqueduct" }
 serde               = "1"
 log                 = "0.4"
+# LZ4 blocks for stream blobs; the safe decoder only (hostile input).
+lz4_flex            = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "std"] }

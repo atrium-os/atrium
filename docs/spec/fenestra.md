@@ -1626,6 +1626,14 @@ strip and window 0 (the WM's background) are not streamed yet.
   reconnect, which resumed without resending; a key pressed during the blackout was not
   replayed; the final desktop equals frescod's screen.
 
+**Whole states.** A blob goes as an LZ4 block (`BLOB_LZ4`, `lz4_flex` with its safe decoder)
+when that saves an eighth or more; the reader checks the declared size against its bounds before
+it decompresses and refuses a block that does not come out at exactly that size. The glyph
+atlas pages that made up most of a first connection's bytes (§5.6) are mostly empty: on
+loopback the first connection fell from 9.5 MB to 103 KB for navigator-ui, 4.5 MB to 290 KB for
+Sheets and 8.4 MB to 59 KB for the pergola demo; in the VM gate Sheets' first connection is
+93 KB. Region updates (typing) still go raw: a resume after typing is 193 KB on loopback.
+
 **The viewer.** `fenestra-view` opens a window by default (winit 0.30 and softbuffer 0.4, the
 `window` feature): the host's desktop drawn on the CPU from each window's raster (cached by
 the held version) composed by the layout, scaled to fit with its aspect kept; keyboard (HID
@@ -1634,8 +1642,8 @@ back in the host screen's pixels. `--headless --out DIR` is the gates' form. A c
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
 **Next in R2.** The strip and background on the viewer; renderers and the session in their
-jails; the SSH mint; remote outputs at the viewer's size and scale; cutting the glyph-atlas
-bytes of whole states; the TCP fallback when UDP is blocked.
+jails; the SSH mint; remote outputs at the viewer's size and scale; compressing
+region updates as blobs are; the TCP fallback when UDP is blocked.
 
 ## 20. Sources
 
