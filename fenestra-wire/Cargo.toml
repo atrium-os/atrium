@@ -1,0 +1,18 @@
+[package]
+name = "fenestra-wire"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Fenestra's network layer (docs/spec/fenestra.md §8, §11.2): QUIC with pinned raw public keys, the K_sess proof bound to the connection, and the session's framing. Portable: the host's fenestra-session jail and every viewer use it."
+
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+ring = "0.17"
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
+log = "0.4"
+
+[dev-dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
