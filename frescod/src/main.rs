@@ -263,8 +263,8 @@ fn main() -> std::io::Result<()> {
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
         }
-        if let Ok(p) = std::env::var("FRESCOD_FENESTRA_SOCK") {
-            b.serve_fenestra(Path::new(&p), fenestra_uids()?, ev_tx.clone())?;
+        if let Some(p) = fenestra_sock() {
+            b.serve_fenestra(&p, fenestra_uids()?, ev_tx.clone())?;
         }
     }
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
@@ -1383,8 +1383,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
         }
-        if let Ok(p) = std::env::var("FRESCOD_FENESTRA_SOCK") {
-            b.serve_fenestra(Path::new(&p), fenestra_uids()?, ev_tx.clone())?;
+        if let Some(p) = fenestra_sock() {
+            b.serve_fenestra(&p, fenestra_uids()?, ev_tx.clone())?;
         }
     }
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
@@ -1559,6 +1559,21 @@ pub(crate) fn split_animating_for(d: Duration) {
 fn animating() -> bool {
     ANIMATING.load(std::sync::atomic::Ordering::Relaxed)
         || video::monotonic_ns() < SPLIT_ANIMATING_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `FRESCOD_FENESTRA_SOCK`, where fenestrad's link is served: None when
+/// unset, or when its directory does not exist (remote viewing was not
+/// commissioned on this host: `scripts/fenestra-service.sh` makes it), said
+/// in the log. Any other failure to serve it stops frescod.
+fn fenestra_sock() -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(std::env::var_os("FRESCOD_FENESTRA_SOCK")?);
+    match p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) if !d.is_dir() => {
+            eprintln!("frescod: no {}: remote viewing is not set up here, no fenestra link", d.display());
+            None
+        }
+        _ => Some(p),
+    }
 }
 
 /// `FRESCOD_FENESTRA_UIDS`: the uids fenestrad may connect as (comma

@@ -556,6 +556,11 @@ allowed_keys = [
     # arcad: the system services the machine store serves, `name=uid,...`
     # (arca.md §6.4; vinculumd's Bluetooth bonds).
     "ARCA_SERVICES",
+    # frescod: where fenestrad's link is served (inside its own
+    # /atrium/sockets mount) and the uids that may hold it (fenestra.md
+    # §19b). Without the socket's directory frescod serves no link.
+    "FRESCOD_FENESTRA_SOCK",
+    "FRESCOD_FENESTRA_UIDS",
 ]
 allowed_prefixes = [
     "ATRIUM_",        # all Atrium-namespaced vars
