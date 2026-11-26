@@ -383,7 +383,7 @@ independent streams, so a large image upload in one window never delays typing i
   (`frescod/src/render_backend.rs`); the renderer never receives fonts. So the stream carries
   atlas pages and their region updates like any other texture, and the viewer needs no font
   files. The cost is one atlas page per font and size the app uses (sent once, then only new
-  glyphs' regions); region updates compress well with zstd.
+  glyphs' regions); region updates compress well (as built, LZ4: §19b).
 - **Possession, not global dedup** (aqueduct.md §6.6): the viewer keeps a separate cache per
   (host, persona), where the host is identified by its **verified SSH host key** (the key sshd
   proved during the mint, not a name or address), and tells the host only which of *that
@@ -1819,7 +1819,17 @@ it decompresses and refuses a block that does not come out at exactly that size.
 atlas pages that made up most of a first connection's bytes (§5.6) are mostly empty: on
 loopback the first connection fell from 9.5 MB to 103 KB for navigator-ui, 4.5 MB to 290 KB for
 Sheets and 8.4 MB to 59 KB for the pergola demo; in the VM gate Sheets' first connection is
-93 KB. Region updates (typing) still go raw: a resume after typing is 193 KB on loopback.
+93 KB.
+
+**Runs of ops.** Typing's bytes are not big regions but thousands of small node ops (Sheets'
+recording: 4,694 `SCENE_NODE_SET` records, 133 KB, each under 1 KiB), so the writer packs each
+run of consecutive `OP` records, whole (length, tag, body), into one `OPS_LZ4` block of up to
+`OPS_RUN` (64 KiB) when that saves an eighth or more; a region update's pixels are a run of one
+large op. The reader bounds the declared size as for a blob, then takes each packed record as an
+`OP` (the stream's op set, the frame's byte and record bounds) and refuses a packed record that is
+cut short, empty, or anything but an `OP`. On loopback a whole session fell from 287 KB to 109 KB
+for Sheets, 101 KB to 77 KB for navigator-ui and 58 KB to 52 KB for the pergola demo; Sheets'
+resume after typing from 192 KB to 61 KB.
 
 **The viewer.** `fenestra-view` opens a window by default (winit 0.30 and softbuffer 0.4, the
 `window` feature): the host's desktop drawn on the CPU from each window's raster (cached by
@@ -1828,8 +1838,7 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** fenestrad in a jail of its own; a remote output on a host with its own monitors; compressing
-region updates as blobs are.
+**Next in R2.** A remote output on a host with its own monitors.
 
 ## 20. Sources
 

@@ -31,15 +31,19 @@
 //! | `BLOB` 3 | a blob's bytes; its SHA-256 is computed on arrival |
 //! | `END` 4 | `version u64 LE` |
 //! | `BLOB_LZ4` 5 | `raw_len u32 LE`, then the blob as one LZ4 block |
+//! | `OPS_LZ4` 6 | `raw_len u32 LE`, then whole `OP` records (length, tag, body) as one LZ4 block |
 //!
 //! A frame is `BEGIN`, ops and blobs, `END`; nothing is applied before its
 //! `END`. `base` 0 is a whole state, applied to an emptied window; any
 //! other `base` is a version of the same `epoch` the viewer holds.
 //!
 //! A blob goes as `BLOB_LZ4` when that is smaller (a glyph atlas page is
-//! mostly empty). The reader checks `raw_len` against its bounds before it
-//! decompresses, and refuses a block that does not decompress to exactly
-//! `raw_len` bytes.
+//! mostly empty), and each run of ops (typing's many small node ops, a
+//! region update's pixels) as `OPS_LZ4`, up to `OPS_RUN` bytes, when that
+//! is smaller. The reader checks `raw_len` against its bounds before it
+//! decompresses, refuses a block that does not decompress to exactly
+//! `raw_len` bytes or holds anything but whole `OP` records, and then
+//! takes each op as it takes an `OP`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hasher;
@@ -61,6 +65,7 @@ pub mod tag {
     pub const BLOB: u8 = 3;
     pub const END: u8 = 4;
     pub const BLOB_LZ4: u8 = 5;
+    pub const OPS_LZ4: u8 = 6;
 }
 
 /// Largest record: a 4096 x 4096 RGBA texture, with room for framing.
@@ -110,8 +115,52 @@ fn blob_record(out: &mut Vec<u8>, data: &[u8]) {
     }
 }
 
+/// The most bytes of `OP` records one `OPS_LZ4` packs.
+pub const OPS_RUN: usize = 64 * 1024;
+
+/// An op, as an `OP` record; `pack_ops` packs runs of them.
 fn op_record(out: &mut Vec<u8>, op: u16, payload: &[u8]) {
     record(out, tag::OP, &[&op.to_le_bytes(), payload]);
+}
+
+/// Replaces each run of consecutive `OP` records in `out[from..]` (the
+/// writer's own records, all whole) by one `OPS_LZ4` of up to `OPS_RUN`
+/// bytes, where that saves at least an eighth. Typing moves thousands of
+/// small node ops, alike in shape; a region update is one large op.
+fn pack_ops(out: &mut Vec<u8>, from: usize) {
+    let mut packed = Vec::with_capacity(out.len() - from);
+    let mut run: Vec<u8> = Vec::new();
+    let flush = |packed: &mut Vec<u8>, run: &mut Vec<u8>| {
+        if run.is_empty() {
+            return;
+        }
+        let z = lz4_flex::block::compress(run);
+        if run.len() <= MAX_RECORD && z.len() + 4 < run.len() - run.len() / 8 {
+            record(packed, tag::OPS_LZ4, &[&(run.len() as u32).to_le_bytes(), &z]);
+        } else {
+            packed.extend_from_slice(run);
+        }
+        run.clear();
+    };
+    let mut at = from;
+    while at + 5 <= out.len() {
+        let len = u32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]) as usize;
+        let end = (at + 4 + len).min(out.len());
+        let rec = &out[at..end];
+        if out[at + 4] == tag::OP {
+            if !run.is_empty() && run.len() + rec.len() > OPS_RUN {
+                flush(&mut packed, &mut run);
+            }
+            run.extend_from_slice(rec);
+        } else {
+            flush(&mut packed, &mut run);
+            packed.extend_from_slice(rec);
+        }
+        at = end;
+    }
+    flush(&mut packed, &mut run);
+    out.truncate(from);
+    out.extend_from_slice(&packed);
 }
 
 /// A node's canonical ops, as a client would send them to make it.
@@ -470,6 +519,7 @@ impl Writer {
                 }
             }
         }
+        pack_ops(out, start);
         record(out, tag::END, &[&self.version.to_le_bytes()]);
         stats.bytes = out.len() - start;
         stats
@@ -663,25 +713,36 @@ impl Reader {
                 self.frame = Some(b);
                 Ok(None)
             }
-            tag::OP | tag::BLOB | tag::BLOB_LZ4 => {
+            tag::OP | tag::BLOB | tag::BLOB_LZ4 | tag::OPS_LZ4 => {
                 if self.frame.is_none() {
                     return Err(StreamError::Framing("a record outside a frame"));
                 }
-                let (t, body) = if t == tag::BLOB_LZ4 { (tag::BLOB, self.unpack(&body)?) } else { (t, body) };
-                if t == tag::OP {
-                    let Some(op) = body.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
-                        return Err(StreamError::Framing("OP without an op"));
-                    };
-                    if !STREAM_OPS.contains(&op) {
-                        return Err(StreamError::Op(op));
+                match t {
+                    tag::BLOB_LZ4 => {
+                        let b = self.unpack(&body)?;
+                        self.take(tag::BLOB, b)
                     }
+                    tag::OPS_LZ4 => {
+                        let run = self.unpack(&body)?;
+                        let mut at = 0;
+                        while at < run.len() {
+                            let Some(head) = run.get(at..at + 4) else {
+                                return Err(StreamError::Framing("a packed record cut short"));
+                            };
+                            let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+                            let Some(rec) = run.get(at + 4..).and_then(|r| r.get(..len)).filter(|r| !r.is_empty()) else {
+                                return Err(StreamError::Framing("a packed record cut short"));
+                            };
+                            if rec[0] != tag::OP {
+                                return Err(StreamError::Framing("a packed record that is not an OP"));
+                            }
+                            self.take(tag::OP, rec[1..].to_vec())?;
+                            at += 4 + len;
+                        }
+                        Ok(None)
+                    }
+                    _ => self.take(t, body),
                 }
-                self.pending_bytes += body.len();
-                if self.pending_bytes > MAX_FRAME_BYTES || self.pending.len() >= MAX_FRAME_RECORDS {
-                    return Err(StreamError::TooBig);
-                }
-                self.pending.push((t, body));
-                Ok(None)
             }
             tag::END => {
                 let Some(b) = self.frame.take() else {
@@ -704,10 +765,29 @@ impl Reader {
         }
     }
 
-    /// A `BLOB_LZ4` body's blob, its declared size checked against the
-    /// frame's bounds before anything is decompressed.
+    /// An `OP` or `BLOB` body held for the frame's `END`, within the
+    /// frame's bounds; an op outside the stream's set is refused.
+    fn take(&mut self, t: u8, body: Vec<u8>) -> Result<Option<Ack>, StreamError> {
+        if t == tag::OP {
+            let Some(op) = body.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+                return Err(StreamError::Framing("OP without an op"));
+            };
+            if !STREAM_OPS.contains(&op) {
+                return Err(StreamError::Op(op));
+            }
+        }
+        self.pending_bytes += body.len();
+        if self.pending_bytes > MAX_FRAME_BYTES || self.pending.len() >= MAX_FRAME_RECORDS {
+            return Err(StreamError::TooBig);
+        }
+        self.pending.push((t, body));
+        Ok(None)
+    }
+
+    /// A `BLOB_LZ4` or `OPS_LZ4` body's bytes, its declared size checked
+    /// against the frame's bounds before anything is decompressed.
     fn unpack(&self, body: &[u8]) -> Result<Vec<u8>, StreamError> {
-        let Some(head) = body.get(..4) else { return Err(StreamError::Framing("BLOB_LZ4 without a size")) };
+        let Some(head) = body.get(..4) else { return Err(StreamError::Framing("an LZ4 record without a size")) };
         let raw = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
         if raw > MAX_RECORD || self.pending_bytes.saturating_add(raw) > MAX_FRAME_BYTES {
             return Err(StreamError::TooBig);
@@ -715,7 +795,7 @@ impl Reader {
         let mut out = vec![0u8; raw];
         match lz4_flex::block::decompress_into(&body[4..], &mut out) {
             Ok(n) if n == raw => Ok(out),
-            _ => Err(StreamError::Framing("a BLOB_LZ4 that does not decompress to its size")),
+            _ => Err(StreamError::Framing("an LZ4 record that does not decompress to its size")),
         }
     }
 

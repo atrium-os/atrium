@@ -68,12 +68,13 @@ fn records(b: &[u8]) -> Vec<Vec<u8>> {
 
 fn forged(r: &mut Rng) -> Vec<u8> {
     let mut body = Vec::new();
-    let t = match r.below(7) {
+    let t = match r.below(8) {
         0 => tag::BEGIN,
         1 => tag::OP,
         2 => tag::BLOB,
         3 => tag::END,
         4 => tag::BLOB_LZ4,
+        5 => tag::OPS_LZ4,
         _ => r.next() as u8,
     };
     let n = match r.below(4) {
@@ -318,13 +319,179 @@ fn sparse_blobs_go_compressed() {
     let raw = |v: u32| move |r: &mut Vec<u8>| r[5..9].copy_from_slice(&v.to_le_bytes());
     let cases: Vec<(&str, Vec<u8>, stream::StreamError)> = vec![
         ("past MAX_RECORD", forge(&raw(stream::MAX_RECORD as u32 + 1)), stream::StreamError::TooBig),
-        ("one byte more", forge(&raw(bytes.len() as u32 + 1)), stream::StreamError::Framing("a BLOB_LZ4 that does not decompress to its size")),
-        ("one byte less", forge(&raw(bytes.len() as u32 - 1)), stream::StreamError::Framing("a BLOB_LZ4 that does not decompress to its size")),
-        ("truncated", forge(&|r: &mut Vec<u8>| r.truncate(r.len() - 3)), stream::StreamError::Framing("a BLOB_LZ4 that does not decompress to its size")),
-        ("no size", forge(&|r: &mut Vec<u8>| r.truncate(7)), stream::StreamError::Framing("BLOB_LZ4 without a size")),
+        ("one byte more", forge(&raw(bytes.len() as u32 + 1)), stream::StreamError::Framing("an LZ4 record that does not decompress to its size")),
+        ("one byte less", forge(&raw(bytes.len() as u32 - 1)), stream::StreamError::Framing("an LZ4 record that does not decompress to its size")),
+        ("truncated", forge(&|r: &mut Vec<u8>| r.truncate(r.len() - 3)), stream::StreamError::Framing("an LZ4 record that does not decompress to its size")),
+        ("no size", forge(&|r: &mut Vec<u8>| r.truncate(7)), stream::StreamError::Framing("an LZ4 record without a size")),
     ];
     for (why, b, want) in cases {
         let (mut fe, mut vs, mut reader) = fresh();
         assert_eq!(reader.feed(&mut fe, &mut vs, &b), Err(want), "{why}");
     }
+}
+
+/// A large region update (a repainted panel: mostly background, a few
+/// marks) goes as `OPS_LZ4`, far smaller, and the viewer's texture
+/// matches the host's after it; a forged `OPS_LZ4` that lies about its
+/// size is refused, and one that unpacks to an op outside the stream's
+/// set is refused as that op.
+#[test]
+fn large_region_updates_go_compressed() {
+    use fresco_scene_server::cas::store::CasStore;
+    const SLOT: u32 = 10;
+    let mut host = frontend();
+    let win = window(&mut host);
+    let mut scene = SceneState::default();
+    let (w, h) = (128u32, 128u32);
+    let whole: Vec<u8> = (0..w * h * 4).map(|i| (i % 251) as u8).collect();
+    host.ingest_blob(&whole);
+    let frame = |host: &mut EnvelopeFrontend, ops: Vec<(u16, Vec<u8>)>| {
+        let b = encode(&SceneFrameBeginPayload::default()).unwrap();
+        host.dispatch(&msg(control::OP_SCENE_FRAME_BEGIN, win, b), CLIENT).unwrap();
+        for (op, p) in ops {
+            host.dispatch(&msg(op, win, p), CLIENT).unwrap();
+        }
+        let b = encode(&SceneFrameEndPayload::default()).unwrap();
+        host.dispatch(&msg(control::OP_SCENE_FRAME_END, win, b), CLIENT).unwrap();
+    };
+    let bind = SlotSetPayload {
+        slot_id: SLOT,
+        hash: CasStore::hash(&whole),
+        kind: SlotKind::Texture(TextureDesc { width: w, height: h, format: TextureFormat::Rgba8UnormSrgb }),
+    };
+    let tex = TextureParams { x: 0.0, y: 0.0, w: 64.0, h: 64.0, slot_id: SLOT };
+    frame(&mut host, vec![(control::OP_SLOT_SET, encode(&bind).unwrap()), set(1, scene_ops::ATRIUM_CORE_TEXTURE, encode(&tex).unwrap())]);
+    let (u, c) = host.take_pending_uploads();
+    scene.apply(u, c);
+    let mut writer = Writer::new(9);
+    assert!(writer.update(host.window_state(win as u32).unwrap(), &scene, (W, H)));
+    let mut first = Vec::new();
+    writer.diff(host.window_state(win as u32).unwrap(), &scene, None, &mut first);
+    let held = (9, writer.version());
+
+    // The panel repainted: white, with a few dark marks.
+    let (rw, rh) = (96u32, 64u32);
+    let mut px = vec![0xffu8; (rw * rh * 4) as usize];
+    for i in 0..300usize {
+        let at = (i * 7919) % (rw * rh) as usize * 4;
+        px[at..at + 3].fill(0x20);
+    }
+    let region = SlotUpdateRegionPayload { slot_id: SLOT, dst_x: 8, dst_y: 16, width: rw, height: rh, bytes: px.clone() };
+    frame(&mut host, vec![(control::OP_SLOT_UPDATE_REGION, encode(&region).unwrap())]);
+    let (u, c) = host.take_pending_uploads();
+    scene.apply(u, c);
+    assert!(writer.update(host.window_state(win as u32).unwrap(), &scene, (W, H)));
+    let mut f = Vec::new();
+    let stats = writer.diff(host.window_state(win as u32).unwrap(), &scene, Some(held), &mut f);
+    assert_eq!(stats.regions, 1);
+    let recs = records(&f);
+    assert!(recs.iter().any(|r| r[4] == tag::OPS_LZ4), "no OPS_LZ4 record");
+    assert!(!recs.iter().any(|r| r[4] == tag::OP && u16::from_le_bytes([r[5], r[6]]) == control::OP_SLOT_UPDATE_REGION), "the region went raw");
+    assert!(f.len() < px.len() / 8, "{} bytes for a {}-byte region", f.len(), px.len());
+
+    let fresh = || {
+        let mut fe = frontend();
+        let win = window(&mut fe);
+        let mut vs = SceneState::default();
+        let mut reader = Reader::new(win, CLIENT);
+        assert_eq!(reader.feed(&mut fe, &mut vs, &first), Ok(Ack::Holds(held.0, held.1)));
+        (fe, vs, reader)
+    };
+    let (mut fe, mut vs, mut reader) = fresh();
+    assert_eq!(reader.feed(&mut fe, &mut vs, &f), Ok(Ack::Holds(9, writer.version())));
+    assert_eq!(vs.texture(SLOT).map(|t| t.data.clone()), scene.texture(SLOT).map(|t| t.data.clone()));
+    let t = vs.texture(SLOT).unwrap();
+    let o = ((16 * w + 8) * 4) as usize;
+    assert_eq!(&t.data[o..o + (rw * 4) as usize], &px[..(rw * 4) as usize], "the region's first row did not land");
+
+    let at = recs.iter().position(|r| r[4] == tag::OPS_LZ4).unwrap();
+    let raw_len = u32::from_le_bytes(recs[at][5..9].try_into().unwrap());
+    let forge = |edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut rs = recs.clone();
+        edit(&mut rs[at]);
+        let n = (rs[at].len() - 4) as u32;
+        rs[at][..4].copy_from_slice(&n.to_le_bytes());
+        rs.concat()
+    };
+    let raw = |v: u32| move |r: &mut Vec<u8>| r[5..9].copy_from_slice(&v.to_le_bytes());
+    // A run packed by hand: whole records, as the writer packs them.
+    let packed = |inner: Vec<u8>| {
+        move |r: &mut Vec<u8>| {
+            let z = lz4_flex::block::compress(&inner);
+            r.truncate(5);
+            r.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+            r.extend_from_slice(&z);
+        }
+    };
+    let rec = |t: u8, body: &[u8]| {
+        let mut r = ((1 + body.len()) as u32).to_le_bytes().to_vec();
+        r.push(t);
+        r.extend_from_slice(body);
+        r
+    };
+    let mut alien = 0x7777u16.to_le_bytes().to_vec();
+    alien.extend([0u8; 2000]);
+    let mut short = rec(tag::OP, &alien);
+    short.truncate(1000);
+    let cases: Vec<(&str, Vec<u8>, stream::StreamError)> = vec![
+        ("past MAX_RECORD", forge(&raw(stream::MAX_RECORD as u32 + 1)), stream::StreamError::TooBig),
+        ("one byte more", forge(&raw(raw_len + 1)), stream::StreamError::Framing("an LZ4 record that does not decompress to its size")),
+        ("one byte less", forge(&raw(raw_len - 1)), stream::StreamError::Framing("an LZ4 record that does not decompress to its size")),
+        ("truncated", forge(&|r: &mut Vec<u8>| r.truncate(r.len() - 3)), stream::StreamError::Framing("an LZ4 record that does not decompress to its size")),
+        ("no size", forge(&|r: &mut Vec<u8>| r.truncate(7)), stream::StreamError::Framing("an LZ4 record without a size")),
+        ("an alien op", forge(&packed(rec(tag::OP, &alien))), stream::StreamError::Op(0x7777)),
+        ("a packed blob", forge(&packed(rec(tag::BLOB, &[1u8; 2000]))), stream::StreamError::Framing("a packed record that is not an OP")),
+        ("a packed END", forge(&packed(rec(tag::END, &held.1.to_le_bytes()))), stream::StreamError::Framing("a packed record that is not an OP")),
+        ("a packed record cut short", forge(&packed(short)), stream::StreamError::Framing("a packed record cut short")),
+        ("a packed empty record", forge(&packed(vec![0u8; 4])), stream::StreamError::Framing("a packed record cut short")),
+    ];
+    for (why, b, want) in cases {
+        let (mut fe, mut vs, mut reader) = fresh();
+        assert_eq!(reader.feed(&mut fe, &mut vs, &b), Err(want), "{why}");
+    }
+}
+
+/// Typing moves many small node ops: a frame of them goes as `OPS_LZ4`
+/// runs, each within `OPS_RUN`, far smaller than raw, and the viewer's
+/// window packs to the host's bytes after it.
+#[test]
+fn runs_of_small_ops_go_compressed() {
+    let mut host = frontend();
+    let win = window(&mut host);
+    let mut scene = SceneState::default();
+    let b = encode(&SceneFrameBeginPayload::default()).unwrap();
+    host.dispatch(&msg(control::OP_SCENE_FRAME_BEGIN, win, b), CLIENT).unwrap();
+    for i in 0..3000u32 {
+        let p = RectParams { x: (i % 40) as f32 * 2.0, y: (i / 40) as f32, w: 2.0, h: 1.0, r: 0.1, g: 0.1, b: 0.1, a: 1.0, radius: 0.0 };
+        let (op, b) = set(100 + i, scene_ops::ATRIUM_CORE_RECT, encode(&p).unwrap());
+        host.dispatch(&msg(op, win, b), CLIENT).unwrap();
+    }
+    let b = encode(&SceneFrameEndPayload::default()).unwrap();
+    host.dispatch(&msg(control::OP_SCENE_FRAME_END, win, b), CLIENT).unwrap();
+    let (u, c) = host.take_pending_uploads();
+    scene.apply(u, c);
+    let mut writer = Writer::new(5);
+    let st = host.window_state(win as u32).unwrap();
+    assert!(writer.update(st, &scene, (W, H)));
+    let mut f = Vec::new();
+    let stats = writer.diff(st, &scene, None, &mut f);
+    let recs = records(&f);
+    let runs: Vec<&Vec<u8>> = recs.iter().filter(|r| r[4] == tag::OPS_LZ4).collect();
+    assert!(runs.len() >= 2, "{} OPS_LZ4 runs", runs.len());
+    for r in &runs {
+        let raw = u32::from_le_bytes(r[5..9].try_into().unwrap()) as usize;
+        assert!(raw <= stream::OPS_RUN, "a run of {raw} bytes");
+    }
+    assert!(!recs.iter().any(|r| r[4] == tag::OP), "an op went raw");
+    // What the same ops cost raw: 4 + 1 + 2 + payload each.
+    let raw: usize = 3000 * (7 + encode(&SceneNodeSetPayload { node_id: 100, op_id: scene_ops::ATRIUM_CORE_RECT, params: encode(&RectParams { x: 0.0, y: 0.0, w: 2.0, h: 1.0, r: 0.1, g: 0.1, b: 0.1, a: 1.0, radius: 0.0 }).unwrap() }).unwrap().len());
+    assert!(stats.bytes < raw / 3, "{} bytes, {raw} raw", stats.bytes);
+
+    let mut fe = frontend();
+    let vwin = window(&mut fe);
+    let mut vs = SceneState::default();
+    let mut reader = Reader::new(vwin, CLIENT);
+    assert_eq!(reader.feed(&mut fe, &mut vs, &f), Ok(Ack::Holds(5, writer.version())));
+    assert_eq!(fe.window_state(vwin as u32).unwrap().rect_nodes.len(), 3000);
+    assert_eq!(packed(&fe, &vs, vwin), packed(&host, &scene, win));
 }
