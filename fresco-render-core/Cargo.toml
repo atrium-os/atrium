@@ -11,5 +11,6 @@ fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
 fresco-compute      = { path = "../fresco-compute" }
 fresco-protocol     = { path = "../fresco-protocol" }
+aqueduct            = { path = "../aqueduct" }
 serde               = "1"
 log                 = "0.4"

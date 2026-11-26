@@ -507,6 +507,7 @@ dependencies = [
 name = "fresco-render-core"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "fresco-compute",
  "fresco-protocol",
  "fresco-scene-server",

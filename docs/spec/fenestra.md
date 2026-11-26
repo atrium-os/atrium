@@ -389,6 +389,84 @@ independent streams, so a large image upload in one window never delays typing i
   readahead), then off screen. A blob that stops being referenced before it is sent is dropped
   from the queue.
 
+### 5.6 As built (R1, 2026-11-26)
+
+`fresco-render-core/src/stream.rs`. Host tests: `tests/stream.rs`, `tests/stream_fuzz.rs`.
+
+- **Records.** Each record is `len u32 | tag u8 | body`. There are four tags:
+  - `BEGIN` carries the epoch, base, version and window size.
+  - `OP` carries a client op's postcard payload.
+  - `BLOB` carries raw bytes, hashed on arrival.
+  - `END` carries the version.
+
+  Only five ops may travel: `SLOT_SET`, `SLOT_CLEAR`, `SLOT_UPDATE_REGION`,
+  `SCENE_NODE_SET` and `SCENE_NODE_CLEAR`. Any other op ends the stream. The reader applies a
+  frame only at its `END`, through its own `EnvelopeFrontend::dispatch` (H9), and then packs
+  with `pack`.
+- **Change detection by scan, not hooks.** `Writer::update` runs after each frame. It encodes
+  every node's canonical ops (a group as `group_now`, so a running animation travels sampled;
+  a glyph run with its turn; a leaf with its place) and compares a 64-bit hash with the last
+  one. So "changed at version" covers every mutation path in the frontend without touching
+  them. The cost is one encode per node per frame, for windows on remote outputs only.
+- **Slot changes.** `SceneState` remembers each slot's last whole upload and its last 64 region
+  uploads (`changes_since`). A viewer that holds an earlier generation gets one
+  `SLOT_UPDATE_REGION` with the bounding box of the regions since. Otherwise it gets the
+  whole texture as a `BLOB` plus `SLOT_SET`, keyed by the SHA-256 of its current bytes.
+- **Order within a diff:**
+  1. Slots, because glyph runs check that their colour twin is bound.
+  2. Clears of removed nodes.
+  3. Changed leaves, each cleared and set afresh, so a place it no longer has goes with the
+     old copy.
+  4. Groups, parents first.
+  5. Leaves.
+  6. Places.
+  7. Slot clears.
+- **No cascades on the viewer.** A client's clear of a group takes its whole subtree. In a
+  stream, the reader first lifts the group's children to the root, so the clear takes only
+  the group. Without this, a subtree that moved on the host would vanish from the viewer: the
+  diff names only what changed, and that subtree's deeper nodes had not.
+
+  With the lift, every node that differs between the viewer's state (any version from the
+  diff's base onwards) and the host's has changed since the base. Applying the diff in the
+  order above therefore yields the host's state.
+- **Lost acks.** A frame to the version the viewer already holds is acked again without
+  being applied. The viewer acks `(epoch, version)`.
+- **Whole states.** The writer sends a whole state when the viewer holds:
+  - nothing,
+  - another epoch, or
+  - a version older than the last forgotten removal (`MAX_GONE` 4096).
+
+  An op refused by the viewer's validator or budgets answers `Ack::Whole`, and frames until
+  the whole state arrives are dropped. A malformed record, an unknown tag, a disallowed op, a
+  frame over `MAX_FRAME_BYTES` (256 MiB) or `MAX_FRAME_RECORDS`, a record over `MAX_RECORD`,
+  or a frame that goes backwards ends the stream with an error.
+- **Tests (Linux host):**
+  - Random client ops (rects, paths, fills, textures, glyph runs and turns, groups, places,
+    clears, slot binds, region updates and clears, animations) for 40 seeds x 150 frames,
+    with two viewers. One viewer misses 20% of sends, 30% of acks are dropped, and the bytes
+    arrive in random pieces. Every caught-up frame packs to the same bytes as the host's
+    (header, ops, textures, texels, LUT). 1000 seeds pass with `FENESTRA_STREAM_SEEDS=1000`.
+  - Mutation checks: each of these makes the test fail:
+    - dropping leaf clears,
+    - dropping places,
+    - dropping turns,
+    - ignoring animations,
+    - unsorted groups,
+    - losing the newest region.
+
+    The cascade bug above was found this way.
+  - Fuzzer: real streams with records dropped, repeated, swapped or forged, lengths that lie,
+    bit flips, truncation, and random bytes. 200 000 iterations ran with no panic, and the
+    reader stayed within its budgets and bounds. A blob changed in flight is never drawn, and
+    an endless frame is cut off at `MAX_FRAME_BYTES`.
+- **Not yet:**
+  - The writer is not wired into `fresco-renderer`.
+  - No recorder and no `fenestra-stream-check.sh` yet (recorded Pergola, Navigator and Officina
+    sessions).
+  - Window 0 (the shared screen) is not streamed.
+  - A slot bound on the host whose blob missed the CAS is not sent, so a run's colour mark can
+    differ there.
+
 ## 6. Latency
 
 ### 6.1 The budget
@@ -1422,7 +1500,7 @@ VM runs only with the coordinator's go.
 | Step | What | Gate |
 |---|---|---|
 | R0 | This spec reviewed and decided. New crates licence-audited. **Done 2026-11-26** (§19a). | review thread sign-off; audit 0 failing |
-| R1 | The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
+| R1 | **In progress:** portable crate, stream writer and reader, randomised equality test and fuzzer done (§5.6); recorder and gate next. The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
 | R2 | `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
 | R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |

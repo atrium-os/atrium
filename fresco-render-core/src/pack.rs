@@ -234,6 +234,19 @@ pub struct SceneState {
     /// Per slot, a number that changes with every upload to it.
     gens: HashMap<u32, u64>,
     next_gen: u64,
+    /// Per slot, what its recent uploads changed, for the scene stream
+    /// (`crate::stream`): the generation of its last whole upload, and the
+    /// region uploads since, oldest first, at most [`EDIT_HISTORY`].
+    edits: HashMap<u32, SlotEdits>,
+}
+
+/// Region uploads a slot remembers ([`SceneState::changes_since`]).
+pub const EDIT_HISTORY: usize = 64;
+
+#[derive(Default)]
+struct SlotEdits {
+    whole: u64,
+    regions: std::collections::VecDeque<(u64, [u32; 4])>,
 }
 
 /// A window's scroll viewports, each with its key: the content hash and
@@ -293,7 +306,7 @@ impl SceneState {
             UploadRequest::Texture { slot_id, .. } | UploadRequest::TextureRegion { slot_id, .. } => *slot_id,
         };
         self.next_gen += 1;
-        self.gens.insert(slot, self.next_gen);
+        let gen = self.next_gen;
         match req {
             UploadRequest::Texture { slot_id, bytes, width, height, format } => {
                 let format = match format.as_raw() {
@@ -309,6 +322,8 @@ impl SceneState {
                     return;
                 }
                 self.slots.insert(slot_id, fresco_compute::Texture { width, height, format, data: bytes });
+                self.gens.insert(slot, gen);
+                self.edits.insert(slot, SlotEdits { whole: gen, regions: Default::default() });
             }
             UploadRequest::TextureRegion { slot_id, bytes, dst_x, dst_y, width, height } => {
                 let Some(t) = self.slots.get_mut(&slot_id) else {
@@ -327,6 +342,16 @@ impl SceneState {
                     let d = ((dst_y as usize + y) * t.width as usize + dst_x as usize) * bpp;
                     t.data[d..d + row].copy_from_slice(&bytes[y * row..(y + 1) * row]);
                 }
+                self.gens.insert(slot, gen);
+                let e = self.edits.entry(slot).or_default();
+                if e.regions.len() == EDIT_HISTORY {
+                    // Forgetting the oldest region makes it part of the
+                    // whole: a consumer that held it takes the slot whole.
+                    if let Some((g, _)) = e.regions.pop_front() {
+                        e.whole = g;
+                    }
+                }
+                e.regions.push_back((gen, [dst_x, dst_y, dst_x + width, dst_y + height]));
             }
         }
     }
@@ -339,6 +364,7 @@ impl SceneState {
     pub fn take_textures_from(&mut self, from: &mut SceneState) {
         self.slots = std::mem::take(&mut from.slots);
         self.gens = std::mem::take(&mut from.gens);
+        self.edits = std::mem::take(&mut from.edits);
         self.next_gen = self.next_gen.max(from.next_gen);
     }
 
@@ -347,10 +373,47 @@ impl SceneState {
         self.slots.contains_key(&slot)
     }
 
+    /// The texture bound to `slot`.
+    pub fn texture(&self, slot: u32) -> Option<&fresco_compute::Texture> {
+        self.slots.get(&slot)
+    }
+
+    /// The generation of `slot`'s last upload (it changes with each).
+    pub fn slot_gen(&self, slot: u32) -> Option<u64> {
+        self.slots.contains_key(&slot).then(|| self.gens.get(&slot).copied()).flatten()
+    }
+
+    /// What changed in `slot` since its upload generation `gen`: `None`
+    /// when it must be taken whole (it was uploaded whole since, or the
+    /// regions since are forgotten, or it holds nothing), `Some(None)`
+    /// when nothing changed, else the bounding box `[x0, y0, x1, y1)` of
+    /// the regions uploaded since.
+    pub fn changes_since(&self, slot: u32, gen: u64) -> Option<Option<[u32; 4]>> {
+        let now = self.slot_gen(slot)?;
+        if now == gen {
+            return Some(None);
+        }
+        let e = self.edits.get(&slot)?;
+        if gen < e.whole || gen > now {
+            return None;
+        }
+        let mut out: Option<[u32; 4]> = None;
+        for &(g, r) in &e.regions {
+            if g > gen {
+                out = Some(match out {
+                    None => r,
+                    Some(o) => [o[0].min(r[0]), o[1].min(r[1]), o[2].max(r[2]), o[3].max(r[3])],
+                });
+            }
+        }
+        Some(out)
+    }
+
     /// Apply a frame's texture slot changes.
     pub fn apply(&mut self, uploads: Vec<UploadRequest>, clears: Vec<u32>) {
         for s in clears {
             self.slots.remove(&s);
+            self.edits.remove(&s);
         }
         for u in uploads {
             self.upload(u);

@@ -9,3 +9,4 @@
 
 pub mod pack;
 pub mod sprites;
+pub mod stream;
