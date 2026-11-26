@@ -117,6 +117,7 @@ fn main() -> ExitCode {
             call(sock, op::STORE, &w.buf)
         }
         "release" => call(sock, op::RELEASE, &unhex(arg(3))),
+        "delete" => call(sock, op::DELETE, &unhex(arg(3))),
         "list" => call(sock, op::LIST, &[]),
         // The Navigator's broker asking for a request's ticket (arca.md §8.2).
         "web-ticket" => {
