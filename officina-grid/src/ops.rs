@@ -118,6 +118,10 @@ pub enum GridOp {
     Calculation(bool),
     /// A sheet's watched cells, the whole list replaced.
     Watches { sheet: u16, list: Vec<(u32, u32)> },
+    /// A sheet's Allow Edit Ranges, the whole list replaced.
+    EditRanges { sheet: u16, list: Vec<crate::sheetareas::EditRange> },
+    /// A sheet's ignored errors, the whole list replaced.
+    IgnoredErrors { sheet: u16, list: Vec<crate::sheetareas::Ignored> },
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -355,6 +359,18 @@ impl GridOp {
             GridOp::Calculation(manual) => {
                 w.u8(32);
                 w.u8(u8::from(*manual));
+                return w.into_bytes();
+            }
+            GridOp::EditRanges { sheet, list } => {
+                w.u8(34);
+                w.u16(*sheet);
+                crate::sheetareas::encode_ranges(list, &mut w);
+                return w.into_bytes();
+            }
+            GridOp::IgnoredErrors { sheet, list } => {
+                w.u8(35);
+                w.u16(*sheet);
+                crate::sheetareas::encode_ignored(list, &mut w);
                 return w.into_bytes();
             }
             GridOp::Watches { sheet, list } => {
@@ -623,6 +639,22 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::Calculation(manual));
+        }
+        if kind == 34 {
+            let sheet = r.u16()?;
+            let list = crate::sheetareas::decode_ranges(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::EditRanges { sheet, list });
+        }
+        if kind == 35 {
+            let sheet = r.u16()?;
+            let list = crate::sheetareas::decode_ignored(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::IgnoredErrors { sheet, list });
         }
         if kind == 33 {
             let sheet = r.u16()?;
@@ -945,6 +977,20 @@ impl Op<Workbook> for GridOp {
                     wb.mark_all(None);
                 }
                 GridOp::Calculation(old)
+            }
+            GridOp::EditRanges { sheet, mut list } => {
+                match wb.sheets.get_mut(sheet as usize) {
+                    Some(sh) if crate::sheetareas::valid_ranges(&list) => std::mem::swap(&mut sh.edit_ranges, &mut list),
+                    _ => return GridOp::Batch(Vec::new()),
+                }
+                GridOp::EditRanges { sheet, list }
+            }
+            GridOp::IgnoredErrors { sheet, mut list } => {
+                match wb.sheets.get_mut(sheet as usize) {
+                    Some(sh) if crate::sheetareas::valid_ignored(&list) => std::mem::swap(&mut sh.ignored, &mut list),
+                    _ => return GridOp::Batch(Vec::new()),
+                }
+                GridOp::IgnoredErrors { sheet, list }
             }
             GridOp::Watches { sheet, mut list } => {
                 match wb.sheets.get_mut(sheet as usize) {

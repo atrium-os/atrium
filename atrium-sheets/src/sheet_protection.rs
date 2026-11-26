@@ -43,6 +43,10 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         GridOp::Iteration(_) | GridOp::Structure(_) | GridOp::Calculation(_) => true,
         // What the Watch Window shows is no part of the sheet's contents.
         GridOp::Watches { .. } => true,
+        // Error Checking's view, not the sheet's contents.
+        GridOp::IgnoredErrors { .. } => true,
+        // Who may change what is fixed while the sheet is protected.
+        GridOp::EditRanges { sheet, .. } => !wb.sheet_protected(*sheet),
         GridOp::Sizes { sheet, .. }
         | GridOp::LayoutSizes { sheet, .. }
         | GridOp::RenameSheet { sheet, .. }

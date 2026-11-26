@@ -587,6 +587,23 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         }
         o.extend_from_slice(b"/>");
     }
+    let area = |&(r0, c0, r1, c1): &(u32, u32, u32, u32)| if (r0, c0) == (r1, c1) { a1(r0, c0) } else { format!("{}:{}", a1(r0, c0), a1(r1, c1)) };
+    if !sh.edit_ranges().is_empty() {
+        o.extend_from_slice(b"<protectedRanges>");
+        for er in sh.edit_ranges() {
+            let sqref: Vec<String> = er.areas.iter().map(area).collect();
+            let _ = write!(o, r#"<protectedRange sqref="{}" name="{}""#, sqref.join(" "), crate::xml::esc(&er.title));
+            for kv in er.password.iter().flat_map(|p| p.split('\n')) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    if ["password", "algorithmName", "hashValue", "saltValue", "spinCount"].contains(&k) {
+                        let _ = write!(o, r#" {k}="{}""#, crate::xml::esc(v));
+                    }
+                }
+            }
+            o.extend_from_slice(b"/>");
+        }
+        o.extend_from_slice(b"</protectedRanges>");
+    }
     let scenarios = sh.scenarios();
     if !scenarios.is_empty() {
         o.extend_from_slice(b"<scenarios>");
@@ -641,6 +658,19 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
             let _ = write!(o, r#"<cellWatch r="{}"/>"#, a1(r, c));
         }
         o.extend_from_slice(b"</cellWatches>");
+    }
+    if !sh.ignored_errors().is_empty() {
+        o.extend_from_slice(b"<ignoredErrors>");
+        for i in sh.ignored_errors() {
+            let _ = write!(o, r#"<ignoredError sqref="{}""#, area(&(i.r0, i.c0, i.r1, i.c1)));
+            for (k, name) in officina_grid::sheetareas::RULES.iter().enumerate() {
+                if i.rules & (1 << k) != 0 {
+                    let _ = write!(o, r#" {name}="1""#);
+                }
+            }
+            o.extend_from_slice(b"/>");
+        }
+        o.extend_from_slice(b"</ignoredErrors>");
     }
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
     if wb.charts().iter().any(|c| c.anchor.sheet == s) || wb.pictures().iter().any(|p| p.anchor.sheet == s) {

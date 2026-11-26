@@ -28,6 +28,7 @@ pub fn bar(kind: DataCmd) -> (&'static str, &'static str, &'static str, &'static
         DataCmd::Consolidate => ("Consolidate", "Sum; A1:B5, Sheet2!A1:B5; top, left", "Combine", "function; ranges; labels in the top row, left column"),
         DataCmd::DataTable => ("Inputs", "B1, B2", "Fill", "row input cell, column input cell (one may be empty)"),
         DataCmd::EvaluateFormula => ("Evaluate", "", "Next", "each Next works out one more part, the leftmost innermost first"),
+        DataCmd::EditRanges => ("Edit ranges", "add Inputs: B2:B9, D1", "Set", "add TITLE: cells, delete TITLE, or list; they can be edited while the sheet is protected"),
         DataCmd::CreateNames => ("Names from", "top, left", "Create", "where the labels are: top row, left column, bottom row, right column"),
         DataCmd::FillAcross => ("Fill to", "all", "Fill", "all, or sheet names; then contents or formats for only those"),
         DataCmd::Sparklines => ("Sparklines", "line B2:F9", "Draw", "line, column or winloss and the data; markers, color 00B050; or clear"),
@@ -50,6 +51,7 @@ pub fn start(d: &Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd) -> Stri
         DataCmd::Sparklines => crate::sparkbar::start(d, sel),
         DataCmd::FillAcross => "all".into(),
         DataCmd::CreateNames => crate::formulas::create_start(d, sel),
+        DataCmd::EditRanges => crate::checks::ranges_start(d, sel),
         DataCmd::EvaluateFormula => officina_grid::eval::steps::evaluate_steps(&d.wb, CellAddr::new(d.sheet, cursor.0, cursor.1)).and_then(|s| s.into_iter().next()).unwrap_or_default(),
         _ => String::new(),
     }
@@ -68,6 +70,7 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd, typed
         DataCmd::Sparklines => crate::sparkbar::run(d, sel, typed),
         DataCmd::FillAcross => crate::series::fill_across(d, sel, typed),
         DataCmd::CreateNames => crate::formulas::create_names(d, sel, typed),
+        DataCmd::EditRanges => crate::checks::edit_ranges(d, typed),
         DataCmd::EvaluateFormula => Err(evaluate_next(d, cursor, typed).1),
         _ => Err("Not a bar command.".into()),
     }

@@ -70,6 +70,8 @@ pub const VIEW_HIDDEN: u16 = 30;
 pub const SCENARIOS: u16 = 31;
 pub const SPARKLINES: u16 = 32;
 pub const WATCHES: u16 = 33;
+pub const EDIT_RANGES: u16 = 34;
+pub const IGNORED_ERRORS: u16 = 35;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -205,6 +207,22 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         w.u16(sheet as u16);
         crate::sparkline::encode(&sh.sparklines, &mut w);
         c.add(SPARKLINES, &w.into_bytes())?;
+    }
+
+    for (sheet, sh) in wb.sheets.iter().enumerate() {
+        if sh.edit_ranges.is_empty() { continue; }
+        let mut w = Writer::new();
+        w.u16(sheet as u16);
+        crate::sheetareas::encode_ranges(&sh.edit_ranges, &mut w);
+        c.add(EDIT_RANGES, &w.into_bytes())?;
+    }
+
+    for (sheet, sh) in wb.sheets.iter().enumerate() {
+        if sh.ignored.is_empty() { continue; }
+        let mut w = Writer::new();
+        w.u16(sheet as u16);
+        crate::sheetareas::encode_ignored(&sh.ignored, &mut w);
+        c.add(IGNORED_ERRORS, &w.into_bytes())?;
     }
 
     for (sheet, sh) in wb.sheets.iter().enumerate() {
@@ -653,6 +671,30 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         let list = crate::sparkline::decode(&mut r)?;
         if !r.is_empty() { return Err(LoadError::Bad("trailing sparkline data")); }
         wb.sheet_mut(sheet).sparklines = list;
+    }
+
+    let mut with_ranges = std::collections::BTreeSet::new();
+    for chunk in of(EDIT_RANGES) {
+        let mut r = Reader::new(c.chunk(chunk)?);
+        let sheet = r.u16()?;
+        if sheet as usize >= wb.sheet_count() || !with_ranges.insert(sheet) {
+            return Err(LoadError::Bad("invalid or repeated worksheet edit ranges"));
+        }
+        let list = crate::sheetareas::decode_ranges(&mut r)?;
+        if !r.is_empty() { return Err(LoadError::Bad("trailing edit range data")); }
+        wb.sheet_mut(sheet).edit_ranges = list;
+    }
+
+    let mut with_ignored = std::collections::BTreeSet::new();
+    for chunk in of(IGNORED_ERRORS) {
+        let mut r = Reader::new(c.chunk(chunk)?);
+        let sheet = r.u16()?;
+        if sheet as usize >= wb.sheet_count() || !with_ignored.insert(sheet) {
+            return Err(LoadError::Bad("invalid or repeated worksheet ignored errors"));
+        }
+        let list = crate::sheetareas::decode_ignored(&mut r)?;
+        if !r.is_empty() { return Err(LoadError::Bad("trailing ignored error data")); }
+        wb.sheet_mut(sheet).ignored = list;
     }
 
     let mut with_watches = std::collections::BTreeSet::new();

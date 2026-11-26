@@ -1,10 +1,12 @@
 //! Formula auditing (docs/spec/officina.md §16.142): Error Checking steps
-//! to the next cell holding an error or a number stored as text and says
-//! why; Trace Error follows an error back through the cells it came from
+//! to the next cell holding an error, a number stored as text or a formula
+//! Excel's rules flag (§16.146: inconsistent with its neighbours, leaving
+//! out a number beside its range, unlocked) and says why; Trace Error follows an error back through the cells it came from
 //! to its source; Evaluate Formula's steps come from
 //! [`officina_grid::eval::steps`].
 
 use officina_grid::addr::{a1, CellAddr, Rect};
+use officina_grid::sheetareas::{EVAL_ERROR, INCONSISTENT, NUMBER_AS_TEXT, OMITS_ADJACENT, UNLOCKED_FORMULA};
 use officina_grid::column::Cell;
 use officina_grid::value::ErrorKind;
 use officina_grid::{Value, Workbook};
@@ -36,17 +38,66 @@ fn number_text(s: &str) -> bool {
     !t.is_empty() && t.parse::<f64>().is_ok_and(f64::is_finite) && t.chars().any(|c| c.is_ascii_digit())
 }
 
-/// What Error Checking says about the cell, if anything.
-fn problem(wb: &Workbook, a: CellAddr, cell: Cell) -> Option<String> {
-    match cell {
-        Cell::Err(k) => Some(format!("{} {}: it {}.", a1(a.row, a.col), k.text(), reason(k))),
-        Cell::Str(_) if wb.formula_text(a).is_none() => match wb.get(a) {
-            Value::Str(s) if number_text(&s) => Some(format!("{} is a number stored as text: formulas won't count it.", a1(a.row, a.col))),
-            _ => None,
-        },
-        _ => None,
-    }
+/// The formula's expression at a cell, if it holds one.
+fn expr_at(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Option<std::sync::Arc<officina_grid::formula::ast::Expr>> {
+    wb.group_at(sheet, row, col).map(|g| wb.group(g).expr.clone())
 }
+
+/// What Error Checking finds at `a`, if anything: the rule
+/// ([`officina_grid::sheetareas`]'s bits) and what to say. Rules the cell
+/// is told to ignore are passed over.
+pub fn problem_at(wb: &Workbook, a: CellAddr) -> Option<(u16, String)> {
+    let ignored = officina_grid::sheetareas::ignored_at(wb.sheet(a.sheet).ignored_errors(), a.row, a.col);
+    let here = a1(a.row, a.col);
+    let live = |rule: u16| ignored & rule == 0;
+    match wb.get(a) {
+        Value::Err(k) if live(EVAL_ERROR) => return Some((EVAL_ERROR, format!("{here} {}: it {}.", k.text(), reason(k)))),
+        Value::Str(s) if live(NUMBER_AS_TEXT) && wb.formula_text(a).is_none() && number_text(&s) => {
+            return Some((NUMBER_AS_TEXT, format!("{here} is a number stored as text: formulas won't count it. Convert to Number fixes it.")));
+        }
+        _ => {}
+    }
+    let e = expr_at(wb, a.sheet, a.row, a.col)?;
+    if live(INCONSISTENT) {
+        let at = |r: Option<u32>, c: Option<u32>| r.zip(c).and_then(|(r, c)| expr_at(wb, a.sheet, r, c));
+        let pairs = [
+            (at(a.row.checked_sub(1), Some(a.col)), at(a.row.checked_add(1), Some(a.col)), "above and below"),
+            (at(Some(a.row), a.col.checked_sub(1)), at(Some(a.row), a.col.checked_add(1)), "left and right"),
+        ];
+        for (x, y, side) in pairs {
+            if let (Some(x), Some(y)) = (x, y) {
+                if x == y && *x != *e {
+                    return Some((INCONSISTENT, format!("{here}'s formula differs from the ones {side} of it, which agree.")));
+                }
+            }
+        }
+    }
+    if live(OMITS_ADJACENT) {
+        let number = |r: u32, c: u32| (r, c) != (a.row, a.col) && matches!(wb.get(CellAddr::new(a.sheet, r, c)), Value::Num(_));
+        for p in crate::data::precedents(wb, a.sheet, a.row, a.col) {
+            if p.sheet != a.sheet || p.cells() < 2 {
+                continue;
+            }
+            let near = if p.c0 == p.c1 {
+                [p.r0.checked_sub(1).map(|r| (r, p.c0)), p.r1.checked_add(1).filter(|&r| r < officina_grid::addr::MAX_ROWS).map(|r| (r, p.c0))]
+            } else if p.r0 == p.r1 {
+                [p.c0.checked_sub(1).map(|c| (p.r0, c)), p.c1.checked_add(1).filter(|&c| c < officina_grid::addr::MAX_COLS).map(|c| (p.r0, c))]
+            } else {
+                continue;
+            };
+            if let Some((r, c)) = near.into_iter().flatten().find(|&(r, c)| number(r, c)) {
+                return Some((OMITS_ADJACENT, format!("{here}'s formula leaves out {}, a number next to the cells it reads.", a1(r, c))));
+            }
+        }
+    }
+    if live(UNLOCKED_FORMULA) && wb.style(a).unlocked {
+        return Some((UNLOCKED_FORMULA, format!("{here} holds a formula but is unlocked: protecting the sheet won't keep it from being changed.")));
+    }
+    None
+}
+
+/// The most formula cells Error Checking looks through for its formula rules.
+pub const MAX_FORMULA_CELLS: u64 = 200_000;
 
 /// Error Checking: the next cell after `from` on the sheet, by rows and
 /// wrapping round, with a problem, and what it is.
@@ -56,23 +107,36 @@ pub fn next_error(wb: &Workbook, sheet: u16, from: (u32, u32)) -> Option<((u32, 
         return None;
     }
     let all = Rect { sheet, r0: 0, c0: 0, r1: rows - 1, c1: cols - 1 };
-    // The first problem after `from` and the first overall, by (row, col).
-    let (mut after, mut first): (Option<(u32, u32)>, Option<(u32, u32)>) = (None, None);
+    // Cells that might have a problem: errors and text, and formula cells.
+    let mut cands: Vec<(u32, u32)> = Vec::new();
     wb.each_cell(&all, &mut |r, c, cell| {
-        if !matches!(cell, Cell::Err(_) | Cell::Str(_)) || problem(wb, CellAddr::new(sheet, r, c), cell).is_none() {
-            return;
-        }
-        if first.is_none_or(|f| (r, c) < f) {
-            first = Some((r, c));
-        }
-        if (r, c) > from && after.is_none_or(|f| (r, c) < f) {
-            after = Some((r, c));
+        if matches!(cell, Cell::Err(_) | Cell::Str(_)) {
+            cands.push((r, c));
         }
     });
-    let at = after.or(first)?;
-    let mut cell = Cell::Empty;
-    wb.each_cell(&Rect { sheet, r0: at.0, c0: at.1, r1: at.0, c1: at.1 }, &mut |_, _, c| cell = c);
-    Some((at, problem(wb, CellAddr::new(sheet, at.0, at.1), cell)?))
+    let mut n = 0u64;
+    for (_, g) in wb.groups() {
+        if g.sheet != sheet {
+            continue;
+        }
+        for r in g.r0..=g.r1 {
+            n += 1;
+            if n > MAX_FORMULA_CELLS {
+                break;
+            }
+            cands.push((r, g.col));
+        }
+    }
+    cands.sort_unstable();
+    cands.dedup();
+    let split = cands.partition_point(|&p| p <= from);
+    let order = cands[split..].iter().chain(&cands[..split]);
+    for &(r, c) in order {
+        if let Some((_, why)) = problem_at(wb, CellAddr::new(sheet, r, c)) {
+            return Some(((r, c), why));
+        }
+    }
+    None
 }
 
 /// Trace Error: from the error at `a`, each cell it reads that holds an

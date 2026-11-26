@@ -431,6 +431,10 @@ struct Seg {
     scenarios: Vec<officina_grid::scenario::Scenario>,
     /// `<cellWatches><cellWatch r>`, at most a sheet's worth.
     watches: Vec<(u32, u32)>,
+    /// `<protectedRanges><protectedRange>`.
+    edit_ranges: Vec<officina_grid::sheetareas::EditRange>,
+    /// `<ignoredErrors><ignoredError>`.
+    ignored: Vec<officina_grid::sheetareas::Ignored>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -699,6 +703,40 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     seg.rep.note(Kind::Dropped, "scenarios past the 256th on a sheet");
                 }
             }
+            b"protectedRange" => {
+                use officina_grid::sheetareas::{EditRange, MAX_AREAS, MAX_EDIT_RANGES};
+                let title = attr(&e, b"name")?.unwrap_or_default();
+                let sqref = attr(&e, b"sqref")?.unwrap_or_default();
+                let areas: Vec<_> = sqref.split_whitespace().take(MAX_AREAS + 1).filter_map(parse_ref).collect();
+                let mut verifier = Vec::new();
+                for key in ["password", "algorithmName", "hashValue", "saltValue", "spinCount"] {
+                    if let Some(v) = attr(&e, key.as_bytes())? {
+                        verifier.push(format!("{key}={v}"));
+                    }
+                }
+                let password = (!verifier.is_empty()).then(|| verifier.join("\n"));
+                let er = EditRange { title, areas, password };
+                if seg.edit_ranges.len() < MAX_EDIT_RANGES && er.valid() && !seg.edit_ranges.iter().any(|o| o.title.eq_ignore_ascii_case(&er.title)) {
+                    seg.edit_ranges.push(er);
+                } else {
+                    seg.rep.note(Kind::Dropped, "edit ranges with no title, a title twice or a bad range");
+                }
+            }
+            b"ignoredError" => {
+                use officina_grid::sheetareas::{Ignored, MAX_IGNORED, RULES};
+                let mut rules = 0u16;
+                for (i, key) in RULES.iter().enumerate() {
+                    if attr(&e, key.as_bytes())?.is_some_and(|v| v == "1" || v == "true") {
+                        rules |= 1 << i;
+                    }
+                }
+                let sqref = attr(&e, b"sqref")?.unwrap_or_default();
+                for (r0, c0, r1, c1) in sqref.split_whitespace().filter_map(parse_ref) {
+                    if rules != 0 && seg.ignored.len() < MAX_IGNORED {
+                        seg.ignored.push(Ignored { r0, c0, r1, c1, rules });
+                    }
+                }
+            }
             b"cellWatch" => {
                 match attr(&e, b"r")?.as_deref().and_then(parse_a1) {
                     Some(at) if seg.watches.len() < officina_grid::watch::MAX_WATCHES => {
@@ -945,6 +983,12 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     if !all || !set {
                         seg.rep.note(Kind::Dropped, "sparklines with an unknown sheet, a bad range or a cell used twice");
                     }
+                }
+                if !seg.edit_ranges.is_empty() && !wb.set_edit_ranges(s, seg.edit_ranges) {
+                    seg.rep.note(Kind::Dropped, "edit ranges");
+                }
+                if !seg.ignored.is_empty() && !wb.set_ignored_errors(s, seg.ignored) {
+                    seg.rep.note(Kind::Dropped, "ignored errors");
                 }
                 if !seg.watches.is_empty() && !wb.set_watches(s, seg.watches) {
                     seg.rep.note(Kind::Dropped, "watched cells");

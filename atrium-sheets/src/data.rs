@@ -216,6 +216,13 @@ pub enum DataCmd {
     ApplyNames,
     AutoOutline,
     WorkbookStats,
+    /// Review tools ([`crate::checks`]): Allow Edit Ranges (a bar), Ignore
+    /// Error, Reset Ignored Errors, Convert to Number, Inspect Document.
+    EditRanges,
+    IgnoreError,
+    ResetIgnored,
+    ConvertToNumber,
+    InspectDocument,
     /// Fill ▸ Across Worksheets (a bar, [`crate::series::fill_across`]).
     FillAcross,
     /// Formulas at the cursor reading the cells last copied, one for each.
@@ -540,6 +547,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Go to Precedents").shortcut("Ctrl+[").enabled(wb.group_at(s, row, col).is_some()), Some(DataCmd::Precedents)),
         (MenuItem::new("Go to Dependents").shortcut("Ctrl+]"), Some(DataCmd::Dependents)),
         (MenuItem::new("Error Checking"), Some(DataCmd::ErrorChecking)),
+        (MenuItem::new("Ignore Error").enabled(crate::audit::problem_at(wb, CellAddr::new(s, row, col)).is_some()), Some(DataCmd::IgnoreError)),
+        (MenuItem::new("Reset Ignored Errors").enabled((0..wb.sheet_count() as u16).any(|x| !wb.sheet(x).ignored_errors().is_empty())), Some(DataCmd::ResetIgnored)),
+        (MenuItem::new("Convert to Number"), Some(DataCmd::ConvertToNumber)),
         (MenuItem::new("Trace Error").enabled(matches!(wb.get(CellAddr::new(s, row, col)), Value::Err(_))), Some(DataCmd::TraceError)),
         (MenuItem::new("Evaluate Formula…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::EvaluateFormula)),
         (MenuItem::new("Insert Function…").shortcut("Shift+F3"), Some(DataCmd::InsertFunction)),
@@ -552,6 +562,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Workbook Statistics…"), Some(DataCmd::WorkbookStats)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
+        (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
+        (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
         (MenuItem::new("Protect Workbook Structure").checked(wb.structure_protected()), Some(DataCmd::ProtectWorkbook)),
         (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
         (MenuItem::new("Data Table…").enabled(nr > 1 && nc > 1), Some(DataCmd::DataTable)),
@@ -3059,7 +3071,10 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::AddWatch => crate::formulas::add_watches(d, sel),
         DataCmd::ApplyNames => crate::formulas::apply_names(d, sel),
         DataCmd::AutoOutline => crate::formulas::auto_outline(d, sel),
-        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats => Ok(String::new()),
+        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument => Ok(String::new()),
+        DataCmd::IgnoreError => crate::checks::ignore_error(d, cursor),
+        DataCmd::ResetIgnored => crate::checks::reset_ignored(d),
+        DataCmd::ConvertToNumber => crate::checks::convert_to_number(d, sel),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

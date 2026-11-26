@@ -27,3 +27,4 @@ pub mod series;
 pub mod audit;
 pub mod sparkbar;
 pub mod formulas;
+pub mod checks;

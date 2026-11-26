@@ -169,12 +169,40 @@ impl Workbook {
             return true;
         }
         let sheet = self.sheet(rect.sheet);
+        // Rows of `col` opened by Allow Edit Ranges (one with a foreign
+        // password stays shut), sorted.
+        let open = |col: u32| -> Vec<(u32, u32)> {
+            let mut v: Vec<(u32, u32)> = sheet.edit_ranges.iter().filter(|e| e.password.is_none())
+                .flat_map(|e| e.areas.iter().filter(|a| (a.1..=a.3).contains(&col)).map(|a| (a.0, a.2)))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let covered = |spans: &[(u32, u32)], a: u32, b: u32| {
+            let mut at = a;
+            for &(x, y) in spans {
+                if x > at {
+                    break;
+                }
+                if y >= at {
+                    if y >= b {
+                        return true;
+                    }
+                    at = y + 1;
+                }
+            }
+            false
+        };
         (rect.c0..=rect.c1).all(|col| {
+            let open = open(col);
+            if covered(&open, rect.r0, rect.r1) {
+                return true;
+            }
             sheet.styles.get(col as usize).is_some_and(|style| {
                 style
                     .spans(rect.r0, rect.r1)
                     .iter()
-                    .all(|&(_, _, id)| self.styles.get(id).unlocked)
+                    .all(|&(a, b, id)| self.styles.get(id).unlocked || covered(&open, a.max(rect.r0), b.min(rect.r1)))
             })
         })
     }

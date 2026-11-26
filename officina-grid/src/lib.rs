@@ -47,6 +47,7 @@ pub mod axis_ids;
 pub mod scenario;
 pub mod sparkline;
 pub mod watch;
+pub mod sheetareas;
 pub mod shift;
 pub mod structural_merge;
 pub mod sheetops;

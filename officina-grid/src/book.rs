@@ -78,6 +78,10 @@ pub struct Sheet {
     pub(crate) sparklines: Vec<crate::sparkline::Sparkline>,
     /// The Watch Window's cells on this sheet, in the order added.
     pub(crate) watches: Vec<(u32, u32)>,
+    /// Allow Edit Ranges: areas that can change while the sheet is protected.
+    pub(crate) edit_ranges: Vec<crate::sheetareas::EditRange>,
+    /// Areas where Error Checking ignores some rules.
+    pub(crate) ignored: Vec<crate::sheetareas::Ignored>,
 }
 
 pub(crate) fn new_sheet_identity() -> u128 {
@@ -86,7 +90,15 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new(), watches: Vec::new() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new(), watches: Vec::new(), edit_ranges: Vec::new(), ignored: Vec::new() }
+    }
+    /// Allow Edit Ranges on this sheet.
+    pub fn edit_ranges(&self) -> &[crate::sheetareas::EditRange] {
+        &self.edit_ranges
+    }
+    /// The areas where Error Checking ignores some rules.
+    pub fn ignored_errors(&self) -> &[crate::sheetareas::Ignored] {
+        &self.ignored
     }
     /// The Watch Window's cells on this sheet, in the order added.
     pub fn watches(&self) -> &[(u32, u32)] {
@@ -415,7 +427,7 @@ impl Workbook {
     pub fn drop_last_sheet(&mut self) -> Option<String> {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
-        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && !sh.sheet_hidden && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.scenarios.is_empty() && sh.sparklines.is_empty() && sh.watches.is_empty() && sh.freeze == (0, 0);
+        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && !sh.sheet_hidden && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.scenarios.is_empty() && sh.sparklines.is_empty() && sh.watches.is_empty() && sh.edit_ranges.is_empty() && sh.ignored.is_empty() && sh.freeze == (0, 0);
         let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
@@ -1067,6 +1079,25 @@ impl Workbook {
     /// [`crate::ops::GridOp::Calculation`] is the undoable change.
     pub fn set_manual_calc(&mut self, manual: bool) {
         self.manual = manual;
+    }
+
+    /// Sets sheet `sheet`'s edit ranges outside undo (files use it); false,
+    /// nothing changed, for a sheet that isn't or a list that isn't valid.
+    pub fn set_edit_ranges(&mut self, sheet: u16, list: Vec<crate::sheetareas::EditRange>) -> bool {
+        if sheet as usize >= self.sheets.len() || !crate::sheetareas::valid_ranges(&list) {
+            return false;
+        }
+        self.sheet_mut(sheet).edit_ranges = list;
+        true
+    }
+
+    /// Sets sheet `sheet`'s ignored errors outside undo (files use it).
+    pub fn set_ignored_errors(&mut self, sheet: u16, list: Vec<crate::sheetareas::Ignored>) -> bool {
+        if sheet as usize >= self.sheets.len() || !crate::sheetareas::valid_ignored(&list) {
+            return false;
+        }
+        self.sheet_mut(sheet).ignored = list;
+        true
     }
 
     /// Sets sheet `sheet`'s watched cells outside undo (files use it); false,
