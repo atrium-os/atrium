@@ -53,7 +53,7 @@ fn normal(x: f64, mean: f64, sd: f64, cumulative: bool) -> R {
     let z = (x - mean) / sd;
     Ok(if cumulative { norm_cdf(z) } else { norm_pdf(z) / sd })
 }
-fn normal_inv(p: f64, mean: f64, sd: f64) -> R {
+pub(super) fn normal_inv(p: f64, mean: f64, sd: f64) -> R {
     let p = prob(p)?;
     if sd <= 0.0 {
         return num_err();

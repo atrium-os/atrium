@@ -599,6 +599,36 @@ impl SheetSource {
         Some(pergola::widgets::GridFloat { key: 1 << 58, at: [ox, oy, w, h], nodes: Rc::new(nodes), movable: false, pressable: false })
     }
 
+    /// Go To Special's marked areas on screen: a tint and an outline each.
+    fn found_marks(&self, view: [f64; 4]) -> Option<pergola::widgets::GridFloat> {
+        use pergola::shape::{Paint, PathData, Shape, Stroke};
+        let (found, sheet) = {
+            let d = self.doc.borrow();
+            (d.found.clone(), d.sheet)
+        };
+        let area = officina_grid::Rect { sheet, r0: self.row_at(view[1].max(0.0)), c0: self.col_at(view[0].max(0.0)), r1: self.row_at(view[1].max(0.0) + view[3]), c1: self.col_at(view[0].max(0.0) + view[2]) };
+        let shown: Vec<officina_grid::Rect> = found.iter().filter(|r| r.sheet == sheet && r.r0 <= area.r1 && r.r1 >= area.r0 && r.c0 <= area.c1 && r.c1 >= area.c0).copied().take(MAX_RINGS).collect();
+        if shown.is_empty() {
+            return None;
+        }
+        let (ox, oy) = (self.col_left(area.c0), self.row_top(area.r0));
+        let (w, h) = (self.col_left(area.c1 + 1) - ox, self.row_top(area.r1 + 1) - oy);
+        let tint = Color::rgba(0.1, 0.45, 0.85, 0.18);
+        let edge = Color::rgba(0.1, 0.45, 0.85, 0.9);
+        let mut nodes = Vec::new();
+        for r in shown {
+            let (r0, c0, r1, c1) = (r.r0.max(area.r0), r.c0.max(area.c0), r.r1.min(area.r1), r.c1.min(area.c1));
+            let (x0, x1) = (self.col_left(c0) - ox, self.col_left(c1 + 1) - ox);
+            let (y0, y1) = (self.row_top(r0) - oy, self.row_top(r1 + 1) - oy);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let shape = Shape::new(PathData::rect(pergola::Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32))).fill(Paint::Solid(tint)).stroke(Stroke::new(Paint::Solid(edge), 1.0));
+            nodes.extend(shape.fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
+        }
+        Some(pergola::widgets::GridFloat { key: (1 << 58) + 3, at: [ox, oy, w, h], nodes: Rc::new(nodes), movable: false, pressable: false })
+    }
+
     /// Trace Precedents and Dependents' arrows over the sheet on screen:
     /// blue, red from an error, and black from or to another sheet (drawn
     /// to a small sheet mark beside the cell); a box round cells read
@@ -1002,6 +1032,7 @@ impl GridSource for SheetSource {
         let mut out = self.data_marks(view, theme);
         out.extend(self.all_notes(view));
         out.extend(self.note_float());
+        out.extend(self.found_marks(view));
         out.extend(self.trace_arrows(view));
         out.extend(self.list_button(theme));
         out.extend(self.fill_button(theme));

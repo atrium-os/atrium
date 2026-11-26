@@ -1812,6 +1812,41 @@ impl Sheets {
                         self.split_text.set(TextEdit::new(&step));
                         Err(say)
                     }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::GoToSpecial) => {
+                        // The bar stays open so next can step through what was found.
+                        let r = crate::special::go_to_special(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed);
+                        match r {
+                            Ok(w) => {
+                                self.show_cell(w.cursor.0, w.cursor.1);
+                                let mut g = self.grid.get_cloned();
+                                match w.select {
+                                    Some(r) => {
+                                        g.anchor = (r.r0, r.c0);
+                                        g.cursor = (r.r1, r.c1);
+                                    }
+                                    None => {
+                                        g.anchor = w.cursor;
+                                        g.cursor = w.cursor;
+                                    }
+                                }
+                                self.grid.set(g);
+                                let mut ed = TextEdit::new("next");
+                                ed.select_all();
+                                self.split_text.set(ed);
+                                self.rev.set(self.rev.get().wrapping_add(1));
+                                Err(w.say)
+                            }
+                            Err(why) => Err(why),
+                        }
+                    }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::ForecastSheet) => {
+                        let r = crate::special::forecast_sheet(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed);
+                        if r.is_ok() {
+                            let last = self.doc.borrow().wb.sheet_count().saturating_sub(1) as u16;
+                            self.show_sheet(last);
+                        }
+                        r
+                    }
                     _ if self.splitting.get() == Some(crate::data::DataCmd::DataForm) => {
                         // The form stays open on the record it moved to.
                         let r = crate::whatif::form_next(&mut self.doc.borrow_mut(), g.cursor, &typed);
@@ -4065,7 +4100,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet)) => {
                     self.close_bars();
                     let g = self.grid.get_cloned();
                     let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));

@@ -11,6 +11,7 @@ use super::textafter::textsplit;
 use super::refs::{indirect, offset};
 use super::conv::*;
 use super::stats::*;
+use super::ets::{forecast_ets, forecast_ets_confint, forecast_ets_seasonality, forecast_ets_stat};
 use super::dist::*;
 use super::linest::*;
 use super::bonds::*;
@@ -285,6 +286,10 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("INTERCEPT", 2, 2, intercept),
     f!("FORECAST", 3, 3, forecast),
     f!("FORECAST.LINEAR", 3, 3, forecast),
+    f!("FORECAST.ETS", 3, 6, forecast_ets),
+    f!("FORECAST.ETS.CONFINT", 3, 7, forecast_ets_confint),
+    f!("FORECAST.ETS.SEASONALITY", 2, 4, forecast_ets_seasonality),
+    f!("FORECAST.ETS.STAT", 3, 6, forecast_ets_stat),
     f!("STEYX", 2, 2, steyx),
     f!("COVAR", 2, 2, covariance_p),
     f!("COVARIANCE.P", 2, 2, covariance_p),

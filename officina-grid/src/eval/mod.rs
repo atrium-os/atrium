@@ -31,6 +31,7 @@ pub mod database;
 mod textmore;
 mod convert;
 mod groupby;
+pub mod ets;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
