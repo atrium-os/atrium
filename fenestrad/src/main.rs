@@ -502,7 +502,16 @@ fn main() {
     // The mint socket's directory is root's: bound before the drop.
     let mint_listener = arg(&args, "--mint-sock").map(|path| {
         // A fresh socket in fenestrad's own directory; any local user
-        // may connect, and the uid check in mint_request decides.
+        // may connect, and the uid check in mint_request decides. One
+        // left by a fenestrad that died is taken away; one that answers
+        // is another fenestrad's, and this one stops.
+        let stale = std::fs::symlink_metadata(&path).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()));
+        if stale {
+            if UnixStream::connect(&path).is_ok() {
+                die(format!("{path}: another fenestrad is taking mints"));
+            }
+            std::fs::remove_file(&path).unwrap_or_else(|e| die(format!("{path}: {e}")));
+        }
         let l = UnixListener::bind(&path).unwrap_or_else(|e| die(format!("{path}: {e}")));
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap_or_else(|e| die(format!("{path}: {e}")));
         (path, l)

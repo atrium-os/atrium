@@ -126,7 +126,7 @@ fen_fenestrad() {
         # The commissioned service, through rc; mints from the seat's user.
         SEAT=/atrium/sockets/ostiarius/active-session
         g "test -e $SEAT || { mkdir -p /atrium/sockets/ostiarius && echo root >$SEAT && touch $G/made-seat; }
-            sysrc atrium_fenestrad_grace=15 atrium_fenestrad_logfile=$G/fenestrad.log >/dev/null && service atrium_fenestrad start" \
+            sysrc atrium_fenestrad_grace=15 atrium_fenestrad_logfile=$G/fenestrad.log >/dev/null && service atrium_fenestrad start </dev/null >/dev/null 2>&1" \
             || gate_abort "service atrium_fenestrad start failed"
         i=0; while [ $i -lt 30 ] && ! g "test -S /var/run/fenestra/mint.sock"; do sleep 1; i=$((i+1)); done
         g "test -S /var/run/fenestra/mint.sock" || { g "tail -20 /var/log/messages"; gate_abort "the service did not open its mint socket"; }
