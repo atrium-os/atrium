@@ -77,12 +77,23 @@ pub fn set(dir: &Path, name: &str, colour: Option<u32>) -> Result<(), String> {
     let tmp = dir.join(format!(".colours.{}", std::process::id()));
     {
         use std::io::Write;
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        let mut f = o.open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        f.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let open = || {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            o.open(&tmp)
+        };
+        // One left by a run that died with this pid is this person's own:
+        // take it away once and try again.
+        let mut f = open()
+            .or_else(|_| std::fs::remove_file(&tmp).and_then(|()| open()))
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        // On disk before the rename, so a crash never leaves a short file.
+        f.write_all(text.as_bytes()).and_then(|()| f.sync_all()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", tmp.display())
+        })?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -112,6 +123,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(d.join("colours")).unwrap().permissions().mode() & 0o777, 0o600);
         }
+        // A temporary file left by a run that died with this pid is
+        // taken away, not a reason to fail.
+        std::fs::write(d.join(format!(".colours.{}", std::process::id())), "stale").unwrap();
+        set(&d, "root@c", Some(7)).unwrap();
+        assert_eq!(get(&d, "root@c"), Some(7));
         // A name over two lines is refused; junk lines are skipped.
         assert!(set(&d, "a\nb", Some(1)).is_err());
         std::fs::write(d.join("colours"), "zzzzzz x\n123456\n00ff00 green host\n").unwrap();
