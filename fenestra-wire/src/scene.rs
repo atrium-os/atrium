@@ -110,9 +110,11 @@ pub enum Control {
     Resume(Vec<(u32, u64, u64)>),
     /// Host: `window` is gone.
     Closed(u32),
-    /// Host, whole-desktop sessions (§3.4): the screen's size and where
-    /// its windows are, bottom to top.
-    Layout { screen: (u32, u32), windows: Vec<Placed> },
+    /// Host: the screen's size and where its windows are, bottom to top.
+    /// `desktop`: a WM runs on the host and the viewer shows the whole
+    /// desktop; else each window is a window of its own on the viewer
+    /// (per-app, §3.4).
+    Layout { screen: (u32, u32), desktop: bool, windows: Vec<Placed> },
     /// Viewer: input, in the host screen's pixels (whole desktop, §9).
     Input(Input),
     /// Host, whole-desktop sessions: frescod's trusted chrome and the
@@ -131,6 +133,9 @@ pub enum Input {
     Motion { x: f32, y: f32 },
     Button { button: u8, pressed: bool },
     Scroll { dx: f32, dy: f32 },
+    /// Per-app sessions: the pointer to `(x, y)` inside `window`, in its
+    /// pixels; buttons and scrolls then go to that window.
+    MotionIn { window: u32, x: f32, y: f32 },
 }
 
 impl Eq for Input {}
@@ -174,6 +179,12 @@ impl Control {
                     b.extend_from_slice(&dx.to_le_bytes());
                     b.extend_from_slice(&dy.to_le_bytes());
                 }
+                Input::MotionIn { window, x, y } => {
+                    b.push(10);
+                    b.extend_from_slice(&window.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                    b.extend_from_slice(&y.to_le_bytes());
+                }
             },
             Control::Output { width, height, scale_milli } => {
                 b.push(9);
@@ -185,10 +196,11 @@ impl Control {
                 b.push(8);
                 b.extend_from_slice(&c.encode());
             }
-            Control::Layout { screen, windows } => {
+            Control::Layout { screen, desktop, windows } => {
                 b.push(3);
                 b.extend_from_slice(&screen.0.to_le_bytes());
                 b.extend_from_slice(&screen.1.to_le_bytes());
+                b.push(*desktop as u8);
                 b.extend_from_slice(&(windows.len().min(MAX_LAYOUT) as u32).to_le_bytes());
                 for (w, x, y, wd, ht) in windows.iter().take(MAX_LAYOUT) {
                     b.extend_from_slice(&w.to_le_bytes());
@@ -257,20 +269,33 @@ impl Control {
             Some(3) => {
                 let side = |v: u32| if (1..=MAX_SIDE).contains(&v) { Ok(v) } else { Err(bad()) };
                 let screen = (side(u32_at(1)?)?, side(u32_at(5)?)?);
-                let n = u32_at(9)? as usize;
-                if n > MAX_LAYOUT || b.len() != 13 + n * 20 {
+                let desktop = match b.get(9) {
+                    Some(0) => false,
+                    Some(1) => true,
+                    _ => return Err(bad()),
+                };
+                let n = u32_at(10)? as usize;
+                if n > MAX_LAYOUT || b.len() != 14 + n * 20 {
                     return Err(bad());
                 }
                 let mut windows: Vec<Placed> = Vec::with_capacity(n);
                 for i in 0..n {
-                    let at = 13 + i * 20;
+                    let at = 14 + i * 20;
                     let p = (u32_at(at)?, u32_at(at + 4)? as i32, u32_at(at + 8)? as i32, side(u32_at(at + 12)?)?, side(u32_at(at + 16)?)?);
                     if windows.iter().any(|q| q.0 == p.0) {
                         return Err(bad());
                     }
                     windows.push(p);
                 }
-                Ok(Control::Layout { screen, windows })
+                Ok(Control::Layout { screen, desktop, windows })
+            }
+            Some(10) if b.len() == 13 => {
+                let (window, x, y) = (u32_at(1)?, f32::from_bits(u32_at(5)?), f32::from_bits(u32_at(9)?));
+                let inside = 0.0..MAX_SIDE as f32;
+                if !(1..=u32::from(u16::MAX)).contains(&window) || !inside.contains(&x) || !inside.contains(&y) {
+                    return Err(bad());
+                }
+                Ok(Control::Input(Input::MotionIn { window, x, y }))
             }
             Some(9) if b.len() == 13 => {
                 let (width, height, scale_milli) = (u32_at(1)?, u32_at(5)?, u32_at(9)?);

@@ -9,7 +9,8 @@
 //! A `Want` asks the broker for one window's difference from what a viewer
 //! holds; the answer is any number of `Data` records then one `End`, all
 //! with the want's ticket. `Changed` says a window's stream moved on, and
-//! `Layout` where the windows are, bottom to top. `Chrome` is frescod's
+//! `Layout` where the windows are, bottom to top, and whether the host
+//! shows a whole desktop (a WM runs) or each app on its own (§3.4). `Chrome` is frescod's
 //! own layer and the background ([`chrome`]), checked in full on decode.
 
 use std::io::{self, Read, Write};
@@ -54,7 +55,10 @@ pub enum Rec {
     /// The difference for `ticket` is complete and brings a viewer to `now`
     /// (`None`: the window is not there).
     End { window: u32, ticket: u32, now: Option<Version> },
-    Layout { screen: (u32, u32), windows: Vec<Placed> },
+    /// `desktop`: a WM runs on the host, so a viewer shows the whole
+    /// desktop; without one each app window is a window of its own on the
+    /// viewer (fenestra.md §3.4).
+    Layout { screen: (u32, u32), desktop: bool, windows: Vec<Placed> },
     /// frescod → fenestrad: its trusted chrome and the background.
     Chrome(chrome::Chrome),
     /// fenestrad → frescod: the viewer's output, the size and scale its
@@ -72,6 +76,10 @@ pub enum Input {
     Key { usage: u16, pressed: bool, modifiers: u8 },
     /// The pointer to `(x, y)` on the host's screen.
     Motion { x: f32, y: f32 },
+    /// The pointer to `(x, y)` inside `window` (its pixels from its top
+    /// left): per-app sessions, where windows the host stacks may overlap
+    /// but are apart on the viewer. Buttons and scrolls then go to it.
+    MotionIn { window: u32, x: f32, y: f32 },
     /// Button 1 (primary) to 5, at the pointer.
     Button { button: u8, pressed: bool },
     /// Scroll at the pointer, in pixels.
@@ -175,13 +183,15 @@ impl Rec {
                     Input::Motion { x, y } => (2, 0, u64::from(x.to_bits()), u64::from(y.to_bits())),
                     Input::Button { button, pressed } => (3, pressed as u32, u64::from(button), 0),
                     Input::Scroll { dx, dy } => (4, 0, u64::from(dx.to_bits()), u64::from(dy.to_bits())),
+                    Input::MotionIn { x, y, .. } => (5, 0, u64::from(x.to_bits()), u64::from(y.to_bits())),
                 };
-                Head { kind: INPUT, window: 0, ticket: sub, flag, a, b, len: 0 }
+                let window = if let Input::MotionIn { window, .. } = *i { window } else { 0 };
+                Head { kind: INPUT, window, ticket: sub, flag, a, b, len: 0 }
             }
             Rec::Output { width, height, scale_milli } => {
                 Head { kind: OUTPUT, window: 0, ticket: 0, flag: 0, a: u64::from(*width) | u64::from(*height) << 32, b: u64::from(*scale_milli), len: 0 }
             }
-            Rec::Layout { screen, windows } => {
+            Rec::Layout { screen, desktop, windows } => {
                 for p in windows {
                     payload.extend_from_slice(&p.window.to_le_bytes());
                     payload.extend_from_slice(&p.x.to_le_bytes());
@@ -189,7 +199,7 @@ impl Rec {
                     payload.extend_from_slice(&p.width.to_le_bytes());
                     payload.extend_from_slice(&p.height.to_le_bytes());
                 }
-                Head { kind: LAYOUT, window: 0, ticket: 0, flag: 0, a: u64::from(screen.0), b: u64::from(screen.1), len: payload.len() as u32 }
+                Head { kind: LAYOUT, window: 0, ticket: 0, flag: *desktop as u32, a: u64::from(screen.0), b: u64::from(screen.1), len: payload.len() as u32 }
             }
             Rec::Chrome(c) => {
                 payload = c.encode();
@@ -261,7 +271,7 @@ impl Rec {
             }
             END => Rec::End { window: window(h.window)?, ticket: h.ticket, now: ver(&h)? },
             INPUT => {
-                unused(h.window == 0)?;
+                unused(h.window == 0 || h.ticket == 5)?;
                 let f32_of = |v: u64| -> Result<f32, Refused> {
                     let v = u32::try_from(v).map_err(|_| Refused("unused field not zero"))?;
                     let f = f32::from_bits(v);
@@ -296,11 +306,21 @@ impl Rec {
                         }
                         Input::Scroll { dx, dy }
                     }
+                    5 => {
+                        unused(h.flag == 0)?;
+                        let (x, y) = (f32_of(h.a)?, f32_of(h.b)?);
+                        let range = 0.0..MAX_SCREEN as f32;
+                        if !range.contains(&x) || !range.contains(&y) {
+                            return Err(Refused("pointer off the window"));
+                        }
+                        Input::MotionIn { window: window(h.window)?, x, y }
+                    }
                     _ => return Err(Refused("unknown input")),
                 })
             }
             LAYOUT => {
-                unused(h.window == 0 && h.ticket == 0 && h.flag == 0)?;
+                unused(h.window == 0 && h.ticket == 0)?;
+                let desktop = flag(h.flag)?;
                 let side = |v: u64| if (1..=u64::from(MAX_SCREEN)).contains(&v) { Ok(v as u32) } else { Err(Refused("screen size")) };
                 let screen = (side(h.a)?, side(h.b)?);
                 if payload.len() % PLACED != 0 {
@@ -318,7 +338,7 @@ impl Rec {
                     }
                     windows.push(p);
                 }
-                Rec::Layout { screen, windows }
+                Rec::Layout { screen, desktop, windows }
             }
             OUTPUT => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0)?;

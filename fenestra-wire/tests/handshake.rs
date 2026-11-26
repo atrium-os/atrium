@@ -162,15 +162,19 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&lie).is_err());
     assert!(Control::decode(&[]).is_err());
     assert_eq!(Control::decode(&Control::Closed(5).encode()).unwrap(), Control::Closed(5));
-    let l = Control::Layout { screen: (1280, 720), windows: vec![(2, -5, 30, 640, 480), (7, 0, 0, 1, 1)] };
+    let l = Control::Layout { screen: (1280, 720), desktop: true, windows: vec![(2, -5, 30, 640, 480), (7, 0, 0, 1, 1)] };
     assert_eq!(Control::decode(&l.encode()).unwrap(), l);
-    // A count past the body, a window placed twice, a zero side: refused.
+    // A mode not 0 or 1, a count past the body, a window placed twice, a
+    // zero side: refused.
     let mut lie = l.encode();
-    lie[9] = 3;
+    lie[9] = 2;
     assert!(Control::decode(&lie).is_err());
-    let twice = Control::Layout { screen: (9, 9), windows: vec![(2, 0, 0, 1, 1); 2] };
+    let mut lie = l.encode();
+    lie[10] = 3;
+    assert!(Control::decode(&lie).is_err());
+    let twice = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, 0, 0, 1, 1); 2] };
     assert!(Control::decode(&twice.encode()).is_err());
-    let zero = Control::Layout { screen: (9, 9), windows: vec![(2, 0, 0, 0, 1)] };
+    let zero = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, 0, 0, 0, 1)] };
     assert!(Control::decode(&zero.encode()).is_err());
     // A viewer's output: in range, or refused.
     let o = Control::Output { width: 1600, height: 900, scale_milli: 2000 };
@@ -186,12 +190,16 @@ fn scene_framing_round_trips_and_refuses() {
         Input::Motion { x: 12.5, y: 700.0 },
         Input::Button { button: 1, pressed: false },
         Input::Scroll { dx: 0.0, dy: -120.0 },
+        Input::MotionIn { window: 4, x: 0.0, y: 31.5 },
     ] {
         assert_eq!(Control::decode(&Control::Input(i).encode()).unwrap(), Control::Input(i));
     }
     assert!(Control::decode(&Control::Input(Input::Motion { x: f32::INFINITY, y: 0.0 }).encode()).is_err());
     assert!(Control::decode(&Control::Input(Input::Button { button: 0, pressed: true }).encode()).is_err());
     assert!(Control::decode(&[4, 1, 0, 2, 0]).is_err());
+    assert!(Control::decode(&Control::Input(Input::MotionIn { window: 0, x: 1.0, y: 1.0 }).encode()).is_err(), "window 0");
+    assert!(Control::decode(&Control::Input(Input::MotionIn { window: 70000, x: 1.0, y: 1.0 }).encode()).is_err(), "past u16");
+    assert!(Control::decode(&Control::Input(Input::MotionIn { window: 4, x: -0.5, y: 1.0 }).encode()).is_err(), "off the window");
 }
 
 #[test]

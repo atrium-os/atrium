@@ -683,6 +683,10 @@ pub struct Compositor {
     /// opens just below them until a WM places it, so a session with no
     /// WM (per-app compositing) does not put app content under the strip.
     pub popup_top: f32,
+    /// A client with window management (a WM, Forum) is connected. A
+    /// remote viewer shows the whole desktop then, and each app on its own
+    /// without one (fenestra.md §3.4).
+    pub wm_running: bool,
     /// The scale (thousandths) a new window opens at: the monitor new
     /// windows land on (resolution-independence.md §3).
     pub new_scale_milli: u32,
@@ -830,6 +834,7 @@ impl Compositor {
             last_press: None,
             popups_upstream: false,
             popup_top: 0.0,
+            wm_running: false,
             new_scale_milli: 1000,
             output_scales: Vec::new(),
             popup_grants: Vec::new(),
@@ -1855,6 +1860,31 @@ impl Compositor {
         }
     }
 
+    /// Per-app remote sessions (fenestra.md §3.4): the pointer at `(x, y)`
+    /// inside window `id`, which the viewer shows apart from the others
+    /// even where the host stacks them over each other. The cursor moves
+    /// to that point of the screen; what is hit there is taken when it is
+    /// `id` or a slot or pop-up of it, else `id` itself. A window that is
+    /// not on screen, or that a sheet holds, takes nothing (0).
+    pub fn pointer_in(&mut self, id: WindowId, x: f32, y: f32) -> (WindowId, (f32, f32)) {
+        let Some(pos) = self.windows.get(&id).filter(|w| !w.hidden && id != 0).map(|w| w.pos) else {
+            return (0, (x, y));
+        };
+        if !self.z_order.contains(&id) || self.held(id) {
+            return (0, (x, y));
+        }
+        let at = (pos.0 + x, pos.1 + y);
+        self.cursor = at;
+        let (hit, local) = self.pointer_target(at.0, at.1);
+        let ours = hit == id
+            || self.windows.get(&hit).is_some_and(|w| w.slot.is_some_and(|s| s.parent == id) || w.popup.as_ref().is_some_and(|p| p.parent == id));
+        if ours {
+            (hit, local)
+        } else {
+            (id, (x, y))
+        }
+    }
+
     /// The window the pointer at screen (`x`, `y`) is over, and the point
     /// in that window's coordinates. Hits the layers last composed
     /// ([`Compositor::shown`]): a window the WM stopped rendering, or one
@@ -2388,6 +2418,21 @@ mod event_tests {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    #[test]
+    fn a_pointer_in_a_window_reaches_it_under_another() {
+        let mut c = Compositor::new();
+        let a = c.create(1, (300, 200));
+        let b = c.create(2, (300, 200));
+        // b is on top of a at the same place; the viewer shows them apart.
+        assert_eq!(c.pointer_target(10.0, 10.0).0, b);
+        assert_eq!(c.pointer_in(a, 10.0, 10.0), (a, (10.0, 10.0)));
+        assert_eq!(c.cursor, (10.0, 10.0));
+        assert_eq!(c.pointer_in(b, 5.0, 6.0), (b, (5.0, 6.0)));
+        assert_eq!(c.pointer_in(77, 5.0, 6.0).0, 0, "no such window");
+        c.windows.get_mut(&a).unwrap().hidden = true;
+        assert_eq!(c.pointer_in(a, 5.0, 6.0).0, 0, "not on screen");
+    }
 
     #[test]
     fn a_new_window_opens_below_the_strip() {

@@ -722,11 +722,13 @@ impl EnvelopeFrontend {
     /// shell client here. Default state is ungranted (deny).
     pub fn grant_window_management(&mut self, client_id: u8) {
         self.wm_capable.insert(client_id);
+        self.compositor.lock().unwrap().wm_running = true;
     }
 
     /// Drop a client's grants (on disconnect). Cheap no-op if absent.
     pub fn revoke_client_caps(&mut self, client_id: u8) {
         self.wm_capable.remove(&client_id);
+        self.compositor.lock().unwrap().wm_running = !self.wm_capable.is_empty();
         self.client_uids.remove(&client_id);
         self.embed_only.remove(&client_id);
     }

@@ -44,7 +44,7 @@ pixels the way RDP and VNC must.
 | Shape | Example | In v1 |
 |---|---|---|
 | **Whole desktop** | Sit at the laptop, use the workstation's whole session (its bar, dock, windows) in one window or full screen. | Yes |
-| **App or window** ("rootless") | Run Artifex on the build box; its windows sit among the laptop's own windows. | Yes, after whole desktop (R4) |
+| **App or window** ("rootless", per-app) | Run Artifex on the build box; its windows sit among the laptop's own windows. | Yes: a host with no WM (per-app compositing) is shown this way (§3.4, decision 17); local move and resize in R4 |
 | **Shared view** | Show one window into a meeting, or let a colleague watch; view only. | Yes, as a restricted mint (aqueduct-remote.md §4) |
 | **Headless host** | A server or cloud VM with no monitor and no GPU runs a session that only remote viewers see. | Yes, and it is the cheapest case (§4.4) |
 | **Atrium viewing a foreign desktop** (Windows, Linux, macOS) | | No. That is an RDP or VNC client app, a separate project. |
@@ -272,6 +272,15 @@ on those outputs into scanout, each renderer jail emits its window's scene as a 
   and stacking happen locally at local latency; the host learns the size and focus so the app
   can lay out. Pop-ups and dialogs keep their parent relation (fresco-popups.md). The host's
   bar and dock are not shown; the viewer's dock shows remote apps with a host badge.
+
+**The host decides the mode** (decision 17). With forum-wm running, the host has a desktop and
+the viewer shows all of it: one window the desktop's size. Without a WM (per-app compositing)
+there is no desktop to show, so each host window is a window of its own on the viewer, the
+app's size, with no host wallpaper or trusted strip around it; the viewer draws its host strip
+on each (§11.5). Every `Layout` says which (`desktop`), and the viewer follows it as it changes.
+In a per-app session the host still stacks its windows somewhere on its screen, possibly over
+each other, so the viewer's pointer goes as a position in a window (`MotionIn`), never as a
+screen position; buttons and scrolls go to that window.
 
 ## 4. What the host has to change, and what it saves
 
@@ -1417,7 +1426,7 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
 
 | GUI | CLI |
 |---|---|
-| Connect dialog | `fenestra connect HOST [--user U] [--view-only] [--app ID \| --window ID] [--rootless \| --desktop] [--fullscreen] [--monitors all\|current]` |
+| Connect dialog | `fenestra connect HOST [--user U] [--view-only] [--app ID \| --window ID] [--fullscreen] [--monitors all\|current]` |
 | Session list (viewer) | `fenestra list [--json]` |
 | Toolbar: disconnect, full screen, send keys | `fenestra disconnect ID`, `fenestra fullscreen ID on\|off`, `fenestra keys ID host\|local` |
 | Statistics panel | `fenestra stats ID [--watch] [--json]` |
@@ -1501,6 +1510,10 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
     crate; R2's first viewer is `fenestra-view`, headless in the cloud gates and windowed on
     the Mac; the Atrium viewer follows on the same core.
 
+17. **Decided by Shankar (2026-11-26): the mode follows the host** (§3.4). Whole desktop when
+    forum-wm runs there, its size; per-app when it does not, each window the app's size. The
+    viewer has no `--rootless` or `--desktop` choice. The per-app core moved from R4 into R2.
+
 ## 18. Out of scope, and honest limits
 
 - **App round trips stay round trips.** A click whose result the app must compute (opening a
@@ -1528,7 +1541,7 @@ VM runs only with the coordinator's go.
 | R1 | **Done 2026-11-26** (§5.6): portable crate, stream writer and reader, fuzzer, recorder; gate 8/8. Wiring the writer into fresco-renderer moves to R2. The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
 | R2 | **In progress** (§19b: QUIC, the session, fenestrad, frescod's stream link, the viewer (windowed and headless), input and reconnect are built; loopback 18/18, cloud VM desktop 12/12, bad networks 15/15). `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
-| R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |
+| R4 | Rootless mode, the rest: local move and resize (§6.4), pop-ups and dialogs kept with their parent, the host strip with the host's name, dock badge. (Each window as its own local window, chosen by the host's mode, moved into R2: decision 17.) | `fenestra-rootless-vm.sh` |
 | R5 | Viewer-scrollable SCROLL groups in frescod (local and remote), Pergola ScrollView and Navigator documents set the flag. | `scroll_bench` locally; scroll latency at 150 ms RTT in the R2 rig |
 | R6 | Fallbacks: pixel-mode regions (lossless and video switching), video layers (re-encode, then compressed passthrough), external surfaces; `fenestra-enc` jail; audio. | encoded-region quality (final lossless refresh asserted), AV sync, bitrate follows `netem` rate changes |
 | R7 | Typing prediction for Pergola plain-text fields. | typing corpus: share of keystrokes shown before the host frame, misprediction rate |
@@ -1652,6 +1665,25 @@ from the kernel) and gone after its grace: the
   address change kept the connection; the 3 min one past the idle timeout made exactly one
   reconnect, which resumed without resending; a key pressed during the blackout was not
   replayed; the final desktop equals frescod's screen.
+
+**Per-app sessions (§3.4, decision 17).** frescod's compositor knows whether a client with
+window management is connected (`wm_running`: set on the grant, cleared when the last such
+client goes), and every `Layout` carries it (link `Rec::Layout` flag, control tag 3's mode
+byte). `fenestra-view` follows it: with a WM, the one desktop window as before; without, one
+local window per placed host window, the window's size plus a 6 pt host strip in a colour from
+the host's name (its name in the strip, and a colour the person picks, are still to come), and
+no desktop composed (headless: `mode apps`, `window-ID.png` each, no `desktop.png`). The
+pointer in such a window is `Input::MotionIn { window, x, y }` (control tag 10, link input 5);
+fenestra-session keeps it inside a window the layout has and drops it for one it does not;
+frescod's `Compositor::pointer_in` moves the cursor to that point of the window and routes to
+the window, or to its slot or pop-up hit there, even where another window covers it on the
+host's screen; buttons and scrolls follow the window it pinned. A window not on screen, or held
+by a sheet, takes nothing. A script's screen-pixel `MOVE` is turned into `MotionIn` for the
+topmost window the layout has there. Closing one app's window on the viewer hides it there
+until the host closes it (closing it on the host is R4). `scripts/fenestra-desktop-vm.sh` runs
+per-app by default (each window drawn at its own size, every window's interior equal to the
+host's screen) and the whole desktop with `FEN_WM=1` (forum-wm in the guest; the whole screen
+pixel-equal).
 
 **The mint (§11.2).** `fenestra-view --ssh "ssh -T user@host"` runs `fenestra-shell mint KEY`
 on the host through that command (split at spaces, no shell) and takes the one `FENESTRA_MINT`

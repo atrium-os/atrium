@@ -10,8 +10,8 @@ fn samples() -> Vec<Rec> {
         Rec::Data { window: 1, ticket: 7, bytes: vec![1, 2, 3] },
         Rec::End { window: 1, ticket: 7, now: Some((5, 6)) },
         Rec::End { window: 1, ticket: 9, now: None },
-        Rec::Layout { screen: (1280, 720), windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1 }] },
-        Rec::Layout { screen: (1, 1), windows: vec![] },
+        Rec::Layout { screen: (1280, 720), desktop: true, windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1 }] },
+        Rec::Layout { screen: (1, 1), desktop: false, windows: vec![] },
         Rec::Output { width: 1600, height: 900, scale_milli: 2000 },
         Rec::Output { width: 64, height: 8192, scale_milli: 500 },
         Rec::Chrome(fenestra_link::chrome::Chrome::from_rects([10, 128, 140], (1280, 26), [([0.0, 0.0, 1280.0, 24.0], [0.08, 0.08, 0.1, 1.0], 0.0)]).unwrap()),
@@ -21,6 +21,7 @@ fn samples() -> Vec<Rec> {
         Rec::Input(Input::Button { button: 1, pressed: true }),
         Rec::Input(Input::Button { button: 5, pressed: false }),
         Rec::Input(Input::Scroll { dx: 0.0, dy: -120.0 }),
+        Rec::Input(Input::MotionIn { window: 3, x: 10.5, y: 0.0 }),
     ]
 }
 
@@ -46,7 +47,7 @@ fn bounds_are_checked_before_buffering() {
     let mut h = header(&Rec::Data { window: 1, ticket: 0, bytes: vec![0] });
     h[32..36].copy_from_slice(&((MAX_DATA + 1) as u32).to_le_bytes());
     assert!(Rec::payload_len(&h).is_err());
-    let mut h = header(&Rec::Layout { screen: (10, 10), windows: vec![] });
+    let mut h = header(&Rec::Layout { screen: (10, 10), desktop: false, windows: vec![] });
     h[32..36].copy_from_slice(&((MAX_LAYOUT * 20 + 20) as u32).to_le_bytes());
     assert!(Rec::payload_len(&h).is_err());
     let mut h = header(&Rec::Changed { window: 1 });
@@ -79,10 +80,10 @@ fn hostile_records_are_refused() {
             b[38] = 1;
             b
         },
-        Rec::Layout { screen: (9, 9), windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1 }; 2] }.encode(),
-        Rec::Layout { screen: (9, 9), windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1 }; 2] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1 }] }.encode(),
         Rec::Data { window: 1, ticket: 0, bytes: vec![] }.encode(),
-        Rec::Layout { screen: (0, 9), windows: vec![] }.encode(),
+        Rec::Layout { screen: (0, 9), desktop: false, windows: vec![] }.encode(),
         Rec::Output { width: 63, height: 900, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 9000, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 900, scale_milli: 4001 }.encode(),
@@ -98,6 +99,20 @@ fn hostile_records_are_refused() {
         Rec::Input(Input::Motion { x: -1.0, y: 0.0 }).encode(),
         Rec::Input(Input::Button { button: 6, pressed: true }).encode(),
         Rec::Input(Input::Scroll { dx: 0.0, dy: 1e9 }).encode(),
+        Rec::Input(Input::MotionIn { window: 0, x: 1.0, y: 1.0 }).encode(),
+        Rec::Input(Input::MotionIn { window: 3, x: -1.0, y: 1.0 }).encode(),
+        {
+            // A window on input that is not pointer-in-a-window.
+            let mut b = Rec::Input(Input::Key { usage: 4, pressed: true, modifiers: 0 }).encode();
+            b[4] = 3;
+            b
+        },
+        {
+            // A layout whose mode is neither 0 nor 1.
+            let mut b = Rec::Layout { screen: (9, 9), desktop: true, windows: vec![] }.encode();
+            b[12] = 2;
+            b
+        },
         {
             let mut b = Rec::Input(Input::Key { usage: 4, pressed: true, modifiers: 0 }).encode();
             b[8] = 9;

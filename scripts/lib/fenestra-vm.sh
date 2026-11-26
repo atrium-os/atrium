@@ -2,13 +2,17 @@
 # guest's frescod in split mode with the fenestra link, atrium-sheets on a
 # small sheet, fenestrad and its session, and the viewer in the container.
 #
-#   fen_setup              build, stage, start frescod and Sheets
+#   fen_setup              build, stage, start frescod and Sheets.
+#                          FEN_WM=1: forum-wm too, so the host shows a
+#                          whole desktop; without it each app is a window
+#                          of its own on the viewer (fenestra.md §3.4)
 #   fen_fenestrad          start fenestrad in the guest, taking mints on its
 #                          socket from the seat's user (root here); sets
 #                          FEN_SSH, the viewer's --ssh transport into it.
 #                          FEN_JAIL=1: sessions in jails through jaild
-#   compare HOST.png       each placed window's interior on the viewer's
-#                          desktop ($W/view/desktop.png) against HOST.png
+#   compare HOST.png       each placed window's interior on the viewer
+#                          (its desktop.png, or per app its window-ID.png)
+#                          against HOST.png
 #   compare_all HOST.png   every pixel of the two
 #
 # Needs the VM booted with NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300.
@@ -35,14 +39,15 @@ fen_setup() {
     xb fenestrad ""
     xb fenestra-session "--bin fenestra-session"
     xb atrium-sheets "--bin atrium-sheets"
+    [ "${FEN_WM:-0}" = 1 ] && xb forum-wm "--bin forum-wm"
     (cd "$ROOT/fenestra-view" && cargo build -q --release) || gate_abort "fenestra-view did not build"
     VIEW="$ROOT/fenestra-view/target/release/fenestra-view"
     T="$TARGET/release"
-    BINS="$ROOT/frescod/target/$T/frescod $ROOT/frescod/target/$T/fresco-renderer $ROOT/fenestrad/target/$T/fenestrad $ROOT/fenestrad/target/$T/fenestra-shell $ROOT/fenestra-session/target/$T/fenestra-session $ROOT/atrium-sheets/target/$T/atrium-sheets"
+    BINS="$([ "${FEN_WM:-0}" = 1 ] && echo "$ROOT/forum-wm/target/$T/forum-wm ")$ROOT/frescod/target/$T/frescod $ROOT/frescod/target/$T/fresco-renderer $ROOT/fenestrad/target/$T/fenestrad $ROOT/fenestrad/target/$T/fenestra-shell $ROOT/fenestra-session/target/$T/fenestra-session $ROOT/atrium-sheets/target/$T/atrium-sheets"
 
     D=/opt/fenestra-desk
     G=/tmp/fendesk
-    g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; sleep 1; rm -rf $D $G; mkdir -p $D $G; true"
+    g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x forum-wm; pkill -x frescod; sleep 1; rm -rf $D $G; mkdir -p $D $G; true"
     for b in $BINS; do
         put "$b" "$D/"
         [ "$(sha256sum "$b" | cut -d' ' -f1)" = "$(g "sha256 -q $D/$(basename "$b")")" ] || gate_abort "hash mismatch for $(basename "$b")"
@@ -90,6 +95,11 @@ allow_rctl = true
     i=0; while [ $i -lt 90 ] && ! g "test -S $G/fresco.sock && test -S $G/fenestra.sock"; do sleep 2; i=$((i+1)); done
     g "test -S $G/fenestra.sock" || { g "tail -20 $G/frescod.log"; gate_abort "frescod did not open the fenestra link"; }
     g "chmod 666 $G/fresco.sock"
+    if [ "${FEN_WM:-0}" = 1 ]; then
+        g "chmod 666 $G/wm.sock; cd $G && env FRESCO_SOCKET=$G/fresco.sock FRESCO_WM_SOCKET=$G/wm.sock FORUM_CTL_SOCKET=$G/ctl.sock daemon -f -o $G/wm.log $D/forum-wm </dev/null"
+        sleep 5
+        g "pgrep -x forum-wm >/dev/null" || { g "tail -20 $G/wm.log"; gate_abort "forum-wm did not start"; }
+    fi
     CSV=$(mktemp)
     { echo "Region,Q1,Q2,Q3,Q4,Total"; i=2
       for r in North South East West Central Islands Coast Hills; do
@@ -145,21 +155,33 @@ else:
 EOF
 }
 
-compare() { python3 -I - "$1" "$W/view/desktop.png" "$V" "$STRIP" <<'EOF'
-import sys
+compare() { python3 -I - "$1" "$W/view" "$V" "$STRIP" <<'EOF'
+import os, sys
 from PIL import Image
 h = Image.open(sys.argv[1]).convert("RGB")
-v = Image.open(sys.argv[2]).convert("RGB")
+desk = os.path.join(sys.argv[2], "desktop.png")
+v = Image.open(desk).convert("RGB") if os.path.exists(desk) else None
 placed = [l.split()[1:] for l in open(sys.argv[3]) if l.startswith("placed ")]
-if h.size != v.size or not placed:
-    print(f"sizes {h.size} {v.size}, {len(placed)} placed"); sys.exit()
+if (v is not None and h.size != v.size) or not placed:
+    print(f"sizes {h.size} {v and v.size}, {len(placed)} placed"); sys.exit()
 bad = []
 for p in placed:
     i, x, y, w, ht = map(int, p)
     box = (max(x + 4, 0), max(y + 4, int(sys.argv[4])), min(x + w - 4, h.size[0]), min(y + ht - 4, h.size[1]))
     if box[2] <= box[0] or box[3] <= box[1]:
         continue
-    a, b = h.crop(box).tobytes(), v.crop(box).tobytes()
+    if v is None:
+        # Per app: the viewer's own window, which starts at the window's
+        # top left on the host's screen.
+        f = os.path.join(sys.argv[2], f"window-{i}.png")
+        if not os.path.exists(f):
+            bad.append(f"window {i}: not drawn"); continue
+        b = Image.open(f).convert("RGB").crop((box[0] - x, box[1] - y, box[2] - x, box[3] - y)).tobytes()
+        a = h.crop(box).tobytes()
+        if len(a) != len(b):
+            bad.append(f"window {i}: sizes differ"); continue
+    else:
+        a, b = h.crop(box).tobytes(), v.crop(box).tobytes()
     n = sum(1 for k in range(0, len(a), 3) if a[k:k+3] != b[k:k+3])
     if n:
         bad.append(f"window {i}: {n} of {len(a)//3} px differ")

@@ -124,7 +124,7 @@ impl Broker {
             }
         });
         let mut inputs = super::Bucket::new(INPUT_PER_S, INPUT_BURST);
-        let mut modifiers = 0u8;
+        let mut pointer = Pointer::default();
         loop {
             let rec = match fenestra_link::read(&mut r) {
                 Ok(Some(rec)) if !rec.from_broker() => rec,
@@ -150,7 +150,7 @@ impl Broker {
                     if !self.remote_on() {
                         continue;
                     }
-                    remote_input(&self.comp, sink, i, &mut modifiers);
+                    remote_input(&self.comp, sink, i, &mut pointer);
                 }
                 _ => unreachable!("from_broker() covers the rest"),
             }
@@ -349,8 +349,10 @@ impl Broker {
             .flat_map(|r| r.wins.lock().unwrap().values().map(|w| (w.global as u32, ())).collect::<Vec<_>>())
             .collect();
         let screen = self.screen();
-        let windows: Vec<Placed> = {
+        let (desktop, windows): (bool, Vec<Placed>) = {
             let c = self.comp.lock().unwrap();
+            let desktop = c.wm_running;
+            (desktop,
             c.z_order
                 .iter()
                 .filter_map(|id| {
@@ -367,9 +369,9 @@ impl Broker {
                     })
                 })
                 .take(fenestra_link::MAX_LAYOUT)
-                .collect()
+                .collect())
         };
-        let rec = Rec::Layout { screen: (screen.0.max(1), screen.1.max(1)), windows };
+        let rec = Rec::Layout { screen: (screen.0.max(1), screen.1.max(1)), desktop, windows };
         let mut f = self.fen.lock().unwrap();
         if f.layout.as_ref() == Some(&rec) {
             return;
@@ -380,31 +382,57 @@ impl Broker {
     }
 }
 
+/// The viewer's pointer as the link last moved it.
+#[derive(Default)]
+struct Pointer {
+    modifiers: u8,
+    /// Per-app sessions: the window the pointer is in and where, which
+    /// its buttons and scrolls go to (the host may stack another window
+    /// over that point).
+    pinned: Option<(u32, f32, f32)>,
+}
+
 /// Route one viewer input event as frescod's input injector routes its
 /// own: the same cursor, hit-test and focus. Remote input mints no
 /// activation token (fenestra.md §11: what a remote press may authorise is
 /// decided separately).
-fn remote_input(comp: &Arc<Mutex<Compositor>>, sink: &Sender<DisplayEvent>, i: Input, modifiers: &mut u8) {
+fn remote_input(comp: &Arc<Mutex<Compositor>>, sink: &Sender<DisplayEvent>, i: Input, p: &mut Pointer) {
     use crate::injector_reader::{cursor_here, cursor_to, focused_window};
+    // Where a button or scroll lands: in the pinned window (asked again,
+    // so one gone or held since takes nothing), else the hit-test's.
+    let at = |p: &Pointer| match p.pinned {
+        Some((w, x, y)) => {
+            let (t, (lx, ly)) = comp.lock().unwrap().pointer_in(w as u16, x, y);
+            (lx, ly, t as u32)
+        }
+        None => cursor_here(comp),
+    };
     let ev = match i {
         Input::Motion { x, y } => {
+            p.pinned = None;
             let (w, h, _) = crate::screen::get();
             let (lx, ly, target) = cursor_to(comp, x.min(w.max(1) as f32 - 1.0), y.min(h.max(1) as f32 - 1.0));
             DisplayEvent::InputPointerMotion { window_id: target, x: lx, y: ly }
         }
+        Input::MotionIn { window, x, y } => {
+            let Ok(id) = u16::try_from(window) else { return };
+            let (t, (lx, ly)) = comp.lock().unwrap().pointer_in(id, x, y);
+            p.pinned = (t != 0).then_some((window, x, y));
+            DisplayEvent::InputPointerMotion { window_id: t as u32, x: lx, y: ly }
+        }
         Input::Button { button, pressed } => {
-            let (lx, ly, target) = cursor_here(comp);
+            let (lx, ly, target) = at(p);
             if pressed && button == 1 {
                 comp.lock().unwrap().press_focus(target as u16);
             }
-            DisplayEvent::InputPointerButton { window_id: target, x: lx, y: ly, button, pressed, modifiers: *modifiers, activation: [0; 16] }
+            DisplayEvent::InputPointerButton { window_id: target, x: lx, y: ly, button, pressed, modifiers: p.modifiers, activation: [0; 16] }
         }
         Input::Key { usage, pressed, modifiers: m } => {
-            *modifiers = m;
+            p.modifiers = m;
             DisplayEvent::InputKey { window_id: focused_window(comp), hid_usage: usage, pressed, modifiers: m, activation: [0; 16], repeat: false }
         }
         Input::Scroll { dx, dy } => {
-            let (_, _, target) = cursor_here(comp);
+            let (_, _, target) = at(p);
             DisplayEvent::InputPointerScroll { window_id: target, dx, dy, phase: 0 }
         }
     };

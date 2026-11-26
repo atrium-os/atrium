@@ -9,7 +9,7 @@
 //! runs in the renderer jail.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,9 +79,13 @@ pub struct Views {
     pub frames: AtomicU64,
     /// Window streams that broke the protocol (each drops its connection).
     pub errors: AtomicU64,
-    /// Whole-desktop sessions: the host's screen and where its windows
-    /// are, bottom to top.
+    /// The host's screen and where its windows are, bottom to top.
     pub layout: Mutex<Option<((u32, u32), Vec<scene::Placed>)>>,
+    /// The host runs a WM, so this viewer shows its whole desktop; else
+    /// each window is shown on its own (per-app, §3.4). From the layout.
+    pub desktop_mode: AtomicBool,
+    /// Moves on with each layout the host sends.
+    pub layout_gen: AtomicU64,
     /// Whole-desktop sessions: the host's trusted chrome and background,
     /// and the chrome as last drawn here.
     pub chrome: Mutex<Option<Chrome>>,
@@ -112,6 +116,29 @@ impl Views {
         o.map(|(width, height, scale_milli)| Control::Output { width, height, scale_milli })
     }
 
+    /// Whether the host's last layout asked for the whole desktop; None
+    /// before any layout.
+    pub fn mode(&self) -> Option<bool> {
+        let l = self.layout.lock().unwrap_or_else(|e| e.into_inner());
+        l.as_ref().map(|_| self.desktop_mode.load(Ordering::Relaxed))
+    }
+
+    /// Input as the host takes it. In a per-app session a pointer given in
+    /// the host screen's pixels (a script) goes to the topmost window the
+    /// layout has there, in that window's pixels; nowhere, it is dropped.
+    pub fn route(&self, i: scene::Input) -> Option<scene::Input> {
+        let scene::Input::Motion { x, y } = i else { return Some(i) };
+        if self.mode() != Some(false) {
+            return Some(i);
+        }
+        let l = self.layout.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, placed) = l.as_ref()?;
+        placed.iter().rev().find_map(|&(window, wx, wy, w, h)| {
+            let (lx, ly) = (x - wx as f32, y - wy as f32);
+            (lx >= 0.0 && ly >= 0.0 && lx < w as f32 && ly < h as f32).then_some(scene::Input::MotionIn { window, x: lx, y: ly })
+        })
+    }
+
     fn resume(&self) -> Vec<(u32, u64, u64)> {
         let w = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         w.iter()
@@ -138,7 +165,11 @@ pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), W
         loop {
             tokio::select! {
                 i = rx.recv() => match i {
-                    Some(i) => control.send(&Msg::App(Control::Input(i).encode())).await?,
+                    Some(i) => {
+                        if let Some(i) = views_o.route(i) {
+                            control.send(&Msg::App(Control::Input(i).encode())).await?;
+                        }
+                    }
                     None => break,
                 },
                 _ = views_o.output_moved.notified() => {
@@ -161,8 +192,11 @@ pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), W
                         Control::Closed(w) => {
                             views.windows.lock().unwrap_or_else(|e| e.into_inner()).remove(&w);
                         }
-                        Control::Layout { screen, windows } => {
-                            *views.layout.lock().unwrap_or_else(|e| e.into_inner()) = Some((screen, windows));
+                        Control::Layout { screen, desktop, windows } => {
+                            let mut l = views.layout.lock().unwrap_or_else(|e| e.into_inner());
+                            views.desktop_mode.store(desktop, Ordering::Relaxed);
+                            *l = Some((screen, windows));
+                            views.layout_gen.fetch_add(1, Ordering::Relaxed);
                         }
                         Control::Chrome(c) => {
                             *views.chrome.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
@@ -270,6 +304,9 @@ pub fn snapshot(views: &Views, dir: &std::path::Path) -> std::io::Result<String>
             report += &format!("placed {id} {x} {y} {w} {h}\n");
         }
     }
+    if let Some(d) = views.mode() {
+        report += if d { "mode desktop\n" } else { "mode apps\n" };
+    }
     if let Some((desk, sha)) = desktop(views) {
         report += &format!("desktop {}x{} {sha}\n", desk.0, desk.1);
         write_png(&dir.join("desktop.png"), desk.0, desk.1, &desk.2)?;
@@ -352,7 +389,9 @@ fn chrome_pixels(views: &Views, chrome: &Chrome, screen: (u32, u32)) -> (u32, u3
     let px = if w == 0 || h == 0 {
         Vec::new()
     } else {
-        let f = fresco_compute::Frame::pack(&fresco_compute::Scene { rects, ..Default::default() }, w, h, w);
+        let mut f = fresco_compute::Frame::pack(&fresco_compute::Scene { rects, ..Default::default() }, w, h, w);
+        // The chrome is drawn over the windows: clear where it has no rect.
+        f.header.clear = [0.0; 4];
         fresco_compute::reference::render(&f)
     };
     d.last = Some((chrome.clone(), screen, (w, h, px.clone())));
@@ -367,8 +406,11 @@ fn opaque([r, g, b]: [u8; 3]) -> u32 {
 /// The whole desktop as the layout places the windows held: each window
 /// over the ones below it (premultiplied BGRA, source over), on the
 /// host's background (black before the host said), with the host's
-/// chrome on top.
+/// chrome on top. None in a per-app session: it has no desktop.
 pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
+    if views.mode() == Some(false) {
+        return None;
+    }
     // A host that sends no layout (the simulator): its windows at the
     // origin, on a screen as large as the largest.
     let given = views.layout.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -459,6 +501,7 @@ mod tests {
     fn the_desktop_has_the_hosts_background_and_chrome_on_top() {
         let views = Views::default();
         *views.layout.lock().unwrap() = Some(((8, 6), Vec::new()));
+        views.desktop_mode.store(true, Ordering::Relaxed);
         // Before the host says: black.
         assert_eq!(desktop(&views).unwrap().0 .2[20], 0xff00_0000);
         let white = [1.0, 1.0, 1.0, 1.0];
@@ -467,6 +510,8 @@ mod tests {
         let (_, _, px) = desktop(&views).unwrap().0;
         assert_eq!(px[0], 0xffff_ffff, "the strip");
         assert_eq!(px[8 * 2], 0xff0a_808c, "under the strip, inside the layer: the background");
+        // A window under the chrome's layer shows through where it has no rect.
+        assert_eq!(chrome_pixels(&views, views.chrome.lock().unwrap().as_ref().unwrap(), (8, 6)).2[8 * 2], 0, "clear between the rects");
         assert_eq!(px[8 * 5 + 7], 0xff0a_808c, "the background");
         // A chrome that covers the screen many times over is not drawn.
         let heavy = Chrome::from_rects([0, 0, 0], (8, 6), (0..9).map(|_| ([0.0, 0.0, 8.0, 6.0], white, 0.0))).unwrap();
@@ -479,9 +524,28 @@ mod tests {
     }
 
     #[test]
+    fn a_per_app_session_has_no_desktop_and_points_into_windows() {
+        let views = Views::default();
+        *views.layout.lock().unwrap() = Some(((100, 100), vec![(2, 0, 10, 50, 50), (3, 20, 20, 50, 50)]));
+        views.desktop_mode.store(true, Ordering::Relaxed);
+        assert!(desktop(&views).is_some());
+        let m = scene::Input::Motion { x: 30.0, y: 30.0 };
+        assert_eq!(views.route(m), Some(m), "a desktop takes screen pixels");
+        views.desktop_mode.store(false, Ordering::Relaxed);
+        assert!(desktop(&views).is_none());
+        assert_eq!(views.mode(), Some(false));
+        assert_eq!(views.route(m), Some(scene::Input::MotionIn { window: 3, x: 10.0, y: 10.0 }), "the topmost window there");
+        assert_eq!(views.route(scene::Input::Motion { x: 5.0, y: 15.0 }), Some(scene::Input::MotionIn { window: 2, x: 5.0, y: 5.0 }));
+        assert_eq!(views.route(scene::Input::Motion { x: 90.0, y: 5.0 }), None, "no window there");
+        let k = scene::Input::Key { usage: 4, pressed: true, modifiers: 0 };
+        assert_eq!(views.route(k), Some(k));
+    }
+
+    #[test]
     fn a_host_changing_its_chrome_every_frame_is_redrawn_at_most_the_budget() {
         let views = Views::default();
         *views.layout.lock().unwrap() = Some(((4, 4), Vec::new()));
+        views.desktop_mode.store(true, Ordering::Relaxed);
         let mut redrawn = 0;
         let mut last = 0u32;
         for i in 0..50u32 {

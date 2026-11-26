@@ -33,6 +33,8 @@ struct Pending {
 #[derive(Default)]
 struct State {
     screen: Option<(u32, u32)>,
+    /// A WM runs on the host: the viewer shows the whole desktop.
+    desktop: bool,
     windows: Vec<Placed>,
     layout_gen: u64,
     chrome: Option<fenestra_link::chrome::Chrome>,
@@ -131,8 +133,9 @@ impl LinkSource {
                     drop(st);
                     wake.send_modify(|g| *g += 1);
                 }
-                Rec::Layout { screen, windows } => {
+                Rec::Layout { screen, desktop, windows } => {
                     st.screen = Some(screen);
+                    st.desktop = desktop;
                     st.windows = windows.iter().map(|p| (p.window, p.x, p.y, p.width, p.height)).collect();
                     st.layout_gen += 1;
                     drop(st);
@@ -199,14 +202,28 @@ impl Source for LinkSource {
 
     /// Input goes on to frescod in the host screen's pixels: a pointer
     /// off the screen is moved onto its edge, input before any layout (or
-    /// past the link's queue) is dropped.
+    /// past the link's queue) is dropped. A pointer in a window is kept
+    /// inside that window, and dropped for a window the layout does not
+    /// have.
     fn input(&self, i: Input) {
-        let Some((w, h)) = self.state.lock().ok().and_then(|st| st.screen) else { return };
+        let Some(((w, h), inside)) = self.state.lock().ok().and_then(|st| {
+            let inside = match i {
+                Input::MotionIn { window, .. } => Some(st.windows.iter().find(|p| p.0 == window).map(|p| (p.3, p.4))),
+                _ => None,
+            };
+            Some((st.screen?, inside))
+        }) else {
+            return;
+        };
         let clamp = |v: f32, side: u32| v.clamp(0.0, side.saturating_sub(1) as f32);
         let i = match i {
             Input::Key { usage, pressed, modifiers } => fenestra_link::Input::Key { usage, pressed, modifiers },
             Input::Motion { x, y } => fenestra_link::Input::Motion { x: clamp(x, w), y: clamp(y, h) },
             Input::Button { button, pressed } => fenestra_link::Input::Button { button, pressed },
+            Input::MotionIn { window, x, y } => {
+                let Some(Some((ww, wh))) = inside else { return };
+                fenestra_link::Input::MotionIn { window, x: clamp(x, ww), y: clamp(y, wh) }
+            }
             Input::Scroll { dx, dy } => {
                 let m = fenestra_link::MAX_SCROLL;
                 fenestra_link::Input::Scroll { dx: dx.clamp(-m, m), dy: dy.clamp(-m, m) }
@@ -234,6 +251,6 @@ impl Source for LinkSource {
     fn layout(&self) -> Option<(u64, Control)> {
         let st = self.state.lock().ok()?;
         let screen = st.screen?;
-        Some((st.layout_gen, Control::Layout { screen, windows: st.windows.clone() }))
+        Some((st.layout_gen, Control::Layout { screen, desktop: st.desktop, windows: st.windows.clone() }))
     }
 }

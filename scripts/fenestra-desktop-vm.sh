@@ -1,7 +1,9 @@
 #!/bin/sh
 # Fenestra R2 VM gate, first part (docs/spec/fenestra.md §3.2, §19 R2): a
-# whole-desktop session from a real frescod in the cloud VM to fenestra-view
-# --headless in the container, over QUIC on a forwarded UDP port.
+# session from a real frescod in the cloud VM to fenestra-view --headless in
+# the container, over QUIC on a forwarded UDP port. Without a WM on the host
+# the session is per-app (each window on its own on the viewer); with
+# FEN_WM=1 forum-wm runs and it is the whole desktop (§3.4).
 #
 # In the guest: frescod in split mode (each client in its own renderer
 # process, here unconfined) with the fenestra link on, an app (Officina's
@@ -80,12 +82,20 @@ cat "$V"
 
 nw=$(grep -c '^window ' "$V")
 check "the viewer drew windows" yes "$([ "$nw" -gt 0 ] && echo yes || echo "no ($nw)")"
-check "the viewer has the host's layout" yes "$(grep -q '^desktop ' "$V" && echo yes || echo no)"
+if [ "${FEN_WM:-0}" = 1 ]; then
+    check "the viewer shows the whole desktop (a WM runs on the host)" "mode desktop yes" "$(grep '^mode ' "$V") $(grep -q '^desktop ' "$V" && echo yes || echo no)"
+else
+    check "the viewer shows each app on its own (no WM on the host)" "mode apps no" "$(grep '^mode ' "$V") $(grep -q '^desktop ' "$V" && echo yes || echo no)"
+fi
 check "no stream errors" 0 "$(awk '$1 == "errors" { print $2 }' "$V")"
 check "nothing sent while idle" 0 "$(awk '$1 == "idle_bytes" { print $2 }' "$V")"
 cmp=$(compare "$W/host.png")
 check "every window equal to frescod's own screen" equal "$cmp"
-check "the whole screen equal, the strip, focus ring and background included" equal "$(compare_all "$W/host.png")"
+if [ "${FEN_WM:-0}" = 1 ]; then
+    check "the whole screen equal, the strip, focus ring and background included" equal "$(compare_all "$W/host.png")"
+else
+    check "each window drawn at its own size, as its own" yes "$(awk '$1 == "placed" { p[$2] = $5 "x" $6 } $1 == "window" { w[$2] = $3 } END { n = 0; for (i in p) { if (w[i] != p[i]) { print "no (" i ": " w[i] " vs " p[i] ")"; exit } n++ } print (n ? "yes" : "no (none placed)") }' "$V")"
+fi
 # The positive control: the screen before the last typing is not what the
 # viewer ended with, so the comparison sees a typed cell.
 check "the typing reached the viewer (its desktop differs from the screen before it)" yes "$(compare "$W/host-middle.png" | grep -q differ && echo yes || echo no)"

@@ -1,12 +1,18 @@
-//! The windowed viewer (fenestra.md §14): one local window showing the
-//! host's whole desktop (§3.4), drawn with softbuffer from the windows'
-//! scene streams, and the person's keyboard, pointer and wheel sent to the
-//! host as `Control::Input` in the host screen's pixels.
+//! The windowed viewer (fenestra.md §14), in the mode the host's layout
+//! says (§3.4):
+//!
+//! - **whole desktop** (a WM runs on the host): one local window showing
+//!   the host's desktop, scaled into it; input goes in the host screen's
+//!   pixels.
+//! - **per-app** (no WM on the host): one local window per host window,
+//!   its size, under a host strip this viewer draws (§11.5); the pointer
+//!   goes as a position in that window (`Input::MotionIn`), so host
+//!   windows stacked over each other still each get their own clicks.
 //!
 //! Drawing here is the CPU path: each window is rastered by the same code
-//! as headless mode when its version moves, composed by the layout, and
-//! scaled to the local window. The GPU path comes later.
+//! as headless mode when its version moves. The GPU path comes later.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -23,15 +29,32 @@ use winit::window::{Window, WindowId};
 
 use crate::{desktop, Views};
 
+/// The host strip over each per-app window, points.
+const HOST_STRIP_PT: f64 = 6.0;
+
+struct Win {
+    w: Rc<Window>,
+    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    /// The host window it shows; None for the whole desktop.
+    host: Option<u32>,
+    /// Per-app: the host window's size as last asked of this one.
+    size: (u32, u32),
+}
+
 struct App {
     views: Arc<Views>,
     input: tokio::sync::mpsc::Sender<Input>,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    wins: HashMap<WindowId, Win>,
     /// The host screen's size as last drawn, for the pointer's scale.
     screen: (u32, u32),
     modifiers: u8,
     title: String,
+    /// Per-app windows the person closed here, until the host's layout
+    /// drops them.
+    dismissed: Vec<u32>,
+    /// The mode the windows are in now.
+    mode: Option<bool>,
+    strip_colour: u32,
 }
 
 impl App {
@@ -41,98 +64,197 @@ impl App {
         let _ = self.input.try_send(i);
     }
 
-    fn draw(&mut self) {
-        let (Some(w), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
-        let size = w.inner_size();
+    fn open(&self, el: &ActiveEventLoop, title: String, size: PhysicalSize<u32>, host: Option<u32>, host_size: (u32, u32)) -> Option<Win> {
+        let attrs = Window::default_attributes().with_title(title).with_inner_size(size);
+        let w = match el.create_window(attrs) {
+            Ok(w) => Rc::new(w),
+            Err(e) => {
+                eprintln!("fenestra-view: no window: {e}");
+                return None;
+            }
+        };
+        match softbuffer::Context::new(w.clone()).and_then(|c| softbuffer::Surface::new(&c, w.clone())) {
+            Ok(surface) => Some(Win { w, surface, host, size: host_size }),
+            Err(e) => {
+                eprintln!("fenestra-view: no surface: {e}");
+                None
+            }
+        }
+    }
+
+    fn strip(w: &Window) -> u32 {
+        (HOST_STRIP_PT * w.scale_factor()).round() as u32
+    }
+
+    /// The local windows the host's layout calls for: the desktop's, or
+    /// one per host window.
+    fn reconcile(&mut self, el: &ActiveEventLoop) {
+        let mode = self.views.mode();
+        let placed: Vec<fenestra_wire::scene::Placed> = self.views.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|l| l.1.clone()).unwrap_or_default();
+        match mode {
+            None => {}
+            Some(true) => {
+                self.wins.retain(|_, w| w.host.is_none());
+                if self.wins.is_empty() {
+                    if let Some(win) = self.open(el, self.title.clone(), PhysicalSize::new(1280, 720), None, (0, 0)) {
+                        let size = win.w.inner_size();
+                        // The host's output follows this window (§4.1).
+                        self.views.set_output(size.width, size.height, (win.w.scale_factor() * 1000.0).round() as u32);
+                        self.wins.insert(win.w.id(), win);
+                    }
+                }
+            }
+            Some(false) => {
+                if self.mode != Some(false) {
+                    // The host's output is this viewer's screen: its windows
+                    // may go anywhere on it.
+                    if let Some(m) = el.primary_monitor().or_else(|| el.available_monitors().next()) {
+                        let s = m.size();
+                        self.views.set_output(s.width, s.height, (m.scale_factor() * 1000.0).round() as u32);
+                    }
+                }
+                self.dismissed.retain(|id| placed.iter().any(|p| p.0 == *id));
+                self.wins.retain(|_, w| w.host.is_some_and(|h| placed.iter().any(|p| p.0 == h)));
+                for &(id, _, _, pw, ph) in &placed {
+                    if self.dismissed.contains(&id) {
+                        continue;
+                    }
+                    match self.wins.values_mut().find(|w| w.host == Some(id)) {
+                        Some(win) => {
+                            if win.size != (pw, ph) {
+                                win.size = (pw, ph);
+                                let _ = win.w.request_inner_size(PhysicalSize::new(pw, ph + Self::strip(&win.w)));
+                            }
+                        }
+                        None => {
+                            let title = format!("{}: window {id}", self.title);
+                            // The strip at this scale is known once the window
+                            // is: open it at the window's size, then add it.
+                            if let Some(win) = self.open(el, title, PhysicalSize::new(pw, ph), Some(id), (pw, ph)) {
+                                let _ = win.w.request_inner_size(PhysicalSize::new(pw, ph + Self::strip(&win.w)));
+                                self.wins.insert(win.w.id(), win);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.mode = mode;
+    }
+
+    fn draw(&mut self, id: WindowId) {
+        let views = self.views.clone();
+        let strip_colour = self.strip_colour;
+        let Some(win) = self.wins.get_mut(&id) else { return };
+        let size = win.w.inner_size();
         let (Some(ww), Some(wh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
-        if surface.resize(ww, wh).is_err() {
+        if win.surface.resize(ww, wh).is_err() {
             return;
         }
-        let Ok(mut buf) = surface.buffer_mut() else { return };
+        let strip = Self::strip(&win.w);
+        let Ok(mut buf) = win.surface.buffer_mut() else { return };
         buf.fill(0x0020_2020);
-        if let Some(((sw, sh, px), _)) = desktop(&self.views) {
-            if self.screen != (sw, sh) {
-                // The first layout, or the host's screen changed: size the
-                // window to it (the window manager may not agree).
-                self.screen = (sw, sh);
-                let _ = w.request_inner_size(PhysicalSize::new(sw, sh));
+        match win.host {
+            None => {
+                if let Some(((sw, sh, px), _)) = desktop(&views) {
+                    if self.screen != (sw, sh) {
+                        // The first layout, or the host's screen changed: size
+                        // the window to it (the window manager may not agree).
+                        self.screen = (sw, sh);
+                        let _ = win.w.request_inner_size(PhysicalSize::new(sw, sh));
+                    }
+                    // Nearest pixel, the host screen scaled into the window
+                    // with its aspect kept.
+                    let (ox, oy, dw, dh) = fit((sw, sh), (size.width, size.height));
+                    for y in 0..dh {
+                        let sy = (u64::from(y) * u64::from(sh) / u64::from(dh)) as usize;
+                        let row = ((oy + y) * size.width + ox) as usize;
+                        for x in 0..dw {
+                            let sx = (u64::from(x) * u64::from(sw) / u64::from(dw)) as usize;
+                            buf[row + x as usize] = px[sy * sw as usize + sx] & 0x00ff_ffff;
+                        }
+                    }
+                }
             }
-            // Nearest pixel, the host screen scaled into the window with
-            // its aspect kept.
-            let (ox, oy, dw, dh) = fit((sw, sh), (size.width, size.height));
-            for y in 0..dh {
-                let sy = (u64::from(y) * u64::from(sh) / u64::from(dh)) as usize;
-                let row = ((oy + y) * size.width + ox) as usize;
-                for x in 0..dw {
-                    let sx = (u64::from(x) * u64::from(sw) / u64::from(dw)) as usize;
-                    buf[row + x as usize] = px[sy * sw as usize + sx] & 0x00ff_ffff;
+            Some(host) => {
+                // The host strip, then the window 1:1 under it.
+                for p in buf.iter_mut().take((strip.min(size.height) * size.width) as usize) {
+                    *p = strip_colour;
+                }
+                let v = views.windows.lock().unwrap_or_else(|e| e.into_inner()).get(&host).cloned();
+                if let Some((w, h, px, _)) = v.and_then(|v| v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached()) {
+                    for y in 0..h.min(size.height.saturating_sub(strip)) {
+                        let row = ((strip + y) * size.width) as usize;
+                        for x in 0..w.min(size.width) {
+                            buf[row + x as usize] = px[(y * w + x) as usize] & 0x00ff_ffff;
+                        }
+                    }
                 }
             }
         }
         let _ = buf.present();
     }
 
-    /// Window pixels to the host screen's; None outside the drawn screen.
-    fn to_host(&self, x: f64, y: f64) -> Option<(f32, f32)> {
-        let w = self.window.as_ref()?;
-        let size = w.inner_size();
-        if size.width == 0 || size.height == 0 || self.screen.0 == 0 {
-            return None;
+    /// A pointer position in local window `id` as the host takes it.
+    fn pointer(&self, id: WindowId, x: f64, y: f64) -> Option<Input> {
+        let win = self.wins.get(&id)?;
+        let size = win.w.inner_size();
+        match win.host {
+            Some(host) => {
+                let y = y - f64::from(Self::strip(&win.w));
+                (x >= 0.0 && y >= 0.0 && x < f64::from(win.size.0) && y < f64::from(win.size.1)).then_some(Input::MotionIn { window: host, x: x as f32, y: y as f32 })
+            }
+            None => {
+                if size.width == 0 || size.height == 0 || self.screen.0 == 0 {
+                    return None;
+                }
+                let (ox, oy, dw, dh) = fit(self.screen, (size.width, size.height));
+                let (hx, hy) = ((x - f64::from(ox)) * f64::from(self.screen.0) / f64::from(dw), (y - f64::from(oy)) * f64::from(self.screen.1) / f64::from(dh));
+                (hx >= 0.0 && hy >= 0.0 && hx < f64::from(self.screen.0) && hy < f64::from(self.screen.1)).then_some(Input::Motion { x: hx as f32, y: hy as f32 })
+            }
         }
-        let (ox, oy, dw, dh) = fit(self.screen, (size.width, size.height));
-        let (hx, hy) = ((x - f64::from(ox)) * f64::from(self.screen.0) / f64::from(dw), (y - f64::from(oy)) * f64::from(self.screen.1) / f64::from(dh));
-        (hx >= 0.0 && hy >= 0.0 && hx < f64::from(self.screen.0) && hy < f64::from(self.screen.1)).then_some((hx as f32, hy as f32))
     }
 }
 
 impl ApplicationHandler<()> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attrs = Window::default_attributes().with_title(self.title.clone()).with_inner_size(PhysicalSize::new(1280u32, 720u32));
-        let w = match el.create_window(attrs) {
-            Ok(w) => Rc::new(w),
-            Err(e) => {
-                eprintln!("fenestra-view: no window: {e}");
-                el.exit();
-                return;
-            }
-        };
-        let surface = softbuffer::Context::new(w.clone()).and_then(|c| softbuffer::Surface::new(&c, w.clone()));
-        match surface {
-            Ok(s) => self.surface = Some(s),
-            Err(e) => {
-                eprintln!("fenestra-view: no surface: {e}");
-                el.exit();
-                return;
-            }
-        }
-        let size = w.inner_size();
-        self.views.set_output(size.width, size.height, (w.scale_factor() * 1000.0).round() as u32);
-        self.window = Some(w);
+        self.reconcile(el);
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, _: ()) {
-        if let Some(w) = &self.window {
-            w.request_redraw();
+    fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
+        self.reconcile(el);
+        for w in self.wins.values() {
+            w.w.request_redraw();
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
         match ev {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::CloseRequested => match self.wins.get(&id).and_then(|w| w.host) {
+                // Closing an app's window here hides it until the host
+                // closes it; the last one ends the viewer.
+                Some(host) => {
+                    self.dismissed.push(host);
+                    self.wins.remove(&id);
+                    if self.wins.is_empty() {
+                        el.exit();
+                    }
+                }
+                None => el.exit(),
+            },
+            WindowEvent::RedrawRequested => self.draw(id),
             WindowEvent::Resized(size) => {
-                if let Some(w) = &self.window {
-                    // The host's output follows the window (§4.1).
-                    self.views.set_output(size.width, size.height, (w.scale_factor() * 1000.0).round() as u32);
-                    w.request_redraw();
+                if let Some(win) = self.wins.get(&id) {
+                    if win.host.is_none() {
+                        // The host's output follows the desktop's window (§4.1).
+                        self.views.set_output(size.width, size.height, (win.w.scale_factor() * 1000.0).round() as u32);
+                    }
+                    win.w.request_redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some((x, y)) = self.to_host(position.x, position.y) {
-                    self.send(Input::Motion { x, y });
+                if let Some(i) = self.pointer(id, position.x, position.y) {
+                    self.send(i);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -176,8 +298,9 @@ impl ApplicationHandler<()> for App {
     }
 }
 
-/// Run the window on this thread (the main one: macOS needs it) until it
-/// is closed. `views` fills from the session running elsewhere.
+/// Run the windows on this thread (the main one: macOS needs it) until
+/// the person closes them. `views` fills from the session running
+/// elsewhere.
 pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: String) -> Result<(), String> {
     let el = EventLoop::<()>::with_user_event().build().map_err(|e| e.to_string())?;
     el.set_control_flow(ControlFlow::Wait);
@@ -188,10 +311,10 @@ pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: St
         std::thread::Builder::new()
             .name("fenestra-view-redraw".into())
             .spawn(move || {
-                let mut seen = (u64::MAX, 0usize);
+                let mut seen = (u64::MAX, 0u64);
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
-                    let now = (views.frames.load(Ordering::Relaxed), views.layout.lock().map(|l| l.as_ref().map_or(0, |l| l.1.len() + 1)).unwrap_or(0));
+                    let now = (views.frames.load(Ordering::Relaxed), views.layout_gen.load(Ordering::Relaxed));
                     if now != seen {
                         seen = now;
                         if proxy.send_event(()).is_err() {
@@ -202,8 +325,17 @@ pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: St
             })
             .map_err(|e| e.to_string())?;
     }
-    let mut app = App { views, input, window: None, surface: None, screen: (0, 0), modifiers: 0, title };
+    let strip_colour = host_colour(&title);
+    let mut app = App { views, input, wins: HashMap::new(), screen: (0, 0), modifiers: 0, title, dismissed: Vec::new(), mode: None, strip_colour };
     el.run_app(&mut app).map_err(|e| e.to_string())
+}
+
+/// The host strip's colour (0RGB): from the host's name until the person
+/// can choose one (§11.5), dark enough for light text.
+fn host_colour(name: &str) -> u32 {
+    let h = name.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let c = |s: u32| 0x30 + ((h >> s) & 0x3f);
+    c(0) << 16 | c(8) << 8 | c(16)
 }
 
 /// The HID usage (keyboard page) for a key, by its position.
