@@ -164,15 +164,18 @@ v = Image.open(desk).convert("RGB") if os.path.exists(desk) else None
 placed = [l.split()[1:] for l in open(sys.argv[3]) if l.startswith("placed ")]
 if (v is not None and h.size != v.size) or not placed:
     print(f"sizes {h.size} {v and v.size}, {len(placed)} placed"); sys.exit()
+boxes = [tuple(map(int, p[:5])) for p in placed]
 bad = []
-for p in placed:
-    i, x, y, w, ht = map(int, p)
+for at, (i, x, y, w, ht) in enumerate(boxes):
     box = (max(x + 4, 0), max(y + 4, int(sys.argv[4])), min(x + w - 4, h.size[0]), min(y + ht - 4, h.size[1]))
     if box[2] <= box[0] or box[3] <= box[1]:
         continue
     if v is None:
         # Per app: the viewer's own window, which starts at the window's
-        # top left on the host's screen.
+        # top left on the host's screen. On the host's screen a window
+        # placed later (higher) covers it, and another window's focus
+        # ring, trusted chrome just inside that window's edge, draws over
+        # everything: neither is this window's own pixels.
         f = os.path.join(sys.argv[2], f"window-{i}.png")
         if not os.path.exists(f):
             bad.append(f"window {i}: not drawn"); continue
@@ -180,9 +183,20 @@ for p in placed:
         a = h.crop(box).tobytes()
         if len(a) != len(b):
             bad.append(f"window {i}: sizes differ"); continue
+        over = boxes[at + 1:]
+        rings = [o for o in boxes if o[0] != i]
+        bw = box[2] - box[0]
+        def mine(k):
+            px, py = box[0] + (k // 3) % bw, box[1] + (k // 3) // bw
+            if any(ox <= px < ox + ow and oy <= py < oy + oh for _, ox, oy, ow, oh in over):
+                return False
+            return not any(ox <= px < ox + ow and oy <= py < oy + oh
+                           and not (ox + 4 <= px < ox + ow - 4 and oy + 4 <= py < oy + oh - 4)
+                           for _, ox, oy, ow, oh in rings)
     else:
         a, b = h.crop(box).tobytes(), v.crop(box).tobytes()
-    n = sum(1 for k in range(0, len(a), 3) if a[k:k+3] != b[k:k+3])
+        mine = lambda k: True
+    n = sum(1 for k in range(0, len(a), 3) if a[k:k+3] != b[k:k+3] and mine(k))
     if n:
         bad.append(f"window {i}: {n} of {len(a)//3} px differ")
 print("equal" if not bad else "; ".join(bad))

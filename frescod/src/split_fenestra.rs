@@ -18,7 +18,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use fenestra_link::{Input, Placed, Rec};
+use fenestra_link::{placed_kind, Input, Placed, Rec};
 use fresco_scene_server::window::{Compositor, DisplayEvent};
 use fresco_split::chan::Shm;
 use fresco_split::Msg;
@@ -409,24 +409,51 @@ impl Broker {
         let (desktop, windows): (bool, Vec<Placed>) = {
             let c = self.comp.lock().unwrap();
             let desktop = c.wm_running;
-            (desktop,
-            c.z_order
-                .iter()
-                .filter_map(|id| {
-                    let w = c.windows.get(id)?;
-                    if !owned.contains_key(&(*id as u32)) || !w.rendering {
-                        return None;
+            // A slot or pop-up names the top-level window it belongs to
+            // (through pop-ups of pop-ups and slots of slots), and is left
+            // out unless that window is placed below it.
+            let root = |mut id: u16| {
+                for _ in 0..16 {
+                    let w = c.windows.get(&id)?;
+                    match (w.slot.map(|s| s.parent), w.popup.as_ref().map(|p| p.parent)) {
+                        (Some(p), _) | (None, Some(p)) => id = p,
+                        (None, None) => return Some(id),
                     }
-                    Some(Placed {
-                        window: *id as u32,
-                        x: w.pos.0.round() as i32,
-                        y: w.pos.1.round() as i32,
-                        width: self.dim(w.size.0, screen.0),
-                        height: self.dim(w.size.1, screen.1),
-                    })
-                })
-                .take(fenestra_link::MAX_LAYOUT)
-                .collect())
+                }
+                None
+            };
+            let mut tops: Vec<u32> = Vec::new();
+            let mut windows = Vec::new();
+            for id in &c.z_order {
+                if windows.len() == fenestra_link::MAX_LAYOUT {
+                    break;
+                }
+                let Some(w) = c.windows.get(id) else { continue };
+                if !owned.contains_key(&(*id as u32)) || !w.rendering {
+                    continue;
+                }
+                let kind = if w.slot.is_some() { placed_kind::SLOT } else if w.popup.is_some() { placed_kind::POPUP } else { placed_kind::TOP };
+                let parent = match kind {
+                    placed_kind::TOP => 0,
+                    _ => match root(*id).map(u32::from) {
+                        Some(r) if tops.contains(&r) => r,
+                        _ => continue,
+                    },
+                };
+                if kind == placed_kind::TOP {
+                    tops.push(*id as u32);
+                }
+                windows.push(Placed {
+                    window: *id as u32,
+                    x: w.pos.0.round() as i32,
+                    y: w.pos.1.round() as i32,
+                    width: self.dim(w.size.0, screen.0),
+                    height: self.dim(w.size.1, screen.1),
+                    parent,
+                    kind,
+                });
+            }
+            (desktop, windows)
         };
         let rec = Rec::Layout { screen: (screen.0.max(1), screen.1.max(1)), desktop, windows };
         let mut f = self.fen.lock().unwrap();

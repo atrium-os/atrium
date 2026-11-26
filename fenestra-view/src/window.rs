@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use fenestra_wire::scene::Input;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use fenestra_wire::scene::placed_kind;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -39,6 +40,9 @@ struct Win {
     host: Option<u32>,
     /// Per-app: the host window's size as last asked of this one.
     size: (u32, u32),
+    /// Per-app pop-ups: the host window it belongs to. A pop-up has no
+    /// strip and no frame, and sits against that window's.
+    popup_of: Option<u32>,
     /// Per-app: a size the person gave it here and the host was asked
     /// for, and when; layouts with another size do not resize this window
     /// back until the host answers or [`RESIZE_WAIT`] passes (§6.4).
@@ -72,8 +76,13 @@ impl App {
         let _ = self.input.try_send(i);
     }
 
-    fn open(&self, el: &ActiveEventLoop, title: String, size: PhysicalSize<u32>, host: Option<u32>, host_size: (u32, u32)) -> Option<Win> {
-        let attrs = Window::default_attributes().with_title(title).with_inner_size(size);
+    fn open(&self, el: &ActiveEventLoop, title: String, size: PhysicalSize<u32>, host: Option<u32>, host_size: (u32, u32), popup_at: Option<PhysicalPosition<i32>>) -> Option<Win> {
+        let mut attrs = Window::default_attributes().with_title(title).with_inner_size(size);
+        if let Some(at) = popup_at {
+            // A pop-up: no frame, at its place, and it never takes the
+            // focus from its parent (which would close it on the host).
+            attrs = attrs.with_decorations(false).with_active(false).with_position(at);
+        }
         let w = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -82,7 +91,7 @@ impl App {
             }
         };
         match softbuffer::Context::new(w.clone()).and_then(|c| softbuffer::Surface::new(&c, w.clone())) {
-            Ok(surface) => Some(Win { w, surface, host, size: host_size, asked: None }),
+            Ok(surface) => Some(Win { w, surface, host, size: host_size, popup_of: None, asked: None }),
             Err(e) => {
                 eprintln!("fenestra-view: no surface: {e}");
                 None
@@ -92,6 +101,26 @@ impl App {
 
     fn strip(w: &Window) -> u32 {
         (HOST_STRIP_PT * w.scale_factor()).round() as u32
+    }
+
+    /// The strip over `win`'s content: a top-level app window's; a
+    /// pop-up has none.
+    fn strip_of(win: &Win) -> u32 {
+        if win.popup_of.is_some() {
+            0
+        } else {
+            Self::strip(&win.w)
+        }
+    }
+
+    /// Where a pop-up at `(x, y)` on the host's screen goes on this one:
+    /// its parent's window here, at the same offset from the parent as on
+    /// the host, under the parent's strip.
+    fn popup_position(&self, parent: u32, x: i32, y: i32, placed: &[fenestra_wire::scene::Placed]) -> Option<PhysicalPosition<i32>> {
+        let p = placed.iter().find(|p| p.0 == parent)?;
+        let win = self.wins.values().find(|w| w.host == Some(parent))?;
+        let at = win.w.inner_position().ok()?;
+        Some(PhysicalPosition::new(at.x + (x - p.1), at.y + Self::strip(&win.w) as i32 + (y - p.2)))
     }
 
     /// The local windows the host's layout calls for: the desktop's, or
@@ -104,7 +133,7 @@ impl App {
             Some(true) => {
                 self.wins.retain(|_, w| w.host.is_none());
                 if self.wins.is_empty() {
-                    if let Some(win) = self.open(el, self.title.clone(), PhysicalSize::new(1280, 720), None, (0, 0)) {
+                    if let Some(win) = self.open(el, self.title.clone(), PhysicalSize::new(1280, 720), None, (0, 0), None) {
                         let size = win.w.inner_size();
                         // The host's output follows this window (§4.1).
                         self.views.set_output(size.width, size.height, (win.w.scale_factor() * 1000.0).round() as u32);
@@ -122,9 +151,33 @@ impl App {
                     }
                 }
                 self.dismissed.retain(|id| placed.iter().any(|p| p.0 == *id));
-                self.wins.retain(|_, w| w.host.is_some_and(|h| placed.iter().any(|p| p.0 == h)));
-                for &(id, _, _, pw, ph) in &placed {
-                    if self.dismissed.contains(&id) {
+                // Slots are drawn inside their parent's window, not as one.
+                let shown = |id: u32| placed.iter().any(|p| p.0 == id && p.6 != placed_kind::SLOT);
+                self.wins.retain(|_, w| w.host.is_some_and(shown));
+                for &(id, x, y, pw, ph, parent, kind) in &placed {
+                    if self.dismissed.contains(&id) || kind == placed_kind::SLOT {
+                        continue;
+                    }
+                    if kind == placed_kind::POPUP {
+                        let at = self.popup_position(parent, x, y, &placed);
+                        match self.wins.values_mut().find(|w| w.host == Some(id)) {
+                            Some(win) => {
+                                if win.size != (pw, ph) {
+                                    win.size = (pw, ph);
+                                    let _ = win.w.request_inner_size(PhysicalSize::new(pw, ph));
+                                }
+                                if let Some(at) = at {
+                                    win.w.set_outer_position(at);
+                                }
+                            }
+                            None => {
+                                let Some(at) = at else { continue };
+                                if let Some(mut win) = self.open(el, format!("{}: pop-up {id}", self.title), PhysicalSize::new(pw, ph), Some(id), (pw, ph), Some(at)) {
+                                    win.popup_of = Some(parent);
+                                    self.wins.insert(win.w.id(), win);
+                                }
+                            }
+                        }
                         continue;
                     }
                     match self.wins.values_mut().find(|w| w.host == Some(id)) {
@@ -143,7 +196,7 @@ impl App {
                             let title = format!("{}: window {id}", self.title);
                             // The strip at this scale is known once the window
                             // is: open it at the window's size, then add it.
-                            if let Some(win) = self.open(el, title, PhysicalSize::new(pw, ph), Some(id), (pw, ph)) {
+                            if let Some(win) = self.open(el, title, PhysicalSize::new(pw, ph), Some(id), (pw, ph), None) {
                                 let _ = win.w.request_inner_size(PhysicalSize::new(pw, ph + Self::strip(&win.w)));
                                 self.wins.insert(win.w.id(), win);
                             }
@@ -164,7 +217,7 @@ impl App {
         if win.surface.resize(ww, wh).is_err() {
             return;
         }
-        let strip = Self::strip(&win.w);
+        let strip = Self::strip_of(win);
         let Ok(mut buf) = win.surface.buffer_mut() else { return };
         buf.fill(0x0020_2020);
         match win.host {
@@ -194,12 +247,32 @@ impl App {
                 for p in buf.iter_mut().take((strip.min(size.height) * size.width) as usize) {
                     *p = strip_colour;
                 }
-                let v = views.windows.lock().unwrap_or_else(|e| e.into_inner()).get(&host).cloned();
-                if let Some((w, h, px, _)) = v.and_then(|v| v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached()) {
-                    for y in 0..h.min(size.height.saturating_sub(strip)) {
-                        let row = ((strip + y) * size.width) as usize;
-                        for x in 0..w.min(size.width) {
-                            buf[row + x as usize] = px[(y * w + x) as usize] & 0x00ff_ffff;
+                // The window, then its slots over it where the host has
+                // them, each source over.
+                let placed: Vec<fenestra_wire::scene::Placed> = views.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|l| l.1.clone()).unwrap_or_default();
+                let me = placed.iter().find(|p| p.0 == host).copied();
+                let mut layers = vec![(host, 0i64, 0i64)];
+                if let Some(me) = me {
+                    layers.extend(placed.iter().filter(|p| p.6 == placed_kind::SLOT && p.5 == host).map(|p| (p.0, i64::from(p.1 - me.1), i64::from(p.2 - me.2))));
+                }
+                for (i, (id, ox, oy)) in layers.into_iter().enumerate() {
+                    let v = views.windows.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+                    let Some((w, h, px, _)) = v.and_then(|v| v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached()) else { continue };
+                    for y in 0..i64::from(h) {
+                        let dy = oy + y;
+                        if dy < 0 || dy >= i64::from(size.height.saturating_sub(strip)) {
+                            continue;
+                        }
+                        let row = ((i64::from(strip) + dy) * i64::from(size.width)) as usize;
+                        for x in 0..i64::from(w) {
+                            let dx = ox + x;
+                            if dx < 0 || dx >= i64::from(size.width) {
+                                continue;
+                            }
+                            let s = px[(y * i64::from(w) + x) as usize];
+                            let d = &mut buf[row + dx as usize];
+                            // The window itself as it is; a slot over it.
+                            *d = if i == 0 { s } else { crate::over(s, *d | 0xff00_0000) } & 0x00ff_ffff;
                         }
                     }
                 }
@@ -214,7 +287,7 @@ impl App {
         let size = win.w.inner_size();
         match win.host {
             Some(host) => {
-                let y = y - f64::from(Self::strip(&win.w));
+                let y = y - f64::from(Self::strip_of(win));
                 (x >= 0.0 && y >= 0.0 && x < f64::from(win.size.0) && y < f64::from(win.size.1)).then_some(Input::MotionIn { window: host, x: x as f32, y: y as f32 })
             }
             None => {
@@ -265,6 +338,7 @@ impl ApplicationHandler<()> for App {
                         // The person resized an app's window: the app is
                         // asked for that size; until it answers, its last
                         // frame stays at the top left, clipped or padded.
+                        Some(_) if win.popup_of.is_some() => {}
                         Some(host) => {
                             let want = (size.width, size.height.saturating_sub(Self::strip(&win.w)));
                             if want != win.size && want.0 > 0 && want.1 > 0 {

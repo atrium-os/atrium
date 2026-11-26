@@ -136,7 +136,7 @@ impl LinkSource {
                 Rec::Layout { screen, desktop, windows } => {
                     st.screen = Some(screen);
                     st.desktop = desktop;
-                    st.windows = windows.iter().map(|p| (p.window, p.x, p.y, p.width, p.height)).collect();
+                    st.windows = windows.iter().map(|p| (p.window, p.x, p.y, p.width, p.height, p.parent, p.kind)).collect();
                     st.layout_gen += 1;
                     drop(st);
                     wake.send_modify(|g| *g += 1);

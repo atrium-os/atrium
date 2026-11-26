@@ -22,7 +22,7 @@ pub const HEADER: usize = 40;
 pub const MAX_DATA: usize = 4 << 20;
 /// The most windows a `Layout` lists.
 pub const MAX_LAYOUT: usize = 256;
-const PLACED: usize = 20;
+const PLACED: usize = 28;
 /// The largest screen side a `Layout` may give.
 pub const MAX_SCREEN: u32 = 65536;
 /// A viewer's output (`Output`): each side in device pixels, and its scale
@@ -40,6 +40,20 @@ pub struct Placed {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// For a slot or a pop-up, the top-level window it belongs to, placed
+    /// before it in the same layout; 0 for a top-level window.
+    pub parent: u32,
+    /// [`placed_kind`].
+    pub kind: u8,
+}
+
+/// What a placed window is to its parent (fenestra.md §3.4): a per-app
+/// viewer draws a slot inside its parent's window and a pop-up as a
+/// window of its own against the parent's.
+pub mod placed_kind {
+    pub const TOP: u8 = 0;
+    pub const SLOT: u8 = 1;
+    pub const POPUP: u8 = 2;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +223,8 @@ impl Rec {
                     payload.extend_from_slice(&p.y.to_le_bytes());
                     payload.extend_from_slice(&p.width.to_le_bytes());
                     payload.extend_from_slice(&p.height.to_le_bytes());
+                    payload.extend_from_slice(&p.parent.to_le_bytes());
+                    payload.extend_from_slice(&u32::from(p.kind).to_le_bytes());
                 }
                 Head { kind: LAYOUT, window: 0, ticket: 0, flag: *desktop as u32, a: u64::from(screen.0), b: u64::from(screen.1), len: payload.len() as u32 }
             }
@@ -352,9 +368,19 @@ impl Rec {
                 let mut windows = Vec::with_capacity(payload.len() / PLACED);
                 for c in payload.chunks_exact(PLACED) {
                     let w = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
-                    let p = Placed { window: window(w(0))?, x: w(4) as i32, y: w(8) as i32, width: w(12), height: w(16) };
+                    let kind = u8::try_from(w(24)).ok().filter(|k| *k <= placed_kind::POPUP).ok_or(Refused("placed kind"))?;
+                    let p = Placed { window: window(w(0))?, x: w(4) as i32, y: w(8) as i32, width: w(12), height: w(16), parent: w(20), kind };
                     if p.width == 0 || p.height == 0 || p.width > MAX_SCREEN || p.height > MAX_SCREEN {
                         return Err(Refused("window size"));
+                    }
+                    // A top-level window has no parent; a slot's or pop-up's is
+                    // a top-level window placed before it.
+                    let parent_ok = match kind {
+                        placed_kind::TOP => p.parent == 0,
+                        _ => windows.iter().any(|q: &Placed| q.window == p.parent && q.kind == placed_kind::TOP),
+                    };
+                    if !parent_ok {
+                        return Err(Refused("a placed window's parent"));
                     }
                     if windows.iter().any(|q: &Placed| q.window == p.window) {
                         return Err(Refused("a window placed twice"));

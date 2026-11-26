@@ -10,7 +10,7 @@ fn samples() -> Vec<Rec> {
         Rec::Data { window: 1, ticket: 7, bytes: vec![1, 2, 3] },
         Rec::End { window: 1, ticket: 7, now: Some((5, 6)) },
         Rec::End { window: 1, ticket: 9, now: None },
-        Rec::Layout { screen: (1280, 720), desktop: true, windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1 }] },
+        Rec::Layout { screen: (1280, 720), desktop: true, windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480, parent: 0, kind: 0 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 2 }] },
         Rec::Layout { screen: (1, 1), desktop: false, windows: vec![] },
         Rec::Output { width: 1600, height: 900, scale_milli: 2000 },
         Rec::Output { width: 64, height: 8192, scale_milli: 500 },
@@ -50,7 +50,7 @@ fn bounds_are_checked_before_buffering() {
     h[32..36].copy_from_slice(&((MAX_DATA + 1) as u32).to_le_bytes());
     assert!(Rec::payload_len(&h).is_err());
     let mut h = header(&Rec::Layout { screen: (10, 10), desktop: false, windows: vec![] });
-    h[32..36].copy_from_slice(&((MAX_LAYOUT * 20 + 20) as u32).to_le_bytes());
+    h[32..36].copy_from_slice(&((MAX_LAYOUT * 28 + 28) as u32).to_le_bytes());
     assert!(Rec::payload_len(&h).is_err());
     let mut h = header(&Rec::Changed { window: 1 });
     h[32..36].copy_from_slice(&1u32.to_le_bytes());
@@ -82,9 +82,15 @@ fn hostile_records_are_refused() {
             b[38] = 1;
             b
         },
-        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1 }; 2] }.encode(),
-        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 0 }; 2] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1, parent: 0, kind: 0 }] }.encode(),
         Rec::Data { window: 1, ticket: 0, bytes: vec![] }.encode(),
+        // A pop-up whose parent is not placed before it, one under a
+        // pop-up, a top-level window with a parent, an unknown kind.
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 3, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 2 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 0 }, Placed { window: 3, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 2 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1, parent: 3, kind: 1 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 0 }, Placed { window: 3, x: 0, y: 0, width: 1, height: 1, parent: 2, kind: 0 }] }.encode(),
+        Rec::Layout { screen: (9, 9), desktop: false, windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1, parent: 0, kind: 3 }] }.encode(),
         Rec::Layout { screen: (0, 9), desktop: false, windows: vec![] }.encode(),
         Rec::Output { width: 63, height: 900, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 9000, scale_milli: 1000 }.encode(),

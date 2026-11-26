@@ -127,9 +127,9 @@ impl Views {
     /// the host screen's pixels (a script) goes to the topmost window the
     /// layout has there, in that window's pixels; nowhere, it is dropped.
     /// A focus or resize for window 0 (a script's) is for the topmost
-    /// window the layout has.
+    /// top-level window the layout has.
     pub fn route(&self, i: scene::Input) -> Option<scene::Input> {
-        let top = || self.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.1.last().map(|p| p.0));
+        let top = || self.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.1.iter().rev().find(|p| p.6 == scene::placed_kind::TOP).map(|p| p.0));
         let i = match i {
             scene::Input::Focus { window: 0 } => scene::Input::Focus { window: top()? },
             scene::Input::Resize { window: 0, width, height } => scene::Input::Resize { window: top()?, width, height },
@@ -148,10 +148,14 @@ impl Views {
         }
         let l = self.layout.lock().unwrap_or_else(|e| e.into_inner());
         let (_, placed) = l.as_ref()?;
-        placed.iter().rev().find_map(|&(window, wx, wy, w, h)| {
+        // A slot is drawn inside its parent's window, so a point on it is
+        // a point in the parent (the host finds the slot there).
+        let hit = placed.iter().rev().find(|&&(_, wx, wy, w, h, _, _)| {
             let (lx, ly) = (x - wx as f32, y - wy as f32);
-            (lx >= 0.0 && ly >= 0.0 && lx < w as f32 && ly < h as f32).then_some(scene::Input::MotionIn { window, x: lx, y: ly })
-        })
+            lx >= 0.0 && ly >= 0.0 && lx < w as f32 && ly < h as f32
+        })?;
+        let to = if hit.6 == scene::placed_kind::SLOT { placed.iter().find(|p| p.0 == hit.5)? } else { hit };
+        Some(scene::Input::MotionIn { window: to.0, x: x - to.1 as f32, y: y - to.2 as f32 })
     }
 
     fn resume(&self) -> Vec<(u32, u64, u64)> {
@@ -315,8 +319,8 @@ pub fn snapshot(views: &Views, dir: &std::path::Path) -> std::io::Result<String>
         write_png(&dir.join(format!("window-{id}.png")), w, h, &px)?;
     }
     if let Some((_, placed)) = views.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        for (id, x, y, w, h) in placed {
-            report += &format!("placed {id} {x} {y} {w} {h}\n");
+        for (id, x, y, w, h, parent, kind) in placed {
+            report += &format!("placed {id} {x} {y} {w} {h} {parent} {kind}\n");
         }
     }
     if let Some(d) = views.mode() {
@@ -437,7 +441,7 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
                 .iter()
                 .filter_map(|(id, v)| {
                     let (w, h) = v.lock().unwrap_or_else(|e| e.into_inner()).reader.size();
-                    (w > 0 && h > 0).then_some((*id, 0, 0, w, h))
+                    (w > 0 && h > 0).then_some((*id, 0, 0, w, h, 0, scene::placed_kind::TOP))
                 })
                 .collect();
             let screen = placed.iter().fold((0, 0), |(a, b), p| (a.max(p.3), b.max(p.4)));
@@ -452,7 +456,7 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
     let background = chrome.as_ref().map_or(0xff00_0000, |c| opaque(c.background));
     let mut out = vec![background; sw as usize * sh as usize];
     let windows = views.windows.lock().unwrap_or_else(|e| e.into_inner());
-    for (id, x, y, _, _) in placed {
+    for (id, x, y, _, _, _, _) in placed {
         let Some(v) = windows.get(&id) else { continue };
         let Some((w, h, px, _)) = v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached() else { continue };
         for row in 0..h as i64 {
@@ -490,7 +494,7 @@ pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
     Some(((sw, sh, out), hex))
 }
 
-fn over(s: u32, d: u32) -> u32 {
+pub(crate) fn over(s: u32, d: u32) -> u32 {
     let a = s >> 24;
     if a == 255 {
         return s;
@@ -541,7 +545,7 @@ mod tests {
     #[test]
     fn a_per_app_session_has_no_desktop_and_points_into_windows() {
         let views = Views::default();
-        *views.layout.lock().unwrap() = Some(((100, 100), vec![(2, 0, 10, 50, 50), (3, 20, 20, 50, 50)]));
+        *views.layout.lock().unwrap() = Some(((100, 100), vec![(2, 0, 10, 50, 50, 0, 0), (3, 20, 20, 50, 50, 0, 0), (4, 22, 22, 10, 10, 3, scene::placed_kind::SLOT)]));
         views.desktop_mode.store(true, Ordering::Relaxed);
         assert!(desktop(&views).is_some());
         let m = scene::Input::Motion { x: 30.0, y: 30.0 };
@@ -550,6 +554,7 @@ mod tests {
         assert!(desktop(&views).is_none());
         assert_eq!(views.mode(), Some(false));
         assert_eq!(views.route(m), Some(scene::Input::MotionIn { window: 3, x: 10.0, y: 10.0 }), "the topmost window there");
+        assert_eq!(views.route(scene::Input::Motion { x: 25.0, y: 25.0 }), Some(scene::Input::MotionIn { window: 3, x: 5.0, y: 5.0 }), "a slot's point is its parent's");
         assert_eq!(views.route(scene::Input::Motion { x: 5.0, y: 15.0 }), Some(scene::Input::MotionIn { window: 2, x: 5.0, y: 5.0 }));
         assert_eq!(views.route(scene::Input::Motion { x: 90.0, y: 5.0 }), None, "no window there");
         let k = scene::Input::Key { usage: 4, pressed: true, modifiers: 0 };

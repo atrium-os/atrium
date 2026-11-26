@@ -98,8 +98,10 @@ pub const MAX_LAYOUT: usize = 256;
 /// The largest screen or window side a layout may give.
 pub const MAX_SIDE: u32 = 65536;
 
-/// A window on the host's screen: `(window, x, y, width, height)`.
-pub type Placed = (u32, i32, i32, u32, u32);
+/// A window on the host's screen: `(window, x, y, width, height, parent,
+/// kind)`; `parent` and `kind` as [`fenestra_link::Placed`]'s.
+pub type Placed = (u32, i32, i32, u32, u32, u32, u8);
+pub use fenestra_link::placed_kind;
 
 /// Control bodies (inside `Msg::App`): `tag u8`, then fixed fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,12 +218,14 @@ impl Control {
                 b.extend_from_slice(&screen.1.to_le_bytes());
                 b.push(*desktop as u8);
                 b.extend_from_slice(&(windows.len().min(MAX_LAYOUT) as u32).to_le_bytes());
-                for (w, x, y, wd, ht) in windows.iter().take(MAX_LAYOUT) {
+                for (w, x, y, wd, ht, parent, kind) in windows.iter().take(MAX_LAYOUT) {
                     b.extend_from_slice(&w.to_le_bytes());
                     b.extend_from_slice(&x.to_le_bytes());
                     b.extend_from_slice(&y.to_le_bytes());
                     b.extend_from_slice(&wd.to_le_bytes());
                     b.extend_from_slice(&ht.to_le_bytes());
+                    b.extend_from_slice(&parent.to_le_bytes());
+                    b.push(*kind);
                 }
             }
         }
@@ -289,14 +293,25 @@ impl Control {
                     _ => return Err(bad()),
                 };
                 let n = u32_at(10)? as usize;
-                if n > MAX_LAYOUT || b.len() != 14 + n * 20 {
+                if n > MAX_LAYOUT || b.len() != 14 + n * 25 {
                     return Err(bad());
                 }
                 let mut windows: Vec<Placed> = Vec::with_capacity(n);
                 for i in 0..n {
-                    let at = 14 + i * 20;
-                    let p = (u32_at(at)?, u32_at(at + 4)? as i32, u32_at(at + 8)? as i32, side(u32_at(at + 12)?)?, side(u32_at(at + 16)?)?);
+                    let at = 14 + i * 25;
+                    let kind = *b.get(at + 24).ok_or_else(bad)?;
+                    let p = (u32_at(at)?, u32_at(at + 4)? as i32, u32_at(at + 8)? as i32, side(u32_at(at + 12)?)?, side(u32_at(at + 16)?)?, u32_at(at + 20)?, kind);
                     if windows.iter().any(|q| q.0 == p.0) {
+                        return Err(bad());
+                    }
+                    // A top-level window has no parent; a slot's or pop-up's
+                    // is a top-level window placed before it.
+                    let parent_ok = match kind {
+                        placed_kind::TOP => p.5 == 0,
+                        placed_kind::SLOT | placed_kind::POPUP => windows.iter().any(|q| q.0 == p.5 && q.6 == placed_kind::TOP),
+                        _ => false,
+                    };
+                    if !parent_ok {
                         return Err(bad());
                     }
                     windows.push(p);

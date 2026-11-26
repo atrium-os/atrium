@@ -162,7 +162,7 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&lie).is_err());
     assert!(Control::decode(&[]).is_err());
     assert_eq!(Control::decode(&Control::Closed(5).encode()).unwrap(), Control::Closed(5));
-    let l = Control::Layout { screen: (1280, 720), desktop: true, windows: vec![(2, -5, 30, 640, 480), (7, 0, 0, 1, 1)] };
+    let l = Control::Layout { screen: (1280, 720), desktop: true, windows: vec![(2, -5, 30, 640, 480, 0, 0), (7, 0, 0, 1, 1, 2, 2)] };
     assert_eq!(Control::decode(&l.encode()).unwrap(), l);
     // A mode not 0 or 1, a count past the body, a window placed twice, a
     // zero side: refused.
@@ -172,10 +172,20 @@ fn scene_framing_round_trips_and_refuses() {
     let mut lie = l.encode();
     lie[10] = 3;
     assert!(Control::decode(&lie).is_err());
-    let twice = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, 0, 0, 1, 1); 2] };
+    let twice = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, 0, 0, 1, 1, 0, 0); 2] };
     assert!(Control::decode(&twice.encode()).is_err());
-    let zero = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, 0, 0, 0, 1)] };
+    let zero = Control::Layout { screen: (9, 9), desktop: false, windows: vec![(2, 0, 0, 0, 1, 0, 0)] };
     assert!(Control::decode(&zero.encode()).is_err());
+    // A pop-up with no parent before it, a slot of a pop-up, a top-level
+    // window with a parent, an unknown kind: refused.
+    for w in [
+        vec![(3, 0, 0, 1, 1, 2, 2)],
+        vec![(2, 0, 0, 1, 1, 0, 0), (3, 0, 0, 1, 1, 2, 2), (4, 0, 0, 1, 1, 3, 1)],
+        vec![(2, 0, 0, 1, 1, 0, 0), (3, 0, 0, 1, 1, 2, 0)],
+        vec![(2, 0, 0, 1, 1, 0, 3)],
+    ] {
+        assert!(Control::decode(&Control::Layout { screen: (9, 9), desktop: false, windows: w.clone() }.encode()).is_err(), "{w:?}");
+    }
     // A viewer's output: in range, or refused.
     let o = Control::Output { width: 1600, height: 900, scale_milli: 2000 };
     assert_eq!(Control::decode(&o.encode()).unwrap(), o);
