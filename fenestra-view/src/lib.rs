@@ -25,6 +25,8 @@ use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 /// Where the viewer's input comes from (a window's events, or a script).
 #[cfg(feature = "window")]
 pub mod window;
+pub mod colours;
+pub use colours::clean_name;
 #[cfg(feature = "window")]
 mod strip;
 

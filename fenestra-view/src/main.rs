@@ -13,6 +13,11 @@
 //! for a remote output of that size and scale (§4.1); the windowed viewer
 //! asks for its window's, and again as it is resized.
 //!
+//! `--host-colour RRGGBB` gives this host's strip that colour and
+//! remembers it; `--forget-colour` goes back to one from the host's name.
+//! `fenestra-view colour NAME [RRGGBB|forget]` shows or sets a host's
+//! colour without connecting (NAME as the strip shows it).
+//!
 //! The mint (`fenestra_wire::mint`): with `--ssh CMD`, it runs `CMD
 //! fenestra-shell mint KEY` (CMD split at spaces, no shell) and reads the
 //! `FENESTRA_MINT` line back from the SSH channel; sshd authenticates the
@@ -40,6 +45,9 @@ fn die(why: impl std::fmt::Display) -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("colour") {
+        colour_command(&args[2..]);
+    }
     let headless = args.iter().any(|a| a == "--headless");
     let ssh = arg(&args, "--ssh");
     let take_over = args.iter().any(|a| a == "--take-over");
@@ -82,7 +90,21 @@ fn main() {
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Input>(1024);
     let window_input = input_tx.clone();
     let views_w = views.clone();
-    let title = format!("Fenestra: {}", ssh.as_deref().and_then(|c| c.split_whitespace().last()).map_or_else(|| dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(), str::to_string));
+    let host_name = fenestra_view::clean_name(&ssh.as_deref().and_then(|c| c.split_whitespace().last()).map_or_else(|| dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(), str::to_string));
+    let picked = match (arg(&args, "--host-colour"), args.iter().any(|a| a == "--forget-colour")) {
+        (Some(_), true) => die("--host-colour or --forget-colour, not both"),
+        (Some(c), false) => {
+            let c = fenestra_view::colours::parse(&c).unwrap_or_else(|| die("--host-colour RRGGBB"));
+            remember(&host_name, Some(c));
+            Some(c)
+        }
+        (None, true) => {
+            remember(&host_name, None);
+            None
+        }
+        (None, false) => fenestra_view::colours::dir().and_then(|d| fenestra_view::colours::get(&d, &host_name)),
+    };
+    let title = format!("Fenestra: {host_name}");
     let session = move || rt.block_on(async move {
         let key = SessionKey::generate().unwrap_or_else(|e| die(e));
         let m = match (&ssh, &dir) {
@@ -255,16 +277,45 @@ fn main() {
             session();
             eprintln!("fenestra-view: the session ended");
         });
-        if let Err(e) = fenestra_view::window::run(views_w, window_input, title) {
+        if let Err(e) = fenestra_view::window::run(views_w, window_input, title, host_name, picked) {
             die(e);
         }
         std::process::exit(0);
     }
     #[cfg(not(feature = "window"))]
     {
-        let _ = (views_w, window_input, title);
+        let _ = (views_w, window_input, title, host_name, picked);
         die("built without the window feature: only --headless");
     }
+}
+
+/// Remembers (or forgets) the colour picked for `name`'s strip.
+fn remember(name: &str, colour: Option<u32>) {
+    let dir = fenestra_view::colours::dir().unwrap_or_else(|| die("no HOME or XDG_CONFIG_HOME for the colours"));
+    if let Err(e) = fenestra_view::colours::set(&dir, name, colour) {
+        die(e);
+    }
+}
+
+/// `fenestra-view colour NAME [RRGGBB|forget]`.
+fn colour_command(rest: &[String]) -> ! {
+    fn usage() -> ! {
+        die("colour NAME [RRGGBB|forget]")
+    }
+    let name = fenestra_view::clean_name(rest.first().unwrap_or_else(|| usage()));
+    match rest.get(1).map(String::as_str) {
+        None => {
+            let c = fenestra_view::colours::dir().and_then(|d| fenestra_view::colours::get(&d, &name));
+            match c {
+                Some(c) => println!("{c:06x} {name}"),
+                None => println!("{name}: from its name"),
+            }
+        }
+        Some("forget") if rest.len() == 2 => remember(&name, None),
+        Some(c) if rest.len() == 2 => remember(&name, Some(fenestra_view::colours::parse(c).unwrap_or_else(|| usage()))),
+        Some(_) => usage(),
+    }
+    std::process::exit(0)
 }
 
 /// Run `cmd fenestra-shell mint KEY` (the SSH transport) and take the mint

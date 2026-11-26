@@ -56,16 +56,6 @@ pub fn draw(buf: &mut [u32], w: u32, h: u32, colour: u32, name: &str, scale: f64
     }
 }
 
-/// The host's name made safe for the strip (the set Vinculum's
-/// `clean_name` removes): control characters, bidirectional embeddings,
-/// overrides, isolates and marks, line and paragraph separators and
-/// zero-width characters go, so a crafted ssh alias or directory name
-/// can't reorder or hide part of the name; the ends are trimmed.
-pub fn clean_name(name: &str) -> String {
-    let keep = |c: &char| !c.is_control() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{2060}' | '\u{FEFF}' | '\u{061C}');
-    name.chars().filter(keep).collect::<String>().trim().to_string()
-}
-
 /// `a` toward `b` by `t` (0..=1), each channel of 0RGB.
 fn mix(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
@@ -78,12 +68,6 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_name_loses_its_controls_and_direction_overrides() {
-        assert_eq!(clean_name("root@host"), "root@host");
-        assert_eq!(clean_name(" a\u{202E}tsoh\u{202C}b\u{2067}c\u{2069}\u{200B}\nd\u{85}e "), "atsohbcde");
-    }
 
     #[test]
     fn the_strip_shows_the_name_inside_it_on_the_hosts_colour() {

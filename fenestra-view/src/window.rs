@@ -439,7 +439,7 @@ impl ApplicationHandler<()> for App {
 /// Run the windows on this thread (the main one: macOS needs it) until
 /// the person closes them. `views` fills from the session running
 /// elsewhere.
-pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: String) -> Result<(), String> {
+pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: String, host_name: String, picked: Option<u32>) -> Result<(), String> {
     let el = EventLoop::<()>::with_user_event().build().map_err(|e| e.to_string())?;
     el.set_control_flow(ControlFlow::Wait);
     let proxy = el.create_proxy();
@@ -463,9 +463,8 @@ pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: St
             })
             .map_err(|e| e.to_string())?;
     }
-    let host_name = crate::strip::clean_name(title.strip_prefix("Fenestra: ").unwrap_or(&title));
-    let strip_colour = host_colour(&host_name);
-    let title = format!("Fenestra: {host_name}");
+    // The colour the person picked for this host, else one from its name.
+    let strip_colour = picked.unwrap_or_else(|| host_colour(&host_name));
     let mut app = App { views, input, wins: HashMap::new(), screen: (0, 0), modifiers: 0, title, dismissed: Vec::new(), mode: None, strip_colour, host_name };
     el.run_app(&mut app).map_err(|e| e.to_string())
 }
