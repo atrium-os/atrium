@@ -127,6 +127,8 @@ extern "C" {
     fn libusb_open(dev: *mut Device, handle: *mut *mut Handle) -> c_int;
     fn libusb_kernel_driver_active(handle: *mut Handle, iface: c_int) -> c_int;
     fn libusb_detach_kernel_driver(handle: *mut Handle, iface: c_int) -> c_int;
+    fn libusb_attach_kernel_driver(handle: *mut Handle, iface: c_int) -> c_int;
+    fn libusb_release_interface(handle: *mut Handle, iface: c_int) -> c_int;
     fn libusb_claim_interface(handle: *mut Handle, iface: c_int) -> c_int;
     fn libusb_control_transfer(
         handle: *mut Handle,
@@ -369,7 +371,9 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
 
 /// Makes the kernel let go of `usb`, configures it if it is not, and claims
 /// its HCI interface. Returns the configuration it was in when found.
-fn claim(usb: &Usb, name: &str) -> std::io::Result<u8> {
+/// Returns the configuration found and whether a kernel driver was detached
+/// (the report hands it back; the driver keeps the device).
+fn claim(usb: &Usb, name: &str) -> std::io::Result<(u8, bool)> {
     // The kernel's own driver (ng_ubt on stock FreeBSD) must let go. Ask
     // first and detach only when one is attached: under dispensatord the
     // kernel driver is already detached, and FreeBSD's detach ioctl needs
@@ -378,7 +382,8 @@ fn claim(usb: &Usb, name: &str) -> std::io::Result<u8> {
     // not-supported: nothing there holds a third-party controller.
     // SAFETY: the handle was just opened.
     let active = unsafe { libusb_kernel_driver_active(usb.handle, usb.iface as c_int) };
-    if active == 1 {
+    let detached = active == 1;
+    if detached {
         // SAFETY: the handle was just opened; no interface is claimed yet.
         let r = unsafe { libusb_detach_kernel_driver(usb.handle, usb.iface as c_int) };
         if r < 0 {
@@ -424,7 +429,7 @@ fn claim(usb: &Usb, name: &str) -> std::io::Result<u8> {
             eprintln!("vinculum-hci: {name}: clear halt on endpoint 0x{ep:02x}: {}", err_name(r));
         }
     }
-    Ok(cur.clamp(0, 255) as u8)
+    Ok((cur.clamp(0, 255) as u8, detached))
 }
 
 /// The HCI interface of `dev`'s active configuration (or, for a device not
@@ -564,8 +569,10 @@ pub fn report(sel: Select) -> std::io::Result<String> {
             continue;
         }
         let usb = Usb { handle: h, iface, config, eps, vendor: dd.id_vendor, product: dd.id_product };
+        let mut detached = false;
         match claim(&usb, &name) {
-            Ok(was) => {
+            Ok((was, d)) => {
+                detached = d;
                 let info = vinculum_hci::report::UsbInfo {
                     vendor: dd.id_vendor,
                     product: dd.id_product,
@@ -584,8 +591,21 @@ pub fn report(sel: Select) -> std::io::Result<String> {
             }
             Err(e) => out.push_str(&format!("controller {name}: cannot claim: {e}\n")),
         }
+        if detached {
+            // The report is read-only: give the kernel's driver (ng_ubt)
+            // back the controller it had. libusb_close re-attaches only what
+            // its own auto-detach took, which claim() does not use.
+            // SAFETY: the handle is open and the interface claimed above.
+            let r = unsafe {
+                libusb_release_interface(h, iface as c_int);
+                libusb_attach_kernel_driver(h, iface as c_int)
+            };
+            if r < 0 {
+                out.push_str(&format!("controller {name}: could not give the kernel driver back: {}\n", err_name(r)));
+            }
+        }
         // SAFETY: the handle was opened above and nothing uses it after;
-        // closing releases the interface and gives the kernel its driver back.
+        // closing releases the interface.
         unsafe { libusb_close(h) };
     }
     // SAFETY: frees the list got above; no pointer from it is used after.

@@ -59,6 +59,34 @@ pub trait KeyStore {
     fn load_all(&mut self) -> Result<Vec<(Id, Result<Bond, Error>)>, Error>;
     fn store(&mut self, bond: &Bond) -> Result<Id, Error>;
     fn delete(&mut self, id: &Id) -> Result<(), Error>;
+
+    /// Deletes every stored item not in `keep`: after a store whose reply
+    /// was lost, the item may exist although the pairing was reported
+    /// failed, and it must not be honoured at the next start.
+    fn forget_unknown(&mut self, keep: &[Id]) -> Result<usize, Error> {
+        let mut n = 0;
+        for (id, _) in self.load_all()? {
+            if !keep.contains(&id) {
+                self.delete(&id)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Splits loaded bonds into the usable ones and the ids of every bond that
+/// shares its address or identity with another: which of two is the live
+/// key cannot be told, so neither is used and that device pairs again.
+pub fn split_duplicates(bonds: Vec<(Id, Bond)>) -> (Vec<(Id, Bond)>, Vec<Id>) {
+    let same = |a: &Bond, b: &Bond| a.address == b.address || (a.identity.is_some() && a.identity == b.identity);
+    let dup: Vec<bool> = bonds.iter().enumerate().map(|(i, (_, a))| bonds.iter().enumerate().any(|(j, (_, b))| i != j && same(a, b))).collect();
+    let mut keep = Vec::new();
+    let mut drop = Vec::new();
+    for ((id, b), d) in bonds.into_iter().zip(dup) {
+        if d { drop.push(id) } else { keep.push((id, b)) }
+    }
+    (keep, drop)
 }
 
 /// Bonds in memory only.

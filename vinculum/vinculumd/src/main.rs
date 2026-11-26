@@ -266,6 +266,14 @@ fn main() {
             Err(e) => eprintln!("vinculumd: bond {id:02x?} unusable ({e}); that device must pair again"),
         }
     }
+    let (kept, dups) = vinculum_keys::split_duplicates(bonds);
+    bonds = kept;
+    for id in dups {
+        eprintln!("vinculumd: bond {id:02x?} shares its device with another; removing both, that device must pair again");
+        if let Err(e) = store.delete(&id) {
+            eprintln!("vinculumd: removing duplicate bond {id:02x?}: {e}");
+        }
+    }
     println!("bonds: {}", bonds.len());
     let mut names: std::collections::HashMap<vinculum_host::Peer, String> = Default::default();
     let mut link = Link::open(&o.transport, &o.transport_uids).unwrap_or_else(|e| {

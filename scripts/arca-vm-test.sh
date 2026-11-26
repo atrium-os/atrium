@@ -131,6 +131,17 @@ BROKER_PUB=$(printf 'b%.0s' $(seq 64))
 sed -e "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" -e "s|vinculumd=65024|vinculumd=50804|" \
     "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" > "$tmpd/42-atrium-arcad.toml"
 put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
+# However the run ends, forget the test bond key (it sits under the
+# vinculumd label) while the test manifest still names this user as
+# vinculumd, then put arcad's real manifest back: a guest left with the test
+# one refuses the real vinculumd (65024) at its next bootstrap start.
+BID=""; SPID=""
+cleanup() {
+    [ -n "$SPID" ] && kill "$SPID" 2>/dev/null
+    [ -n "$BID" ] && as arcabt "delete $BID" >/dev/null 2>&1
+    put "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
+}
+trap cleanup EXIT
 # Only Arca's manifest: the smoke manifests would churn the bootstrap log.
 g "mkdir -p /etc/atrium/services.d.off && mv /etc/atrium/services.d/*-atrium-smoke-*.toml /etc/atrium/services.d.off/ 2>/dev/null; true"
 # arcad's devfs ruleset (32, atrium_arca: basics + tesserakeys) must be loaded.
@@ -239,7 +250,6 @@ echo "=== 5. couriers in their own jails (arca-courierd)"
 SRV=$(mktemp -d)
 "$ROOT/arca/arca-courier/target/debug/examples/courier-test-server" api.example,evil.example "$SRV/ca.pem" "$SRV/port" "$SRV/log" &
 SPID=$!
-trap 'kill $SPID 2>/dev/null' EXIT
 i=0; while [ $i -lt 50 ] && [ ! -s "$SRV/port" ]; do sleep 0.1; i=$((i+1)); done
 PORT=$(cat "$SRV/port")
 put "$SRV/ca.pem" /tmp/courierd-ca.pem
@@ -492,15 +502,11 @@ echo "  SKIP: no /dev/tesserakeys in the guest (load tessera_fs before arcad)"
 fi
 
 # The test bond key lives in the machine store under the vinculumd label,
-# so the real vinculumd would find it as a corrupt bond: forget it while
-# the test manifest still names this user as vinculumd.
+# so the real vinculumd would find it as a corrupt bond (cleanup does it
+# too, on an early exit).
 check "a service forgets its bond key" "status=0 body=" "$(as arcabt "delete $BID")"
 check "and it is gone" gone "$(as arcabt "release $BID" | grep -q '^status=0' && echo present || echo gone)"
-
-# Put arcad's real manifest back: the test one names vinculumd as 50804 and
-# a test web broker, so a guest left with it refuses the real vinculumd
-# (65024) at its next bootstrap start.
-put "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
+BID=""
 
 echo "=== $pass passed, $fail failed"
 [ "$fail" = 0 ]

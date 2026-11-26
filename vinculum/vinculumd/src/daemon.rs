@@ -633,6 +633,18 @@ impl Daemon {
                     }
                     Err(e) => {
                         // A bond we can't keep is no bond: drop the link.
+                        // If the reply was lost after the request went out,
+                        // the item may exist anyway: remove what we don't
+                        // hold, so a pairing reported failed is not honoured
+                        // after a restart.
+                        if matches!(e, vinculum_keys::Error::Io(_)) {
+                            let keep: Vec<_> = self.bonds.iter().map(|(id, _)| *id).collect();
+                            match self.store.forget_unknown(&keep) {
+                                Ok(0) => {}
+                                Ok(n) => eprintln!("vinculumd: removed {n} bond(s) left by a failed store"),
+                                Err(e2) => eprintln!("vinculumd: could not check the key store after a failed store: {e2}"),
+                            }
+                        }
                         self.broadcast(&Event::PairingFailed { address: a, why: format!("key store: {e}") });
                         self.host.disconnect(handle, now);
                     }

@@ -202,3 +202,25 @@ fn arca_locked_fails_closed() {
     let mut s = vinculum_keys::arca::ArcaStore::from_stream(client);
     assert!(matches!(s.load_all(), Err(Error::Refused(_))));
 }
+
+#[test]
+fn forget_unknown_removes_an_item_stored_behind_a_lost_reply() {
+    let mut s = MemoryStore::default();
+    let kept = s.store(&bond(1)).unwrap();
+    let _orphan = s.store(&bond(2)).unwrap();
+    assert_eq!(s.forget_unknown(&[kept]).unwrap(), 1);
+    let left: Vec<_> = s.load_all().unwrap().into_iter().map(|(id, _)| id).collect();
+    assert_eq!(left, vec![kept]);
+}
+
+#[test]
+fn duplicate_bonds_for_one_device_are_both_dropped() {
+    let a = (([1u8; 16]), bond(1));
+    let mut b1 = bond(1);
+    b1.ltk = [9; 16];
+    let b = ([2u8; 16], b1);
+    let c = (([3u8; 16]), bond(2));
+    let (keep, drop) = vinculum_keys::split_duplicates(vec![a, b, c]);
+    assert_eq!(keep.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![[3u8; 16]]);
+    assert_eq!(drop, vec![[1u8; 16], [2u8; 16]]);
+}
