@@ -38,7 +38,7 @@ pub use chip::{Chip, ListRow};
 pub use code_grid::{CodeGrid, CodeView, OtherKey};
 pub use choice::{Check, Checkbox, RadioGroup, Segmented, Tabs, Toggle};
 pub use credential_field::{CredentialField, CredentialState};
-pub use grid_view::{CellAlign, CellIcon, CellVAlign, CellRange, CellView, EditMode, GridAction, GridFloat, GridSource, GridState, GridView};
+pub use grid_view::{CellAlign, CellIcon, CellVAlign, CellRange, CellView, EditMode, Spark, SparkStyle, spark_shapes, GridAction, GridFloat, GridSource, GridState, GridView};
 pub use group::{GroupBox, Section};
 pub use label::{Glyph, Label};
 pub use popup::{Dialog, DialogButton, Dropdown, Mark, Menu, MenuButton, MenuItem, MenuState, PanelButton, PanelContent, TriggerIcon, PANEL_PADDING};

@@ -96,7 +96,7 @@ fn find(list: &[Scenario], name: &str) -> Option<usize> {
 fn set_list(d: &mut Doc, label: &str, list: Vec<Scenario>) -> Result<(), String> {
     let sheet = d.sheet;
     d.run(label, vec![GridOp::Scenarios { sheet, list }]);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     Ok(())
@@ -146,7 +146,7 @@ pub fn run(d: &mut Doc, typed: &str) -> Result<String, String> {
             let s = d.sheet;
             let ops = sc.cells.iter().map(|(r, c, v)| GridOp::set(CellAddr::new(s, *r, *c), Input::typed(v))).collect();
             d.run("Show Scenario", ops);
-            if d.status == crate::sheet_protection::REFUSED {
+            if crate::sheet_protection::refused(&d.status) {
                 return Err(d.status.clone());
             }
             d.wb.recalc();

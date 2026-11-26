@@ -16,6 +16,7 @@ pub use outline::supports_outlines;
 pub mod pivot;
 #[cfg(feature = "read")]
 pub mod read;
+pub mod sparkline;
 pub mod styles;
 pub mod validation;
 mod threaded;

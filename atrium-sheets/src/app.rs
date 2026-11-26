@@ -1340,7 +1340,7 @@ impl Sheets {
                 d.size_preview(rows, i, i, px);
             }
             d.size_done();
-            if d.status != crate::sheet_protection::REFUSED {
+            if !crate::sheet_protection::refused(&d.status) {
                 let n = sizes.len();
                 d.status = match (rows, n) {
                     (true, 1) => "Fitted 1 row to its contents.".into(),
@@ -3945,7 +3945,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross)) => {
                     self.close_bars();
                     let g = self.grid.get_cloned();
                     let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));
@@ -7703,6 +7703,47 @@ mod tests {
             press(&mut app, at(r));
             assert_eq!(s.doc.borrow().sheet, 1, "a press on Sheet2's {what}");
         }
+    }
+
+    #[test]
+    fn a_protected_workbook_structure_refuses_sheet_changes_until_unlocked() {
+        use crate::data::DataCmd;
+        use crate::tabs::TabCmd;
+        let s = sheets_of(b"a,1\n");
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        run(Cmd::Data(DataCmd::AddSheet));
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 2);
+        run(Cmd::Data(DataCmd::ProtectWorkbook));
+        assert!(s.doc.borrow().wb.structure_protected());
+        let refused = || s.doc.borrow().status.contains("structure is protected");
+        run(Cmd::Data(DataCmd::AddSheet));
+        assert!(refused() && s.doc.borrow().wb.sheet_count() == 2, "{}", s.doc.borrow().status);
+        run(Cmd::Data(DataCmd::DeleteSheet));
+        assert!(refused() && s.doc.borrow().wb.sheet_count() == 2, "{}", s.doc.borrow().status);
+        run(Cmd::Data(DataCmd::RenameSheet));
+        s.rename_text.set(TextEdit::new("Totals"));
+        run(Cmd::Tab(TabCmd::RenameDone));
+        assert_eq!(s.doc.borrow().wb.sheet_name(1), "Sheet2");
+        run(Cmd::Data(DataCmd::MoveSheetLeft));
+        assert_eq!(s.doc.borrow().wb.sheet_name(0), "Sheet1");
+        // Cells still edit.
+        assert!(s.doc.borrow_mut().type_into(0, 0, "5"));
+        // Unlocked: sheets change again; the lock undoes too.
+        run(Cmd::Data(DataCmd::ProtectWorkbook));
+        assert!(!s.doc.borrow().wb.structure_protected());
+        run(Cmd::Data(DataCmd::AddSheet));
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 3);
+        // A lock with a password from a file stays on.
+        let mut p = officina_grid::protection::SheetProtection::new(officina_grid::protection::ProtectionFormat::ExcelWorkbook);
+        assert!(p.keep("workbookHashValue", "abc"));
+        s.doc.borrow_mut().wb.set_structure_protection(Some(p));
+        run(Cmd::Data(DataCmd::ProtectWorkbook));
+        assert!(s.doc.borrow().wb.structure_protected() && s.doc.borrow().status.contains("password"), "{}", s.doc.borrow().status);
+        let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&s.doc.borrow().wb)).unwrap();
+        assert_eq!(back.structure_protection(), s.doc.borrow().wb.structure_protection());
     }
 
     #[test]

@@ -75,6 +75,7 @@ pub struct Sheet {
     pub(crate) outlines: [crate::outline::Outline; 2],
     pub(crate) axis_ids: [crate::axis_ids::AxisIds; 2],
     pub(crate) scenarios: Vec<crate::scenario::Scenario>,
+    pub(crate) sparklines: Vec<crate::sparkline::Sparkline>,
 }
 
 pub(crate) fn new_sheet_identity() -> u128 {
@@ -83,7 +84,15 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new() }
+    }
+    /// The sheet's sparklines.
+    pub fn sparklines(&self) -> &[crate::sparkline::Sparkline] {
+        &self.sparklines
+    }
+    /// The sparkline drawn in (`row`, `col`).
+    pub fn sparkline_at(&self, row: u32, col: u32) -> Option<&crate::sparkline::Sparkline> {
+        self.sparklines.iter().find(|s| (s.row, s.col) == (row, col))
     }
     /// The sheet's What-If scenarios, in the order they were added.
     pub fn scenarios(&self) -> &[crate::scenario::Scenario] {
@@ -215,6 +224,8 @@ impl Iteration {
 pub struct Workbook {
     pub(crate) date_system: crate::eval::dates::DateSystem,
     pub(crate) iteration: Option<Iteration>,
+    /// Protect Workbook: the structure locked, with any foreign verifier.
+    pub(crate) structure: Option<crate::protection::SheetProtection>,
     pub(crate) sheets: Vec<Sheet>,
     pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
@@ -275,6 +286,7 @@ impl Workbook {
         Workbook {
             date_system,
             iteration: None,
+            structure: None,
             sheets: Vec::new(),
             tracked_cells: None,
             strings: StringPool::new(),
@@ -393,7 +405,7 @@ impl Workbook {
     pub fn drop_last_sheet(&mut self) -> Option<String> {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
-        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && !sh.sheet_hidden && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.scenarios.is_empty() && sh.freeze == (0, 0);
+        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && !sh.sheet_hidden && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.scenarios.is_empty() && sh.sparklines.is_empty() && sh.freeze == (0, 0);
         let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
@@ -1015,6 +1027,16 @@ impl Workbook {
     }
 
     /// Iterative calculation, when on.
+    /// Sets sheet `sheet`'s sparklines outside undo (files use it); false,
+    /// changing nothing, for a list [`crate::sparkline::valid_list`] refuses.
+    pub fn set_sparklines(&mut self, sheet: u16, list: Vec<crate::sparkline::Sparkline>) -> bool {
+        if sheet as usize >= self.sheet_count() || !crate::sparkline::valid_list(&list) {
+            return false;
+        }
+        self.sheet_mut(sheet).sparklines = list;
+        true
+    }
+
     /// Sets sheet `sheet`'s scenarios outside undo (files use it); false,
     /// changing nothing, for a list [`crate::scenario::valid_list`] refuses.
     /// Use [`crate::ops::GridOp::Scenarios`] for an undoable change.

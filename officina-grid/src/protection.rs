@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 pub enum ProtectionFormat {
     Excel,
     Ods,
+    /// Excel's `<workbookProtection>` (the workbook's structure).
+    ExcelWorkbook,
 }
 
 impl ProtectionFormat {
@@ -35,6 +37,14 @@ impl ProtectionFormat {
                 "autoFilter",
                 "pivotTables",
                 "selectUnlockedCells",
+            ],
+            Self::ExcelWorkbook => &[
+                "workbookPassword",
+                "workbookAlgorithmName",
+                "workbookHashValue",
+                "workbookSaltValue",
+                "workbookSpinCount",
+                "lockWindows",
             ],
             Self::Ods => &[
                 "table:protection-key",
@@ -75,6 +85,12 @@ impl SheetProtection {
         true
     }
 
+    /// Whether a password guards it (a verifier from the file), so it can't
+    /// be taken off here.
+    pub fn has_password(&self) -> bool {
+        self.settings.keys().any(|k| k.contains("assword") || k.contains("HashValue") || k == "table:protection-key")
+    }
+
     pub fn format(&self) -> ProtectionFormat {
         self.format
     }
@@ -89,6 +105,7 @@ impl SheetProtection {
         w.u8(match self.format {
             ProtectionFormat::Excel => 0,
             ProtectionFormat::Ods => 1,
+            ProtectionFormat::ExcelWorkbook => 2,
         });
         w.var(self.settings.len() as u64);
         for (key, value) in self.settings() {
@@ -101,6 +118,7 @@ impl SheetProtection {
         let format = match r.u8()? {
             0 => ProtectionFormat::Excel,
             1 => ProtectionFormat::Ods,
+            2 => ProtectionFormat::ExcelWorkbook,
             _ => return Err(WireError::Invalid("sheet protection format")),
         };
         let count = r.count("sheet protection settings", format.keys().len() as u64, 2)?;
@@ -122,6 +140,22 @@ impl Workbook {
         self.sheets
             .get(sheet as usize)
             .is_some_and(|sheet| sheet.protection.is_some())
+    }
+
+    /// The workbook's structure is protected: no sheet may be added,
+    /// deleted, renamed, moved, hidden or shown, or have its tab coloured.
+    pub fn structure_protected(&self) -> bool {
+        self.structure.is_some()
+    }
+
+    pub fn structure_protection(&self) -> Option<&SheetProtection> {
+        self.structure.as_ref()
+    }
+
+    /// Sets the structure protection outside undo (files use it); use
+    /// [`crate::ops::GridOp::Structure`] for an undoable change.
+    pub fn set_structure_protection(&mut self, p: Option<SheetProtection>) {
+        self.structure = p;
     }
 
     pub fn any_sheet_protected(&self) -> bool {

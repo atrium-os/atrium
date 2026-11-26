@@ -3,10 +3,34 @@ use officina_grid::Workbook;
 
 pub(crate) const REFUSED: &str = "This sheet is protected. Only unlocked cells can be edited.";
 
+pub(crate) const STRUCTURE_REFUSED: &str = "The workbook's structure is protected: sheets can't be added, deleted, renamed, moved, hidden or recoloured.";
+
+/// Whether `status` says an edit was refused for protection.
+pub(crate) fn refused(status: &str) -> bool {
+    status == REFUSED || status == STRUCTURE_REFUSED
+}
+
 /// Check a whole transaction before applying any part of it. Metadata and
 /// structural changes use the conservative sheet protection policy.
 pub(crate) fn allows(wb: &Workbook, ops: &[GridOp]) -> bool {
-    !wb.any_sheet_protected() || ops.iter().all(|op| allows_op(wb, op))
+    refusal(wb, ops).is_none()
+}
+
+/// Why the transaction is refused, if it is.
+pub(crate) fn refusal(wb: &Workbook, ops: &[GridOp]) -> Option<&'static str> {
+    if wb.structure_protected() && ops.iter().any(changes_structure) {
+        return Some(STRUCTURE_REFUSED);
+    }
+    (wb.any_sheet_protected() && !ops.iter().all(|op| allows_op(wb, op))).then_some(REFUSED)
+}
+
+fn changes_structure(op: &GridOp) -> bool {
+    match op {
+        GridOp::Batch(ops) => ops.iter().any(changes_structure),
+        GridOp::AddSheet(_) | GridOp::AddIdentifiedSheet { .. } | GridOp::DropSheet | GridOp::MoveSheet { .. }
+        | GridOp::RenameSheet { .. } | GridOp::HideSheet { .. } | GridOp::TabColor { .. } => true,
+        _ => false,
+    }
 }
 
 fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
@@ -16,7 +40,7 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         GridOp::Restyle(style) => !wb.sheet_protected(style.rect.sheet),
         GridOp::Filter(state) => !wb.sheet_protected(state.sheet),
         // A calculation setting of the workbook, not a sheet's contents.
-        GridOp::Iteration(_) => true,
+        GridOp::Iteration(_) | GridOp::Structure(_) => true,
         GridOp::Sizes { sheet, .. }
         | GridOp::LayoutSizes { sheet, .. }
         | GridOp::RenameSheet { sheet, .. }
@@ -26,7 +50,7 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         | GridOp::Comments { sheet, .. }
         | GridOp::Links { sheet, .. }
         | GridOp::HiddenWidths { sheet, .. }
-        | GridOp::AxisIdentities { sheet, .. } | GridOp::Outline { sheet, .. } | GridOp::Scenarios { sheet, .. } => !wb.sheet_protected(*sheet),
+        | GridOp::AxisIdentities { sheet, .. } | GridOp::Outline { sheet, .. } | GridOp::Scenarios { sheet, .. } | GridOp::Sparklines { sheet, .. } => !wb.sheet_protected(*sheet),
         GridOp::Tables(tables) => tables
             .iter()
             .filter(|t| wb.sheet_protected(t.rect.sheet))

@@ -230,6 +230,23 @@ pub fn pivot_view(cv: Option<CellView>, role: officina_grid::pivot::Role) -> Opt
     }
 }
 
+/// What the grid draws for sparkline `sp`.
+pub fn spark_view(wb: &officina_grid::Workbook, sp: &officina_grid::sparkline::Sparkline) -> std::sync::Arc<pergola::widgets::Spark> {
+    use officina_grid::sparkline::SparkKind;
+    use pergola::widgets::SparkStyle;
+    std::sync::Arc::new(pergola::widgets::Spark {
+        style: match sp.kind {
+            SparkKind::Line => SparkStyle::Line,
+            SparkKind::Column => SparkStyle::Column,
+            SparkKind::WinLoss => SparkStyle::WinLoss,
+        },
+        points: sp.points(wb),
+        color: rgb(sp.color),
+        negative: rgb(sp.negative),
+        markers: sp.markers,
+    })
+}
+
 /// A cell's view under its conditional formats: their fill, colour scale, font
 /// colour, weight and number format, and the data bar under the text.
 fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value, system: DateSystem) -> Option<CellView> {
@@ -994,7 +1011,16 @@ impl GridSource for SheetSource {
     }
     fn cell(&self, r: u32, c: u32) -> Option<CellView> {
         let z = self.zoom_factor() as f32;
-        let mut cv = self.cell_at_100(r, c)?;
+        let spark = {
+            let d = self.doc.borrow();
+            let sh = d.wb.sheet(d.sheet);
+            if sh.sparklines().is_empty() { None } else { sh.sparkline_at(r, c).map(|sp| spark_view(&d.wb, sp)) }
+        };
+        let mut cv = match (self.cell_at_100(r, c), spark) {
+            (Some(cv), None) => cv,
+            (cv, Some(sp)) => CellView { spark: Some(sp), ..cv.unwrap_or_else(|| CellView::text("")) },
+            (None, None) => return None,
+        };
         if z != 1.0 {
             cv.size = Some(cv.size.unwrap_or(pergola::theme::type_size::SM) * z);
         }

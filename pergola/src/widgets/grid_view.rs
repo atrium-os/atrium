@@ -127,6 +127,8 @@ pub struct CellView {
     pub bar: Option<(f32, Color)>,
     /// An icon at the cell's left (a conditional format's icon set).
     pub icon: Option<(CellIcon, Color)>,
+    /// A sparkline drawn over the cell's ground.
+    pub spark: Option<std::sync::Arc<Spark>>,
     /// Steps the text is indented from the left (a pivot's inner items), each
     /// [`INDENT_STEP`] px.
     pub indent: u8,
@@ -148,6 +150,99 @@ pub struct CellView {
     /// repeated to the cell's width. What comes before it sits at the left
     /// edge, what comes after at the right (Accounting's sign and number).
     pub fill_at: Option<usize>,
+}
+
+/// How a sparkline draws its points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkStyle {
+    Line,
+    Column,
+    /// Each point a block up (positive) or down (negative) from the middle.
+    WinLoss,
+}
+
+/// A sparkline: a small chart of `points` inside one cell. A `None` point
+/// is a gap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spark {
+    pub style: SparkStyle,
+    pub points: Vec<Option<f64>>,
+    pub color: Color,
+    pub negative: Color,
+    /// The highest and lowest points marked.
+    pub markers: bool,
+}
+
+/// The shapes of sparkline `sp` in the box (`x`, `y`, `w`, `h`), also used
+/// when printing.
+pub fn spark_shapes(sp: &Spark, x: f32, y: f32, w: f32, h: f32, mut emit: impl FnMut(Node)) {
+    let n = sp.points.len();
+    let (x, y, w, h) = (x + 2.0, y + 2.0, w - 4.0, h - 4.0);
+    if n == 0 || w < 4.0 || h < 4.0 {
+        return;
+    }
+    let vals = sp.points.iter().flatten().copied();
+    let (lo, hi) = vals.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    if !lo.is_finite() {
+        return;
+    }
+    let slot = w / n as f32;
+    match sp.style {
+        SparkStyle::Line => {
+            let span = if hi > lo { hi - lo } else { 1.0 };
+            let at = |i: usize, v: f64| (x + slot * (i as f32 + 0.5), y + h - ((v - lo) / span) as f32 * h - if hi > lo { 0.0 } else { h / 2.0 });
+            let mut last: Option<(f32, f32)> = None;
+            for (i, p) in sp.points.iter().enumerate() {
+                match p {
+                    Some(v) => {
+                        let pt = at(i, *v);
+                        if let Some(prev) = last {
+                            emit(Node::Path { p0: prev, p1: pt, width: 1.0, color: sp.color });
+                        }
+                        last = Some(pt);
+                    }
+                    None => last = None,
+                }
+            }
+            if sp.markers {
+                for (i, p) in sp.points.iter().enumerate() {
+                    if let Some(v) = *p {
+                        if v == hi || v == lo {
+                            let (px, py) = at(i, v);
+                            emit(Node::Rect { rect: Rect::new(px - 2.0, py - 2.0, 4.0, 4.0), fill: if v == lo && hi > lo { sp.negative } else { sp.color }, radius: 2.0 });
+                        }
+                    }
+                }
+            }
+        }
+        SparkStyle::Column => {
+            // Bars stand on zero, so every point shows.
+            let (base, top) = (lo.min(0.0), hi.max(0.0));
+            let span = if top > base { top - base } else { 1.0 };
+            let zero = y + h - ((0.0f64.max(base) - base) / span) as f32 * h;
+            for (i, p) in sp.points.iter().enumerate() {
+                let Some(v) = *p else { continue };
+                let yv = y + h - ((v - base) / span) as f32 * h;
+                let (t, b) = if yv < zero { (yv, zero) } else { (zero, yv) };
+                let bw = (slot - 1.0).max(1.0);
+                let marked = sp.markers && (v == hi || v == lo);
+                let fill = if v < 0.0 || (marked && v == lo && hi > lo) { sp.negative } else { sp.color };
+                emit(Node::Rect { rect: Rect::new(x + slot * i as f32, t, bw, (b - t).max(1.0)), fill, radius: 0.0 });
+            }
+        }
+        SparkStyle::WinLoss => {
+            let mid = y + h / 2.0;
+            for (i, p) in sp.points.iter().enumerate() {
+                let Some(v) = *p else { continue };
+                if v == 0.0 {
+                    continue;
+                }
+                let bw = (slot - 1.0).max(1.0);
+                let (t, fill) = if v > 0.0 { (y, sp.color) } else { (mid, sp.negative) };
+                emit(Node::Rect { rect: Rect::new(x + slot * i as f32, t, bw, h / 2.0 - 1.0), fill, radius: 0.0 });
+            }
+        }
+    }
 }
 
 /// One step of a cell's indent, px.
@@ -309,7 +404,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -2466,6 +2561,9 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
     if let Some((share, c)) = cv.bar {
         let w = ((cw - 4.0) * share.clamp(0.0, 1.0)).max(0.0);
         ctx.add(Node::Rect { rect: Rect::new(cx + 2.0, cy + 2.0, q(w as f64), (ch - 5.0).max(0.0)), fill: c, radius: 0.0 });
+    }
+    if let Some(sp) = &cv.spark {
+        spark_shapes(sp, cx, cy, cw, ch, |node| { ctx.add(node); });
     }
     for (k, b) in cv.borders.iter().enumerate() {
         let Some((w, c)) = *b else { continue };
@@ -4799,5 +4897,45 @@ mod tests {
         let (s, _) = fit_text(&CellView::text("ok"), 40.0, &style);
         assert_eq!(s, "ok");
         let _ = texts(&[]);
+    }
+}
+
+#[cfg(test)]
+mod spark_tests {
+    use super::*;
+
+    fn shapes(style: SparkStyle, points: &[Option<f64>], markers: bool) -> Vec<Node> {
+        let sp = Spark { style, points: points.to_vec(), color: Color::rgba(0.0, 0.0, 1.0, 1.0), negative: Color::rgba(1.0, 0.0, 0.0, 1.0), markers };
+        let mut out = Vec::new();
+        spark_shapes(&sp, 0.0, 0.0, 84.0, 24.0, |n| out.push(n));
+        out
+    }
+
+    #[test]
+    fn sparklines_draw_segments_bars_and_blocks_inside_the_cell() {
+        // A line: a segment between neighbours, none across the gap.
+        let line = shapes(SparkStyle::Line, &[Some(1.0), Some(3.0), None, Some(2.0), Some(5.0)], false);
+        assert_eq!(line.len(), 2);
+        // The highest and lowest marked.
+        assert_eq!(shapes(SparkStyle::Line, &[Some(1.0), Some(3.0), Some(2.0)], true).len(), 4);
+        // Columns: one each, the negative one in the negative colour, all inside.
+        let cols = shapes(SparkStyle::Column, &[Some(2.0), Some(-1.0), Some(4.0)], false);
+        assert_eq!(cols.len(), 3);
+        for n in &cols {
+            let Node::Rect { rect, .. } = n else { panic!("{n:?}") };
+            assert!(rect.x() >= 0.0 && rect.y() >= 0.0 && rect.max_x() <= 84.0 && rect.max_y() <= 24.0, "{rect:?}");
+        }
+        assert!(matches!(cols[1], Node::Rect { fill, .. } if fill.r == 1.0));
+        // Win/loss: zeros draw nothing; up above the middle, down below.
+        let wl = shapes(SparkStyle::WinLoss, &[Some(1.0), Some(0.0), Some(-2.0)], false);
+        assert_eq!(wl.len(), 2);
+        let (Node::Rect { rect: up, .. }, Node::Rect { rect: down, .. }) = (&wl[0], &wl[1]) else { panic!() };
+        assert!(up.max_y() <= 12.0 && down.y() >= 12.0);
+        // Nothing to draw: no numbers, or no room.
+        assert!(shapes(SparkStyle::Line, &[None, None], false).is_empty());
+        let sp = Spark { style: SparkStyle::Column, points: vec![Some(1.0)], color: Color::TRANSPARENT, negative: Color::TRANSPARENT, markers: false };
+        let mut n = 0;
+        spark_shapes(&sp, 0.0, 0.0, 6.0, 24.0, |_| n += 1);
+        assert_eq!(n, 0);
     }
 }

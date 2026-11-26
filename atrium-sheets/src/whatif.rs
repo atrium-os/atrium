@@ -28,6 +28,8 @@ pub fn bar(kind: DataCmd) -> (&'static str, &'static str, &'static str, &'static
         DataCmd::Consolidate => ("Consolidate", "Sum; A1:B5, Sheet2!A1:B5; top, left", "Combine", "function; ranges; labels in the top row, left column"),
         DataCmd::DataTable => ("Inputs", "B1, B2", "Fill", "row input cell, column input cell (one may be empty)"),
         DataCmd::EvaluateFormula => ("Evaluate", "", "Next", "each Next works out one more part, the leftmost innermost first"),
+        DataCmd::FillAcross => ("Fill to", "all", "Fill", "all, or sheet names; then contents or formats for only those"),
+        DataCmd::Sparklines => ("Sparklines", "line B2:F9", "Draw", "line, column or winloss and the data; markers, color 00B050; or clear"),
         DataCmd::Series => ("Series", "linear 2, stop 100", "Fill", "linear, growth, date (day, weekday, month, year) or trend; the step; stop; rows or columns"),
         DataCmd::Scenarios => ("Scenario", "add Best: B1=5, B2=7", "Run", "add NAME: cells, show NAME, delete NAME, or summary and the result cells"),
         _ => ("Split at", "comma, -+, fixed 3, 8", "Split", "a name or characters (+ after: runs count as one), fixed 3, 8 for widths, or empty to find one"),
@@ -44,6 +46,8 @@ pub fn start(d: &Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd) -> Stri
         DataCmd::Subtotal => subtotal_start(d, sel, cursor),
         DataCmd::Scenarios => crate::scenarios::start(d, sel),
         DataCmd::Series => "linear 1".into(),
+        DataCmd::Sparklines => crate::sparkbar::start(d, sel),
+        DataCmd::FillAcross => "all".into(),
         DataCmd::EvaluateFormula => officina_grid::eval::steps::evaluate_steps(&d.wb, CellAddr::new(d.sheet, cursor.0, cursor.1)).and_then(|s| s.into_iter().next()).unwrap_or_default(),
         _ => String::new(),
     }
@@ -59,6 +63,8 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), kind: DataCmd, typed
         DataCmd::DataTable => data_table(d, sel, typed),
         DataCmd::Scenarios => crate::scenarios::run(d, typed),
         DataCmd::Series => crate::series::series(d, sel, typed),
+        DataCmd::Sparklines => crate::sparkbar::run(d, sel, typed),
+        DataCmd::FillAcross => crate::series::fill_across(d, sel, typed),
         DataCmd::EvaluateFormula => Err(evaluate_next(d, cursor, typed).1),
         _ => Err("Not a bar command.".into()),
     }
@@ -77,7 +83,7 @@ pub fn evaluate_next(d: &Doc, cursor: (u32, u32), shown: &str) -> (String, Strin
 }
 
 fn refused(d: &Doc) -> Option<String> {
-    (d.status == crate::sheet_protection::REFUSED).then(|| d.status.clone())
+    (crate::sheet_protection::refused(&d.status)).then(|| d.status.clone())
 }
 
 /// Iterative Calculation: `count, change` turns it on (circular formulas

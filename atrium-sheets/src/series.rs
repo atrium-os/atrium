@@ -208,7 +208,7 @@ pub fn series(d: &mut Doc, sel: CellRange, typed: &str) -> Result<String, String
         return Err(format!("Put a number (or date) in {} to start the series from.", a1(sel.r0, sel.c0)));
     }
     d.run("Series", ops);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     Ok(format!("{filled} {} filled {}.", if filled == 1 { "cell" } else { "cells" }, if down { "down" } else { "across" }))
@@ -257,10 +257,74 @@ pub fn justify(d: &mut Doc, sel: CellRange) -> Result<String, String> {
     let mut col: Vec<Vec<Input>> = lines.into_iter().map(|l| vec![Input::Value(Value::str(&l))]).collect();
     col.resize_with(rows as usize, || vec![Input::Empty]);
     d.run("Justify", vec![GridOp::block(s, sel.r0, sel.c0, col)]);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     Ok(format!("Text justified into {n} {}.", if n == 1 { "line" } else { "lines" }))
+}
+
+/// The most cells Fill Across Worksheets copies to each sheet.
+pub const MAX_ACROSS_CELLS: u64 = 1_000_000;
+
+/// Fill ▸ Across Worksheets: the selection copied to the same place on
+/// other sheets: `all` (or empty) for every other sheet, or sheet names
+/// separated by commas, then `contents` or `formats` for only those
+/// (both by default), as one undo step.
+pub fn fill_across(d: &mut Doc, sel: CellRange, typed: &str) -> Result<String, String> {
+    use officina_grid::clip::{Clip, What};
+    let s = d.sheet;
+    let rect = officina_grid::addr::Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    if rect.cells() > MAX_ACROSS_CELLS {
+        return Err(format!("Fill Across Worksheets copies at most {MAX_ACROSS_CELLS} cells."));
+    }
+    let mut what = What::All;
+    let mut names: Vec<String> = Vec::new();
+    for part in typed.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let mut part = part.to_string();
+        for (word, w) in [("contents", What::Formulas), ("formats", What::Formats)] {
+            let cut = part.len().checked_sub(word.len()).filter(|&at| part.is_char_boundary(at));
+            if let Some(at) = cut.filter(|&at| part[at..].eq_ignore_ascii_case(word) && (at == 0 || part[..at].ends_with(' '))) {
+                what = w;
+                part = part[..at].trim().to_string();
+            }
+        }
+        if !part.is_empty() {
+            names.push(part);
+        }
+    }
+    let all = names.is_empty() || (names.len() == 1 && names[0].eq_ignore_ascii_case("all"));
+    let targets: Vec<u16> = if all {
+        (0..d.wb.sheet_count() as u16).filter(|&t| t != s).collect()
+    } else {
+        let mut v = Vec::new();
+        for n in &names {
+            let t = d.wb.sheet_id(n.trim_matches('\'')).ok_or_else(|| format!("There is no sheet called {n:?}."))?;
+            if t == s {
+                return Err(format!("{n:?} is the sheet being copied from."));
+            }
+            if !v.contains(&t) {
+                v.push(t);
+            }
+        }
+        v
+    };
+    if targets.is_empty() {
+        return Err("There is no other sheet to fill.".into());
+    }
+    let clip = Clip::take(&d.wb, rect, false);
+    let mut ops = Vec::new();
+    for &t in &targets {
+        let (o, _) = clip.paste_as(&d.wb, t, sel.r0, sel.c0, what, false)?;
+        ops.extend(o);
+    }
+    d.run("Fill Across Worksheets", ops);
+    if crate::sheet_protection::refused(&d.status) {
+        return Err(d.status.clone());
+    }
+    let n = targets.len();
+    Ok(format!("{} copied to {n} other {}{}.", if rect.cells() == 1 { a1(sel.r0, sel.c0) } else { format!("{}:{}", a1(sel.r0, sel.c0), a1(sel.r1, sel.c1)) },
+        if n == 1 { "sheet" } else { "sheets" },
+        match what { What::Formulas => ", contents only", What::Formats => ", formats only", _ => "" }))
 }
 
 #[cfg(test)]
@@ -332,5 +396,77 @@ mod tests {
         d.type_into(5, 0, "7");
         d.wb.recalc();
         assert!(justify(&mut d, CellRange { r0: 0, c0: 0, r1: 5, c1: 0 }).unwrap_err().contains("holds a number"));
+    }
+}
+
+#[cfg(test)]
+mod across_tests {
+    use crate::doc::Doc;
+    use officina_grid::addr::{CellAddr, Rect};
+    use officina_grid::style::Style;
+    use pergola::widgets::CellRange;
+
+    #[test]
+    fn fill_across_worksheets_copies_contents_and_formats_to_other_sheets() {
+        let mut d = Doc::from_csv("f.csv", b"Total,5\n").unwrap().0;
+        d.type_into(0, 2, "=B1*2");
+        d.wb.set_style(&Rect { sheet: 0, r0: 0, c0: 0, r1: 0, c1: 0 }, Style { fill: Some(0xFFC7CE), ..Style::default() });
+        d.wb.add_sheet("Two").unwrap();
+        d.wb.add_sheet("Three").unwrap();
+        d.wb.recalc();
+        let sel = CellRange { r0: 0, c0: 0, r1: 0, c1: 2 };
+        let m = super::fill_across(&mut d, sel, "all").unwrap();
+        assert_eq!(m, "A1:C1 copied to 2 other sheets.");
+        for t in [1, 2] {
+            assert_eq!(d.wb.formatted(CellAddr::new(t, 0, 0)).text, "Total");
+            assert_eq!(d.wb.formula_text(CellAddr::new(t, 0, 2)).as_deref(), Some("=B1*2"));
+            assert_eq!(d.wb.value(t, 0, 2), officina_grid::Value::Num(10.0));
+            assert_eq!(d.wb.style(CellAddr::new(t, 0, 0)).fill, Some(0xFFC7CE));
+        }
+        assert!(d.undo());
+        assert_eq!(d.wb.value(1, 0, 0), officina_grid::Value::Empty);
+        // Formats only, to one sheet.
+        super::fill_across(&mut d, sel, "Three formats").unwrap();
+        assert_eq!(d.wb.value(2, 0, 0), officina_grid::Value::Empty);
+        assert_eq!(d.wb.style(CellAddr::new(2, 0, 0)).fill, Some(0xFFC7CE));
+        assert_eq!(d.wb.style(CellAddr::new(1, 0, 0)).fill, None);
+        assert!(super::fill_across(&mut d, sel, "Nope").unwrap_err().contains("no sheet"));
+        assert!(super::fill_across(&mut d, sel, "Sheet1").unwrap_err().contains("being copied from"));
+    }
+}
+
+#[cfg(test)]
+mod color_sort_tests {
+    use crate::doc::Doc;
+    use officina_grid::addr::{CellAddr, Rect};
+    use officina_grid::style::Style;
+    use pergola::widgets::CellRange;
+
+    #[test]
+    fn custom_sort_puts_a_colour_first_or_last_and_keeps_the_rest_in_order() {
+        let mut d = Doc::from_csv("c.csv", b"Name,Qty\na,1\nb,2\nc,3\nd,4\n").unwrap().0;
+        d.wb.recalc();
+        let red = Style { fill: Some(0xFFC7CE), ..Style::default() };
+        for r in [2, 4] {
+            d.wb.set_style(&Rect { sheet: 0, r0: r, c0: 0, r1: r, c1: 0 }, red.clone());
+        }
+        let mut font = Style::default();
+        font.font.color = Some(0x00B050);
+        d.wb.set_style(&Rect { sheet: 0, r0: 3, c0: 1, r1: 3, c1: 1 }, font);
+        let names = |d: &Doc| (1..5).map(|r| d.wb.formatted(CellAddr::new(0, r, 0)).text).collect::<Vec<_>>();
+        let sel = CellRange { r0: 1, c0: 0, r1: 1, c1: 0 };
+        let m = crate::data::custom_sort(&mut d, sel, (1, 0), "Name fill FFC7CE").unwrap();
+        assert!(m.contains("A fill #FFC7CE first"), "{m}");
+        assert_eq!(names(&d), ["b", "d", "a", "c"]);
+        // The colour went with its cells.
+        assert_eq!(d.wb.style(CellAddr::new(0, 1, 0)).fill, Some(0xFFC7CE));
+        crate::data::custom_sort(&mut d, sel, (1, 0), "Name fill ffc7ce bottom, Name desc").unwrap();
+        assert_eq!(names(&d), ["c", "a", "d", "b"]);
+        // Font colour, then values.
+        crate::data::custom_sort(&mut d, sel, (1, 0), "Qty font 00B050, Name").unwrap();
+        assert_eq!(names(&d), ["c", "a", "b", "d"]);
+        assert!(crate::data::custom_sort(&mut d, sel, (1, 0), "Name fill pink").unwrap_err().contains("isn't a colour"));
+        assert!(d.undo());
+        assert_eq!(names(&d), ["c", "a", "d", "b"]);
     }
 }

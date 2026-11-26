@@ -780,11 +780,13 @@ impl Doc {
     }
 
     fn check_protection(&mut self, ops: &[GridOp]) -> bool {
-        if crate::sheet_protection::allows(&self.wb, ops) {
-            return true;
+        match crate::sheet_protection::refusal(&self.wb, ops) {
+            None => true,
+            Some(why) => {
+                self.status = why.into();
+                false
+            }
         }
-        self.status = crate::sheet_protection::REFUSED.into();
-        false
     }
 
     pub(crate) fn run_action(&mut self, label: &str, ops: Vec<GridOp>) -> bool {

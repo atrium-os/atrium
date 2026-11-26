@@ -68,6 +68,7 @@ pub const HIDDEN_SHEETS: u16 = 28;
 pub const ZOOM: u16 = 29;
 pub const VIEW_HIDDEN: u16 = 30;
 pub const SCENARIOS: u16 = 31;
+pub const SPARKLINES: u16 = 32;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -146,7 +147,7 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     // Older files end after the sheet settings and use the 1900 calendar.
     let date1904 = wb.date_system() == crate::eval::dates::DateSystem::Excel1904;
     let protected = wb.sheets.iter().filter(|s| s.protection.is_some()).count();
-    let flags = u8::from(date1904) | (u8::from(protected != 0) << 1) | (u8::from(wb.iteration.is_some()) << 2);
+    let flags = u8::from(date1904) | (u8::from(protected != 0) << 1) | (u8::from(wb.iteration.is_some()) << 2) | (u8::from(wb.structure.is_some()) << 3);
     if flags != 0 {
         w.u8(flags);
     }
@@ -162,6 +163,9 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     if let Some(it) = wb.iteration {
         w.u32(it.count);
         w.f64(it.change);
+    }
+    if let Some(p) = &wb.structure {
+        p.encode(&mut w);
     }
     c.add(WORKBOOK, &w.into_bytes())?;
     if wb.sheets.iter().any(|sheet| sheet.identity != 0) {
@@ -192,6 +196,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         w.u16(sheet as u16);
         for outline in &sh.outlines { outline.encode(&mut w); }
         c.add(OUTLINES, &w.into_bytes())?;
+    }
+
+    for (sheet, sh) in wb.sheets.iter().enumerate() {
+        if sh.sparklines.is_empty() { continue; }
+        let mut w = Writer::new();
+        w.u16(sheet as u16);
+        crate::sparkline::encode(&sh.sparklines, &mut w);
+        c.add(SPARKLINES, &w.into_bytes())?;
     }
 
     for (sheet, sh) in wb.sheets.iter().enumerate() {
@@ -578,7 +590,7 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     }
     if r.remaining() != 0 {
         let flags = r.u8()?;
-        if flags & !7 != 0 {
+        if flags & !15 != 0 {
             return Err(LoadError::Bad("unknown workbook settings"));
         }
         if flags & 1 != 0 {
@@ -602,6 +614,9 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             }
             wb.iteration = Some(it);
         }
+        if flags & 8 != 0 {
+            wb.structure = Some(crate::protection::SheetProtection::decode(&mut r)?);
+        }
     }
     done(&r)?;
 
@@ -616,6 +631,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         let cols = crate::outline::Outline::decode(&mut r, crate::shift::Axis::Cols)?;
         if !r.is_empty() { return Err(LoadError::Bad("trailing worksheet outline data")); }
         wb.sheet_mut(sheet).outlines = [rows, cols];
+    }
+
+    let mut with_sparks = std::collections::BTreeSet::new();
+    for chunk in of(SPARKLINES) {
+        let mut r = Reader::new(c.chunk(chunk)?);
+        let sheet = r.u16()?;
+        if sheet as usize >= wb.sheet_count() || !with_sparks.insert(sheet) {
+            return Err(LoadError::Bad("invalid or repeated worksheet sparklines"));
+        }
+        let list = crate::sparkline::decode(&mut r)?;
+        if !r.is_empty() { return Err(LoadError::Bad("trailing sparkline data")); }
+        wb.sheet_mut(sheet).sparklines = list;
     }
 
     let mut with_scenarios = std::collections::BTreeSet::new();

@@ -45,6 +45,7 @@ pub mod protection;
 pub mod recalc;
 pub mod axis_ids;
 pub mod scenario;
+pub mod sparkline;
 pub mod shift;
 pub mod structural_merge;
 pub mod sheetops;

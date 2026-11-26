@@ -649,6 +649,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         o.extend_from_slice(b"</tableParts>");
     }
     super::validation::extension_xml(wb, s, &mut extensions);
+    super::sparkline::extension_xml(wb, s, &mut extensions);
     if !extensions.is_empty() {
         o.extend_from_slice(b"<extLst>");
         o.extend(extensions);
@@ -901,6 +902,15 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         if let Some(name) = code_name {
             let _ = write!(w, r#" codeName="{name}""#);
+        }
+        w.extend_from_slice(b"/>");
+    }
+    if let Some(p) = wb.structure_protection() {
+        w.extend_from_slice(br#"<workbookProtection lockStructure="1""#);
+        if p.format() == officina_grid::protection::ProtectionFormat::ExcelWorkbook {
+            for (key, value) in p.settings() {
+                let _ = write!(w, r#" {key}="{}""#, crate::xml::esc(value));
+            }
         }
         w.extend_from_slice(b"/>");
     }

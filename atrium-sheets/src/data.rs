@@ -202,6 +202,12 @@ pub enum DataCmd {
     ErrorChecking,
     TraceError,
     EvaluateFormula,
+    /// The sparkline bar ([`crate::sparkbar`]).
+    Sparklines,
+    /// Protect Workbook: the structure locked, or unlocked.
+    ProtectWorkbook,
+    /// Fill ▸ Across Worksheets (a bar, [`crate::series::fill_across`]).
+    FillAcross,
     /// Formulas at the cursor reading the cells last copied, one for each.
     PasteLink,
     /// The selection's text centred across its columns without merging
@@ -439,6 +445,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Series…").enabled(nr > 1 || nc > 1), Some(DataCmd::Series)),
         (MenuItem::new("Fill: Justify"), Some(DataCmd::Justify)),
+        (MenuItem::new("Fill: Across Worksheets…").enabled(d.wb.sheet_count() > 1), Some(DataCmd::FillAcross)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
         (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
         (MenuItem::new("Flash Fill").shortcut("Ctrl+E"), Some(DataCmd::FlashFill)),
@@ -530,6 +537,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
         (MenuItem::new("Calculate Sheet").shortcut("Shift+F9"), Some(DataCmd::CalculateSheet)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
+        (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
+        (MenuItem::new("Protect Workbook Structure").checked(wb.structure_protected()), Some(DataCmd::ProtectWorkbook)),
         (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
         (MenuItem::new("Data Table…").enabled(nr > 1 && nc > 1), Some(DataCmd::DataTable)),
         (MenuItem::new("Iterative Calculation…").checked(wb.iteration().is_some()), Some(DataCmd::Iteration)),
@@ -678,7 +687,7 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
     let msg = match apply(d, sel, cursor, cmd) {
         Ok(m) | Err(m) => m,
     };
-    if d.status != crate::sheet_protection::REFUSED {
+    if !crate::sheet_protection::refused(&d.status) {
         d.status = msg;
     }
 }
@@ -724,15 +733,40 @@ pub fn custom_sort_start(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> String 
     }
 }
 
+/// A colour level typed in Custom Sort: `fill FFC7CE`, `font 9C0006`,
+/// `fill none` (no fill) or `font auto`, with `bottom` (or `last`) to put
+/// those cells last. `None` when `what` names no colour.
+fn color_level(what: &str) -> Result<Option<(String, bool, Option<u32>, bool)>, String> {
+    let words: Vec<&str> = what.split_whitespace().collect();
+    let Some(i) = words.iter().rposition(|w| matches!(*w, "fill" | "font" | "cell")) else { return Ok(None) };
+    let cell = words[i] != "font";
+    let mut rest = words[i + 1..].to_vec();
+    let last = rest.last().is_some_and(|w| matches!(*w, "bottom" | "last"));
+    if last || rest.last().is_some_and(|w| matches!(*w, "top" | "first")) {
+        rest.pop();
+    }
+    let rgb = match rest.as_slice() {
+        ["none"] | ["auto"] | ["automatic"] => None,
+        [hex] => {
+            let h = hex.trim_start_matches('#');
+            Some(u32::from_str_radix(h, 16).ok().filter(|_| h.len() == 6).ok_or_else(|| format!("{hex:?} isn't a colour: type six hex digits such as FFC7CE, or none."))?)
+        }
+        _ => return Err("Type the colour after fill or font, such as: Region fill FFC7CE".into()),
+    };
+    Ok(Some((words[..i].join(" "), cell, rgb, last)))
+}
+
 /// Custom Sort: the data at the selection or cursor sorted by the columns
 /// `spec` lists, first to last, as one step. Each is a column letter or a
-/// header, optionally followed by `desc` (Z to A) or `asc`, separated by
-/// commas or `then`: `Region, Sales desc`.
+/// header, optionally followed by `desc` (Z to A) or `asc`, or by a colour
+/// (`fill FFC7CE`, `font 9C0006 bottom`: those cells first, or last),
+/// separated by commas or `then`: `Region, Sales desc`.
 pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) -> Result<String, String> {
     let (rect, t) = sort_rect(d, sel, cursor)?;
     let s = d.sheet;
     let header = |c: u32| t.header.then(|| d.wb.formatted(officina_grid::CellAddr::new(s, t.rect.r0, c)).text.trim().to_lowercase());
     let mut keys: Vec<SortKey> = Vec::new();
+    let mut levels: Vec<officina_grid::sort::SortLevel> = Vec::new();
     let mut names = Vec::new();
     let spec = spec.replace(" then ", ",").replace(" THEN ", ",").replace(" Then ", ",");
     for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -740,6 +774,8 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
             return Err(format!("Custom Sort sorts by at most {MAX_SORT_KEYS} columns."));
         }
         let lower = part.to_lowercase();
+        let color = color_level(&lower)?;
+        let lower = color.as_ref().map_or(lower.clone(), |c| c.0.clone());
         let (what, descending) = if let Some(w) = ["descending", "desc", "z-a", "z to a"].iter().find_map(|x| lower.strip_suffix(x)) {
             (w.trim(), true)
         } else if let Some(w) = ["ascending", "asc", "a-z", "a to z"].iter().find_map(|x| lower.strip_suffix(x)) {
@@ -752,16 +788,31 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
         let Some(col) = by_header.or(by_letter) else {
             return Err(format!("{part:?} isn't a column of the data: use a letter from {} to {} or a header.", officina_grid::addr::col_name(rect.c0), officina_grid::addr::col_name(rect.c1)));
         };
+        if let Some((_, cell, rgb, last)) = color {
+            if levels.len() == MAX_SORT_KEYS {
+                return Err(format!("Custom Sort sorts by at most {MAX_SORT_KEYS} levels."));
+            }
+            levels.push(officina_grid::sort::SortLevel::Color { col, cell, rgb, last });
+            let shade = rgb.map_or(if cell { "no fill".to_string() } else { "automatic".to_string() }, |c| format!("#{c:06X}"));
+            names.push(format!("{} {} {shade} {}", officina_grid::addr::col_name(col), if cell { "fill" } else { "font" }, if last { "last" } else { "first" }));
+            continue;
+        }
         if keys.iter().any(|k| k.col == col) {
             return Err(format!("Column {} is listed twice.", officina_grid::addr::col_name(col)));
         }
         keys.push(SortKey { col, descending });
+        levels.push(officina_grid::sort::SortLevel::Value(SortKey { col, descending }));
         names.push(format!("{}{}", officina_grid::addr::col_name(col), if descending { " (Z to A)" } else { "" }));
     }
-    if keys.is_empty() {
+    if levels.is_empty() {
         return Err("Type the columns to sort by, such as: Region, Sales desc".into());
     }
-    match sort_op(&d.wb, rect, &keys) {
+    let op = if levels.len() == keys.len() {
+        sort_op(&d.wb, rect, &keys)
+    } else {
+        officina_grid::sort::reorder_op(&d.wb, rect, &officina_grid::sort::order_levels(&d.wb, &rect, &levels))
+    };
+    match op {
         Some(op) => {
             d.run("Custom Sort", vec![op]);
             Ok(format!("Sorted {} rows by {}{}.", rect.r1 - rect.r0 + 1, names.join(", then "), if t.header { " (the first row is kept as the header)" } else { "" }))
@@ -931,7 +982,7 @@ pub fn goal_seek(d: &mut Doc, cursor: (u32, u32), spec: &str) -> Result<String, 
     match best {
         Some((miss, v)) if miss <= SEEK_TOLERANCE => {
             d.run("Goal Seek", vec![GridOp::set(x, officina_grid::book::Input::Value(Value::Num(v)))]);
-            if d.status == crate::sheet_protection::REFUSED {
+            if crate::sheet_protection::refused(&d.status) {
                 return Err(d.status.clone());
             }
             d.wb.recalc();
@@ -939,6 +990,23 @@ pub fn goal_seek(d: &mut Doc, cursor: (u32, u32), spec: &str) -> Result<String, 
         }
         Some((_, v)) => Err(format!("Goal Seek found no value of {name} that makes {here} {}; the closest was {}.", show_num(goal), show_num(v))),
         None => Err(format!("{here} doesn't give a number as {name} changes, so Goal Seek can't reach {}.", show_num(goal))),
+    }
+}
+
+/// Protect Workbook: locks the structure (no password; Excel's own lock
+/// with a password, from a file, can't be taken off here), or unlocks it.
+pub fn protect_workbook(d: &mut Doc) -> Result<String, String> {
+    match d.wb.structure_protection() {
+        Some(p) if p.has_password() => Err("The structure is locked with a password from another app: unlock it there.".into()),
+        Some(_) => {
+            d.run("Unprotect Workbook", vec![GridOp::Structure(None)]);
+            Ok("Workbook structure unlocked: sheets can be added, deleted, renamed and moved.".into())
+        }
+        None => {
+            let p = officina_grid::protection::SheetProtection::new(officina_grid::protection::ProtectionFormat::ExcelWorkbook);
+            d.run("Protect Workbook", vec![GridOp::Structure(Some(p))]);
+            Ok("Workbook structure protected: sheets can't be added, deleted, renamed, moved or hidden.".into())
+        }
     }
 }
 
@@ -1380,7 +1448,7 @@ pub fn rename_name(d: &mut Doc, i: usize, new: &str) -> Result<String, String> {
     let (ops, kept) = officina_grid::names::rename_ops(&d.wb, row.scope, &row.name, new)?;
     d.status.clear();
     d.run("Rename Name", ops);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     let new = new.trim();
@@ -1408,7 +1476,7 @@ pub fn edit_name_refers(d: &mut Doc, i: usize, refers: &str) -> Result<String, S
     let op = GridOp::names(&d.wb, &new);
     d.status.clear();
     d.run("Edit Name", vec![op]);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     Ok(format!("{} now refers to {}.", shown_name(&row.name), text.trim_start_matches('=')))
@@ -1538,7 +1606,7 @@ fn shift_cells(d: &mut Doc, sel: CellRange, cmd: DataCmd) -> Result<String, Stri
         first.push(GridOp::clear(sel_rect));
         first.push(GridOp::Restyle(officina_grid::ops::StyleRegion { rect: sel_rect, spans: Vec::new() }));
         d.run(label, first);
-        if d.status == crate::sheet_protection::REFUSED {
+        if crate::sheet_protection::refused(&d.status) {
             return Err(d.status.clone());
         }
         started = true;
@@ -2968,8 +3036,9 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable | DataCmd::Scenarios | DataCmd::Series | DataCmd::ErrorChecking | DataCmd::TraceError | DataCmd::EvaluateFormula => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable | DataCmd::Scenarios | DataCmd::Series | DataCmd::ErrorChecking | DataCmd::TraceError | DataCmd::EvaluateFormula | DataCmd::Sparklines | DataCmd::FillAcross => Ok(String::new()),
         DataCmd::Justify => crate::series::justify(d, sel),
+        DataCmd::ProtectWorkbook => protect_workbook(d),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

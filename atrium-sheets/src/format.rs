@@ -255,7 +255,7 @@ pub fn run(d: &mut Doc, sel: CellRange, cmd: FormatCmd) {
     let msg = match apply(d, sel, cmd) {
         Ok(m) | Err(m) => m,
     };
-    if d.status != crate::sheet_protection::REFUSED {
+    if !crate::sheet_protection::refused(&d.status) {
         d.status = msg;
     }
 }
@@ -550,7 +550,7 @@ pub fn set_code(d: &mut Doc, sel: CellRange, code: &str) -> Result<String, Strin
     d.status.clear();
     let op = GridOp::restyle(&d.wb, r, &|st: &Style| Style { num_fmt: code.into(), ..st.clone() });
     d.run("Number Format", vec![op]);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     let at = CellAddr::new(s, sel.r0, sel.c0);
@@ -592,7 +592,7 @@ pub fn set_angle(d: &mut Doc, sel: CellRange, text: &str) -> Result<String, Stri
     d.status.clear();
     let op = GridOp::restyle(&d.wb, r, &|st: &Style| Style { rotation: deg, ..st.clone() });
     d.run("Text Rotation", vec![op]);
-    if d.status == crate::sheet_protection::REFUSED {
+    if crate::sheet_protection::refused(&d.status) {
         return Err(d.status.clone());
     }
     Ok(if deg == 0 { "Rotation taken off.".into() } else { format!("Text turned {deg}°.") })

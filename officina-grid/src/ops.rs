@@ -110,6 +110,10 @@ pub enum GridOp {
     Iteration(Option<crate::book::Iteration>),
     /// A sheet's What-If scenarios, the whole list replaced.
     Scenarios { sheet: u16, list: Vec<crate::scenario::Scenario> },
+    /// Protect Workbook on (with its settings) or off.
+    Structure(Option<crate::protection::SheetProtection>),
+    /// A sheet's sparklines, the whole list replaced.
+    Sparklines { sheet: u16, list: Vec<crate::sparkline::Sparkline> },
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -319,6 +323,23 @@ impl GridOp {
                 w.u16(*sheet);
                 w.u8(axis.index() as u8);
                 outline.encode(&mut w);
+                return w.into_bytes();
+            }
+            GridOp::Structure(p) => {
+                w.u8(31);
+                match p {
+                    Some(p) => {
+                        w.u8(1);
+                        p.encode(&mut w);
+                    }
+                    None => w.u8(0),
+                }
+                return w.into_bytes();
+            }
+            GridOp::Sparklines { sheet, list } => {
+                w.u8(30);
+                w.u16(*sheet);
+                crate::sparkline::encode(list, &mut w);
                 return w.into_bytes();
             }
             GridOp::Scenarios { sheet, list } => {
@@ -565,6 +586,25 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::HideSheet { sheet, hidden });
+        }
+        if kind == 31 {
+            let p = match r.u8()? {
+                0 => None,
+                1 => Some(crate::protection::SheetProtection::decode(&mut r)?),
+                _ => return Err(WireError::Invalid("structure protection")),
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Structure(p));
+        }
+        if kind == 30 {
+            let sheet = r.u16()?;
+            let list = crate::sparkline::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Sparklines { sheet, list });
         }
         if kind == 29 {
             let sheet = r.u16()?;
@@ -843,6 +883,18 @@ impl Op<Workbook> for GridOp {
                     }
                 }
                 GridOp::Outline { sheet, axis, outline }
+            }
+            GridOp::Structure(p) => {
+                let old = wb.structure.take();
+                wb.structure = p;
+                GridOp::Structure(old)
+            }
+            GridOp::Sparklines { sheet, mut list } => {
+                match wb.sheets.get_mut(sheet as usize) {
+                    Some(sh) if crate::sparkline::valid_list(&list) => std::mem::swap(&mut sh.sparklines, &mut list),
+                    _ => return GridOp::Batch(Vec::new()),
+                }
+                GridOp::Sparklines { sheet, list }
             }
             GridOp::Scenarios { sheet, mut list } => {
                 match wb.sheets.get_mut(sheet as usize) {

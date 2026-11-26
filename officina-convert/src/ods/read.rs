@@ -1463,6 +1463,16 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             rep.note(Kind::Dropped, "database ranges");
                         }
                     }
+                    b"office:spreadsheet" => {
+                        let a = attrs(e);
+                        if a.get("table:structure-protected").is_some_and(|v| matches!(v.as_str(), "true" | "1")) {
+                            wb.set_structure_protection(Some(crate::sheet_protection::read(
+                                officina_grid::protection::ProtectionFormat::Ods,
+                                a.iter().map(|(key, value)| (key.as_str(), value.as_str())),
+                                &mut rep,
+                            )));
+                        }
+                    }
                     b"table:iteration" => {
                         // OpenFormula's defaults: 100 steps, 0.001.
                         let a = attrs(e);

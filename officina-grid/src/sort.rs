@@ -95,6 +95,54 @@ pub fn order(wb: &Workbook, rect: &Rect, keys: &[SortKey]) -> Vec<u32> {
     idx.into_iter().map(|i| rows[i]).collect()
 }
 
+/// One level of a sort: a column's values, or a colour — the cells
+/// showing it first (or last), the others after (or before) in their order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortLevel {
+    Value(SortKey),
+    /// `cell`: the cell's fill (else its font colour); `rgb` None for no
+    /// fill or automatic, as colour filters match.
+    Color { col: u32, cell: bool, rgb: Option<u32>, last: bool },
+}
+
+impl SortLevel {
+    pub fn col(&self) -> u32 {
+        match self {
+            SortLevel::Value(k) => k.col,
+            SortLevel::Color { col, .. } => *col,
+        }
+    }
+}
+
+/// [`order`] with colour levels too (Excel's Sort On: Cell Colour or Font
+/// Colour). The sort is stable.
+pub fn order_levels(wb: &Workbook, rect: &Rect, levels: &[SortLevel]) -> Vec<u32> {
+    let rows: Vec<u32> = (rect.r0..=rect.r1).collect();
+    enum Col {
+        Vals(Vec<K>, bool),
+        Hit(Vec<bool>, bool),
+    }
+    let cols: Vec<Col> = levels.iter().map(|l| match *l {
+        SortLevel::Value(k) => Col::Vals(rows.iter().map(|&r| K::of(&wb.get(CellAddr::new(rect.sheet, r, k.col)))).collect(), k.descending),
+        SortLevel::Color { col, cell, rgb, last } => Col::Hit(rows.iter().map(|&r| crate::filter::shown_color(wb, CellAddr::new(rect.sheet, r, col), cell) == Some(rgb)).collect(), last),
+    }).collect();
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    idx.sort_by(|&a, &b| {
+        for c in &cols {
+            let o = match c {
+                Col::Vals(v, desc) => cmp(&v[a], &v[b], *desc),
+                // Matching cells first: `true` sorts before `false`.
+                Col::Hit(h, last) => if *last { h[a].cmp(&h[b]) } else { h[b].cmp(&h[a]) },
+            };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    });
+    idx.into_iter().map(|i| rows[i]).collect()
+}
+
 /// The edit that sorts `rect` by `keys` (the caller leaves a header row out of
 /// `rect`). `None` when the rows are already in order or a key is outside the range.
 /// Whether `rect`'s rows can be sorted with the merged cells in it, as

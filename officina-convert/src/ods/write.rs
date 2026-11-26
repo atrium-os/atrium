@@ -1583,7 +1583,19 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     let whole_cell = !wb.filter_conditions().any(partial_regex);
-    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false">"#);
+    let structure = match wb.structure_protection() {
+        Some(p) => {
+            let mut a = String::from(r#" table:structure-protected="true""#);
+            if p.format() == officina_grid::protection::ProtectionFormat::Ods {
+                for (key, value) in p.settings() {
+                    let _ = write!(a, r#" {key}="{}""#, crate::xml::esc(value));
+                }
+            }
+            a
+        }
+        None => String::new(),
+    };
+    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet{structure}><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false">"#);
     if wb.date_system() == dates::DateSystem::Excel1904 {
         content.push_str(r#"<table:null-date table:date-value="1904-01-01"/>"#);
     }

@@ -605,6 +605,12 @@ pub(crate) fn shift_with_ids(
         if &moved != outline { ops.push(GridOp::Outline { sheet, axis, outline: moved }); }
     }
 
+    let sparks = &wb.sheet(sheet).sparklines;
+    if !sparks.is_empty() {
+        let moved = crate::sparkline::shifted(sparks, sheet, s);
+        if &moved != sparks { ops.push(GridOp::Sparklines { sheet, list: moved }); }
+    }
+
     let scenarios = &wb.sheet(sheet).scenarios;
     if !scenarios.is_empty() {
         let moved = crate::scenario::shifted(scenarios, s);

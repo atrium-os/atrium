@@ -425,6 +425,8 @@ struct Seg {
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
     links: Vec<((u32, u32, u32, u32), Option<String>, Option<String>)>,
+    /// `x14:sparklineGroups`, resolved once the sheet is placed.
+    sparks: Vec<super::sparkline::Raw>,
     /// `<scenarios><scenario><inputCells>`.
     scenarios: Vec<officina_grid::scenario::Scenario>,
 }
@@ -732,6 +734,11 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     seg.valid.base = data[tag_start..r.buffer_position() as usize].to_vec();
                 }
             }
+            b"ext" if !empty && attr(&e, b"uri")?.is_some_and(|uri| uri.eq_ignore_ascii_case(super::sparkline::EXT_URI)) => {
+                let span = r.read_to_end(e.name())?;
+                let inner = data.get(span.start as usize..span.end as usize).unwrap_or_default();
+                super::sparkline::read_extension(inner, &mut seg.sparks)?;
+            }
             b"ext" if !empty && attr(&e, b"uri")?.is_some_and(|uri| uri.eq_ignore_ascii_case(super::validation::EXT_URI)) => {
                 let end = e.name().as_ref().to_vec();
                 r.read_to_end(quick_xml::name::QName(&end))?;
@@ -919,6 +926,13 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 }
                 if let Some(z) = seg.zoom {
                     wb.sheet_mut(s).zoom = z;
+                }
+                if !seg.sparks.is_empty() {
+                    let (list, all) = super::sparkline::resolve(&wb, s, &seg.sparks);
+                    let set = wb.set_sparklines(s, list);
+                    if !all || !set {
+                        seg.rep.note(Kind::Dropped, "sparklines with an unknown sheet, a bad range or a cell used twice");
+                    }
                 }
                 if !seg.scenarios.is_empty() && !wb.set_scenarios(s, seg.scenarios) {
                     seg.rep.note(Kind::Dropped, "scenarios with no name, a name twice, no cells or a cell twice");
@@ -1398,6 +1412,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     // Defined names: (name, sheet index it is local to, formula text).
     let mut names: Vec<(String, Option<u32>, String)> = Vec::new();
     let mut iteration: Option<officina_grid::book::Iteration> = None;
+    let mut structure = None;
     {
         let mut r = xml(&wb_xml);
         let mut buf = Vec::new();
@@ -1437,6 +1452,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                         let change = attr(&e, b"iterateDelta")?.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.001);
                         iteration = Some(officina_grid::book::Iteration { count, change });
                     }
+                    b"workbookProtection" if attr(&e, b"lockStructure")?.is_some_and(|v| v == "1" || v == "true") => {
+                        let attrs = e.attributes().with_checks(false).flatten().filter_map(|a| {
+                            let key = std::str::from_utf8(a.key.local_name().as_ref()).ok()?.to_string();
+                            Some((key, a.unescape_value().ok()?.into_owned()))
+                        }).collect::<Vec<_>>();
+                        structure = Some(attrs);
+                    }
                     b"workbookPr" => out.date1904 = attr(&e, b"date1904")?.is_some_and(|v| v == "1" || v == "true"),
                     b"definedName" => {
                         let name = attr(&e, b"name")?.unwrap_or_default();
@@ -1471,6 +1493,14 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         if !wb.set_iteration(Some(it)) {
             out.report.note(Kind::Dropped, "iteration settings");
         }
+    }
+    if let Some(attrs) = structure {
+        let p = crate::sheet_protection::read(
+            officina_grid::protection::ProtectionFormat::ExcelWorkbook,
+            attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &mut out.report,
+        );
+        wb.set_structure_protection(Some(p));
     }
     for (name, _) in &sheets {
         // Names Excel allows and we don't get a safe stand-in.
