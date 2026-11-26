@@ -5790,6 +5790,53 @@ Tests:
   - `[ss].00`, `[mm]:ss`, `[DBNum1][$-804]General` and `[h]:mm:ss`, an empty string, CRLF text and a CRLF formula result round-trip;
   - LibreOffice reads the written accounting and four-section styles with the same text.
 
+### 16.168 Close-out: installed Sheets on the Mac VM, and Sheets as built (2026-11-27)
+Round 6 of the six-round finishing plan, second part. This ends the plan.
+
+**The VM check** ran on the Mac's HVF VM (arm64, main at 228f55e10, everything built on the host). It used installed Sheets and Scrinium for a person on a headless 1280×720 frescod. The workbook had three sheets (one with a red tab), a table, a chart, checkboxes and an accounting format.
+- Worksheet tabs (§16.71): presses on the Sheet2 label (including the old failure point at (193, 681)), the Data label, two tab edges and the colour bar each showed that sheet.
+- The typed bars from rounds 2 to 4 each opened: Format Chart…, PivotTable Tools…, Themes…, Table Design…, Insert Shape…, Camera… and Quick Analysis….
+- New Window showed two captioned windows. Arrange Side by Side, View Side by Side (Scroll Together) and Close Window worked.
+- Save, then reopening through the picker in a new document jail, kept every setting:
+  - the accounting text (`$ 1,234.50`, `$ (56.25)`, `$ -`);
+  - the checkboxes, the tab colour, the three sheets, the table, the chart and the column width.
+  
+  A host read of the saved file matched the original cell for cell.
+
+**Fixed from the check:**
+- The Data menu (about 218 items, 6,300 px) and the Format menu now take at most the window's height below their button. Their items scroll by the wheel and the arrows, as in a pop-up frescod shrank. Before, the items below Zoom In could not be seen. Pergola's `Menu` and `MenuButton` gained `max_height`.
+- Escape closes a typed bar (Themes…, Solver…, Sort…, Goal Seek…, a name) as its Cancel does. Before, only Find and the chart editor took Escape.
+- A typed bar's hint is cut with an ellipsis where the window ends, and the whole hint is the tooltip.
+
+**Found, not fixed here:**
+- Scrinium's ordinary Save refuses a workbook the person owns ("Cannot preserve workbook ownership. Use Save As."). Scrinium writes the replacement as its own app user and can't give the file back to its owner (`scrinium/src/workbook.rs`, `prepare_replacement`). Files made in a shell, by another app or by an earlier install can only be saved with Save As. This belongs to Scrinium.
+- When the arrows move a menu's highlight, the screen shows it only at the next input event. Pergola's own menu test sees the highlight move at once, so the missed frame is in the app's loop on the guest.
+- The bar labels "Quick" and "Table" are short to fit the 100 px label column.
+
+Evidence is on the Mac in `~/atrium-vm/evidence/sheets-closeout-2026-11-27/`:
+- `RESULTS.md`;
+- 46 screenshots;
+- the original and saved workbooks;
+- the build, deploy and guest logs.
+
+**Sheets as built.** Sheets covers the everyday Excel desktop in one window. Each feature's section is in this chapter (§16.1–§16.168), and the dated log is in the appendix.
+- The grid is the engine of §8. It has dynamic arrays, tables and structured references, the function library of §8.2, iterative calculation, recalculation within a time budget with visible cells first, and undo.
+- Every document is opened in its own jail (§3). Files go through Scrinium's picker, with review and merge (§16.68) and versions.
+- `.xlsx`, `.xlsm`, `.xls` (read), `.ods`, `.csv` and the native format read and write with a report of what changed (§5.2). Real workbooks round-trip as §16.167 measures.
+- The rest is built as listed in the HANDOFF row and the §16 sections:
+  - formatting, conditional formats, validation, filters and sorting;
+  - names, comments and notes, protection and sharing marks;
+  - charts with Format Chart…, PivotTables with PivotTable Tools…;
+  - What-If (Goal Seek, Scenarios, Data Table, Solver), the Analysis ToolPak, sparklines;
+  - themes, table styles, shapes, Camera, Quick Analysis, checkboxes, Custom Views;
+  - spelling and AutoCorrect, Find and Replace, printing to Prelum, New Window.
+
+**Out of scope** (decided 2026-11-26): Power Query and the Data Model, VBA, linked data types, online services and co-authoring, WEBSERVICE and IMAGE. Page Setup and headers and footers belong to the printing workstream.
+
+Tests:
+- Pergola `a_menu_with_a_most_height_scrolls_inside_the_window`: 200 items under a 240 px most height draw fewer than 20 and keep within it. The arrows reach item 29 and the wheel the last.
+- Sheets `escape_closes_a_typed_bar_as_its_cancel_does`: Themes…, Format Chart…, Quick Analysis… and Solver… close on Escape, and Escape with nothing open does nothing.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

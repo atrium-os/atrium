@@ -594,6 +594,16 @@ impl Sheets {
         if self.painter.borrow().is_some() {
             return Some(Cmd::PainterOff);
         }
+        // A typed bar (Themes…, Solver…, Sort…, Goal Seek…, a name) closes as its Cancel does.
+        if self.splitting.get().is_some() || self.sorting.get() || self.angling.get() {
+            return Some(Cmd::Tab(crate::tabs::TabCmd::SplitCancel));
+        }
+        if self.seeking.get() {
+            return Some(Cmd::Tab(crate::tabs::TabCmd::SeekCancel));
+        }
+        if self.naming.get() {
+            return Some(Cmd::Tab(crate::tabs::TabCmd::NameCancel));
+        }
         self.authoring.escape().map(Cmd::Author)
     }
 
@@ -2561,7 +2571,13 @@ impl Sheets {
             TextField::new(self.split_text.clone()).key(0x5348_5350).placeholder(example).autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SplitDone))).render(ctx);
             Button::primary(button).at(112.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitDone)).render(ctx);
             Button::secondary("Cancel").at(192.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitCancel)).render(ctx);
-            ctx.add(Node::Text { rect: Rect::new(272.0 + fw, y + 6.0, (w - 284.0 - fw).max(0.0), 18.0), content: hint.into(), style: crate::tabs::style(t.text_secondary(), false) });
+            let room = (w - 284.0 - fw).max(0.0);
+            let hint_style = crate::tabs::style(t.text_secondary(), false);
+            let shown = fit_text(hint, room, &hint_style);
+            let id = ctx.add(Node::Text { rect: Rect::new(272.0 + fw, y + 6.0, room, 18.0), content: shown.clone(), style: hint_style });
+            if shown != hint {
+                ctx.tooltip(id, hint);
+            }
             return;
         }
         if self.sorting.get() || self.angling.get() {
@@ -3275,6 +3291,8 @@ impl View for Sheets {
             })
             .at(x, 8.0)
             .width(76.0)
+            // Its 200-odd items scroll in the window's height below the button.
+            .max_height(h - 56.0)
             .render(ctx);
             x += 84.0;
             let entries = crate::format::menu(&self.doc.borrow(), g.selection());
@@ -3287,6 +3305,7 @@ impl View for Sheets {
             })
             .at(x, 8.0)
             .width(84.0)
+            .max_height(h - 56.0)
             .render(ctx);
             x += 92.0;
             // Format Painter: pressed again while on, it stays on (Excel's double-click).
@@ -5249,6 +5268,25 @@ fn short_url(u: &str) -> String {
 /// Who new comments are by: `$USER`, else "Me" (as Write writes them).
 pub(crate) fn comment_author() -> String {
     std::env::var("USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "Me".into())
+}
+
+
+/// `text` cut with an ellipsis to fit `room` px in `style`, whole when it fits.
+fn fit_text(text: &str, room: f32, style: &pergola::node::TextStyle) -> String {
+    if Node::measure_text(text, style).w <= room {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let s: String = chars[..mid].iter().collect::<String>() + "…";
+        if Node::measure_text(&s, style).w <= room { lo = mid } else { hi = mid - 1 }
+    }
+    if lo == 0 {
+        return String::new();
+    }
+    chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
 }
 
 #[cfg(test)]
@@ -9534,6 +9572,23 @@ mod tests {
     }
 
     #[test]
+    fn escape_closes_a_typed_bar_as_its_cancel_does() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"a,b\n1,2\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        assert!(s.authoring_escape().is_none());
+        for c in [DataCmd::Themes, DataCmd::FormatChart, DataCmd::QuickAnalysis, DataCmd::Solver] {
+            run(Cmd::Data(c));
+            assert_eq!(s.splitting.get(), Some(c));
+            let esc = s.authoring_escape();
+            assert!(matches!(esc, Some(Cmd::Tab(crate::tabs::TabCmd::SplitCancel))), "{c:?}");
+            run(esc.unwrap());
+            assert!(s.splitting.get().is_none(), "{c:?}");
+        }
+        assert!(s.authoring_escape().is_none());
+    }
+
+    #[test]
     fn format_painter_paints_the_next_selection_once_or_until_escape() {
         use crate::data::DataCmd;
         use crate::format::FormatCmd;
@@ -9573,6 +9628,7 @@ mod tests {
         assert!(st(1, 1).font.bold && st(3, 1).font.bold && !st(2, 1).font.bold);
         let esc = s.authoring_escape();
         assert!(matches!(esc, Some(Cmd::PainterOff)));
+
         run(esc.unwrap());
         assert!(s.painter.borrow().is_none());
         select(&s, (2, 1), (2, 1));

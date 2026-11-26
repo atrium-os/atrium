@@ -147,13 +147,21 @@ pub struct Menu {
     pub attached: bool,
     /// That edge's colour, when the button is lit in another (its tint).
     pub tint: Option<Color>,
+    /// The most height it may take (the window's room below it): past it the
+    /// items scroll, as in a pop-up frescod shrank.
+    pub max_height: Option<f32>,
     on_pick: Rc<dyn Fn(usize)>,
     on_slide: Option<Rc<dyn Fn(usize, f64)>>,
 }
 
 impl Menu {
     pub fn new(state: Mutable<MenuState>, items: Vec<MenuItem>, on_pick: impl Fn(usize) + 'static) -> Self {
-        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, tint: None, on_pick: Rc::new(on_pick), on_slide: None }
+        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, tint: None, max_height: None, on_pick: Rc::new(on_pick), on_slide: None }
+    }
+    /// At most `h` tall; the items scroll past it.
+    pub fn max_height(mut self, h: f32) -> Self {
+        self.max_height = Some(h.max(size::menu_item() + 2.0 * MENU_INSET));
+        self
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.x = x;
@@ -235,7 +243,11 @@ impl View for Menu {
             let s = self.state.clone();
             ctx.popup(r, spec, move || s.set(MenuState::default()), |ctx| {
                 // Shrunk to fit the screen: the items scroll in what it got.
-                let room = ctx.popup_room().filter(|h| *h < r.h());
+                let room = match (ctx.popup_room(), self.max_height) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+                .filter(|h| *h < r.h());
                 self.body(ctx, st, r, room)
             });
             return;
@@ -244,7 +256,8 @@ impl View for Menu {
         let catcher = ctx.add(Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
         let s = self.state.clone();
         ctx.on_click(catcher, move || s.set(MenuState::default()));
-        self.body(ctx, st, r, None);
+        let room = self.max_height.filter(|h| *h < r.h());
+        self.body(ctx, st, r, room);
     }
 }
 
@@ -734,11 +747,18 @@ pub struct MenuButton {
     /// An icon instead of the label and caret (the label stays its
     /// accessible name).
     pub icon: Option<TriggerIcon>,
+    /// Passed to its [`Menu::max_height`].
+    pub max_height: Option<f32>,
     on_pick: Rc<dyn Fn(usize)>,
     on_slide: Option<Rc<dyn Fn(usize, f64)>>,
 }
 
 impl MenuButton {
+    /// Its menu at most `h` tall; the items scroll past it.
+    pub fn max_height(mut self, h: f32) -> Self {
+        self.max_height = Some(h);
+        self
+    }
     pub fn new(label: impl Into<String>, menu: Mutable<MenuState>, items: Vec<MenuItem>, on_pick: impl Fn(usize) + 'static) -> Self {
         Self {
             label: label.into(),
@@ -747,6 +767,7 @@ impl MenuButton {
             rect: Rect::new(0.0, 0.0, 160.0, size::button_height()),
             attached: false,
             icon: None,
+            max_height: None,
             on_pick: Rc::new(on_pick),
             on_slide: None,
         }
@@ -818,6 +839,9 @@ impl View for MenuButton {
             let pick = self.on_pick.clone();
             let mut m = Menu::new(self.menu.clone(), self.items.clone(), move |i| pick(i));
             m.on_slide = self.on_slide.clone();
+            if let Some(h) = self.max_height {
+                m = m.max_height(h);
+            }
             // An icon button is small and sits at the end of a row (the
             // bar's right side): its menu lines up with its right edge.
             let align = if self.icon.is_some() { crate::popup::Align::End } else { crate::popup::Align::Start };
@@ -1264,6 +1288,51 @@ mod tests {
         app.tick();
         assert_eq!(shown(&app).len(), 10);
         let _ = value;
+    }
+
+    struct Tall {
+        menu: Mutable<MenuState>,
+    }
+    impl View for Tall {
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
+            let items: Vec<MenuItem> = (0..200).map(|i| MenuItem::new(format!("Item {i}"))).collect();
+            MenuButton::new("Data", self.menu.clone(), items, |_| {}).at(10.0, 10.0).width(80.0).max_height(240.0).render(ctx);
+        }
+    }
+
+    /// A menu longer than the window's room, drawn inside the window (no
+    /// pop-ups): it keeps to its most height and scrolls, by arrows and wheel.
+    #[test]
+    fn a_menu_with_a_most_height_scrolls_inside_the_window() {
+        let d = Arc::new(AtomicBool::new(true));
+        let menu = Mutable::with_dirty(MenuState::default(), d.clone());
+        let mut app = App::new_with_flag(Tall { menu: menu.clone() }, d);
+        app.tick();
+        click(&mut app, 20.0, 20.0);
+        assert!(menu.get().open);
+        let shown = |app: &App<Tall>| -> Vec<(String, Rect)> {
+            app.tree().iter().filter_map(|(_, n)| match n {
+                Node::Text { content, rect, .. } if content.starts_with("Item ") => Some((content.clone(), *rect)),
+                _ => None,
+            }).collect()
+        };
+        let v = shown(&app);
+        assert!(!v.is_empty() && v.len() < 20, "{} items drawn", v.len());
+        let bottom = v.iter().map(|(_, r)| r.y() + r.h()).fold(0.0, f32::max);
+        let top = v.iter().map(|(_, r)| r.y()).fold(f32::MAX, f32::min);
+        assert!(bottom - top <= 240.0, "{top}..{bottom}");
+        for _ in 0..30 {
+            key(&mut app, Key::Down);
+        }
+        let v = shown(&app);
+        assert!(v.iter().any(|(c, _)| c == "Item 29") && !v.iter().any(|(c, _)| c == "Item 0"), "{v:?}");
+        for _ in 0..400 {
+            app.handle_event(Event::Scroll { at: Some(Point::new(30.0, top + 10.0)), dx: 0.0, dy: 8.0, modifiers: Modifiers::default(), phase: crate::event::ScrollPhase::None });
+            app.tick();
+        }
+        assert_eq!(shown(&app).last().map(|(c, _)| c.as_str()), Some("Item 199"));
     }
 
     /// The pointer and the keys share one highlight: moving onto an item
