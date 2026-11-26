@@ -508,10 +508,74 @@ bitrate from congestion control (§8.3). Because the surface is one node in the 
 only its rect is encoded; the app's toolbar and panels around a 3D viewport stay scene nodes.
 A host with no GPU has no external surfaces to send.
 
-A later option is to send the surface's own rendering commands (the Atrium GPU IR or the
-Vulkan subset) and render on the viewer's GPU. That is SPICE's remote Virgl idea and has the
-same hazard (a remote GPU command stream is a large attack surface on the viewer's GPU driver);
-it is out of scope and listed in §18.
+### 7.2a Rendering 3D on the viewer's GPU instead (Shankar's question, 2026-11-26)
+
+Could the viewer run the 3D itself, so a Tier-3 app's frames are drawn by the viewer's GPU
+rather than sent as pictures? There are two ways to do it, and they behave very differently.
+
+**Way 1: remote the app's Vulkan commands (aqueduct-gpu over the network).** The app's
+`atrium-vk-icd` already records whole frames and sends them as one `OP_GPU_SUBMIT_FRAME`
+envelope; IDs are assigned locally, device properties come once in the handshake, and shaders
+and immutable textures are CAS blobs (aqueduct-gpu.md §3.5, §4.4). Carillon already carries that
+wire across a VM boundary to MoltenVK on the Mac. So the protocol is close to remotable as is:
+a `fenestra-gpu` jail on the viewer runs an `aqueduct-gpu-host` session against the viewer's
+GPU and draws the surface there.
+
+What it buys: exact pixels at the viewer's resolution, no encoder, no GPU needed on the host
+(a cloud box could run a 3D viewer app), and CAS-cached shaders and assets after the first run.
+
+What breaks, and why it decides the default:
+
+1. **Fences become network round trips.** A Vulkan app waits on a fence before it reuses a
+   frame's buffers. If the fence signals on the viewer, the app can have at most its frames in
+   flight per RTT: 3 frames in flight at 100 ms RTT caps it at 30 fps, at 200 ms at 15 fps.
+   Pixel streaming has no such cap, because the host renders at full rate locally. The cap can
+   be lifted only by signalling fences on the host when a frame is *sent*, which is correct only
+   while the app never reads GPU results back.
+2. **Readbacks stall.** Occlusion and timestamp queries, GPU compute results (physics,
+   culling), host-visible buffers the GPU writes, screenshots: every one is a full RTT, and
+   engines do several per frame. Many engines are built on them.
+3. **Bandwidth moves to the worst place.** Per-frame uniform and vertex streaming, dynamic
+   textures and persistently mapped memory need dirty tracking across the network (the problem
+   that made Venus slow). Open-world texture streaming is gigabytes. First launch must upload
+   the game's assets to the viewer: minutes to hours on a WAN, where a picture stream starts in
+   a second.
+4. **The viewer's GPU is the wrong GPU.** The usual reason to view a machine remotely for 3D
+   is that the host has the strong GPU (the R9700 box) and the viewer has a laptop iGPU or a
+   phone. Features and limits also differ by viewer: an app that chose features on one viewer
+   gets device-lost when a different viewer attaches, or when the session moves back to the
+   host's screen.
+5. **Security.** The viewer's GPU driver would run command streams written by the host. Under
+   aqueduct-gpu.md §11 (option A), shader validation is only advisory against a hostile
+   producer; the real boundary is the GPU MMU, the broker writing packets and the hang
+   watchdog. That is acceptable for apps the person installed locally; for any host they
+   connect to, it puts a remote party one driver bug from the viewer's kernel. It would have to
+   be opt-in per host, and only on a driver that passes `gpu-isolation.md`'s attestation gate.
+
+**Way 2: retained 3D in the scene.** If the app describes its 3D as a retained scene (meshes,
+materials, transforms, a camera: wire-format.md's `NODE_MESH`, `NODE_CAMERA`, the
+`0x0C00` 3D range, which is sketched but not drawn by today's renderers), then 3D remotes like
+2D: meshes and textures go once as CAS blobs, and a frame is a few changed transforms. The
+viewer renders it at its own resolution and refresh, and it can **orbit, pan and zoom the camera
+locally with no round trip**, which no pixel protocol can do. This fits model viewers, CAD and
+scientific views, Artifex previews and web 3D content. It does not fit game engines, which
+wire-format.md already places outside Fresco's scope.
+
+**Answer: pictures stay the default for Vulkan surfaces, and viewer-side 3D comes through the
+scene, not through remoted Vulkan.**
+
+| 3D content | On the viewer's GPU | As pictures |
+|---|---|---|
+| Model viewers, CAD, data viz, product previews | **Best, via retained 3D nodes** (local camera, exact pixels, tiny bandwidth) | works |
+| Games, engines with readbacks and streaming | poor: fps capped by RTT, readback stalls, huge uploads, wrong GPU | **Best** (§2.6 techniques) |
+| A modest Vulkan app on a LAN, strong viewer GPU, no GPU on the host | good, if it never reads back | works if the host has a GPU |
+
+So the plan is: (a) external surfaces go as pictures (R6); (b) the retained 3D nodes, once
+Fresco draws them, travel in the scene stream like everything else, which makes viewer-side
+3D the normal case for 3D *UI* (R11, after the renderers draw them locally); (c) Vulkan command
+remoting stays possible later as an opt-in per host and per app, for LAN use with a host
+without a GPU, restricted to apps that declare no readbacks (decision 15). The compositor's own
+drawing on the viewer already uses the viewer's GPU when it has one, as any local window does.
 
 ### 7.3 Pixel-mode windows and windows the viewer cannot draw
 
@@ -910,6 +974,11 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
     *Recommend yes.* Replaying keystrokes and clicks into a screen the person could not see is
     how you delete the wrong thing; mosh replays because a terminal line is forgiving, a GUI is
     not.
+15. **3D: Vulkan surfaces go as pictures by default; viewer-side 3D comes through retained 3D
+    scene nodes (R11); remoting Vulkan commands to the viewer is a later opt-in per host and per
+    app, LAN only, for apps that declare no GPU readbacks** (§7.2a). *Recommend yes.* Remoted
+    Vulkan caps frame rate by RTT and stalls on readbacks, and it puts the host one driver bug
+    from the viewer's kernel; retained 3D gets the benefits without either.
 
 ## 18. Out of scope, and honest limits
 
@@ -922,7 +991,7 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
   encoder: game-streaming quality, not better.
 - **First connection to a new host** costs the session's blobs (estimated a few MB); on a slow
   link the first screen is slower than RDP's first frame, and every later one is faster.
-- **Remote GPU command streams** (rendering a game's Vulkan on the viewer), **foreign
+- **Remote Vulkan command streams** as a default (§7.2a explains why not; opt-in later), **foreign
   desktops**, **USB and smartcard redirection**, **multi-viewer collaboration** with several
   people controlling one session at once (a shared view is supported; shared control needs
   input arbitration), and **file transfer** beyond the R8 drag are not designed here.
@@ -945,6 +1014,7 @@ VM runs only with the coordinator's go.
 | R8 | Clipboard both ways via Tabula, drag of files into a remote app via Scrinium. | `fenestra-clipboard-vm.sh` |
 | R9 | Pairing without SSH (Arca device keys), mDNS discovery, Concursus for NAT. | pairing and revocation gate |
 | R10 | Real hardware: two Atrium machines on a LAN and over a real WAN; R9700 host for surfaces. | numbers for §6.1, 3 runs per arm |
+| R11 | Retained 3D nodes in the scene stream (after the local renderers draw them), with local camera control on the viewer. | a model viewer orbited at 300 ms RTT with no round trip per frame (asserted by stream bytes) |
 
 ## 20. Sources
 
