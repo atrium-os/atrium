@@ -366,6 +366,12 @@ fn main() -> std::io::Result<()> {
     let mut heartbeat = IDLE_HEARTBEAT;
     let mut slow_render_warned = false;
     let mut last_gen: u64 = 0;              /* 0 != initial 1 -> render frame 0 */
+    /* Viewed from elsewhere: the viewer's output while viewed (from the
+     * link), the one the desktop has now, and whether a monitor change
+     * just put the monitors' layout back under it. */
+    let mut viewer_output: Option<(u32, u32, u32)> = None;
+    let mut desk_remote: Option<(u32, u32, u32)> = None;
+    let mut desk_reapply = false;
     /* Force the first present immediately (heartbeat treated as already due). */
     let mut last_render = Instant::now()
         .checked_sub(IDLE_HEARTBEAT)
@@ -589,6 +595,7 @@ fn main() -> std::io::Result<()> {
             if span.is_none() {
                 remember(&heads, &mut remembered, &mut mirrors_memo);
             }
+            desk_reapply = desk_remote.is_some();
             screen::set(dw, dh, refresh);
             publish_outputs(&frontend, &heads, &scales, span.as_ref());
             let info = {
@@ -607,13 +614,15 @@ fn main() -> std::io::Result<()> {
         /* Viewed from elsewhere (viewed.rs, decision 3): the monitors
          * show the viewed screen while a session is on, and until the
          * seat is locked after it; Disconnect pressed there ends it. The
-         * desktop keeps the monitors' size here (the viewer's size on a
-         * host with monitors is the headless path's, for now). */
+         * desktop takes the viewer's output meanwhile, as headless does,
+         * and gets the monitors' back once the seat is locked. */
         if let Some(b) = split.as_deref() {
             if viewed::take_disconnect() {
                 b.disconnect();
             }
-            let _ = b.take_output();
+            if let Some(o) = b.take_output() {
+                viewer_output = o;
+            }
             if !viewed::live() {
                 let on = b.viewed();
                 match viewed::phase() {
@@ -630,6 +639,38 @@ fn main() -> std::io::Result<()> {
                 if viewed::poll(lock::current().is_some()) {
                     last_gen = 0;
                 }
+            }
+            /* While viewed nothing reads the desktop's frame for a monitor
+             * (upload_head shows the viewed screen, direct scanout is off),
+             * so its size is the viewer's alone. */
+            let want = viewer_output.filter(|_| viewed::active() && !viewed::live());
+            if want != desk_remote || (desk_reapply && want.is_some()) {
+                desk_reapply = false;
+                let (w, h) = want.map_or((dw, dh), |(w, h, _)| (w, h));
+                renderer.resize(&vm, w, h, load_bundles).map_err(io_other)?;
+                framebuffer = vec![0u8; w as usize * h as usize * 4];
+                match want {
+                    Some((w, h, sc)) => {
+                        let mut f = frontend.lock().unwrap();
+                        f.set_outputs(vec![remote_output(w, h, sc)]);
+                        screen::set_outputs(f.display_outputs().outputs);
+                    }
+                    None => publish_outputs(&frontend, &heads, &scales, span.as_ref()),
+                }
+                let info = {
+                    let mut f = frontend.lock().unwrap();
+                    f.set_display_mode(w, h, refresh);
+                    f.display_info()
+                };
+                screen::set(w, h, refresh);
+                eprintln!("frescod: {} {w}x{h} at scale {}", if want.is_some() { "viewed; the desktop takes the viewer's output:" } else { "the desktop is the monitors' again:" }, info.scale_milli);
+                let _ = ev_main.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
+                    width: info.width, height: info.height,
+                    refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
+                    scale_milli: info.scale_milli,
+                });
+                desk_remote = want;
+                last_gen = 0;
             }
         }
 

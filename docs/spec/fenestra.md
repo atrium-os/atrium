@@ -1820,8 +1820,10 @@ seat keeps its outputs; the viewer sees the host's layout). Headless frescod sta
 with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture saved as
 `PNG-seat.png`): `scripts/fenestra-seat-vm.sh` 14/14 runs it with forum-wm, a viewer at
 1600x900@1.5 and a stub lock socket. On the display path each monitor scans out the viewed screen
-(the button and pointer on the first) and a spanning window's direct scanout stops; that path
-still keeps the desktop at the monitors' size while viewed, and has not run on a real display yet.
+(the button and pointer on the first) and a spanning window's direct scanout stops; the desktop
+takes the viewer's output there too (renderer and frame at its size, the one remote output
+published), put back over any monitor change while viewed, and gets the monitors' layout back
+only once the seat is locked. It has not run on a real display yet.
 "By whom" says first what the host itself saw: the address the viewer's connection came from,
 as observed by the session (its QUIC or TCP peer, sent to fenestrad as a `Peer` record, and again
 when a migrated connection's address changes; kind 6, session to fenestrad
