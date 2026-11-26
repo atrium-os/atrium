@@ -229,6 +229,51 @@ listen = [{ port = 8080, proto = "tcp", from = "local-network" }]
 - **The install sheet** shows the same two lines. The words live in
   `opifex-sheet` with the other capabilities.
 
+## 5a. Everything from the command line (Shankar, 2026-11-26)
+
+Shankar: "there should be CLI ways to do everything the gui does." Every
+action above has a command, with the same rules as the GUI.
+
+| GUI | Command |
+|---|---|
+| "Running in the background" list | `portcullis background list [--json]`: each app, its persona, its state (running, paused after crashes, quit, not allowed), its restarts, and where it listens |
+| Settings › Apps switch on | `portcullis background allow <app> [--persona P]` |
+| Switch off ("Don't open at sign-in") | `portcullis background disallow <app> [--persona P]` |
+| Quit in the list | `portcullis background quit <app> [--persona P]` |
+| Open it now | `portcullis launch <app>` (exists) |
+| Why did it stop? | `portcullis background log <app>`: the supervisor's starts, exits, restarts and pauses for that app |
+| Listen switch, per network | `portcullis listen allow <app> <port> [--network current\|<saved name>]`, `portcullis listen disallow <app> <port> [--network ...]` |
+| Listen status, connections | `portcullis listen list [--json]` |
+| New project from a template | `cargo atrium new --template status-item\|server` |
+| Package view | `opifex token agent`, `cargo atrium bundle --sign … --json`, `opifex side-load <file>`, all existing |
+
+**How a command proves it is the person.** Nothing runs as the person
+(homes.md §1), so a command typed in the Terminal runs in a workspace
+or an app console, as that jail's uid. Reads need no proof: portcullisd
+resolves the caller's owner through the launch registry and shows only
+that person's apps (`list`, `log`). Changes need the same proof as the
+GUI's press, so an app or a script can't approve itself:
+
+- **In the Terminal**, the command asks the Terminal with OSC 7770, the
+  same way `pkg` and `make run` ask in a workspace today
+  (dev-tools-plan.md M4). The Terminal shows "proj asks: let Photo
+  Server run in the background" with Allow and Cancel, and sends the
+  request with the activation of that press, or of Enter in its own
+  window (frescod's `APPROVE` purpose, Curia §13). It gets that one verb
+  through a new restricted capability, `background-grants`, which only
+  the Terminal holds. Every change goes this way, including `disallow`
+  and `quit`. The GUI's Off and Quit need no press, but there the
+  caller is Curia or forum-wm, never an arbitrary process.
+- **Outside the Terminal** (a script, a workspace job), a change is
+  refused with the reason: "run it in the Terminal, or allow it in
+  Settings". Read commands work everywhere.
+- **The host shell** (homes.md §6, root behind Sigillum) can do all of
+  it for any person: `portcullis --user alice background allow …`. That
+  is the administration and recovery path, not daily use.
+
+Every command takes `--json` for scripts. Its words and refusals are
+the GUI's, from one table in `portcullis-ipc`, so the two never drift.
+
 ## 6. What changes where
 
 | Where | Change |
@@ -243,6 +288,8 @@ listen = [{ port = 8080, proto = "tcp", from = "local-network" }]
 | Curia (Apps page) | two switches per app; the listen switch also lists the networks it is on for |
 | `opifex-sheet`, launch prompt | words for both asks |
 | SDK | `status-item` and `server` templates; `cargo atrium check` warns on a `listen` with no `[resources]` |
+| `portcullis` CLI | `background list/allow/disallow/quit/log` and `listen list/allow/disallow`, `--json`, `--user` for root (§5a) |
+| Terminal (stoa-term) | the OSC 7770 ask for those changes, sent with the press's activation; the `background-grants` capability |
 | Artifex | the templates in New project; the Package card lines |
 
 No app-specific code goes into portcullisd. Both verbs are generic and
@@ -269,6 +316,10 @@ read only the manifest and the person's grant.
    after Quit, not after the link drops, and not when a second app asks
    for the same port. On this computer, another user's process and a page
    in Navigator are refused, and the person's own process gets through.
+   Each step ships its CLI verbs with it (§5a), and each VM check drives
+   the CLI as well as the GUI: a change from the Terminal with Allow,
+   the same change refused from a workspace script, and a read from
+   both.
 5. **B5 templates and Artifex.** Both templates, Artifex's New project
    and Package card, the sheet's words; vm-templates-check and
    vm-artifex-check gain one section each.
@@ -299,6 +350,7 @@ read only the manifest and the person's grant.
 | G5 | Should `listen` be allowed per network, with a café Wi-Fi never reached and open Wi-Fi refused? | Yes: per saved network, open networks refused (§4.2) |
 | G6 | Should ports be 1024+ only, with no internet reach? | Yes for v1 (§8) |
 | G7 | Templates: Rust first, C after? | Yes |
+| G8 | Should every change from the CLI be confirmed with a press in the Terminal, and refused from scripts, with root's host shell able to do it for anyone? | Yes (§5a) |
 
 ### Review
 
