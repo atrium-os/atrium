@@ -187,6 +187,10 @@ pub struct ReplayReport {
     pub frames_sent: usize,
     pub whole_sent: usize,
     pub bytes_sent: usize,
+    /// The most nodes, and glyph runs, any one window held at a draw (a
+    /// replay that drew no text has not tested text).
+    pub max_nodes: usize,
+    pub max_glyph_runs: usize,
     /// Stream errors and refusals on a viewer (each one a failure).
     pub viewer_errors: Vec<String>,
 }
@@ -296,6 +300,9 @@ pub fn replay(events: &[Event], viewers: usize, drop_acks: f64, seed: u64) -> Re
                         views: (0..viewers).map(|_| new_view(size.0, size.1)).collect(),
                     });
                     s.writer.update(st, &scene, size);
+                    let leaves = st.rect_nodes.len() + st.texture_nodes.len() + st.path_nodes.len() + st.glyph_run_nodes.len() + st.fill_nodes.len();
+                    rep.max_nodes = rep.max_nodes.max(leaves + st.group_nodes.len());
+                    rep.max_glyph_runs = rep.max_glyph_runs.max(st.glyph_run_nodes.len());
                     let want = packed(&host, &scene, win, size);
                     for (vi, v) in s.views.iter_mut().enumerate() {
                         if v.broken {

@@ -43,8 +43,8 @@ fn main() {
         let r = record::replay(&events, viewers, drop_acks, seed);
         let verdict = if r.passed() { "PASS" } else { "FAIL" };
         println!(
-            "{verdict} {f}: {} events, {} draws, {} windows, {} frames compared, {} differed, {} viewer errors, {} frames sent ({} whole), {} bytes",
-            r.events, r.draws, r.windows, r.compared, r.differed.len(), r.viewer_errors.len(), r.frames_sent, r.whole_sent, r.bytes_sent
+            "{verdict} {f}: {} events, {} draws, {} windows (up to {} nodes, {} glyph runs), {} frames compared, {} differed, {} viewer errors, {} frames sent ({} whole), {} bytes",
+            r.events, r.draws, r.windows, r.max_nodes, r.max_glyph_runs, r.compared, r.differed.len(), r.viewer_errors.len(), r.frames_sent, r.whole_sent, r.bytes_sent
         );
         for d in r.differed.iter().chain(&r.viewer_errors).take(10) {
             println!("  {d}");

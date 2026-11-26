@@ -468,6 +468,24 @@ independent streams, so a large image upload in one window never delays typing i
   `scripts/fenestra-record-vm.sh` records the three sessions in a VM, and
   `scripts/fenestra-stream-check.sh` is the R1 gate (the tests above plus the three
   replays).
+- **Gate result, 2026-11-26 (cloud VM, TCG; content only, no timings): `fenestra-stream-check.sh`
+  8 ok, 0 failed.** The sessions were recorded on the arm64 guest. A replay on the Linux host
+  with the guest's fonts (`ATRIUM_FONT_PATH`) packed every compared frame equal, with 30% of
+  acks dropped and again with all of them dropped:
+
+  | Session | Frames compared | Up to nodes | Up to glyph runs |
+  |---|---|---|---|
+  | forum-demo, light then dark | 62 | 47 | 8 |
+  | navigator-ui | 100 | 162 | 83 |
+  | atrium-sheets on a small sheet, typed into and scrolled | 134 | 1074 | 165 |
+
+  Without the fonts, a replay draws no text, so the gate now fails when a replay shows no glyph
+  runs.
+
+  Bytes, for R2 (not a result): with 30% of acks lost, navigator-ui sent 19 MB in 22 frames
+  and Sheets 9 MB in 64. Almost all of it is frescod's own glyph atlas pages, which go whole in
+  each whole state. R2 must measure this and cut it: send atlas pages as regions, or bound
+  their size.
 - **Not yet:**
   - The writer is not wired into `fresco-renderer`.
   - Window 0 (the shared screen) is not streamed.
@@ -1507,7 +1525,7 @@ VM runs only with the coordinator's go.
 | Step | What | Gate |
 |---|---|---|
 | R0 | This spec reviewed and decided. New crates licence-audited. **Done 2026-11-26** (§19a). | review thread sign-off; audit 0 failing |
-| R1 | **In progress:** portable crate, stream writer and reader, randomised equality test and fuzzer done (§5.6); recorder and gate next. The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
+| R1 | **Done 2026-11-26** (§5.6): portable crate, stream writer and reader, fuzzer, recorder; gate 8/8. Wiring the writer into fresco-renderer moves to R2. The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
 | R2 | `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
 | R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |

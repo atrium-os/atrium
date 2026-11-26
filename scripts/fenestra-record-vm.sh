@@ -1,6 +1,6 @@
 #!/bin/sh
 # Record frescod sessions for the Fenestra stream gate (docs/spec/fenestra.md
-# §5.6, §19 R1): a Pergola app (pergola's `form` example), Navigator
+# §5.6, §19 R1): a Pergola app (forum-demo, Pergola's reference screen), Navigator
 # (navigator-ui's scenes) and Officina (atrium-sheets on a small sheet), each
 # on a headless in-process frescod built with `fenestra-record`, driven
 # through frescod's input injector (clicks, keys, scrolls). The recordings
@@ -36,7 +36,7 @@ xb frescod "--features fenestra-record --bin frescod"
 BINS="$ROOT/frescod/target/$TARGET/release/frescod"
 for a in $APPS; do
     case $a in
-        pergola) xb pergola "--example form"; BINS="$BINS $ROOT/pergola/target/$TARGET/release/examples/form" ;;
+        pergola) xb forum-demo "--bin forum-demo"; BINS="$BINS $ROOT/forum-demo/target/$TARGET/release/forum-demo" ;;
         navigator) xb navigator-ui "--bin navigator-ui"; BINS="$BINS $ROOT/navigator-ui/target/$TARGET/release/navigator-ui" ;;
         sheets) xb atrium-sheets "--bin atrium-sheets"; BINS="$BINS $ROOT/atrium-sheets/target/$TARGET/release/atrium-sheets" ;;
         *) die "unknown app $a (pergola, navigator, sheets)" ;;
@@ -45,10 +45,14 @@ done
 
 D=/opt/fenestra-rec
 S=/tmp/fenrec
-g "pkill -x frescod; pkill -x form; pkill -x navigator-ui; pkill -x atrium-sheets; sleep 1; rm -rf $D $S; mkdir -p $D $S; chmod 777 $S; true"
+g "pkill -x frescod; pkill -x forum-demo; pkill -x navigator-ui; pkill -x atrium-sheets; sleep 1; rm -rf $D $S; mkdir -p $D $S; chmod 777 $S; true"
 for b in $BINS; do
     put "$b" "$D/"
     [ "$(sha256sum "$b" | cut -d' ' -f1)" = "$(g "sha256 -q $D/$(basename "$b")")" ] || die "hash mismatch for $(basename "$b")"
+done
+g "mkdir -p /usr/local/share/fonts/ibm-plex"
+for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
+    g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
 done
 . "$ROOT/scripts/vm-fonts.sh"; vm_install_fonts
 mkdir -p "$OUT"
@@ -81,14 +85,14 @@ for a in $APPS; do
     start_frescod "$a"
     case $a in
         pergola)
-            g "cd $S && env HOME=$S FRESCO_SOCKET=$S/fresco.sock daemon -f -o $S/app-$a.log $D/form </dev/null"
+            # The reference screen, light, then dark (a whole repaint).
+            g "cd $S && env FRESCO_SOCKET=$S/fresco.sock daemon -f -o $S/app-$a.log $D/forum-demo light </dev/null"
             sleep "$WAIT"
-            press 200 120; typeword 11 8 15 15 18 44 26 18 21 15 7    # "hello world"
-            key 43; typeword 30 31 32; key 42; key 42                 # Tab, "123", two Backspaces
-            press 120 220; press 300 220; key 40
-            scroll 200 200 -120; scroll 200 200 120
+            press 640 360; scroll 640 360 -120
+            g "pkill -x forum-demo; sleep 2; cd $S && env FRESCO_SOCKET=$S/fresco.sock daemon -f -o $S/app-$a-dark.log $D/forum-demo dark </dev/null"
             sleep "$WAIT"
-            finish "$a" form
+            press 640 400; key 43; key 43
+            finish "$a" forum-demo
             ;;
         navigator)
             g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATOR_UI_SIZE=1280x720 daemon -f -o $S/app-$a.log $D/navigator-ui --light </dev/null"

@@ -32,6 +32,9 @@ else
 fi
 cargo build -q --release --bin fenestra-stream-replay 2>/dev/null || gate_abort "fenestra-stream-replay did not build"
 REPLAY="$ROOT/fresco-render-core/target/release/fenestra-stream-replay"
+# frescod's own text (TEXT_RUN_INSTALL) needs the fonts the guest had, or
+# the replay draws no text and tests none.
+export ATRIUM_FONT_PATH="$ROOT/fonts/ibm-plex:$ROOT/fonts/phosphor"
 
 for app in pergola navigator sheets; do
     f="$REC/$app.frec"
@@ -44,6 +47,7 @@ for app in pergola navigator sheets; do
         line=$("$REPLAY" --viewers 2 --drop-acks "$drop" "$f" | head -1)
         echo "  $line"
         case "$line" in
+            *" 0 glyph runs"*) bad "$app ($drop of acks dropped): no text was replayed: $line" ;;
             PASS*) ok "$app: equal with $drop of acks dropped" ;;
             *) bad "$app ($drop of acks dropped): $line" ;;
         esac
