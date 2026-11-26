@@ -589,15 +589,18 @@ impl Seat {
     /// window holds it.
     /// While the session is viewed from elsewhere and the seat shows the
     /// viewed screen (viewed.rs), the seat's input acts on that screen
-    /// alone: true when `m` was taken. Modifiers are still followed, and a
-    /// key or button held from before is still released where it went.
+    /// alone: true when `m` was taken. A key, modifier or button held from
+    /// before is still released where it went.
     fn to_viewed(&mut self, m: &Message) -> bool {
         match *m {
             Message::Key { usage, down, repeat, .. } => {
                 let (page, id) = ((usage >> 16) as u16, (usage & 0xffff) as u16);
+                // A modifier pressed at the seat while viewed is not held
+                // for the session (nor after it): only its release goes on,
+                // clearing one held from before.
                 let modifier = page == 0x07 && (0xe0..=0xe7).contains(&id);
                 let release = !down && page == 0x07 && self.keys.iter().any(|&(_, k)| k == id);
-                if modifier || release {
+                if (modifier && !down) || release {
                     return false;
                 }
                 if page == 0x07 && !repeat {
@@ -1034,6 +1037,34 @@ mod tests {
         press(true);
         assert!(pads.lock().unwrap().guide_down.is_empty());
         assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_BUTTON, 1)]);
+    }
+
+    #[test]
+    fn nothing_from_the_seat_reaches_the_session_while_viewed() {
+        let _g = crate::viewed::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let comp = Arc::new(Mutex::new(Compositor::new()));
+        let (tx, rx) = channel();
+        let mut seat = Seat::default();
+        let key = |seat: &mut Seat, usage: u32, down: bool| seat.handle(Message::Key { id: 1, ts_ns: 0, usage, down, repeat: false }, &tx, &comp);
+        // Shift held from before the session.
+        key(&mut seat, 0x0007_00e1, true);
+        crate::viewed::begin(640, 480, 1000);
+        // Ctrl at the seat, then a w, a click, a scroll, a move: nothing out.
+        key(&mut seat, 0x0007_00e0, true);
+        key(&mut seat, 0x0007_001a, true);
+        key(&mut seat, 0x0007_001a, false);
+        seat.handle(Message::Button { id: 1, ts_ns: 0, usage: 0x0009_0001, down: true }, &tx, &comp);
+        seat.handle(Message::Button { id: 1, ts_ns: 0, usage: 0x0009_0001, down: false }, &tx, &comp);
+        seat.handle(Message::Motion { id: 1, ts_ns: 0, dx: 5.0, dy: 5.0, raw_dx: 5, raw_dy: 5 }, &tx, &comp);
+        assert_eq!(rx.try_iter().count(), 0, "seat input reached the session");
+        // Shift's release goes on; Ctrl was never held for the session.
+        key(&mut seat, 0x0007_00e1, false);
+        crate::viewed::end();
+        assert!(crate::viewed::poll(true));
+        assert!(!crate::viewed::active());
+        key(&mut seat, 0x0007_0004, true);
+        let mods: Vec<u8> = rx.try_iter().filter_map(|e| match e { DisplayEvent::InputKey { modifiers, .. } => Some(modifiers), _ => None }).collect();
+        assert_eq!(mods, vec![0], "a modifier from the viewed time held on");
     }
 
     #[test]

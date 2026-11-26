@@ -2184,6 +2184,17 @@ above.
 
 ## 5. Quirks and gotchas (running list — append as found)
 
+### Fenestra: a seat stuck on "the remote session ended, locking"
+- After a remote session, frescod keeps the host's monitors on its viewed
+  screen until ostiarius has locked the seat (fenestra.md §19b, decision 3).
+  If ostiarius never answers its lock socket
+  (`/atrium/sockets/ostiarius-lock/lock.sock`), the desk stays there by
+  design, and frescod logs `viewed: locking the seat: ...` once a minute.
+  Recover over ssh: `pkill -x atrium-ostiarius` (the bootstrap supervises
+  it from services.d and starts it again), or lock by hand:
+  `echo USER > /atrium/sockets/ostiarius/session-locked`, which ostiarius's
+  lock screen then unlocks as usual.
+
 ### macOS / APFS
 - **APFS is case-insensitive by default** — `tar -xJf base.txz` fails because FreeBSD man pages have `ALQ.9.gz` and `alq.9.gz` (hardlinks). Workaround: extract only what's needed for cross-compile:
   ```sh

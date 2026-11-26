@@ -916,7 +916,10 @@ mod tests {
             }
             panic!("no lock socket");
         };
-        assert!(ask("{\"op\":\"lock\"}\n").contains("\"ok\""));
+        // frescod (viewed.rs) takes a lock as done by this prefix alone:
+        // serde's tag first. A reorder must break here, not at the desk.
+        assert!(ask("{\"op\":\"lock\"}\n").starts_with("{\"status\":\"ok\""));
+        assert!(serde_json::to_string(&crate::control::Response::Ok { active: None }).unwrap().starts_with("{\"status\":\"ok\""));
         assert!(ask("{\"op\":\"unlock_with_key\"}\n").contains("err"));
         assert!(ask("{\"op\":\"unlock\",\"password\":\"x\"}\n").contains("err"));
         assert_eq!(*seen.lock().unwrap(), vec!["{\"op\":\"lock\"}"], "only the lock reached the control socket");

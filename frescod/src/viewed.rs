@@ -171,7 +171,14 @@ pub fn poll(locked: bool) -> bool {
         drop(s);
         let _ = std::thread::Builder::new().name("frescod-viewed-lock".into()).spawn(|| {
             if let Err(e) = ask_lock(&lock_sock()) {
-                eprintln!("frescod: viewed: locking the seat: {e} (the seat stays on the viewed screen)");
+                // Once a minute, not at every retry: the seat stays on the
+                // viewed screen until it is locked (RUNBOOK, Fenestra).
+                static SAID: Mutex<Option<Instant>> = Mutex::new(None);
+                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                    *said = Some(Instant::now());
+                    eprintln!("frescod: viewed: locking the seat: {e} (the seat stays on the viewed screen until it is locked)");
+                }
             }
             // The next look at the lock, and the next request if it is
             // still not locked: the frame loop may have nothing else to do.
