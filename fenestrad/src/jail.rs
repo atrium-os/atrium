@@ -199,9 +199,88 @@ impl Jails {
 
 /// Drop jaild's record of the jail (and its network and listen rules).
 fn release(jaild: &str, uid: u32) {
+    release_named(jaild, &name(uid));
+}
+
+fn release_named(jaild: &str, name: &str) {
     if let Ok(mut c) = jaild::client::Client::connect(jaild) {
-        let _ = c.send(&Request::RemoveJail { jid: None, name: Some(name(uid)) });
+        let _ = c.send(&Request::RemoveJail { jid: None, name: Some(name.into()) });
     }
+}
+
+/// jaild's `[fenestra_daemon]`: these must match its policy.
+pub const DAEMON_NAME: &str = "system-fenestrad";
+pub const DAEMON_EXEC: &str = "/usr/local/bin/atrium-fenestrad";
+
+/// fenestrad's unprivileged side in its own jail (fenestra.md §19b):
+/// `DAEMON_EXEC` as `uid`/`gid` with `sock` as its stdin and stdout and
+/// `extra` from fd 3 on, `argv` after the binary. No network at all
+/// (`Isolated`), the base libraries and installed binaries read-only and
+/// nothing else. A jail left by an earlier root side goes first. Returns
+/// the process descriptor: closing it ends the process.
+pub fn start_daemon(jaild: &str, uid: u32, gid: u32, sock: BorrowedFd<'_>, extra: &[BorrowedFd<'_>], args: &[String]) -> io::Result<OwnedFd> {
+    let root = Path::new(JAILS_DIR).join(DAEMON_NAME);
+    release_named(jaild, DAEMON_NAME);
+    let mut tries = 0;
+    while !try_teardown_named(DAEMON_NAME, &root) {
+        tries += 1;
+        if tries > 15 {
+            return Err(io::Error::other(format!("an earlier {DAEMON_NAME} jail will not go")));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    for d in DIRS {
+        std::fs::create_dir_all(root.join(d))?;
+    }
+    let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+    let id = portcullis_identity::for_app("org.atrium.fenestrad").map_err(|e| io::Error::other(format!("host identity: {e}")))?;
+    let mut argv = vec![DAEMON_EXEC.to_string()];
+    argv.extend(args.iter().cloned());
+    let req = Request::CreateJail(CreateJailRequest {
+        class: None,
+        devices: vec![],
+        name: DAEMON_NAME.into(),
+        path: root.to_string_lossy().into_owned(),
+        children_max: 0,
+        mounts: vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")],
+        devfs_ruleset: DEVFS_RULESET,
+        network: NetworkConfig::Isolated,
+        exec: Some(ExecSpec { cwd: None, groups: vec![], path: DAEMON_EXEC.into(), argv, env: Vec::new(), uid, gid, stdio: true, listen: Vec::new(), ready: false }),
+        rctl: None,
+        hostname: Some(DAEMON_NAME.into()),
+        hostid: Some(id.hostid),
+        hostuuid: Some(id.hostuuid.clone()),
+        allow_mlock: false,
+        allow_tessera_keys: false,
+        syscall_profile: Some("fenestrad".into()),
+        devfs_grant: None,
+        devfs_grants: vec![],
+        fuse: None,
+    });
+    let err = io::stderr();
+    let mut fds = vec![sock, sock, err.as_fd()];
+    fds.extend_from_slice(extra);
+    let mut c = jaild::client::Client::connect(jaild).map_err(|e| io::Error::other(format!("connect {jaild}: {e}")))?;
+    let (resp, got) = c.send_with_fds(&req, &fds, 1).map_err(|e| io::Error::other(format!("jaild: {e}")))?;
+    // SAFETY: jaild handed these over; each is owned once.
+    let mut got: Vec<OwnedFd> = got.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+    match resp {
+        Response::JailCreated(r) if r.procdesc_attached => got.pop().ok_or_else(|| io::Error::other("jaild sent no procdesc")),
+        Response::PolicyDenied { rule, detail } => Err(io::Error::other(format!("jaild refused ({rule}): {detail}"))),
+        Response::SyscallFailed { name, errno, msg } => Err(io::Error::other(format!("jaild: {name} (errno {errno}): {msg}"))),
+        other => Err(io::Error::other(format!("jaild: unexpected {other:?}"))),
+    }
+}
+
+/// Takes the daemon's jail apart once its process has gone; true once
+/// nothing is left (a few tries, a vnet-less jail goes at once).
+pub fn end_daemon(jaild: &str) -> bool {
+    release_named(jaild, DAEMON_NAME);
+    let root = Path::new(JAILS_DIR).join(DAEMON_NAME);
+    (0..10).any(|_| try_teardown_named(DAEMON_NAME, &root) || {
+        std::thread::sleep(Duration::from_millis(500));
+        false
+    })
 }
 
 fn jail_exists(name: &str) -> bool {
@@ -215,15 +294,18 @@ fn jail_exists(name: &str) -> bool {
 
 /// One attempt to take a session's jail apart; true once nothing is left.
 fn try_teardown(uid: u32) -> bool {
-    let (name, root) = (name(uid), root(uid));
-    let _ = std::process::Command::new("jail").arg("-r").arg(&name).stderr(std::process::Stdio::null()).status();
-    if jail_exists(&name) {
+    try_teardown_named(&name(uid), &root(uid))
+}
+
+fn try_teardown_named(name: &str, root: &Path) -> bool {
+    let _ = std::process::Command::new("jail").arg("-r").arg(name).stderr(std::process::Stdio::null()).status();
+    if jail_exists(name) {
         return false;
     }
     if !root.exists() {
         return true;
     }
-    if !portcullis_mounts::converge(&[root.as_path()], portcullis_mounts::Force::Yes).is_empty() {
+    if !portcullis_mounts::converge(&[root], portcullis_mounts::Force::Yes).is_empty() {
         return false;
     }
     // Never remove_dir_all: a surviving mount would take the removal into
@@ -255,7 +337,7 @@ fn janitor(pool: Arc<Mutex<Pool>>) {
 }
 
 /// Block until the process behind `pd` exits.
-fn wait(pd: &OwnedFd) -> io::Result<()> {
+pub fn wait(pd: &OwnedFd) -> io::Result<()> {
     // SAFETY: kqueue returns a new descriptor or -1.
     let kq = unsafe { libc::kqueue() };
     if kq < 0 {

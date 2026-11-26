@@ -60,7 +60,8 @@ pub fn validate_create(
             || matches!(req.class, Some(crate::protocol::JailClass::App { .. }));
         validate_exec(exec, policy, own_tree,
                       is_courier(req, policy) || is_share_server(req, policy) || is_print_worker(req, policy)
-                          || is_crypta_engine(req, policy) || is_fenestra_session(req, policy))?;
+                          || is_crypta_engine(req, policy) || is_fenestra_session(req, policy)
+                          || is_fenestra_daemon(req, policy))?;
     }
     validate_host_identity(req)?;
     validate_class(req, policy)?;
@@ -346,6 +347,29 @@ pub fn is_fenestra_session(req: &CreateJailRequest, policy: &Policy) -> bool {
         _ => false,
     };
     exec.path == c.exec_path && network_ok && exec.stdio && without_devices_or_children(req) && !req.allow_mlock
+}
+
+/// Whether `req` is fenestrad's unprivileged side (`[fenestra_daemon]`,
+/// fenestra.md §19b): exactly the policy's name, rooted at
+/// `<instance_root_dir>/<name>`, running exactly `exec_path` as `uid`,
+/// taking its caller's stdio (the root side's socket; the mint socket and
+/// frescod's link at 3 and 4). No network at all (`Isolated`), no
+/// device, FUSE, child jail or locked memory.
+pub fn is_fenestra_daemon(req: &CreateJailRequest, policy: &Policy) -> bool {
+    use crate::protocol::NetworkConfig;
+    let Some(c) = policy.fenestra_daemon.as_ref() else { return false };
+    let Some(dir) = policy.exec_paths.instance_root_dir.as_deref() else { return false };
+    let Some(exec) = req.exec.as_ref() else { return false };
+    req.name == c.name
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&c.name)
+        && exec.path == c.exec_path
+        && exec.uid == c.uid
+        && exec.gid == c.uid
+        && exec.groups.is_empty()
+        && exec.stdio
+        && matches!(req.network, NetworkConfig::Isolated)
+        && without_devices_or_children(req)
+        && !req.allow_mlock
 }
 
 /// The pf tag the `CRYPTA_OUTER` rules key on (vpn.md §5.4).
@@ -1790,6 +1814,53 @@ mod tests {
             assert!(!is_fenestra_session(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
+    }
+
+    /// fenestrad's unprivileged side: exactly the policy's name, root,
+    /// binary and uid, with no network at all; anything else is refused.
+    #[test]
+    fn the_fenestra_daemon_jail_and_only_it() {
+        use crate::protocol::NetworkConfig;
+        let p = load_sample_policy();
+        let exe = "/usr/local/bin/atrium-fenestrad";
+        let daemon = |name: &str, path: &str, exe: &str, uid: u32, net: NetworkConfig| {
+            let mut r = instance_req(name, path, exe, true);
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r.network = net;
+            r
+        };
+        let root = "/var/lib/atrium/jails/system-fenestrad";
+        let ok = daemon("system-fenestrad", root, exe, 65057, NetworkConfig::Isolated);
+        assert!(is_fenestra_daemon(&ok, &p));
+        validate_create(&ok, &p).expect("fenestrad's jail");
+        let mut mlock = ok.clone();
+        mlock.allow_mlock = true;
+        let mut kids = ok.clone();
+        kids.children_max = 1;
+        let mut groups = ok.clone();
+        groups.exec.as_mut().unwrap().groups = vec![0];
+        let mut no_stdio = ok.clone();
+        no_stdio.exec.as_mut().unwrap().stdio = false;
+        for (r, why) in [
+            (daemon("system-fenestrad", root, exe, 65057, NetworkConfig::Disable), "the host's stack, unaddressed"),
+            (daemon("system-fenestrad", root, exe, 65057, NetworkConfig::Inherit), "the host's stack"),
+            (daemon("system-fenestrad", root, exe, 65057, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None, fib: None }), "a network"),
+            (daemon("system-fenestrad", root, exe, 0, NetworkConfig::Isolated), "root"),
+            (daemon("system-fenestrad", root, exe, 65010, NetworkConfig::Isolated), "another uid"),
+            (daemon("system-fenestrad2", "/var/lib/atrium/jails/system-fenestrad2", exe, 65057, NetworkConfig::Isolated), "another name"),
+            (daemon("system-fenestrad", "/var/lib/atrium/jails/elsewhere", exe, 65057, NetworkConfig::Isolated), "another root"),
+            (daemon("system-fenestrad", root, "/usr/local/bin/atrium-svc", 65057, NetworkConfig::Isolated), "another binary"),
+            (mlock, "locked memory"),
+            (kids, "child jails"),
+            (groups, "wheel"),
+        ] {
+            assert!(!is_fenestra_daemon(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+        // Not stdio: not this class, though a plain service may be valid.
+        assert!(!is_fenestra_daemon(&no_stdio, &p));
     }
 
     /// Crypta's engines: exactly the policy's name, root, binary and uid, a

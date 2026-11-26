@@ -284,11 +284,20 @@ struct Config {
     bin: String,
     bind: Option<String>,
     public_ip: Option<std::net::IpAddr>,
-    seat: String,
+    seat: Seat,
     grace: Option<u64>,
     /// Sessions in jails through jaild (`--jaild SOCK --lan IFACE SUBNET`).
     #[cfg(target_os = "freebsd")]
     jails: Option<Jailing>,
+}
+
+/// Who says which user is at the seat.
+enum Seat {
+    /// Ostiarius' active session file, read here.
+    File(String),
+    /// The root side, for fenestrad in its own jail (it reaches no path).
+    #[cfg(target_os = "freebsd")]
+    Root(Arc<privsep::jailer::Jailer>),
 }
 
 /// Who asks jaild for a session's jail.
@@ -427,15 +436,99 @@ fn jail_args(grace: Option<u64>) -> Vec<String> {
     args
 }
 
+/// Mints, one request at a time, each bounded by MINT_TIMEOUT.
+fn take_mints(relay: &Arc<Relay>, cfg: &Config, l: &UnixListener) {
+    let mut next = 0u32;
+    for c in l.incoming() {
+        let Ok(c) = c else { continue };
+        let Ok(mut out) = c.try_clone() else { continue };
+        let answer = mint_request(relay, cfg, &mut next, c);
+        if answer.starts_with("FENESTRA_REFUSED") {
+            eprint!("fenestrad: mint {answer}");
+        }
+        let _ = out.write_all(answer.as_bytes());
+    }
+}
+
+/// fenestrad's unprivileged side in its own jail (`--worker`, started by
+/// the root side through jaild; fenestra.md §19b): the root side's socket
+/// on stdin, the mint socket at fd 3, frescod's link (already connected as
+/// this uid) at fd 4. It reaches nothing by path: sessions and the seat's
+/// user come from the root side.
+#[cfg(target_os = "freebsd")]
+fn worker(args: &[String]) -> ! {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: SIG_IGN; no handler runs. A stray "reload" ends nothing.
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    // SAFETY: fds 3 and 4 are what the root side passed through jaild,
+    // each owned once here; checked to be what they should before use.
+    let (mint, link) = unsafe { (OwnedFd::from_raw_fd(3), OwnedFd::from_raw_fd(4)) };
+    if !local_socket(&mint, true) || !local_socket(&link, false) {
+        die("--worker needs the mint socket at fd 3 and frescod's link at fd 4");
+    }
+    let l = UnixListener::from(mint);
+    let f = UnixStream::from(link);
+    // SAFETY: getters of this process's credentials.
+    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    if uid == 0 || euid == 0 {
+        die("--worker runs as its own user, never root");
+    }
+    let jailer = Arc::new(privsep::jailer::Jailer::from_stdin());
+    let cfg = Config {
+        bin: String::new(),
+        bind: None,
+        public_ip: arg(args, "--public-ip").map(|s| s.parse().unwrap_or_else(|_| die("--public-ip IP"))),
+        seat: Seat::Root(jailer.clone()),
+        grace: None,
+        jails: Some(Jailing::Root(jailer)),
+    };
+    eprintln!("fenestrad: jailed, as uid {uid}");
+    let fr = f.try_clone().unwrap_or_else(|e| die(e));
+    let relay = Arc::new(Relay { table: Mutex::new(Table::default()), frescod: Mutex::new(f) });
+    {
+        let relay = relay.clone();
+        std::thread::spawn(move || die(relay.from_frescod(fr)));
+    }
+    eprintln!("fenestrad: taking mints from the root side's socket");
+    take_mints(&relay, &cfg, &l);
+    die("the mint socket closed")
+}
+
+/// Whether `fd` is a local stream socket, listening or not as asked.
+#[cfg(target_os = "freebsd")]
+fn local_socket(fd: &impl std::os::fd::AsRawFd, listening: bool) -> bool {
+    // SAFETY: an all-zero sockaddr_storage is valid for getsockname to
+    // fill; it writes at most `len` bytes.
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: getsockname on a descriptor we hold, into our buffer.
+    let named = unsafe { libc::getsockname(fd.as_raw_fd(), (&mut ss as *mut libc::sockaddr_storage).cast(), &mut len) } == 0;
+    let mut on: libc::c_int = 0;
+    let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt into a c_int of the stated size.
+    let accepts = unsafe { libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ACCEPTCONN, (&mut on as *mut libc::c_int).cast(), &mut l) } == 0 && on != 0;
+    named && i32::from(ss.ss_family) == libc::AF_UNIX && accepts == listening
+}
+
 /// One mint request on the mint socket: the answer line for the caller.
 fn mint_request(relay: &Arc<Relay>, cfg: &Config, next: &mut u32, mut c: UnixStream) -> String {
     let refuse = |why: &str| format!("FENESTRA_REFUSED {why}\n");
     // Who is asking is the kernel's answer, and must be the seat's user.
     let Ok((uid, _)) = portcullis_peer::uid_gid(c.as_raw_fd()) else { return refuse("no peer credentials") };
-    let Some(user) = portcullis_peer::username(uid) else { return refuse("no such user") };
-    if portcullis_peer::seat::active_at(&cfg.seat).as_deref() != Some(user.as_str()) {
-        return refuse("not the user of the seat session");
-    }
+    let user = match &cfg.seat {
+        Seat::File(path) => {
+            let Some(user) = portcullis_peer::username(uid) else { return refuse("no such user") };
+            if portcullis_peer::seat::active_at(path).as_deref() != Some(user.as_str()) {
+                return refuse("not the user of the seat session");
+            }
+            user
+        }
+        #[cfg(target_os = "freebsd")]
+        Seat::Root(j) => match j.seat() {
+            Some((seat_uid, name)) if seat_uid == uid => name,
+            _ => return refuse("not the user of the seat session"),
+        },
+    };
     if c.set_read_timeout(Some(MINT_TIMEOUT)).is_err() {
         return refuse("socket");
     }
@@ -479,6 +572,10 @@ fn mint_request(relay: &Arc<Relay>, cfg: &Config, next: &mut u32, mut c: UnixStr
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "freebsd")]
+    if args.get(1).map(String::as_str) == Some("--worker") {
+        worker(&args);
+    }
     let sock = arg(&args, "--frescod").unwrap_or_else(|| die("--frescod SOCK is needed"));
     // Before any thread: getpwnam, and the fork for the root side.
     let user = arg(&args, "--user").map(|n| privsep::lookup(&n).unwrap_or_else(|e| die(e)));
@@ -493,12 +590,28 @@ fn main() {
         let (iface, subnet) = lan.unwrap_or_else(|| die("--jaild needs --lan IFACE SUBNET (where viewers come from)"));
         (sock, iface, subnet)
     });
+    let seat = arg(&args, "--seat").unwrap_or_else(|| portcullis_peer::seat::ACTIVE_SESSION.into());
+    // `--jail`: the unprivileged side in a jail of its own; this process
+    // stays the root side (privsep::jailer::run_jailed).
+    let own_jail = args.iter().any(|a| a == "--jail");
+    #[cfg(not(target_os = "freebsd"))]
+    if own_jail {
+        die("--jail is for Atrium only");
+    }
+    #[cfg(target_os = "freebsd")]
+    if own_jail && (user.is_none() || jaild_at.is_none() || arg(&args, "--mint-sock").is_none()) {
+        die("--jail needs --user, --jaild and --mint-sock");
+    }
     // The root side first, so it holds nothing but what it is given here.
     #[cfg(target_os = "freebsd")]
-    let jails = jaild_at.map(|(sock, iface, subnet)| match &user {
-        Some(_) => Jailing::Root(Arc::new(privsep::jailer::split(move || jail::Jails::new(&sock, &iface, &subnet), jail_args(grace)))),
-        None => Jailing::Here(jail::Jails::new(&sock, &iface, &subnet)),
-    });
+    let (jails, jaild_at) = if own_jail {
+        (None, jaild_at)
+    } else {
+        (jaild_at.map(|(sock, iface, subnet)| match &user {
+            Some(_) => Jailing::Root(Arc::new(privsep::jailer::split(move || jail::Jails::new(&sock, &iface, &subnet), jail_args(grace), seat.clone()))),
+            None => Jailing::Here(jail::Jails::new(&sock, &iface, &subnet)),
+        }), None)
+    };
     // The mint socket's directory is root's: bound before the drop.
     let mint_listener = arg(&args, "--mint-sock").map(|path| {
         // A fresh socket in fenestrad's own directory; any local user
@@ -516,6 +629,17 @@ fn main() {
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap_or_else(|e| die(format!("{path}: {e}")));
         (path, l)
     });
+    #[cfg(target_os = "freebsd")]
+    if let (Some((jsock, iface, subnet)), Some(u), Some((_, l))) = (jaild_at, &user, mint_listener.as_ref()) {
+        let mint: std::os::fd::OwnedFd = l.try_clone().unwrap_or_else(|e| die(e)).into();
+        let mut wargs = Vec::new();
+        if let Some(ip) = arg(&args, "--public-ip") {
+            ip.parse::<std::net::IpAddr>().unwrap_or_else(|_| die("--public-ip IP"));
+            wargs.extend(["--public-ip".to_string(), ip]);
+        }
+        let js = jsock.clone();
+        privsep::jailer::run_jailed(&jsock, move || jail::Jails::new(&js, &iface, &subnet), jail_args(grace), seat, u, mint, &sock, wargs);
+    }
     if let Some(u) = &user {
         privsep::drop_to(u).unwrap_or_else(|e| die(format!("dropping to {}: {e}", u.name)));
         eprintln!("fenestrad: running as {} (uid {})", u.name, u.uid);
@@ -527,7 +651,7 @@ fn main() {
         bin: arg(&args, "--session").unwrap_or_else(|| die("--session BIN is needed")),
         bind: arg(&args, "--bind"),
         public_ip: arg(&args, "--public-ip").map(|s| s.parse().unwrap_or_else(|_| die("--public-ip IP"))),
-        seat: arg(&args, "--seat").unwrap_or_else(|| portcullis_peer::seat::ACTIVE_SESSION.into()),
+        seat: Seat::File(seat),
         grace,
         #[cfg(target_os = "freebsd")]
         jails,
@@ -550,17 +674,7 @@ fn main() {
     match (mint_listener, arg(&args, "--mint-dir")) {
         (Some((path, l)), None) => {
             eprintln!("fenestrad: taking mints on {path}");
-            let mut next = 0u32;
-            // One request at a time, each bounded by MINT_TIMEOUT.
-            for c in l.incoming() {
-                let Ok(c) = c else { continue };
-                let Ok(mut out) = c.try_clone() else { continue };
-                let answer = mint_request(&relay, &cfg, &mut next, c);
-                if answer.starts_with("FENESTRA_REFUSED") {
-                    eprint!("fenestrad: mint {answer}");
-                }
-                let _ = out.write_all(answer.as_bytes());
-            }
+            take_mints(&relay, &cfg, &l);
         }
         (None, Some(dir)) => {
             if let Err(e) = start_session(&relay, &cfg, 1, MintBy::Dir(dir)) {

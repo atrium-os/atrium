@@ -80,6 +80,10 @@ pub struct Policy {
     /// Absent = none.
     #[serde(default)]
     pub fenestra_sessions: Option<FenestraSessionPolicy>,
+    /// fenestrad's unprivileged side in a jail of its own (fenestra.md
+    /// §19b). Absent = it runs unjailed.
+    #[serde(default)]
+    pub fenestra_daemon: Option<FenestraDaemonPolicy>,
     /// Per-jail system call filter profiles (jail-sysfil.md §5). Absent =
     /// no profiles, and a request that names one is refused.
     #[serde(default)]
@@ -336,6 +340,20 @@ pub struct FenestraSessionPolicy {
     pub uid_last:    u32,
     pub port_first:  u16,
     pub port_last:   u16,
+}
+
+/// `[fenestra_daemon]`: fenestrad's root side asks for one jail for its
+/// unprivileged side (fenestra.md §19b), named `name` at
+/// `<instance_root_dir>/<name>`, running exactly `exec_path` as `uid`, with
+/// the root side's socket as its stdio and the mint socket and frescod's
+/// link as fds 3 and 4. No network at all (an own empty stack), no device,
+/// no child jail, no locked memory; it reaches nothing by path.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FenestraDaemonPolicy {
+    pub name:      String,
+    pub exec_path: String,
+    pub uid:       u32,
 }
 
 /// `[print_workers]`: prelumd asks for one jail per worker (printing.md

@@ -29,7 +29,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
 [ "${FEN_SERVICE:-0}" = 1 ] && FEN_JAIL=1
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 4 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 5 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -164,9 +164,13 @@ if [ "${FEN_SERVICE:-0}" = 1 ]; then
             sleep 1; i=$((i+1)); done
         echo "no: root [$(side root)] _fenestra [$(side _fenestra)]"; }
     R0=$(side root); U0=$(side _fenestra)
+    # The unprivileged side in its own jail: an own stack with nothing in
+    # it but lo0, and no host path under its root but the base libraries.
+    FJ=$(g "ps -o jid= -p ${U0:-0} | tr -d ' '; jls -j system-fenestrad vnet 2>/dev/null; ifconfig -j system-fenestrad -l 2>/dev/null; ls /var/lib/atrium/jails/system-fenestrad 2>/dev/null | tr '\n' ' '" | tr -s ' \n' ' ')
+    case "$FJ" in [1-9]*" new lo0 dev lib libexec tmp usr ") ok "fenestrad's own side runs jailed: no network, no host paths";; *) bad "fenestrad's own jail: $FJ";; esac
     # A stray "reload" (SIGHUP to both) ends nothing.
     g "pkill -HUP -x atrium-fenestrad"; sleep 3
-    check "a SIGHUP leaves both sides running" "$R0 $U0" "$(side root) $(side _fenestra)"
+    check "a SIGHUP leaves both sides running" "yes $R0 $U0" "$([ -n "$R0" ] && [ -n "$U0" ] && echo yes) $(side root) $(side _fenestra)"
     # The root side killed outright: its other side goes with it (no
     # orphan holding the mint socket and frescod's link) and daemon(8)
     # starts the pair again, which takes frescod's link again.
@@ -181,9 +185,10 @@ if [ "${FEN_SERVICE:-0}" = 1 ]; then
     P2=$(whole "${1:-0}" "${2:-0}")
     case "$P2" in no:*) bad "its unprivileged side killed, the service came back: $P2";; *) ok "its unprivileged side killed, the service came back";; esac
     # A stop takes it all down: both sides and any session jail.
+    STOP_FROM="$(side root)$(side _fenestra)"
     g "service atrium_fenestrad stop >/dev/null 2>&1"
     i=0; while [ $i -lt 15 ] && [ -n "$(side root)$(side _fenestra)" ]; do sleep 1; i=$((i+1)); done
-    check "service stop ends both sides and every session jail" "none" "$( [ -z "$(side root)$(side _fenestra)" ] && ! g "jls name | grep -q '^system-fenestra-'" && echo none || echo "left: $(side root) $(side _fenestra) $(g "jls name | grep system-fenestra-")")"
+    check "service stop ends both sides and every session jail" "none" "$( [ -n "$STOP_FROM" ] && [ -z "$(side root)$(side _fenestra)" ] && ! g "jls name | grep -q '^system-fenestra'" && echo none || echo "left: $(side root) $(side _fenestra) $(g "jls name | grep system-fenestra")")"
     g "test -e $G/made-seat && rm -f /atrium/sockets/ostiarius/active-session; sysrc -x atrium_fenestrad_grace atrium_fenestrad_logfile >/dev/null 2>&1; true"
 fi
 g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; true"

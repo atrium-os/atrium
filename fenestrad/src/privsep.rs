@@ -87,8 +87,9 @@ pub mod jailer {
 
     use crate::jail::{Jails, Running};
 
-    /// Every request and answer is exactly this long, NUL-padded.
-    const MSG: usize = 32;
+    /// Every request and answer is exactly this long, NUL-padded (room for
+    /// `OK <uid> <user name>`).
+    const MSG: usize = 64;
     /// Session jails the unprivileged side may hold at once: one with
     /// control, and one more while a take-over replaces it.
     pub const MAX_RUNNING: usize = 2;
@@ -138,13 +139,27 @@ pub mod jailer {
         pub fn stop(&self, port: u16) {
             let _ = self.ask(&format!("STOP {port}"), &[]);
         }
+
+        /// The seat session's user, `(uid, name)`, as the root side reads
+        /// it; None when no one is signed in at the seat or it can't say.
+        pub fn seat(&self) -> Option<(u32, String)> {
+            let a = self.ask("SEAT", &[]).ok()?;
+            let (uid, name) = a.strip_prefix("OK ")?.split_once(' ')?;
+            Some((uid.parse().ok()?, name.to_string()))
+        }
+
+        /// The jailed side's handle: the root side's socket is its stdin.
+        pub fn from_stdin() -> Jailer {
+            // SAFETY: fd 0 is the socket jaild gave this process, owned once.
+            Jailer { sock: Mutex::new(unsafe { OwnedFd::from_raw_fd(0) }) }
+        }
     }
 
     /// Fork. The child returns, as the side that will drop to `_fenestra`;
     /// the parent stays root, serves it with `jails` (made after the fork,
     /// so its threads are the parent's alone) and exits when it goes.
     /// Call before any thread starts.
-    pub fn split(make: impl FnOnce() -> Jails, args: Vec<String>) -> Jailer {
+    pub fn split(make: impl FnOnce() -> Jails, args: Vec<String>, seat: String) -> Jailer {
         let mut sv = [0i32; 2];
         // SAFETY: socketpair writes two descriptors into `sv`.
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } != 0 {
@@ -198,12 +213,119 @@ pub mod jailer {
                         libc::sigaction(s, &sa, std::ptr::null_mut());
                     }
                 }
-                serve(parent.as_fd(), &make(), &args);
+                serve(parent.as_fd(), &make(), &args, &seat);
                 let mut st = 0;
                 // SAFETY: reaps our own child.
                 unsafe { libc::waitpid(pid, &mut st, 0) };
                 std::process::exit(0)
             }
+        }
+    }
+
+    /// The root side of a jailed fenestrad (fenestra.md §19b), for good:
+    /// connects to frescod at `frescod` as `user` (in a child that drops to
+    /// it first, so frescod sees `user`'s uid), then asks jaild for the
+    /// unprivileged side's own jail ([`crate::jail::start_daemon`]): this
+    /// side's socket as its stdio, `mint` (the bound mint socket) at fd 3
+    /// and the frescod link at fd 4, `worker_args` after `--worker`. Then
+    /// it serves that side as [`split`]'s root side does, and answers
+    /// `SEAT` from `seat`. When either side goes, so does the other, and
+    /// every session jail and the daemon's jail with them. Call before any
+    /// thread starts.
+    pub fn run_jailed(jaild: &str, make: impl FnOnce() -> Jails, args: Vec<String>, seat: String, user: &super::User, mint: OwnedFd, frescod: &str, worker_args: Vec<String>) -> ! {
+        // SAFETY: SIG_IGN; no handler runs.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let link = connect_as(user, frescod).unwrap_or_else(|e| crate::die(format!("{frescod} as {}: {e}", user.name)));
+        let mut sv = [0i32; 2];
+        // SAFETY: socketpair writes two descriptors into `sv`.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } != 0 {
+            crate::die(format!("socketpair: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: both are fresh descriptors of ours, each owned once.
+        let (mine, theirs) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        let mut argv = vec!["--worker".to_string()];
+        argv.extend(worker_args);
+        let pd = crate::jail::start_daemon(jaild, user.uid, user.gid, theirs.as_fd(), &[mint.as_fd(), link.as_fd()], &argv)
+            .unwrap_or_else(|e| crate::die(format!("fenestrad's jail: {e}")));
+        // What it was given is its own now.
+        drop((theirs, mint, link));
+        eprintln!("fenestrad: the unprivileged side runs in jail {} as {}", crate::jail::DAEMON_NAME, user.name);
+        WORKER_PD.store(pd.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+        for s in [libc::SIGTERM, libc::SIGINT] {
+            // SAFETY: as in `split`: the handler only calls pdkill(2).
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = pass_on_pd as extern "C" fn(libc::c_int) as usize as libc::sighandler_t;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(s, &sa, std::ptr::null_mut());
+            }
+        }
+        serve(mine.as_fd(), &make(), &args, &seat);
+        // SAFETY: a procdesc we own; SIGKILL to the process it names.
+        unsafe { libc::pdkill(pd.as_raw_fd(), libc::SIGKILL) };
+        let _ = crate::jail::wait(&pd);
+        if !crate::jail::end_daemon(jaild) {
+            eprintln!("fenestrad: {} did not come apart; the next start takes it", crate::jail::DAEMON_NAME);
+        }
+        std::process::exit(0)
+    }
+
+    /// A socket to `path`, connected as `user`: a child drops to it,
+    /// connects and passes the socket back, so the peer's credentials are
+    /// `user`'s.
+    fn connect_as(user: &super::User, path: &str) -> io::Result<OwnedFd> {
+        let mut sv = [0i32; 2];
+        // SAFETY: socketpair writes two descriptors into `sv`.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both are fresh descriptors of ours, each owned once.
+        let (mine, theirs) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        // SAFETY: no thread has started (the caller's promise); the child
+        // drops, connects, sends and _exits.
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {
+                drop(mine);
+                let code = match super::drop_to(user).map_err(io::Error::other).and_then(|()| std::os::unix::net::UnixStream::connect(path)) {
+                    Ok(s) => i32::from(atrium_fdpass::send(theirs.as_raw_fd(), &message("LINK"), &[s.as_raw_fd()]).is_err()),
+                    Err(e) => {
+                        let _ = atrium_fdpass::send(theirs.as_raw_fd(), &message(&format!("ERR {e}")), &[]);
+                        1
+                    }
+                };
+                // SAFETY: ends the child without running the parent's
+                // destructors or atexit handlers.
+                unsafe { libc::_exit(code) }
+            }
+            _ => {}
+        }
+        drop(theirs);
+        let mut buf = [0u8; MSG];
+        let got = atrium_fdpass::recv(mine.as_raw_fd(), &mut buf, 1);
+        let mut st = 0;
+        // SAFETY: reaps our own child.
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        let got = got?;
+        match (text(&buf), got.fds.into_iter().next()) {
+            (Some("LINK"), Some(fd)) => Ok(fd),
+            (Some(t), _) => Err(io::Error::other(t.to_string())),
+            _ => Err(io::Error::other("no answer")),
+        }
+    }
+
+    /// The jailed side's process descriptor, for [`pass_on_pd`].
+    static WORKER_PD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// The jailed root side's stop handler: the stop goes to the jail.
+    extern "C" fn pass_on_pd(_: libc::c_int) {
+        let pd = WORKER_PD.load(std::sync::atomic::Ordering::Relaxed);
+        if pd >= 0 {
+            // SAFETY: pdkill(2) is a plain syscall, async-signal-safe; `pd`
+            // is our own procdesc.
+            unsafe { libc::pdkill(pd, libc::SIGTERM) };
         }
     }
 
@@ -219,6 +341,25 @@ pub mod jailer {
         }
     }
 
+    /// `OK <uid> <name>` for the seat session's user, read here as root.
+    fn seat_user(seat: &str) -> String {
+        let Some(name) = portcullis_peer::seat::active_at(seat) else { return "ERR no one at the seat".into() };
+        // Whoever is at the seat, root too, as the unjailed check takes it.
+        let Ok(c) = std::ffi::CString::new(name.as_str()) else { return "ERR not a user name".into() };
+        // SAFETY: getpwnam with a NUL-terminated name, from this thread
+        // only (the root side's one caller); the record is read at once.
+        let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+        if pw.is_null() {
+            return "ERR no such user".into();
+        }
+        // SAFETY: pw is non-null and points at a passwd record from libc.
+        let uid = unsafe { (*pw).pw_uid };
+        if name.len() + 16 >= MSG || name.contains(' ') {
+            return "ERR a name that does not fit".into();
+        }
+        format!("OK {uid} {name}")
+    }
+
     /// Whether `fd` is a local (AF_UNIX) socket: all a session is given.
     fn unix_socket(fd: BorrowedFd<'_>) -> bool {
         // SAFETY: an all-zero sockaddr_storage is valid for getsockname to
@@ -231,7 +372,7 @@ pub mod jailer {
     }
 
     /// The root side: one request at a time until the other side goes.
-    fn serve(sock: BorrowedFd<'_>, jails: &Jails, args: &[String]) {
+    fn serve(sock: BorrowedFd<'_>, jails: &Jails, args: &[String], seat: &str) {
         let mut running: HashMap<u16, Running> = HashMap::new();
         loop {
             let mut buf = [0u8; MSG];
@@ -262,6 +403,7 @@ pub mod jailer {
                     }
                 },
                 (Some("START"), [_, _]) => "ERR too many sessions".into(),
+                (Some("SEAT"), []) => seat_user(seat),
                 (Some(t), []) if t.starts_with("STOP ") => match t[5..].parse::<u16>().ok().and_then(|p| running.remove(&p)) {
                     Some(r) => {
                         r.kill();

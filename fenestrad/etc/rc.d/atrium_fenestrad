@@ -7,8 +7,9 @@
 # fenestrad, Fenestra's daemon on the host (docs/spec/fenestra.md §3.2,
 # §19b). Root only to bind the mint socket and to keep jaild: it forks a
 # root side that holds jaild and answers two fixed requests, and the rest
-# runs as _fenestra, which reads every peer's bytes and holds frescod's
-# link. Each viewing session gets its own jail from jaild. daemon(8)
+# runs as _fenestra in a jail of its own (system-fenestrad: no network,
+# no host paths), which reads every peer's bytes and holds frescod's link.
+# Each viewing session gets its own jail from jaild. daemon(8)
 # starts it again when it exits (frescod restarted, or not up yet).
 # Installed by scripts/fenestra-service.sh.
 #
@@ -54,12 +55,12 @@ else
 	_log="-S -T atrium-fenestrad"
 fi
 
-command_args="-f -R 2 -P ${pidfile} ${_log} /usr/local/sbin/atrium-fenestrad \
+command_args="-f -R 2 -P ${pidfile} ${_log} /usr/local/bin/atrium-fenestrad \
 	--frescod /atrium/sockets/fenestra/fenestra.sock \
 	--session /usr/local/bin/atrium-fenestra-session \
 	--mint-sock /var/run/fenestra/mint.sock \
 	--jaild /var/run/atrium/jaild.sock --lan ${atrium_fenestrad_lan} \
-	--public-ip ${atrium_fenestrad_public_ip} --user _fenestra \
+	--public-ip ${atrium_fenestrad_public_ip} --user _fenestra --jail \
 	${atrium_fenestrad_grace:+--grace ${atrium_fenestrad_grace}}"
 
 run_rc_command "$1"

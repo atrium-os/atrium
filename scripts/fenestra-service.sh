@@ -25,7 +25,9 @@ id _frescod >/dev/null 2>&1 || { echo "fenestra-service: no _frescod user (scrip
 
 install -d -m 0755 /atrium/sockets
 install -d -o _frescod -g _fenestra -m 0750 /atrium/sockets/fenestra
-install -m 0755 "$D" /usr/local/sbin/atrium-fenestrad
+# In /usr/local/bin: the unprivileged side's jail mounts it read-only.
+install -m 0755 "$D" /usr/local/bin/atrium-fenestrad
+rm -f /usr/local/sbin/atrium-fenestrad
 install -m 0755 "$SH" /usr/local/bin/fenestra-shell
 install -m 0755 "$SESS" /usr/local/bin/atrium-fenestra-session
 HERE=$(dirname "$0")/..

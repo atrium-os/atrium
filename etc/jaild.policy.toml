@@ -513,6 +513,16 @@ uid_last    = 60599
 port_first  = 24300
 port_last   = 24315
 
+# fenestrad's unprivileged side (docs/spec/fenestra.md §19b): its root side
+# (rc, root, holding only jaild) asks for this one jail, named and rooted as
+# below, running exactly exec_path as uid (_fenestra) with the root side's
+# socket as its stdio and the mint socket and frescod's link as fds 3 and 4.
+# No network at all, no device, no child jail; it reaches nothing by path.
+[fenestra_daemon]
+name      = "system-fenestrad"
+exec_path = "/usr/local/bin/atrium-fenestrad"
+uid       = 65057
+
 # ---------------------------------------------------------------
 # Environment variable allow-list for execve. Anything not
 # matching is dropped.
@@ -575,6 +585,8 @@ min_user_uid        = 1000
 max_user_uid        = 65000
 allowed_system_uids = [
     65055,   # _fasti: Calendar store service
+    65057,   # _fenestra: fenestrad's unprivileged side, in its own jail
+             # ([fenestra_daemon])
     65056,   # _imagedec: the system's image decoder, started per call by
              # portcullisd (SystemWorker) under the system worker rule
              # (image-decode-bundle.sh; app-composition.md C6)
@@ -645,6 +657,7 @@ allowed_system_uids = [
 allowed_system_gids = [
     65055,   # _fasti
     65056,   # _imagedec
+    65057,   # _fenestra
     # mirrors uid table
     65010,   # _frescod
     65011,   # _fresco-render
@@ -986,6 +999,12 @@ families = ["unix"]
 
 # Fasti validates its inherited listener with getsockopt(SO_ACCEPTCONN).
 [sysfil.profiles.calendar-store]
+include = ["base"]
+sockopts = ["0xffff:2"]
+
+# fenestrad's unprivileged side ([fenestra_daemon]): unix sockets only; it
+# checks its inherited mint socket listens (SO_ACCEPTCONN).
+[sysfil.profiles.fenestrad]
 include = ["base"]
 sockopts = ["0xffff:2"]
 

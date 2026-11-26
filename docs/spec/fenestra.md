@@ -1750,8 +1750,22 @@ jaild and one `SOCK_SEQPACKET` socket to the unprivileged side, and answers only
 32-byte requests, `START` with the session's link and mint sockets attached (refused unless both
 are local sockets) and `STOP PORT`. The session's arguments, uid, port and network are the
 root side's own; the unprivileged side can ask for a jail but not say what is in it, and may hold
-at most two (one more during a take-over). The root side ends with the other side. fenestrad is not
-yet in a jail of its own (it would need jaild to pass it the frescod link and mint socket). Without `--jaild` a session is a plain child (other systems, hosts without jaild).
+at most two (one more during a take-over). The root side ends with the other side. Without `--jaild` a session is a plain child (other systems, hosts without jaild).
+
+**fenestrad's own jail (`--jail`, what the boot service runs).** The unprivileged side is not
+forked: the root side binds the mint socket, connects to frescod in a child that drops to
+`_fenestra` first (so frescod sees `_fenestra`'s uid) and passes the socket back, then asks
+jaild for `system-fenestrad` (`[fenestra_daemon]`: exactly that name and root, exactly
+`/usr/local/bin/atrium-fenestrad` as uid and gid 65057 with no extra groups, the caller's
+stdio, `Isolated` network (an own stack with only `lo0`), no device, FUSE, child jail or locked
+memory; sysfil profile `fenestrad`). It runs `atrium-fenestrad --worker` with the root side's
+socket as stdin and stdout, the mint socket at fd 3 and frescod's link at fd 4 (each checked to
+be a local socket, the mint one listening), and refuses to run as root. Its root holds the base
+libraries and installed binaries read-only and nothing else, so it reaches no path on the host:
+the seat's user comes from the root side (`SEAT`, answered `OK <uid> <name>` from Ostiarius'
+file; requests are 64 bytes now). A stop goes to the jail through its process descriptor; the
+jail dies with the root side (the descriptor closes); when either goes the root side takes down
+the session jails and the daemon's jail, and the next start removes one left over.
 
 **fenestrad as a boot service.** `scripts/fenestra-service.sh` commissions a host once: the
 `_fenestra` user, `/atrium/sockets/fenestra` (owned `_frescod`, group `_fenestra`, 0750) where
@@ -1768,8 +1782,9 @@ jail, and the unprivileged side dies with the root side (`PROC_PDEATHSIG_CTL`), 
 left holding the mint socket or frescod's link. A socket left at the mint path by a fenestrad that
 died is removed; one that answers stops the new fenestrad. `FEN_SERVICE=1
 scripts/fenestra-desktop-vm.sh` (after `deploy-portcullis.sh`) commissions and starts the service,
-runs the whole per-app gate through it, checks a SIGHUP ends nothing, kills each side in turn and checks the pair comes back
-whole, and checks a stop leaves no fenestrad and no session jail: 24/24.
+runs the whole per-app gate through it, checks the unprivileged side runs in its own jail with
+no network and no host path, checks a SIGHUP ends nothing, kills each side in turn and checks the pair comes back
+whole, and checks a stop leaves no fenestrad and no session jail: 25/25.
 
 **The viewer's size and scale (§4.1), first step.** The viewer asks for a remote output of its
 window's size in device pixels and its scale (`Control::Output`, sides 64 to 8192, scale 0.5 to
