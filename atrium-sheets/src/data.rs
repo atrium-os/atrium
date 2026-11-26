@@ -56,6 +56,12 @@ pub enum DataCmd {
     PasteTransposed,
     /// The copied cells' comments only.
     PasteComments,
+    /// Values (or formulas) with the copied number formats; all but the
+    /// copied borders; the copied columns' widths.
+    PasteValuesNumFmt,
+    PasteFormulasNumFmt,
+    PasteNoBorders,
+    PasteWidths,
     /// The copied numbers added to, taken from, multiplied with or
     /// dividing the numbers where they land.
     PasteAdd,
@@ -261,6 +267,10 @@ pub enum DataCmd {
     /// the window runs them.
     NextComment,
     PrevComment,
+    /// Document properties (a bar); [`crate::checks::properties`].
+    Properties,
+    /// Insert Symbol (a bar); [`crate::symbols`].
+    InsertSymbol,
     /// Zero values shown or left blank on this sheet (a view setting).
     ZeroValues,
     /// Shrink to Fit on the selection.
@@ -523,6 +533,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Format Painter"), Some(DataCmd::FormatPainter)),
         (MenuItem::new("Paste Transposed").enabled(special), Some(DataCmd::PasteTransposed)),
         (MenuItem::new("Paste Comments").enabled(special), Some(DataCmd::PasteComments)),
+        (MenuItem::new("Paste Values and Number Formats").enabled(special), Some(DataCmd::PasteValuesNumFmt)),
+        (MenuItem::new("Paste Formulas and Number Formats").enabled(special), Some(DataCmd::PasteFormulasNumFmt)),
+        (MenuItem::new("Paste All Except Borders").enabled(special), Some(DataCmd::PasteNoBorders)),
+        (MenuItem::new("Paste Column Widths").enabled(special), Some(DataCmd::PasteWidths)),
         (MenuItem::new("Paste Skipping Blanks").enabled(special), Some(DataCmd::PasteSkipBlanks)),
         (MenuItem::new("Paste and Add").enabled(special), Some(DataCmd::PasteAdd)),
         (MenuItem::new("Paste and Subtract").enabled(special), Some(DataCmd::PasteSubtract)),
@@ -623,6 +637,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
         (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
         (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
+        (MenuItem::new("Properties…"), Some(DataCmd::Properties)),
+        (MenuItem::new("Insert Symbol…"), Some(DataCmd::InsertSymbol)),
         if wb.sheet_protected(s) {
             (MenuItem::new("Unprotect Sheet…"), Some(DataCmd::UnprotectSheet))
         } else {
@@ -2784,6 +2800,10 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         | DataCmd::PasteTransposed
         | DataCmd::PasteSkipBlanks
         | DataCmd::PasteComments
+        | DataCmd::PasteValuesNumFmt
+        | DataCmd::PasteFormulasNumFmt
+        | DataCmd::PasteNoBorders
+        | DataCmd::PasteWidths
         | DataCmd::PasteAdd
         | DataCmd::PasteSubtract
         | DataCmd::PasteMultiply
@@ -2796,6 +2816,10 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 DataCmd::PasteFormulas => (of(What::Formulas), "Paste Formulas"),
                 DataCmd::PasteFormats => (of(What::Formats), "Paste Formats"),
                 DataCmd::PasteComments => (of(What::Comments), "Paste Comments"),
+                DataCmd::PasteValuesNumFmt => (of(What::ValuesNumFmt), "Paste Values and Number Formats"),
+                DataCmd::PasteFormulasNumFmt => (of(What::FormulasNumFmt), "Paste Formulas and Number Formats"),
+                DataCmd::PasteNoBorders => (of(What::NoBorders), "Paste All Except Borders"),
+                DataCmd::PasteWidths => (of(What::Widths), "Paste Column Widths"),
                 DataCmd::PasteSkipBlanks => (Special { skip_blanks: true, ..of(What::All) }, "Paste Skipping Blanks"),
                 DataCmd::PasteAdd => (math(Arith::Add), "Paste and Add"),
                 DataCmd::PasteSubtract => (math(Arith::Sub), "Paste and Subtract"),
@@ -3115,7 +3139,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3596,6 +3620,22 @@ mod tests {
         let out = Rect { sheet: 1, r0: p.dest.row, c0: p.dest.col, r1: p.dest.row + 10, c1: p.dest.col + 3 };
         d.wb.each(&out, &mut |_, _, v| found |= v == Value::Num(100.0));
         assert!(found, "the copy's pivot reads the copy");
+    }
+
+    #[test]
+    fn paste_number_formats_and_widths_from_the_menu() {
+        let mut d = doc();
+        d.type_into(0, 5, "0.25");
+        d.run("Format", vec![GridOp::restyle(&d.wb, Rect { sheet: 0, r0: 0, c0: 5, r1: 0, c1: 5 }, |st| st.clone().with_num_fmt("0%"))]);
+        d.wb.sheet_mut(0).col_sizes.set(5, 200.0);
+        d.take_clip(Rect { sheet: 0, r0: 0, c0: 5, r1: 0, c1: 5 }, false, String::new());
+        run(&mut d, one(9, 6), (9, 6), DataCmd::PasteValuesNumFmt);
+        assert_eq!(d.status, "Paste Values and Number Formats: done.");
+        assert_eq!(d.wb.formatted(CellAddr::new(0, 9, 6)).text, "25%");
+        run(&mut d, one(9, 7), (9, 7), DataCmd::PasteWidths);
+        assert_eq!(d.wb.sheet(0).col_sizes.size(7), 200.0);
+        assert_eq!(cell(&d, 9, 7), "");
+        assert!(menu(&d, one(0, 0), (0, 0)).iter().any(|(m, c)| m.label == "Paste All Except Borders" && m.enabled && *c == Some(DataCmd::PasteNoBorders)));
     }
 
     #[test]

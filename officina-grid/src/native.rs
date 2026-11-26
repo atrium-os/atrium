@@ -29,6 +29,7 @@
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, a plain note, styled note or thread |
 //! | 29 | ZOOM | sheets' view zoom other than 100 %: count; per sheet, its index and percent (10–400) |
 //! | 30 | VIEW_HIDDEN | sheets showing no gridlines, headings or zeros: count; per sheet, its index and flags (1 gridlines off, 2 headings off, 4 zero values hidden) |
+//! | 36 | PROPERTIES | document properties: title, subject, author, keywords, category, comments |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -72,6 +73,7 @@ pub const SPARKLINES: u16 = 32;
 pub const WATCHES: u16 = 33;
 pub const EDIT_RANGES: u16 = 34;
 pub const IGNORED_ERRORS: u16 = 35;
+pub const PROPERTIES: u16 = 36;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -223,6 +225,12 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         w.u16(sheet as u16);
         crate::sheetareas::encode_ignored(&sh.ignored, &mut w);
         c.add(IGNORED_ERRORS, &w.into_bytes())?;
+    }
+
+    if !wb.props.is_empty() {
+        let mut w = Writer::new();
+        wb.props.encode(&mut w);
+        c.add(PROPERTIES, &w.into_bytes())?;
     }
 
     for (sheet, sh) in wb.sheets.iter().enumerate() {
@@ -695,6 +703,16 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         let list = crate::sheetareas::decode_ignored(&mut r)?;
         if !r.is_empty() { return Err(LoadError::Bad("trailing ignored error data")); }
         wb.sheet_mut(sheet).ignored = list;
+    }
+
+    let mut props = of(PROPERTIES);
+    if let Some(chunk) = props.next() {
+        if props.next().is_some() {
+            return Err(LoadError::Bad("repeated document properties"));
+        }
+        let mut r = Reader::new(c.chunk(chunk)?);
+        wb.props = crate::docprops::DocProps::decode(&mut r)?;
+        if !r.is_empty() { return Err(LoadError::Bad("trailing document properties")); }
     }
 
     let mut with_watches = std::collections::BTreeSet::new();

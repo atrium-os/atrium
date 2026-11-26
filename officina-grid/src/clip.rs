@@ -47,6 +47,27 @@ pub enum What {
     Formats,
     /// Comments only.
     Comments,
+    /// Values (formulas as their values) and the copied number formats; the
+    /// rest of the cells' formats stay.
+    ValuesNumFmt,
+    /// Formulas and values and the copied number formats.
+    FormulasNumFmt,
+    /// All but the copied borders: the cells' own borders stay.
+    NoBorders,
+    /// The copied columns' widths only.
+    Widths,
+}
+
+impl What {
+    /// Values only, formulas pasted as what they show.
+    fn values_only(self) -> bool {
+        matches!(self, What::Values | What::ValuesNumFmt)
+    }
+
+    /// Nothing of the cells' contents is pasted.
+    fn no_contents(self) -> bool {
+        matches!(self, What::Formats | What::Comments | What::Widths)
+    }
 }
 
 /// Paste Special's arithmetic: each pasted number combined with the
@@ -88,6 +109,8 @@ pub struct Clip {
     /// Comments and links on the cells, by place in the area.
     notes: Vec<(u32, u32, crate::comments::Comment)>,
     links: Vec<(u32, u32, crate::links::Link)>,
+    /// The copied columns' widths, px, left to right (empty from outside).
+    widths: Vec<f64>,
 }
 
 impl Clip {
@@ -138,7 +161,8 @@ impl Clip {
         let styles = formats.spans.into_iter().map(|(c, a, b, st)| (c - rect.c0, a - rect.r0, b - rect.r0, st)).collect();
         let inside = |&(r, c): &(u32, u32)| used.contains(CellAddr::new(rect.sheet, r, c));
         let links = wb.links(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), l)| (r - rect.r0, c - rect.c0, l.clone())).collect();
-        Clip { from: used, cut, cells, styles, notes, links }
+        let widths = wb.sheets.get(rect.sheet as usize).map_or_else(Vec::new, |sh| (used.c0..=used.c1).map(|c| sh.col_sizes.size(c)).collect());
+        Clip { from: used, cut, cells, styles, notes, links, widths }
     }
 
     pub fn rows(&self) -> u32 {
@@ -193,7 +217,10 @@ impl Clip {
     /// As [`paste_as`](Self::paste_as), with arithmetic and skipping blanks.
     pub fn paste_special(&self, wb: &Workbook, sheet: u16, row: u32, col: u32, sp: Special) -> Result<(Vec<GridOp>, Rect), String> {
         let Special { what, transpose, arith, skip_blanks } = sp;
-        if arith.is_some() && matches!(what, What::Formats | What::Comments) {
+        if what == What::Widths {
+            return self.paste_widths(wb, sheet, col);
+        }
+        if arith.is_some() && what.no_contents() {
             return Err("Formats can't be added or multiplied.".into());
         }
         if self.cut && (what != What::All || transpose || arith.is_some() || skip_blanks) {
@@ -218,7 +245,7 @@ impl Clip {
             let (r, c) = at(*dr, *dc);
             match content {
                 Content::Value(v) => values.push((r, c, v.clone())),
-                Content::Expr(_, v) if what == What::Values => {
+                Content::Expr(_, v) if what.values_only() => {
                     if !v.is_empty() {
                         values.push((r, c, v.clone()))
                     }
@@ -292,7 +319,7 @@ impl Clip {
                 }
             }
         }
-        if let (Some(op), true) = (arith, !matches!(what, What::Formats | What::Comments)) {
+        if let (Some(op), true) = (arith, !what.no_contents()) {
             // Each copied number with the cell it lands on; a copied formula
             // (pasting all or formulas) is combined with it as a formula, as
             // Excel does: =(what was there)+(the copied formula).
@@ -306,7 +333,7 @@ impl Clip {
             for (dr, dc, content) in &self.cells {
                 let (r, c) = at(*dr, *dc);
                 let right = match content {
-                    Content::Expr(..) if what != What::Values => match pasted.get(&(r, c)) {
+                    Content::Expr(..) if !what.values_only() => match pasted.get(&(r, c)) {
                         Some(e) => Expr::Paren(Box::new((**e).clone())),
                         None => continue,
                     },
@@ -340,21 +367,35 @@ impl Clip {
                 cells.push((r, c, Some(v), None));
             }
             ops.extend(by_runs(sheet, cells));
-        } else if !matches!(what, What::Formats | What::Comments) && skip_blanks {
+        } else if !what.no_contents() && skip_blanks {
             let mut cells: Vec<_> = values.into_iter().map(|(r, c, v)| (r, c, Some(v), None)).collect();
             for f in fills {
                 cells.push((f.r0, f.col, None, Some(f)));
             }
             ops.extend(by_runs(sheet, cells));
-        } else if !matches!(what, What::Formats | What::Comments) {
+        } else if !what.no_contents() {
             ops.push(GridOp::Replace(Region { rect: to, values, fills }));
         }
         if matches!(what, What::All | What::Formats) {
             ops.push(GridOp::Restyle(StyleRegion { rect: to, spans }));
+        } else if matches!(what, What::ValuesNumFmt | What::FormulasNumFmt | What::NoBorders) {
+            // Each landing cell keeps part of its own style: all but the number
+            // format, or its borders. Cells copied plain count as the default style.
+            let keep = |src: &Style, dst: &Style| if what == What::NoBorders {
+                Style { borders: dst.borders, diagonals: dst.diagonals, ..src.clone() }
+            } else {
+                Style { num_fmt: src.num_fmt.clone(), ..dst.clone() }
+            };
+            let plain = Style::default();
+            ops.push(GridOp::restyle(wb, to, |dst| keep(&plain, dst)));
+            for (c, a, b, st) in &spans {
+                let r = Rect { sheet, r0: *a, c0: *c, r1: *b, c1: *c };
+                ops.push(GridOp::restyle(wb, r, |dst| keep(st, dst)));
+            }
         }
         // Comments and links come with the cells (a cut takes them away
         // from where they were first).
-        if matches!(what, What::All | What::Comments) {
+        if matches!(what, What::All | What::Comments | What::NoBorders) {
             let fsh = self.from.sheet;
             let place = |dr: u32, dc: u32| at(dr, dc);
             if !self.notes.is_empty() {
@@ -369,7 +410,7 @@ impl Clip {
                 }
                 ops.push(GridOp::Comments { sheet, set });
             }
-            if !self.links.is_empty() && what == What::All {
+            if !self.links.is_empty() && matches!(what, What::All | What::NoBorders) {
                 if self.cut {
                     let gone: Vec<_> = self.links.iter().map(|(dr, dc, _)| (self.from.r0 + dr, self.from.c0 + dc, None)).collect();
                     ops.push(GridOp::Links { sheet: fsh, set: gone });
@@ -386,6 +427,23 @@ impl Clip {
 }
 
 impl Clip {
+    /// Paste Special's Column Widths: the copied columns' widths from column
+    /// `col` on, as one size change.
+    fn paste_widths(&self, wb: &Workbook, sheet: u16, col: u32) -> Result<(Vec<GridOp>, Rect), String> {
+        if self.widths.is_empty() {
+            return Err("Column widths come only from cells copied in Sheets.".into());
+        }
+        if (sheet as usize) >= wb.sheet_count() {
+            return Err("That sheet is gone.".into());
+        }
+        if col as u64 + self.widths.len() as u64 > MAX_COLS as u64 {
+            return Err("That doesn't fit on the sheet there.".into());
+        }
+        let over = self.widths.iter().enumerate().map(|(i, &w)| (col + i as u32, w)).collect();
+        let to = Rect { sheet, r0: 0, c0: col, r1: 0, c1: col + self.widths.len() as u32 - 1 };
+        Ok((vec![GridOp::Sizes { sheet, rows: false, over }], to))
+    }
+
     /// What else points at cells a cut moves, moved with them: defined
     /// names, conditional formats and validation rules (their areas wholly
     /// inside, and their formulas), and charts' data.
@@ -744,6 +802,54 @@ mod tests {
 
     fn run(wb: &mut Workbook, ops: Vec<GridOp>) -> GridOp {
         GridOp::Batch(ops).apply(wb)
+    }
+
+    #[test]
+    fn number_formats_borders_and_widths_paste_on_their_own() {
+        use crate::style::{Edge, Line};
+        let mut wb = wb();
+        set(&mut wb, 0, 0, "5");
+        set(&mut wb, 0, 1, "=A1*2");
+        let mut src = Style::default().with_num_fmt("0.00%");
+        src.font.bold = true;
+        src.borders[3] = Edge { line: Line::Thick, color: None };
+        wb.set_style(&rect(0, 0, 0, 1), src);
+        wb.sheet_mut(0).col_sizes.set(1, 150.0);
+        wb.recalc();
+        // Where it lands: italic, a thin top border, its own format.
+        let mut dst = Style::default().with_num_fmt("0.0");
+        dst.font.italic = true;
+        dst.borders[2] = Edge { line: Line::Thin, color: None };
+        wb.set_style(&rect(5, 0, 5, 1), dst);
+        let clip = Clip::take(&wb, rect(0, 0, 0, 1), false);
+        let paste = |wb: &Workbook, what| clip.paste_special(wb, 0, 5, 0, Special::of(what)).unwrap().0;
+        // Values and number formats: the value, the percent; still italic, never bold.
+        let ops = paste(&wb, What::ValuesNumFmt);
+        let undo = run(&mut wb, ops);
+        let st = wb.style(CellAddr::new(0, 5, 1)).clone();
+        assert_eq!((shown(&wb, 0, 5, 1).as_str(), &*st.num_fmt, st.font.italic, st.font.bold), ("10", "0.00%", true, false));
+        undo.apply(&mut wb);
+        // Formulas and number formats: the formula moves.
+        let ops = paste(&wb, What::FormulasNumFmt);
+        let undo = run(&mut wb, ops);
+        assert_eq!(shown(&wb, 0, 5, 1), "=A6*2");
+        assert_eq!(&*wb.style(CellAddr::new(0, 5, 1)).num_fmt, "0.00%");
+        undo.apply(&mut wb);
+        // All except borders: the copied style, the landing cell's borders.
+        let ops = paste(&wb, What::NoBorders);
+        let undo = run(&mut wb, ops);
+        let st = wb.style(CellAddr::new(0, 5, 0)).clone();
+        assert!(st.font.bold && !st.font.italic && st.borders[2].line == Line::Thin && st.borders[3].line == Line::None, "{st:?}");
+        assert_eq!(shown(&wb, 0, 5, 0), "5");
+        undo.apply(&mut wb);
+        // Column widths only: nothing else lands.
+        let (ops, _) = clip.paste_special(&wb, 0, 9, 3, Special::of(What::Widths)).unwrap();
+        let undo = run(&mut wb, ops);
+        assert_eq!(wb.sheet(0).col_sizes.size(4), 150.0);
+        assert_eq!(shown(&wb, 0, 9, 3), "");
+        undo.apply(&mut wb);
+        assert_ne!(wb.sheet(0).col_sizes.size(4), 150.0);
+        assert!(clip.paste_special(&wb, 0, 0, 0, Special { arith: Some(Arith::Add), ..Special::of(What::Widths) }).is_ok_and(|(ops, _)| ops.len() == 1));
     }
 
     #[test]

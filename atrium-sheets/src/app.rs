@@ -224,6 +224,12 @@ pub const FILTER_W: f32 = 300.0;
 /// A value's row in the list.
 pub const FILTER_ROW_H: f32 = 28.0;
 
+/// The Paste Special bar's choices of what to paste, as Excel lists them.
+const PASTE_WHATS: [(&str, officina_grid::clip::What); 9] = {
+    use officina_grid::clip::What;
+    [("All", What::All), ("Values", What::Values), ("Formulas", What::Formulas), ("Formats", What::Formats), ("Comments", What::Comments), ("Values+Fmt", What::ValuesNumFmt), ("Formulas+Fmt", What::FormulasNumFmt), ("No Borders", What::NoBorders), ("Widths", What::Widths)]
+};
+
 /// A validation rule's list, to pick the cell's value from (§16.83).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListPanel {
@@ -1945,10 +1951,10 @@ impl Sheets {
                 self.changed();
             }
             TabCmd::PasteWhat(_) | TabCmd::PasteOp(_) | TabCmd::PasteSkip | TabCmd::PasteTurn => {
-                use officina_grid::clip::{Arith, What};
+                use officina_grid::clip::Arith;
                 let Some(mut sp) = self.paste_bar.get() else { return };
                 match c {
-                    TabCmd::PasteWhat(i) => sp.what = [What::All, What::Values, What::Formulas, What::Formats, What::Comments][(i as usize).min(4)],
+                    TabCmd::PasteWhat(i) => sp.what = PASTE_WHATS[(i as usize).min(PASTE_WHATS.len() - 1)].1,
                     TabCmd::PasteOp(i) => sp.arith = [None, Some(Arith::Add), Some(Arith::Sub), Some(Arith::Mul), Some(Arith::Div)][(i as usize).min(4)],
                     TabCmd::PasteSkip => sp.skip_blanks = !sp.skip_blanks,
                     _ => sp.transpose = !sp.transpose,
@@ -2423,7 +2429,7 @@ impl Sheets {
             return;
         }
         if let Some(sp) = self.paste_bar.get() {
-            use officina_grid::clip::{Arith, What};
+            use officina_grid::clip::Arith;
             let st = crate::tabs::style(t.text_primary(), true);
             let mut x = 12.0;
             ctx.add(Node::Text { rect: Rect::new(x, y + 6.0, 44.0, 18.0), content: "Paste".into(), style: st.clone() });
@@ -2432,7 +2438,7 @@ impl Sheets {
                 let b = if on { Button::primary(label) } else { Button::secondary(label) };
                 b.at(x, y + 2.0).width(w).on_click(push(c)).render(ctx);
             };
-            for (i, (label, what)) in [("All", What::All), ("Values", What::Values), ("Formulas", What::Formulas), ("Formats", What::Formats), ("Comments", What::Comments)].into_iter().enumerate() {
+            for (i, (label, what)) in PASTE_WHATS.into_iter().enumerate() {
                 let w = 12.0 + 7.0 * label.len() as f32;
                 chip(ctx, label, sp.what == what, x, w, TabCmd::PasteWhat(i as u8));
                 x += w + 4.0;
@@ -4106,7 +4112,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.

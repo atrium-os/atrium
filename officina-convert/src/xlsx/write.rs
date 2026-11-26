@@ -929,9 +929,26 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     if dynamic {
         ct.push_str(r#"<Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/>"#);
     }
+    let props = wb.properties();
+    if !props.is_empty() {
+        ct.push_str(r#"<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>"#);
+    }
     ct.push_str("</Types>");
     z.add("[Content_Types].xml", ct.as_bytes())?;
-    z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
+    if props.is_empty() {
+        z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
+    } else {
+        z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>"#)?;
+        let mut core = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#);
+        for (i, (_, el, _)) in officina_grid::docprops::FIELDS.iter().enumerate() {
+            let v = props.get(i);
+            if !v.is_empty() {
+                core.push_str(&format!("<{el}>{}</{el}>", crate::xml::esc(v)));
+            }
+        }
+        core.push_str("</cp:coreProperties>");
+        z.add("docProps/core.xml", core.as_bytes())?;
+    }
     let mut w: Vec<u8> = Vec::new();
     let _ = write!(w, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {NS}>"#);
     let code_name = macros.and_then(|m| m.workbook_code.as_deref());

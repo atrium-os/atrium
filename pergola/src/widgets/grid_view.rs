@@ -2629,6 +2629,20 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         }
     }
     let lh = style.size * 1.3;
+    // An accounting underline runs across the cell; the text is then drawn without it.
+    use crate::inline::Emphasis;
+    let under = Emphasis::Underline as u8 | Emphasis::Double as u8;
+    let plain;
+    let cv = if cv.marks & (Emphasis::Accounting as u8 | Emphasis::Underline as u8) == Emphasis::Accounting as u8 | Emphasis::Underline as u8 && !cv.wrap && !cv.text.contains('\n') && cv.rotation == 0 {
+        let r = Rect::new(cx + PAD, cy + line_top(cv.valign, ch, lh), (cw - 2.0 * PAD).max(0.0), lh);
+        for n in crate::inline::rules(r, &style, cv.marks & under) {
+            ctx.add(n);
+        }
+        plain = CellView { marks: cv.marks & !(under | Emphasis::Accounting as u8), ..cv.clone() };
+        &plain
+    } else {
+        cv
+    };
     if cv.rotation != 0 && draw_rotated(ctx, cv, &style, Rect::new(cx+PAD+lead, cy, avail, ch)) {
         return;
     }
@@ -3749,6 +3763,17 @@ mod tests {
         assert_eq!(draw(CellView { marks: u, ..CellView::text("x") }, 100.0, 20.0).1.len(), 1);
         assert_eq!(draw(CellView { marks: u | crate::inline::Emphasis::Double as u8, ..CellView::text("x") }, 100.0, 20.0).1.len(), 2);
         assert_eq!(draw(CellView { marks: crate::inline::Emphasis::Double as u8, ..CellView::text("x") }, 100.0, 20.0).1.len(), 0, "double alone draws nothing");
+        // An accounting underline spans the cell, not the text.
+        let widths = |marks: u8| {
+            let mut app = App::new(One(CellView { marks, ..CellView::text("x") }, 100.0, 20.0));
+            app.tick();
+            app.tree().iter().filter_map(|(_, n)| match n { Node::Rect { rect, .. } if rect.h() <= 2.0 => Some(rect.w()), _ => None }).collect::<Vec<f32>>()
+        };
+        let acc = crate::inline::Emphasis::Accounting as u8;
+        assert!(widths(u).iter().all(|&w| w < 20.0), "{:?}", widths(u));
+        let w = widths(u | acc);
+        assert!(w.len() == 1 && w[0] > 80.0, "{w:?}");
+        assert_eq!(widths(u | acc | crate::inline::Emphasis::Double as u8).len(), 2);
     }
 
     #[test]

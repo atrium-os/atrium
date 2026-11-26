@@ -928,6 +928,54 @@ fn trailing_row_style(
 
 /// Reads an `.ods` package into a workbook.
 
+/// The document properties in `meta.xml`: keywords (one element each)
+/// joined with commas, the category from a user-defined property named
+/// Category or (as LibreOffice keeps `.xlsx`'s) OOXMLCorePropertyCategory.
+/// What can't be read is left out.
+fn meta_properties(xml: &[u8]) -> officina_grid::docprops::DocProps {
+    use officina_grid::docprops::{DocProps, FIELDS, MAX_PROP};
+    let mut p = DocProps::default();
+    let mut r = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut at: Option<usize> = None;
+    let mut text = String::new();
+    let mut keywords: Vec<String> = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                at = if name == "meta:user-defined" {
+                    attrs(&e).get("meta:name").filter(|n| n.eq_ignore_ascii_case("category") || n.as_str() == "OOXMLCorePropertyCategory").map(|_| 4)
+                } else {
+                    FIELDS.iter().position(|(_, _, odf)| *odf == name && name != "meta:user-defined")
+                };
+                text.clear();
+            }
+            Ok(Event::Text(t)) if at.is_some() => {
+                if let Ok(s) = t.unescape() {
+                    if text.len() + s.len() <= MAX_PROP {
+                        text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::End(_)) => match at.take() {
+                Some(3) => {
+                    if keywords.len() < 256 && !text.trim().is_empty() {
+                        keywords.push(text.trim().to_string());
+                    }
+                }
+                Some(i) => p.set(i, &text),
+                None => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    p.set(3, &keywords.join(", "));
+    p
+}
+
 pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let z = Archive::open(data)?;
     let mut out = Loaded::default();
@@ -946,6 +994,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     styles.read(&content, &mut rep);
 
     let mut wb = Workbook::with_date_system(date_system(&content, &mut rep)?);
+    if let Some(m) = z.read_name("meta.xml")? {
+        wb.set_properties(meta_properties(&m));
+    }
     let mut style_ids: HashMap<String, StyleId> = HashMap::new();
     let mut r = Reader::from_reader(&content[..]);
     r.config_mut().trim_text(false);

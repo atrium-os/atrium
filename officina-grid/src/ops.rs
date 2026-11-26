@@ -124,6 +124,8 @@ pub enum GridOp {
     IgnoredErrors { sheet: u16, list: Vec<crate::sheetareas::Ignored> },
     /// Protect Sheet on (with its verifier and allowances) or off.
     Protection { sheet: u16, protection: Option<crate::protection::SheetProtection> },
+    /// The workbook's document properties, all replaced.
+    Properties(crate::docprops::DocProps),
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -379,6 +381,11 @@ impl GridOp {
                     }
                     None => w.u8(0),
                 }
+                return w.into_bytes();
+            }
+            GridOp::Properties(p) => {
+                w.u8(37);
+                p.encode(&mut w);
                 return w.into_bytes();
             }
             GridOp::IgnoredErrors { sheet, list } => {
@@ -673,6 +680,13 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::Protection { sheet, protection });
+        }
+        if kind == 37 {
+            let p = crate::docprops::DocProps::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Properties(p));
         }
         if kind == 35 {
             let sheet = r.u16()?;
@@ -1022,6 +1036,7 @@ impl Op<Workbook> for GridOp {
                 }
                 GridOp::Protection { sheet, protection }
             }
+            GridOp::Properties(p) => GridOp::Properties(std::mem::replace(&mut wb.props, p)),
             GridOp::IgnoredErrors { sheet, mut list } => {
                 match wb.sheets.get_mut(sheet as usize) {
                     Some(sh) if crate::sheetareas::valid_ignored(&list) => std::mem::swap(&mut sh.ignored, &mut list),

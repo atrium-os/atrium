@@ -31,4 +31,5 @@ pub mod checks;
 pub mod arrows;
 pub mod dataform;
 pub mod special;
+pub mod symbols;
 pub mod lock;

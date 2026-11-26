@@ -16,6 +16,9 @@ pub enum Emphasis {
     /// Smaller text, raised or lowered (a whole spreadsheet cell's).
     Super = 32,
     Sub = 64,
+    /// With `Underline`: the line runs across the whole cell (a
+    /// spreadsheet's accounting underline).
+    Accounting = 128,
 }
 
 /// The share of the size super- and subscript text is drawn at, and how far

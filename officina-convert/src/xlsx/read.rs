@@ -1452,6 +1452,43 @@ fn skip(r: &mut Reader<&[u8]>, e: &BytesStart) -> Result<(), XlsxError> {
     Ok(())
 }
 
+/// The document properties in `docProps/core.xml`; what can't be read is
+/// left out.
+fn core_properties(xml: &[u8]) -> officina_grid::docprops::DocProps {
+    use officina_grid::docprops::{DocProps, FIELDS, MAX_PROP};
+    let mut p = DocProps::default();
+    let mut r = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut at: Option<usize> = None;
+    let mut text = String::new();
+    loop {
+        buf.clear();
+        match r.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.local_name();
+                let name = String::from_utf8_lossy(name.as_ref()).into_owned();
+                at = FIELDS.iter().position(|(_, ooxml, _)| ooxml.split(':').nth(1) == Some(name.as_str()));
+                text.clear();
+            }
+            Ok(Event::Text(t)) if at.is_some() => {
+                if let Ok(s) = t.unescape() {
+                    if text.len() + s.len() <= MAX_PROP {
+                        text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                if let Some(i) = at.take() {
+                    p.set(i, &text);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    p
+}
+
 /// Reads an `.xlsx` (or `.xlsm`) package into a workbook.
 pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     let z = Archive::open(data)?;
@@ -1562,6 +1599,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     if let Some(it) = iteration {
         if !wb.set_iteration(Some(it)) {
             out.report.note(Kind::Dropped, "iteration settings");
+        }
+    }
+    if let Some(core) = root.values().find(|(t, _)| t.ends_with("/metadata/core-properties")).map(|(_, p)| p.clone()) {
+        if let Some(xml) = z.read_name(&core)? {
+            wb.set_properties(core_properties(&xml));
         }
     }
     if let Some(attrs) = structure {

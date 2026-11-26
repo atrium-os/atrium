@@ -184,6 +184,7 @@ pub enum Finding {
     Macros,
     PivotTables,
     Watches,
+    Properties,
 }
 
 /// One line of the inspector: what, how many, what it says, and whether
@@ -235,8 +236,10 @@ pub fn inspect(d: &Doc) -> Vec<Inspected> {
     let pivots = wb.pivots().len();
     let macros = wb.macros().is_some();
     let n = |k: u64, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
+    let props: Vec<&str> = officina_grid::docprops::FIELDS.iter().enumerate().filter(|(i, _)| !wb.properties().get(*i).is_empty()).map(|(_, f)| f.0).collect();
     vec![
         Inspected { what: Finding::Comments, title: "Comments", count: comments, detail: if comments > 0 { format!("{} found.", n(comments as u64, "comment", "comments")) } else { "None found.".into() }, removable: true },
+        Inspected { what: Finding::Properties, title: "Document properties", count: props.len(), detail: if props.is_empty() { "None found.".into() } else { format!("The file names its {}.", props.join(", ")) }, removable: true },
         Inspected { what: Finding::HiddenRowsCols, title: "Hidden rows and columns", count: (rows + cols) as usize, detail: if rows + cols > 0 { format!("{} and {} with data around them. Remove All deletes them and what they hold.", n(rows, "hidden row", "hidden rows"), n(cols, "hidden column", "hidden columns")) } else { "None found.".into() }, removable: true },
         Inspected { what: Finding::HiddenSheets, title: "Hidden worksheets", count: hidden_sheets.len(), detail: if hidden_sheets.is_empty() { "None found.".into() } else { format!("{}. Remove All deletes them.", hidden_sheets.join(", ")) }, removable: true },
         Inspected { what: Finding::Scenarios, title: "Defined scenarios", count: scenarios, detail: if scenarios > 0 { format!("{} found.", n(scenarios as u64, "scenario", "scenarios")) } else { "None found.".into() }, removable: true },
@@ -281,6 +284,11 @@ pub fn remove(d: &mut Doc, what: Finding) -> Result<String, String> {
             }
             d.remove_macros();
             return Ok("Macros removed. The file keeps them until you save it.".into());
+        }
+        Finding::Properties => {
+            if !d.wb.properties().is_empty() {
+                ops.push(GridOp::Properties(Default::default()));
+            }
         }
         Finding::PivotTables => return Err("PivotTables stay: delete one by deleting its cells.".into()),
         Finding::HiddenSheets => return remove_hidden_sheets(d),
@@ -355,6 +363,28 @@ fn remove_hidden_rows_cols(d: &mut Doc) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn properties_bar_sets_names_clears_and_inspector_removes() {
+        use super::*;
+        let mut d = crate::doc::Doc::from_csv("p.csv", b"a\n").unwrap().0;
+        assert_eq!(properties_start(&d), "title: ");
+        assert!(properties(&mut d, "colour: red").unwrap_err().contains("isn't a property"));
+        assert!(properties(&mut d, "Budget").is_err());
+        properties(&mut d, "title: Budget 2027; Author: Ana Rao; keywords: plan, money").unwrap();
+        assert_eq!(properties_start(&d), "title: Budget 2027; author: Ana Rao; keywords: plan, money");
+        properties(&mut d, "author:").unwrap();
+        assert_eq!(d.wb.properties().get(2), "");
+        let found = inspect(&d);
+        let line = found.iter().find(|f| f.what == Finding::Properties).unwrap();
+        assert_eq!((line.count, line.detail.as_str()), (2, "The file names its title, keywords."));
+        remove(&mut d, Finding::Properties).unwrap();
+        assert!(d.wb.properties().is_empty());
+        assert!(d.undo());
+        assert_eq!(d.wb.properties().get(0), "Budget 2027");
+        properties(&mut d, "clear").unwrap();
+        assert!(d.wb.properties().is_empty());
+    }
+
     use super::*;
 
     fn doc(csv: &[u8]) -> Doc {
@@ -466,4 +496,41 @@ mod tests {
         assert!(d.undo());
         assert_eq!(d.wb.sheet_count(), 2);
     }
+}
+
+/// The Properties bar's text: each property set, as `title: Budget; author: Ana`.
+pub fn properties_start(d: &Doc) -> String {
+    let p = d.wb.properties();
+    let set: Vec<String> = officina_grid::docprops::FIELDS.iter().enumerate().filter(|(i, _)| !p.get(*i).is_empty()).map(|(i, f)| format!("{}: {}", f.0, p.get(i).replace('\n', " ").replace(';', ","))).collect();
+    if set.is_empty() { "title: ".into() } else { set.join("; ") }
+}
+
+/// Properties…: `title: Budget; author: Ana Rao` sets the properties it
+/// names (`subject:` alone clears one; `clear` clears them all). One step.
+pub fn properties(d: &mut Doc, typed: &str) -> Result<String, String> {
+    use officina_grid::docprops::{DocProps, FIELDS};
+    let mut p = d.wb.properties().clone();
+    let t = typed.trim();
+    if t.eq_ignore_ascii_case("clear") || t.eq_ignore_ascii_case("none") {
+        p = DocProps::default();
+    } else {
+        let mut named = 0;
+        for part in t.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+            let (k, v) = part.split_once(':').ok_or_else(|| format!("{part:?}: type a property, a colon and its value, such as title: Budget"))?;
+            let i = DocProps::index(k).ok_or_else(|| format!("{:?} isn't a property: use {}.", k.trim(), FIELDS.iter().map(|f| f.0).collect::<Vec<_>>().join(", ")))?;
+            p.set(i, v);
+            named += 1;
+        }
+        if named == 0 {
+            return Err("Type a property, a colon and its value, such as title: Budget".into());
+        }
+    }
+    if &p == d.wb.properties() {
+        return Ok("The properties are already so.".into());
+    }
+    d.status.clear();
+    d.run("Properties", vec![GridOp::Properties(p)]);
+    refused(d)?;
+    let set = FIELDS.iter().enumerate().filter(|(i, _)| !d.wb.properties().get(*i).is_empty()).count();
+    Ok(if set == 0 { "The document has no properties now.".into() } else { format!("Properties set: {}.", properties_start(d)) })
 }

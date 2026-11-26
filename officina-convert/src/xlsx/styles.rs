@@ -188,6 +188,7 @@ struct FontIn {
     strike: bool,
     color: Option<u32>,
     double: bool,
+    accounting: bool,
     script: officina_grid::style::Script,
 }
 
@@ -332,6 +333,7 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                     b"u" => {
                         font.underline = val.is_none_or(|v| v != "none");
                         font.double = val.is_some_and(|v| v == "double" || v == "doubleAccounting");
+                        font.accounting = val.is_some_and(|v| v == "singleAccounting" || v == "doubleAccounting");
                     }
                     b"vertAlign" => {
                         font.script = match val.map(String::as_str) {
@@ -509,6 +511,7 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                 color: f.color.filter(|c| Some(*c) != base.color
                     || (fo != 0 && font_colors.get(fo) != font_colors.first())),
                 double: f.underline && f.double,
+                accounting: f.underline && f.accounting,
                 script: f.script,
             };
         }
@@ -722,7 +725,12 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
             o.push_str("<strike/>");
         }
         if f.underline {
-            o.push_str(if f.double { r#"<u val="double"/>"# } else { "<u/>" });
+            o.push_str(match (f.double, f.accounting) {
+                (false, false) => "<u/>",
+                (true, false) => r#"<u val="double"/>"#,
+                (false, true) => r#"<u val="singleAccounting"/>"#,
+                (true, true) => r#"<u val="doubleAccounting"/>"#,
+            });
         }
         match f.script {
             officina_grid::style::Script::Super => o.push_str(r#"<vertAlign val="superscript"/>"#),

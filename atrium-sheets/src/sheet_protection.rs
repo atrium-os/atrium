@@ -57,6 +57,8 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         GridOp::Links { sheet, .. } => open_to(wb, *sheet, "insertHyperlinks"),
         // A calculation setting of the workbook, not a sheet's contents.
         GridOp::Iteration(_) | GridOp::Structure(_) | GridOp::Calculation(_) => true,
+        // The document's properties, not a sheet's contents.
+        GridOp::Properties(_) => true,
         // What the Watch Window shows is no part of the sheet's contents.
         GridOp::Watches { .. } => true,
         // Error Checking's view, not the sheet's contents.

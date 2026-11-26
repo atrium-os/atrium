@@ -37,7 +37,7 @@ impl Clip {
         }
         styles.sort_unstable_by_key(|&(col, row, _, _)| (col, row));
         let from = Rect { sheet: 0, r0: 0, c0: 0, r1: rows as u32 - 1, c1: cols as u32 - 1 };
-        Some(Clip { from, cut: false, cells, styles, notes: Vec::new(), links: Vec::new() })
+        Some(Clip { from, cut: false, cells, styles, notes: Vec::new(), links: Vec::new(), widths: Vec::new() })
     }
 
     /// Encode a copy as values, styles and comments, with a per-copy ID that can match
@@ -134,7 +134,7 @@ impl Clip {
         }
         // Clipboard contents are position-independent and never cut.
         let from = Rect { sheet: 0, r0: 0, c0: 0, r1: rows - 1, c1: cols - 1 };
-        Ok(Clip { from, cut: false, cells, styles, notes, links: Vec::new() })
+        Ok(Clip { from, cut: false, cells, styles, notes, links: Vec::new(), widths: Vec::new() })
     }
 }
 

@@ -48,6 +48,39 @@ const NS: &str = concat!(
     r#"office:version="1.3""#
 );
 
+/// The document properties as `meta.xml` elements: a keyword element each,
+/// the category as the user-defined property LibreOffice keeps `.xlsx`'s in.
+fn meta_props(wb: &Workbook) -> String {
+    let p = wb.properties();
+    let mut out = String::new();
+    for (i, (_, _, el)) in officina_grid::docprops::FIELDS.iter().enumerate() {
+        let v = p.get(i);
+        if v.is_empty() {
+            continue;
+        }
+        match i {
+            3 => {
+                for k in v.split([',', ';']).map(str::trim).filter(|k| !k.is_empty()) {
+                    out.push_str("<meta:keyword>");
+                    esc(&mut out, k);
+                    out.push_str("</meta:keyword>");
+                }
+            }
+            4 => {
+                out.push_str(r#"<meta:user-defined meta:name="OOXMLCorePropertyCategory">"#);
+                esc(&mut out, v);
+                out.push_str("</meta:user-defined>");
+            }
+            _ => {
+                let _ = write!(out, "<{el}>");
+                esc(&mut out, v);
+                let _ = write!(out, "</{el}>");
+            }
+        }
+    }
+    out
+}
+
 pub(super) fn esc(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -1661,7 +1694,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     }
     let settings_entry = if settings.is_some() { r#"<manifest:file-entry manifest:full-path="settings.xml" manifest:media-type="text/xml"/>"# } else { "" };
     let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>{settings_entry}{objects}</manifest:manifest>"#);
-    let meta = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" office:version="1.3"><office:meta><meta:generator>Officina</meta:generator></office:meta></office:document-meta>"#);
+    let meta = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.3"><office:meta><meta:generator>Officina</meta:generator>{}</office:meta></office:document-meta>"#, meta_props(wb));
     let mut z = ZipWriter::new(out);
     // The mimetype first and stored, so the file can be recognised by its bytes.
     z.add_stored("mimetype", MIME.as_bytes())?;

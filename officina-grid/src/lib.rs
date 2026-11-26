@@ -24,6 +24,7 @@ pub mod tracking;
 pub mod condfmt;
 pub mod csv;
 pub mod deps;
+pub mod docprops;
 pub mod eval;
 pub mod fast;
 pub mod filter;

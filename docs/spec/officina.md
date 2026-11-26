@@ -5262,6 +5262,22 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
 - LibreOffice check (`officina-convert/examples/fonteffects_lo.rs write|read`, LibreOffice 24.2 in the cloud container): our `.xlsx` and our `.ods` converted by LibreOffice keep all six effects and alignments, and LibreOffice's `.ods` of our file reads back with all of them.
 - Tests: `officina-grid` `style` (effects through the native encoding; super and sub together refused), `officina-convert` `tests/fonteffects.rs` (`.xlsx` and `.ods` round trips), Pergola `fill_justify_distributed_and_script_cells_draw_as_spreadsheets_do` (repeats, word positions, a paragraph's last line, script size and offset, one rule or two), Sheets `format` (the toggles reaching the grid's cell, undo; next comment order and wrap) and `app` (Next Comment moving the cursor and its status).
 
+### 16.152 Document properties, the rest of Paste Special, accounting underlines, Insert Symbol (2026-11-26)
+
+`officina-grid/src/docprops.rs`, `What` in `officina-grid/src/clip.rs`, `Font::accounting`, `officina-convert` `xlsx/read.rs`, `xlsx/write.rs`, `ods/read.rs`, `ods/write.rs`, `atrium-sheets/src/checks.rs` (`properties`), `atrium-sheets/src/symbols.rs`.
+
+- **Properties…** (a bar, for example `title: Budget 2027; author: Ana Rao`): the workbook's title, subject, author, keywords, category and comments, as Excel's File > Info keeps them. `NAME:` on its own clears one property and `clear` clears them all. Each property is trimmed, has its control characters dropped (line breaks are kept), and holds at most 4,096 bytes. `GridOp::Properties` (tag 37) makes this one undo step, allowed on protected sheets and structure. Saved as native chunk 36 PROPERTIES, `.xlsx` `docProps/core.xml` (written only when one is set, `dc:title`, `dc:subject`, `dc:creator`, `cp:keywords`, `cp:category`, `dc:description`), and `.ods` `meta.xml` (`dc:title`, `dc:subject`, `meta:initial-creator`, one `meta:keyword` for each keyword, `dc:description`, and the category as the user-defined property `OOXMLCorePropertyCategory`, as LibreOffice keeps `.xlsx`'s). The **Document Inspector** lists the properties set, second after comments, and Remove All clears them.
+- **Paste Special** gains Excel's remaining choices, each in the Paste menu and on the Paste Special bar:
+  - **Values and Number Formats** and **Formulas and Number Formats**: the contents with the copied cells' number formats, each landing cell keeping the rest of its own style.
+  - **All Except Borders**: everything, with each landing cell keeping its own borders and diagonals.
+  - **Column Widths**: only the copied columns' widths, kept with the copy when it was taken.
+
+  Each is one step.
+- **Single Accounting Underline** and **Double Accounting Underline** (the Format menu): the line runs under the whole cell's width rather than the text's, for one-line text. Native flag bit 5, `.xlsx` `singleAccounting`/`doubleAccounting` (and `.xls` underline 0x21/0x22). `.ods` has no accounting underline, so it saves as a plain single or double underline, as LibreOffice does.
+- **Insert Symbol…** (a bar): a symbol by its name (44 of them: degree, euro, rupee, plus minus, not equal, check, arrows, fractions…), by its code (`U+2122`), or typed as itself (at most 8 characters, no control characters, no surrogates), put after the cursor cell's text as one step. Refused in a formula cell.
+- LibreOffice check (`officina-convert/examples/fonteffects_lo.rs`, LibreOffice 24.2): all six properties survive our `.xlsx` to LibreOffice's `.ods` and our `.ods` to LibreOffice's `.xlsx`. LibreOffice writes keywords to `.xlsx` joined by spaces (`budget plan`) and drops accounting underlines to plain ones.
+- Tests: `officina-grid` `docprops` (cleaning, bounds, the native file and undo) and `clip` (each new paste choice: what lands and what stays, undo), `officina-convert` `tests/fonteffects.rs` (properties through `.xlsx` and `.ods`, no `core.xml` when none are set; accounting underlines through `.xlsx`), Pergola (an accounting underline spans the cell), Sheets `checks` (the Properties bar, the inspector line, Remove All and undo), `symbols`, `format` (the accounting toggles) and `data` (the paste commands from the menu).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

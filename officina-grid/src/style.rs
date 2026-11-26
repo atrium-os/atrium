@@ -116,6 +116,9 @@ pub struct Font {
     pub color: Option<u32>,
     /// The underline is doubled (only with `underline`).
     pub double: bool,
+    /// The underline is an accounting one: across the cell's width, not
+    /// only the text's (only with `underline`).
+    pub accounting: bool,
     pub script: Script,
 }
 
@@ -130,7 +133,7 @@ pub enum Script {
 
 impl Default for Font {
     fn default() -> Self {
-        Font { name: None, size: None, bold: false, italic: false, underline: false, strike: false, color: None, double: false, script: Script::Normal }
+        Font { name: None, size: None, bold: false, italic: false, underline: false, strike: false, color: None, double: false, accounting: false, script: Script::Normal }
     }
 }
 
@@ -270,7 +273,7 @@ impl Style {
         w.u8(f.bold as u8 | (f.italic as u8) << 1 | (f.underline as u8) << 2 | (f.strike as u8) << 3 | (self.wrap as u8) << 4
             | (self.unlocked as u8) << 5 | (self.hide_formula as u8) << 6 | (self.hide_value as u8) << 7);
         color_out(w, f.color);
-        let effects = u8::from(f.double && f.underline) << 2 | match f.script { Script::Normal => 0, Script::Super => 1 << 3, Script::Sub => 1 << 4 };
+        let effects = u8::from(f.double && f.underline) << 2 | match f.script { Script::Normal => 0, Script::Super => 1 << 3, Script::Sub => 1 << 4 } | u8::from(f.accounting && f.underline) << 5;
         let extended = self.shrink_to_fit || self.gradient.is_some() || self.diagonals.iter().any(|e| e.line != Line::None) || effects != 0;
         if extended {
             w.u8(3);
@@ -325,8 +328,9 @@ impl Style {
         let mut effects = 0;
         if tag == 3 {
             let extra = r.u8()?;
-            // Bit 2 a double underline, bit 3 superscript, bit 4 subscript.
-            if extra > 0x1F || extra & 0x18 == 0x18 {
+            // Bit 2 a double underline, bit 3 superscript, bit 4 subscript,
+            // bit 5 an accounting underline.
+            if extra > 0x3F || extra & 0x18 == 0x18 {
                 return Err(WireError::Invalid("extra style flags"));
             }
             shrink_to_fit = extra & 1 != 0;
@@ -378,6 +382,7 @@ impl Style {
                 strike: flags & 8 != 0,
                 color,
                 double: flags & 4 != 0 && effects & 4 != 0,
+                accounting: flags & 4 != 0 && effects & 32 != 0,
                 script: if effects & 8 != 0 { Script::Super } else if effects & 16 != 0 { Script::Sub } else { Script::Normal },
             },
             fill,

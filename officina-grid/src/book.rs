@@ -253,6 +253,7 @@ pub struct Workbook {
     /// Allow Edit Ranges unlocked by their password for this session: their
     /// verifiers. Never saved, as in Excel (until the workbook closes).
     pub(crate) unlocked_ranges: Vec<String>,
+    pub(crate) props: crate::docprops::DocProps,
     pub(crate) sheets: Vec<Sheet>,
     pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
@@ -316,6 +317,7 @@ impl Workbook {
             manual: false,
             structure: None,
             unlocked_ranges: Vec::new(),
+            props: Default::default(),
             sheets: Vec::new(),
             tracked_cells: None,
             strings: StringPool::new(),

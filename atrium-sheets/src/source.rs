@@ -127,6 +127,7 @@ pub fn font_marks(f: &officina_grid::style::Font) -> u8 {
     use officina_grid::style::Script;
     (if f.italic { Emphasis::Italic as u8 } else { 0 }) | (if f.underline { Emphasis::Underline as u8 } else { 0 }) | (if f.strike { Emphasis::Strike as u8 } else { 0 })
         | (if f.underline && f.double { Emphasis::Double as u8 } else { 0 })
+        | (if f.underline && f.accounting { Emphasis::Accounting as u8 } else { 0 })
         | match f.script { Script::Normal => 0, Script::Super => Emphasis::Super as u8, Script::Sub => Emphasis::Sub as u8 }
 }
 

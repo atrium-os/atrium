@@ -17,6 +17,9 @@ pub enum FormatCmd {
     Strike,
     /// A double underline on (an underline doubled) or back to single.
     DoubleUnderline,
+    /// An accounting underline (across the cell; single, or double with
+    /// `true`) on, or off.
+    Accounting(bool),
     /// Superscript or subscript on the whole cell, or back to normal.
     Script(officina_grid::style::Script),
     /// Left, centre, right, or as the value says (General).
@@ -168,7 +171,9 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Italic").checked(st.font.italic).shortcut("Ctrl+I"), Some(FormatCmd::Italic)),
         (MenuItem::new("Underline").checked(st.font.underline).shortcut("Ctrl+U"), Some(FormatCmd::Underline)),
         (MenuItem::new("Strikethrough").checked(st.font.strike).shortcut("Ctrl+5"), Some(FormatCmd::Strike)),
-        (MenuItem::new("Double Underline").checked(st.font.underline && st.font.double), Some(FormatCmd::DoubleUnderline)),
+        (MenuItem::new("Double Underline").checked(st.font.underline && st.font.double && !st.font.accounting), Some(FormatCmd::DoubleUnderline)),
+        (MenuItem::new("Single Accounting Underline").checked(st.font.underline && st.font.accounting && !st.font.double), Some(FormatCmd::Accounting(false))),
+        (MenuItem::new("Double Accounting Underline").checked(st.font.underline && st.font.accounting && st.font.double), Some(FormatCmd::Accounting(true))),
         (MenuItem::new("Superscript").checked(st.font.script == Script::Super), Some(FormatCmd::Script(Script::Super))),
         (MenuItem::new("Subscript").checked(st.font.script == Script::Sub), Some(FormatCmd::Script(Script::Sub))),
         (MenuItem::new(format!("Larger Text ({pt} pt)")).separated(), Some(FormatCmd::Larger)),
@@ -325,14 +330,24 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
         FormatCmd::Italic => toggle!("Italic", italic),
         FormatCmd::Underline => {
             let on = !first.font.underline;
-            one(d, "Underline", &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = false; st });
+            one(d, "Underline", &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = false; st.font.accounting = false; st });
             Ok(format!("Underline {}.", if on { "on" } else { "off" }))
         }
         FormatCmd::Strike => toggle!("Strikethrough", strike),
         FormatCmd::DoubleUnderline => {
-            let on = !(first.font.underline && first.font.double);
-            one(d, "Double Underline", &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = on; st });
+            let on = !(first.font.underline && first.font.double && !first.font.accounting);
+            one(d, "Double Underline", &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = on; st.font.accounting = false; st });
             Ok(if on { "Double underline on.".into() } else { "Double underline off.".into() })
+        }
+        FormatCmd::Accounting(double) => {
+            let f = &first.font;
+            let on = !(f.underline && f.accounting && f.double == double);
+            one(d, if double { "Double Accounting Underline" } else { "Single Accounting Underline" }, &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = on && double; st.font.accounting = on; st });
+            Ok(match (on, double) {
+                (false, _) => "Accounting underline off.".into(),
+                (true, false) => "Single accounting underline: across the cell.".into(),
+                (true, true) => "Double accounting underline: across the cell.".into(),
+            })
         }
         FormatCmd::Script(want) => {
             let to = if first.font.script == want { Script::Normal } else { want };
@@ -546,6 +561,14 @@ mod tests {
         // Plain Underline off takes the double away too.
         run(&mut d.borrow_mut(), sel, FormatCmd::Underline);
         assert!(!st(&d).font.underline && !st(&d).font.double);
+        // Accounting: across the cell, single or double; asked again, off.
+        run(&mut d.borrow_mut(), sel, FormatCmd::Accounting(true));
+        assert!(st(&d).font.underline && st(&d).font.double && st(&d).font.accounting);
+        assert!(src.cell(0, 0).unwrap().marks & Emphasis::Accounting as u8 != 0);
+        run(&mut d.borrow_mut(), sel, FormatCmd::Accounting(false));
+        assert!(st(&d).font.accounting && !st(&d).font.double);
+        run(&mut d.borrow_mut(), sel, FormatCmd::Accounting(false));
+        assert!(!st(&d).font.underline && !st(&d).font.accounting);
         for (a, spread) in [(HAlign::Fill, Spread::Fill), (HAlign::Justify, Spread::Justify), (HAlign::Distributed, Spread::Distributed), (HAlign::Left, Spread::None)] {
             run(&mut d.borrow_mut(), sel, FormatCmd::Align(a));
             assert_eq!(src.cell(0, 0).unwrap().spread, spread);
