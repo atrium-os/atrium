@@ -1,0 +1,10 @@
+# Triggered background work is not built (insula.md §11.4): refused, not ignored.
+# EXPECT_ERROR: unknown field
+[app]
+id      = "org.example.bg"
+name    = "Bg"
+version = "1"
+entry   = "bin/x"
+
+[background.triggered]
+on = "push"

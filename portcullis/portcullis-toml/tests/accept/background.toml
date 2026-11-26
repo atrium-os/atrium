@@ -1,0 +1,19 @@
+# A bar app that asks to open at sign-in, and a server port it asks for
+# (background-apps.md §3.1, §4.1). Asks only: the person allows each.
+[app]
+id      = "org.example.clipboard-history"
+name    = "Clipboard History"
+version = "0.1.0"
+entry   = "bin/clipboard-history"
+
+[background.resident]
+start   = "sign-in"
+restart = "on-failure"
+
+[resources]
+memory = "128M"
+cpu    = 25
+
+[capabilities.network]
+outbound = "any"
+listen = [{ port = 8080, proto = "tcp", from = "local-network" }]

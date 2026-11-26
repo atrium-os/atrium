@@ -28,6 +28,10 @@ pub struct Manifest {
     pub setup:        Option<SetupSection>,
     pub resources:    Option<ResourcesSection>,
     pub supervision:  Option<SupervisionSection>,
+    /// `[background.resident]` (background-apps.md §3.1): the app asks to run
+    /// while the person is signed in, supervised. A request only: nothing
+    /// runs in the background until the person allows it, per persona.
+    pub background:   Option<BackgroundSection>,
     /// `[[opens]]`: the file types the app opens (opening-files.md §5.1).
     /// Eligibility only: it puts the app on a type's "Open with" list and
     /// gives it no file.
@@ -232,6 +236,30 @@ impl Manifest {
             }
         }
         (!v.is_empty()).then(|| format!("Opens links: {}", v.join(", ")))
+    }
+
+    /// The words for what `[background.resident]` and `listen` ask
+    /// (background-apps.md §3.2, §4.2): the install sheet, Settings › Apps,
+    /// the launch prompt and Artifex's Package card all show these, so they
+    /// never drift. Each is a separate switch the person turns on, never
+    /// part of what Allow grants.
+    pub fn background_lines(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        match self.resident().map(|r| r.start) {
+            Some(ResidentStart::SignIn) => v.push("Opens when you sign in and keeps running in the background (if you allow it)".into()),
+            Some(ResidentStart::Manual) => v.push("Keeps running in the background once opened (if you allow it)".into()),
+            None => {}
+        }
+        for l in self.listen() {
+            let proto = if l.proto == crate::network::Proto::Udp { " (UDP)" } else { "" };
+            v.push(match l.from {
+                crate::network::ListenFrom::LocalNetwork => format!(
+                    "Lets devices on your network connect on port {}{proto} (if you allow it, per network)", l.port),
+                crate::network::ListenFrom::ThisComputer => format!(
+                    "Lets your own programs on this computer connect on port {}{proto} (if you allow it)", l.port),
+            });
+        }
+        v
     }
 
     /// For the install screen: "Opens Audio: FLAC audio, MP3 audio", one
@@ -774,6 +802,42 @@ pub struct SupervisionSection {
     pub instances:  Option<InstancesPolicy>,
 }
 
+/// `[background]`. Only `resident` exists today; the other lifecycle classes
+/// of insula.md §11 are refused as unknown keys until they are built.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundSection {
+    pub resident: Option<ResidentSection>,
+}
+
+/// `[background.resident]`: runs while the person is signed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidentSection {
+    pub start:   ResidentStart,
+    /// Absent = `on-failure`.
+    #[serde(default)]
+    pub restart: ResidentRestart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResidentStart {
+    /// Opened at the person's sign-in, if they allowed it.
+    SignIn,
+    /// Opened only by the person, then kept running until quit.
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResidentRestart {
+    /// A non-zero exit or a signal restarts it (with the burst limit).
+    #[default]
+    OnFailure,
+    Never,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
@@ -794,6 +858,17 @@ impl Manifest {
     /// applied at this stage — call `validate()` for that.
     pub fn from_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
+    }
+
+    /// `[background.resident]`, if the app asks to run in the background.
+    pub fn resident(&self) -> Option<ResidentSection> {
+        self.background.as_ref().and_then(|b| b.resident)
+    }
+
+    /// The `listen` ports the app asks for (background-apps.md §4.1).
+    pub fn listen(&self) -> &[crate::network::Listen] {
+        self.capabilities.network.as_ref().and_then(|n| n.grants())
+            .map(|g| g.listen.as_slice()).unwrap_or(&[])
     }
 
     /// The entry path, resolved canonically: `[bundle].entry` if present, else the
@@ -1042,6 +1117,17 @@ input.pointer_lock = true
 #[cfg(test)]
 mod opens_tests {
     use super::*;
+
+    #[test]
+    fn background_lines_say_what_is_asked() {
+        let m = Manifest::from_str(include_str!("../tests/accept/background.toml")).unwrap();
+        assert_eq!(m.background_lines(), vec![
+            "Opens when you sign in and keeps running in the background (if you allow it)".to_string(),
+            "Lets devices on your network connect on port 8080 (if you allow it, per network)".to_string(),
+        ]);
+        let plain = Manifest::from_str(include_str!("../tests/accept/minimal.toml")).unwrap();
+        assert!(plain.background_lines().is_empty());
+    }
 
     #[test]
     fn opens_lines_and_lookup() {

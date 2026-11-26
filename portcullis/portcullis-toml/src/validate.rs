@@ -237,6 +237,21 @@ pub fn validate(m: &Manifest) -> Report {
         }
     }
 
+    /* ── [background.resident] (background-apps.md §3.1, G3) ── */
+
+    /* A background app must name its ceilings, so none runs without limits. */
+    if m.resident().is_some() {
+        let res = m.resources.as_ref();
+        if res.and_then(|r| r.memory.as_ref()).is_none() || res.and_then(|r| r.cpu).is_none() {
+            r.errors.push("[background.resident] needs [resources] memory and cpu: \
+                           a background app must name its limits".into());
+        }
+    }
+    if !m.listen().is_empty() && m.resources.is_none() {
+        r.warnings.push("network.listen with no [resources]: a server that the network can \
+                         reach should name its limits".into());
+    }
+
     /* ── [[opens]] (opening-files.md §5.1) ───────────────────── */
 
     let mut seen = std::collections::BTreeSet::new();

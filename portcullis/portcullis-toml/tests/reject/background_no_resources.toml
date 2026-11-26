@@ -1,0 +1,13 @@
+# A background app must name its limits (background-apps.md §3.1, G3).
+# EXPECT_ERROR: needs [resources] memory and cpu
+[app]
+id      = "org.example.bg"
+name    = "Bg"
+version = "1"
+entry   = "bin/x"
+
+[background.resident]
+start = "sign-in"
+
+[resources]
+memory = "128M"

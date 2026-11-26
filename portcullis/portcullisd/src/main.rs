@@ -1092,7 +1092,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &resp)?;
             continue;
         }
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings | Request::PersonaVpns) {
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings | Request::PersonaVpns) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1801,6 +1801,8 @@ fn handle_launch(
             let mut lines = delta.describe();
             lines.extend(manifest.opens_lines());
             lines.extend(manifest.links_line());
+            // Asked, not granted by this approval: a switch in Settings › Apps.
+            lines.extend(manifest.background_lines());
             return write_response(writer, &Response::LaunchNeedsApproval {
                 delta: lines,
             });
@@ -2997,8 +2999,11 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
         }
         Request::RemoveAccess { app_id } => {
             let Some((_, t, m)) = launch::installed_texts().into_iter().find(|(_, _, m)| m.app.id == app_id) else {
-                // Uninstalled: its grant can still go.
-                if tp.policy.grants.remove(&app_id).is_none() {
+                // Uninstalled: its grants can still go.
+                let had = tp.policy.grants.remove(&app_id).is_some()
+                    | tp.policy.background.remove(&app_id).is_some()
+                    | tp.policy.listen.remove(&app_id).is_some();
+                if !had {
                     return refuse(format!("{app_id} is not installed"));
                 }
                 return match tp.policy.save(&tp.policy_path.clone()) {
@@ -3010,6 +3015,7 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                 return refuse(why);
             }
             tp.policy.grants.remove(&app_id);
+            tp.policy.forget_app(&app_id);
             match tp.policy.save(&tp.policy_path.clone()) {
                 Ok(()) => {
                     eprintln!("portcullisd: {owner} removed {app_id}'s access (from {caller})");
@@ -3044,6 +3050,42 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                     Response::Ok
                 }
                 Err(e) => refuse(format!("save: {e}")),
+            }
+        }
+        Request::SetBackground { app_id, persona, on, activation } => {
+            let Some((tree, t, m)) = launch::installed_texts().into_iter().find(|(_, _, m)| m.app.id == app_id) else {
+                return refuse(format!("{app_id} is not installed"));
+            };
+            let hash = hash_manifest(t.as_bytes());
+            if let Some(why) = access::may_set_background(&row(&t, &m, &tp.policy), on) {
+                return refuse(why);
+            }
+            let named = (persona != portcullis_policy::PERSONAL).then_some(persona.as_str());
+            if !tp.policy.has_persona(named) {
+                return refuse(format!("{persona}: not one of your personas"));
+            }
+            if on {
+                // The launch's own trust gate: never allow a manifest it would refuse.
+                if let Err(why) = manifest_trust::verify(&tree, &t) {
+                    return refuse(why);
+                }
+                // Last of the checks: a refusal above doesn't spend the press.
+                let token = activation.unwrap_or(fresco_protocol::activation::NONE);
+                if let Err(why) = opens::spend_press_for(&opens::activation_socket(), token, uid, fresco_protocol::activation::purpose::APPROVE) {
+                    return refuse(why);
+                }
+            }
+            match tp.policy.set_background(&app_id, &persona, &hash, on) {
+                Ok(false) => Response::Ok,
+                Ok(true) => match tp.policy.save(&tp.policy_path.clone()) {
+                    Ok(()) => {
+                        eprintln!("portcullisd: {owner} {} {app_id} in the background in {persona} (from {caller})",
+                                  if on { "allowed" } else { "stopped allowing" });
+                        Response::Ok
+                    }
+                    Err(e) => refuse(format!("save: {e}")),
+                },
+                Err(why) => refuse(why),
             }
         }
         Request::Links => {
@@ -4623,7 +4665,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::SetBackground { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
         | Request::ShareTargets | Request::SetShareTargets { .. }
 
         | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. }

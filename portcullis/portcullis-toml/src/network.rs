@@ -8,7 +8,11 @@
 //! outbound = ["github.com:443", "1.1.1.1:53/udp", "10.0.0.0/8"]   # or "any"
 //! peers    = ["org.atrium.db:5432"]
 //! inbound  = [8080]
+//! listen   = [{ port = 8080, proto = "tcp", from = "local-network" }]
 //! ```
+//!
+//! `listen` asks for reach from outside the app's own stack
+//! (background-apps.md §4): the person still has to allow it, per network.
 //!
 //! ★ What cannot be enforced yet is REFUSED at parse, never ignored: an app
 //! asking for `lan_alias`, `expose` or `mdns` fails to load with the reason,
@@ -51,6 +55,68 @@ pub struct NetworkGrants {
     pub peers:    Vec<Peer>,
     /// Ports other apps may dial on this one.
     pub inbound:  Vec<u16>,
+    /// Ports the local network or this computer may reach — a request only;
+    /// nothing forwards until the person allows it (background-apps.md §4.2).
+    pub listen:   Vec<Listen>,
+}
+
+/// At most this many `listen` entries per app (background-apps.md §4.1).
+pub const MAX_LISTEN: usize = 4;
+
+/// Who a `listen` port is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenFrom {
+    /// Only the person's own processes on this machine.
+    ThisComputer,
+    /// Devices on a network the person allowed it on.
+    LocalNetwork,
+}
+
+impl ListenFrom {
+    pub fn as_str(self) -> &'static str {
+        match self { ListenFrom::ThisComputer => "this-computer", ListenFrom::LocalNetwork => "local-network" }
+    }
+}
+
+/// One `listen` entry: `{ port = 8080, proto = "tcp", from = "local-network" }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listen {
+    /// 1024-65535: nothing below 1024 in v1 (background-apps.md §8).
+    pub port:  u16,
+    pub proto: Proto,
+    pub from:  ListenFrom,
+}
+
+impl Listen {
+    fn parse(v: &toml::Value) -> Result<Self, String> {
+        let t = v.as_table().ok_or("network.listen entries are tables: { port, proto, from }")?;
+        let mut port = None;
+        let mut proto = Proto::Tcp;
+        let mut from = None;
+        for (k, v) in t {
+            match k.as_str() {
+                "port" => port = Some(v.as_integer().filter(|p| (1024..=65535).contains(p))
+                    .ok_or("network.listen port must be 1024-65535 (below 1024 is not offered)")? as u16),
+                "proto" => proto = match v.as_str() {
+                    Some("tcp") => Proto::Tcp,
+                    Some("udp") => Proto::Udp,
+                    _ => return Err("network.listen proto is \"tcp\" or \"udp\"".into()),
+                },
+                "from" => from = Some(match v.as_str() {
+                    Some("this-computer") => ListenFrom::ThisComputer,
+                    Some("local-network") => ListenFrom::LocalNetwork,
+                    _ => return Err("network.listen from is \"this-computer\" or \"local-network\" \
+                                     (there is no internet reach)".into()),
+                }),
+                other => return Err(format!("network.listen: unknown key {other:?} (port, proto, from)")),
+            }
+        }
+        Ok(Listen {
+            port: port.ok_or("network.listen entry has no port")?,
+            proto,
+            from: from.ok_or("network.listen entry has no from")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +209,7 @@ fn valid_host(h: &str) -> bool {
 /// Keys the table form refuses outright (§0.1) — they cannot be enforced yet.
 const REFUSED: &[(&str, &str)] = &[
     ("lan_alias", "a LAN-visible address is not supported on per-app stacks yet"),
-    ("expose",    "inbound port-forwarding from the host is not supported yet"),
+    ("expose",    "use `listen = [{ port, proto, from }]` instead (background-apps.md §4)"),
     ("mdns",      "mDNS participation is reserved for V2"),
 ];
 
@@ -188,8 +254,22 @@ impl<'de> Deserialize<'de> for NetworkSpec {
                                 .ok_or_else(|| D::Error::custom("network.inbound entries are ports 1-65535"))?;
                             g.inbound.push(p as u16);
                         },
+                        ("listen", toml::Value::Array(a)) => {
+                            if a.len() > MAX_LISTEN {
+                                return Err(D::Error::custom(format!(
+                                    "network.listen: at most {MAX_LISTEN} entries")));
+                            }
+                            for e in a {
+                                let l = Listen::parse(e).map_err(D::Error::custom)?;
+                                if g.listen.iter().any(|o| o.port == l.port && o.proto == l.proto) {
+                                    return Err(D::Error::custom(format!(
+                                        "network.listen: port {} is listed twice", l.port)));
+                                }
+                                g.listen.push(l);
+                            }
+                        }
                         (k, _) => return Err(D::Error::custom(format!(
-                            "network.{k}: unknown or malformed key (outbound, peers, inbound)"))),
+                            "network.{k}: unknown or malformed key (outbound, peers, inbound, listen)"))),
                     }
                 }
                 Ok(NetworkSpec::Grants(g))
@@ -214,6 +294,17 @@ impl Serialize for NetworkSpec {
                 m.serialize_entry("peers",
                     &g.peers.iter().map(|p| format!("{}:{}", p.app_id, p.port)).collect::<Vec<_>>())?;
                 m.serialize_entry("inbound", &g.inbound)?;
+                if !g.listen.is_empty() {
+                    let l: Vec<toml::Value> = g.listen.iter().map(|l| {
+                        let mut t = toml::map::Map::new();
+                        t.insert("port".into(), toml::Value::Integer(l.port.into()));
+                        t.insert("proto".into(), toml::Value::String(
+                            if l.proto == Proto::Udp { "udp" } else { "tcp" }.into()));
+                        t.insert("from".into(), toml::Value::String(l.from.as_str().into()));
+                        toml::Value::Table(t)
+                    }).collect();
+                    m.serialize_entry("listen", &l)?;
+                }
                 m.end()
             }
         }
@@ -271,6 +362,7 @@ mod tests {
             let e = parse(&format!("[network]\n{k} = {v}")).unwrap_err();
             assert!(e.contains(k), "{e}");
         }
+        assert!(parse("[network]\nexpose = []").unwrap_err().contains("listen"));
         assert!(parse("[network]\nwhatever = 1").unwrap_err().contains("unknown"));
     }
 
@@ -286,6 +378,35 @@ mod tests {
         assert!(parse("[network]\ninbound = [0]").is_err());
     }
 
+    #[test]
+    fn listen_parses_and_refuses_what_v1_does_not_offer() {
+        let g = parse(r#"
+            [network]
+            listen = [{ port = 8080, proto = "tcp", from = "local-network" },
+                      { port = 5353, proto = "udp", from = "this-computer" }]
+        "#).unwrap();
+        assert_eq!(g.grants().unwrap().listen, vec![
+            Listen { port: 8080, proto: Proto::Tcp, from: ListenFrom::LocalNetwork },
+            Listen { port: 5353, proto: Proto::Udp, from: ListenFrom::ThisComputer },
+        ]);
+        for (bad, why) in [
+            (r#"[{ port = 80, from = "local-network" }]"#, "1024"),
+            (r#"[{ port = 8080, from = "internet" }]"#, "internet"),
+            (r#"[{ port = 8080 }]"#, "no from"),
+            (r#"[{ from = "this-computer" }]"#, "no port"),
+            (r#"[{ port = 8080, from = "this-computer", proto = "sctp" }]"#, "proto"),
+            (r#"[{ port = 8080, from = "this-computer", bind = "0.0.0.0" }]"#, "unknown key"),
+            (r#"[8080]"#, "tables"),
+            (r#"[{ port = 8080, from = "this-computer" }, { port = 8080, from = "local-network" }]"#, "twice"),
+            (r#"[{ port = 2001, from = "this-computer" }, { port = 2002, from = "this-computer" },
+                 { port = 2003, from = "this-computer" }, { port = 2004, from = "this-computer" },
+                 { port = 2005, from = "this-computer" }]"#, "at most 4"),
+        ] {
+            let e = parse(&format!("[network]\nlisten = {bad}")).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+    }
+
     /// Serialize → parse is a fixed point (the manifest round-trips).
     #[test]
     fn serialize_then_parse_is_a_fixed_point() {
@@ -294,6 +415,7 @@ mod tests {
             outbound = ["github.com:443", "1.1.1.1:53/udp", "10.0.0.0/8"]
             peers = ["org.atrium.db:5432"]
             inbound = [8080]
+            listen = [{ port = 8080, proto = "tcp", from = "local-network" }]
         "#).unwrap();
         let text = toml::to_string(&W { network: src.clone() }).unwrap();
         assert_eq!(parse(&text).unwrap(), src, "{text}");

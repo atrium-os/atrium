@@ -4,9 +4,9 @@
 
 use std::io;
 
-use portcullis_ipc::{AccessBy, AccessEntry};
+use portcullis_ipc::{AccessBy, AccessEntry, BackgroundAccess};
 use portcullis_policy::{compute_delta, decide, GrantSource, Policy};
-use portcullis_toml::Manifest;
+use portcullis_toml::{Manifest, ResidentStart};
 
 /// The page's row for `m` (installed, its text hashing to `hash`), for
 /// the person whose policy is `user`.
@@ -17,6 +17,9 @@ pub fn entry(m: &Manifest, hash: &str, user: &Policy, system: Result<&Policy, &i
     let mut asks = compute_delta(&m.capabilities, None, None, hash).describe();
     asks.extend(m.opens_lines());
     asks.extend(m.links_line());
+    // Background running and listening are switches of their own, never
+    // part of what Allow grants: they are asked, never `missing`.
+    asks.extend(m.background_lines());
     let d = decide(&id, &m.capabilities, hash, user, system);
     let missing = if d.delta.is_empty() {
         Vec::new()
@@ -35,12 +38,30 @@ pub fn entry(m: &Manifest, hash: &str, user: &Policy, system: Result<&Policy, &i
         yours: user.grants.get(&id).map(|g| g.granted_at.clone()),
         restricted: m.capabilities.restricted().into_iter().map(String::from).collect(),
         settings: m.roles.as_ref().is_some_and(|r| r.app_settings.is_some() && r.implements.iter().any(|n| n == "app-settings")),
+        background: m.resident().map(|r| BackgroundAccess {
+            at_sign_in: r.start == ResidentStart::SignIn,
+            allowed_in: user.background_personas(&m.app.id, hash),
+            stale: user.background.get(&m.app.id).is_some_and(|g| g.manifest_hash != hash),
+        }),
         id,
         name,
         by,
         asks,
         missing,
     }
+}
+
+/// Why Settings may not turn `e`'s background switch `on` (or off), or
+/// `None` when it may. On needs an app that asks for it and runs as it is:
+/// a background app the person hasn't allowed to run would only fail.
+pub fn may_set_background(e: &AccessEntry, on: bool) -> Option<String> {
+    if e.background.is_none() {
+        return Some(format!("{} doesn't ask to run in the background", e.name));
+    }
+    if on && e.by.is_none() {
+        return Some(format!("allow {} first: it asks for more than it has", e.name));
+    }
+    None
 }
 
 /// Why Settings may not allow `e`'s app, or `None` when it may.
@@ -141,6 +162,50 @@ audio = true
         // Not installed by the system: still not the person's to allow.
         let e = entry(&man, &h, &Policy::default(), Ok(&Policy::default()));
         assert!(may_approve(&e).unwrap().contains("only the system"));
+    }
+
+    const BAR: &str = r#"
+[app]
+id = "org.example.bar"
+name = "Clipboard History"
+version = "1.0"
+entry = "bin/bar"
+
+[background.resident]
+start = "sign-in"
+
+[resources]
+memory = "64M"
+cpu = 10
+"#;
+
+    #[test]
+    fn a_background_app_asks_and_its_switch_needs_the_app_allowed() {
+        let man = m(BAR);
+        let h = hash_manifest(BAR.as_bytes());
+        let mut you = Policy::default();
+        let e = entry(&man, &h, &you, Ok(&Policy::default()));
+        assert!(e.asks.iter().any(|l| l.starts_with("Opens when you sign in")), "{:?}", e.asks);
+        assert!(!e.missing.iter().any(|l| l.contains("sign in")), "not part of Allow: {:?}", e.missing);
+        assert_eq!(e.background, Some(BackgroundAccess { at_sign_in: true, allowed_in: vec![], stale: false }));
+        // Nothing to grant beyond running: it runs unasked, so on is offered.
+        assert_eq!(e.by, Some(AccessBy::You));
+        assert_eq!(may_set_background(&e, true), None);
+        assert_eq!(may_set_background(&e, false), None, "off is always allowed");
+        you.set_background("org.example.bar", "personal", &h, true).unwrap();
+        let e = entry(&man, &h, &you, Ok(&Policy::default()));
+        assert_eq!(e.background.as_ref().unwrap().allowed_in, vec!["personal".to_string()]);
+        // An update: stale, allowed nowhere.
+        let newer = BAR.replace("10", "20");
+        let e = entry(&m(&newer), &hash_manifest(newer.as_bytes()), &you, Ok(&Policy::default()));
+        assert_eq!(e.background, Some(BackgroundAccess { at_sign_in: true, allowed_in: vec![], stale: true }));
+        // An app that asks for something it wasn't given can't be turned on.
+        let player = entry(&m(PLAYER), &hash_manifest(PLAYER.as_bytes()), &Policy::default(), Ok(&Policy::default()));
+        assert!(may_set_background(&player, true).unwrap().contains("doesn't ask"));
+        let asking = BAR.replace("[resources]", "[capabilities]\naudio = true\n\n[resources]");
+        let e = entry(&m(&asking), &hash_manifest(asking.as_bytes()), &Policy::default(), Ok(&Policy::default()));
+        assert!(may_set_background(&e, true).unwrap().contains("allow Clipboard History first"));
+        assert_eq!(may_set_background(&e, false), None);
     }
 
     #[test]

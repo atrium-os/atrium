@@ -518,6 +518,14 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                 }
                 Got::Done { app_id, result: r }
             }
+            Want::SetBackground { app_id, persona, on, activation } => {
+                let r = done(ask(&Request::SetBackground { app_id: app_id.clone(), persona: persona.clone(), on, activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: {app_id} in the background in {persona}: {}", if on { "on" } else { "off" }),
+                    Err(e) => eprintln!("curia: {app_id} in the background in {persona}: {e}"),
+                }
+                Got::Done { app_id, result: r }
+            }
             Want::Remove { app_id } => {
                 let r = done(ask(&Request::RemoveAccess { app_id: app_id.clone() }));
                 match &r {

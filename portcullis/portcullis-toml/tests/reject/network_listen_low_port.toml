@@ -1,0 +1,10 @@
+# Nothing below 1024 in v1 (background-apps.md §8, G6).
+# EXPECT_ERROR: 1024-65535
+[app]
+id      = "org.example.srv"
+name    = "Srv"
+version = "1"
+entry   = "bin/x"
+
+[capabilities.network]
+listen = [{ port = 80, from = "local-network" }]

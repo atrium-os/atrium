@@ -19,6 +19,11 @@
 //! the person picks, shows in the page in place of the list. Curia sees
 //! only its pixels.
 //!
+//! An app that asks to run in the background (background-apps.md §3.2)
+//! gets a switch per persona in its details: "Open Clipboard History when
+//! you sign in". Off by default; turning one on goes with a press, which
+//! portcullisd spends; turning one off needs none.
+//!
 //! Its Between personas section (personas.md §6): a switch per persona,
 //! direction and kind ("Work may send links to Personal"). Off by default;
 //! turning one on goes with a press and then the person confirming it's
@@ -31,6 +36,9 @@ pub enum Want {
     Refresh,
     Allow { app_id: String, activation: [u8; 16] },
     Remove { app_id: String },
+    /// Turn `app_id`'s background switch in `persona` on or off. On carries
+    /// the press; off needs none.
+    SetBackground { app_id: String, persona: String, on: bool, activation: Option<[u8; 16]> },
     /// Make `app` the default for `scheme` links; `None`: ask each time.
     SetLink { scheme: String, app: Option<String>, activation: [u8; 16] },
     /// The share sheet's order and hidden apps, all of them.
@@ -186,6 +194,23 @@ pub fn status(e: &AccessEntry) -> String {
 fn day(at: &str) -> Option<&str> {
     let d = at.get(..10)?;
     (d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-').then_some(d)
+}
+
+/// The background switch's words for `e` in `persona`; `in_persona`
+/// when the person has named personas, so each switch says which.
+pub fn background_words(e: &AccessEntry, persona: &str, in_persona: bool) -> Option<String> {
+    let b = e.background.as_ref()?;
+    let w = if b.at_sign_in {
+        format!("Open {} when you sign in", e.name)
+    } else {
+        format!("Keep {} running in the background once opened", e.name)
+    };
+    Some(if in_persona { format!("{w}, in {}", persona_name(persona)) } else { w })
+}
+
+/// `e` may run in the background in `persona` now.
+pub fn background_on(e: &AccessEntry, persona: &str) -> bool {
+    e.background.as_ref().is_some_and(|b| b.allowed_in.iter().any(|p| p == persona))
 }
 
 /// What Allow would give, or why it can't be offered.
@@ -522,6 +547,27 @@ impl AppsPage {
         self.wants.push(Want::Allow { app_id: id.into(), activation });
     }
 
+    /// Turn `id`'s background switch in `persona` to `on`. On needs the
+    /// press (`None`: not from one, so nothing is asked), and an app that
+    /// runs as it is.
+    pub fn set_background(&mut self, id: &str, persona: &str, on: bool, activation: Option<[u8; 16]>) {
+        let Some(e) = self.find(id) else { return };
+        if self.busy.is_some() || e.background.is_none() || background_on(e, persona) == on {
+            return;
+        }
+        if on && e.by.is_none() {
+            self.note = Some((id.into(), format!("Allow {} first", e.name)));
+            return;
+        }
+        if on && activation.is_none() {
+            self.note = Some((id.into(), "Press Turn on with the pointer or Enter".into()));
+            return;
+        }
+        self.busy = Some(id.into());
+        self.note = None;
+        self.wants.push(Want::SetBackground { app_id: id.into(), persona: persona.into(), on, activation: activation.filter(|_| on) });
+    }
+
     /// Remove: the first press asks, the second takes the grant away.
     pub fn remove(&mut self, id: &str) {
         if self.busy.is_some() || !self.find(id).is_some_and(can_remove) {
@@ -606,7 +652,43 @@ mod tests {
             yours: yours.then(|| "2026-11-15T10:00:00Z".into()),
             restricted: restricted.iter().map(|s| s.to_string()).collect(),
             settings: false,
+            background: None,
         }
+    }
+
+    #[test]
+    fn background_switches_go_with_a_press_on_and_none_off() {
+        use portcullis_ipc::BackgroundAccess;
+        let bg = |by, allowed: &[&str]| AccessEntry {
+            name: "Clipboard History".into(),
+            background: Some(BackgroundAccess { at_sign_in: true, allowed_in: allowed.iter().map(|s| s.to_string()).collect(), stale: false }),
+            ..e("org.x.bar", by, &[], true, &[])
+        };
+        let mut p = AppsPage::default();
+        p.apply(Got::List(Ok(vec![bg(Some(AccessBy::You), &[]), e("plain", Some(AccessBy::You), &[], true, &[])])));
+        let row = p.find("org.x.bar").unwrap().clone();
+        assert_eq!(background_words(&row, "personal", false).as_deref(), Some("Open Clipboard History when you sign in"));
+        assert_eq!(background_words(&row, "work", true).as_deref(), Some("Open Clipboard History when you sign in, in Work"));
+        assert_eq!(background_words(p.find("plain").unwrap(), "personal", false), None, "it doesn't ask");
+        p.set_background("org.x.bar", "personal", true, None);
+        assert!(p.take_wants().is_empty(), "on needs the press");
+        assert!(p.note.as_ref().unwrap().1.contains("Press"));
+        p.set_background("plain", "personal", true, Some([1; 16]));
+        assert!(p.take_wants().is_empty(), "no switch to turn");
+        p.set_background("org.x.bar", "personal", true, Some([1; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetBackground { app_id: "org.x.bar".into(), persona: "personal".into(), on: true, activation: Some([1; 16]) }]);
+        p.apply(Got::Done { app_id: "org.x.bar".into(), result: Ok(()) });
+        p.take_wants();
+        p.apply(Got::List(Ok(vec![bg(Some(AccessBy::You), &["personal"])])));
+        assert!(background_on(p.find("org.x.bar").unwrap(), "personal"));
+        p.set_background("org.x.bar", "personal", false, Some([2; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetBackground { app_id: "org.x.bar".into(), persona: "personal".into(), on: false, activation: None }], "off spends no press");
+        // An app not allowed to run can't be turned on.
+        let mut q = AppsPage::default();
+        q.apply(Got::List(Ok(vec![bg(None, &[])])));
+        q.set_background("org.x.bar", "personal", true, Some([1; 16]));
+        assert!(q.take_wants().is_empty());
+        assert_eq!(q.note.as_ref().unwrap().1, "Allow Clipboard History first");
     }
 
     #[test]

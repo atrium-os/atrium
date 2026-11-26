@@ -1232,6 +1232,7 @@ fn clone_manifest_with(
         setup:        None,           /* setup never recurses */
         resources:    None,
         supervision:  None,
+        background:   None,
         opens:        Vec::new(),
         links:        Vec::new(),
         /* The setup script is no app: no workers, roles or IPC of its own. */

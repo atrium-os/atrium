@@ -621,6 +621,18 @@ pub enum Request {
     /// asking for a restricted capability: only the system grants those.
     /// Answer: `Ok`.
     ApproveAccess { app_id: String, activation: [u8; 16] },
+    /// ★ Let `app_id` run in the background in `persona` ("personal" or a
+    /// persona's name), or stop letting it (background-apps.md §3.2).
+    /// `app-grants` only. Turning on needs `activation`, a press portcullisd
+    /// spends with frescod (purpose APPROVE), and an app the person has
+    /// already allowed to run; turning off needs no press. Answer: `Ok`.
+    SetBackground {
+        app_id:     String,
+        persona:    String,
+        on:         bool,
+        #[serde(default)]
+        activation: Option<[u8; 16]>,
+    },
     /// ★ Settings' Links section (opening-links.md §4.4): each link scheme
     /// an installed app takes, those apps, and the person's default.
     /// `app-grants` only, about the person that app belongs to. Answer:
@@ -863,6 +875,24 @@ pub struct AccessEntry {
     /// Settings shows inside its window (curia.md §15).
     #[serde(default)]
     pub settings: bool,
+    /// It asks to run in the background (`[background.resident]`,
+    /// background-apps.md §3.2), and where the person lets it.
+    #[serde(default)]
+    pub background: Option<BackgroundAccess>,
+}
+
+/// An app's background switch on Settings' Apps page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundAccess {
+    /// It opens at sign-in (`start = "sign-in"`); otherwise only once opened.
+    pub at_sign_in: bool,
+    /// The personas it may run in the background in now ("personal" or a
+    /// persona's name). Empty after an update until the person allows it
+    /// again.
+    pub allowed_in: Vec<String>,
+    /// The person had allowed it for an older manifest.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 

@@ -25,10 +25,10 @@ pub use schema::{
     AppSection, Capabilities, FontsCap, InputCaps, InstancesPolicy, Manifest,
     NetworkCap, OpenMode, OpensSection, PoolSection, ResourcesSection, RestartPolicy, SetupSection,
     SupervisionSection, WorkerSection, WorkerInput, WorkerLifetime, WorkerIsolation,
-    RolesSection, IpcSection,
+    RolesSection, IpcSection, BackgroundSection, ResidentSection, ResidentStart, ResidentRestart,
 };
 pub use validate::{validate, Report};
-pub use network::{Dest, NetworkGrants, NetworkSpec, Outbound, Peer, Proto};
+pub use network::{Dest, Listen, ListenFrom, NetworkGrants, NetworkSpec, Outbound, Peer, Proto};
 
 /// Parse + validate in one call. Returns the parsed manifest plus a
 /// validation report; the report may have warnings even on success.

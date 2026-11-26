@@ -28,7 +28,7 @@ pub mod links;
 pub mod share;
 pub mod opens;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -60,7 +60,46 @@ pub struct Policy {
     /// Turned on in Curia behind user verification.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crossings: Vec<Crossing>,
+    /// Apps the person lets run in the background while they are signed in
+    /// (background-apps.md §3.2), by app id. Only a press in Settings puts
+    /// one here; a manifest's `[background.resident]` only asks.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub background: BTreeMap<String, BackgroundGrant>,
+    /// Apps the person lets the network or this computer reach on their
+    /// `listen` ports (background-apps.md §4.2), by app id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub listen: BTreeMap<String, ListenGrant>,
 }
+
+/// The person's leave for one app to run in the background.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BackgroundGrant {
+    /// The manifest it was given for. Any other manifest (an update) makes
+    /// it stale, and it holds nowhere until the person allows it again.
+    pub manifest_hash: String,
+    pub granted_at:    String,
+    /// The personas it runs in ([`PERSONAL`] or a persona's name). Never
+    /// empty: turning off the last one removes the grant.
+    pub personas:      BTreeSet<String>,
+}
+
+/// The person's leave for one app's `listen` ports (background-apps.md §4.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ListenGrant {
+    pub manifest_hash: String,
+    pub granted_at:    String,
+    /// The one persona whose instance gets the ports: a host port has one
+    /// owner (§4.3).
+    pub persona:       String,
+    /// The networks `local-network` ports hold on: a saved Wi-Fi network's
+    /// or a wired gateway's identity, as atrium-netd names it. Empty: only
+    /// `this-computer` ports hold.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub networks:      BTreeSet<String>,
+}
+
+/// At most this many networks per listen grant.
+pub const MAX_LISTEN_NETWORKS: usize = 16;
 
 /// One crossing switch: `from` may send `kinds` to `to` (personas.md §6).
 /// Personas by name; Personal is `personal` (never a named persona's name).
@@ -278,14 +317,86 @@ impl Policy {
         Ok(true)
     }
 
-    /// Take persona `name` out, and every crossing switch naming it.
-    /// Personal can't be removed.
+    /// Take persona `name` out, and every crossing switch, background and
+    /// listen grant naming it. Personal can't be removed.
     pub fn remove_persona(&mut self, name: &str) -> Result<(), String> {
         if self.personas.remove(name).is_none() {
             return Err(format!("{name}: not one of your personas"));
         }
         self.crossings.retain(|c| c.from != name && c.to != name);
+        for g in self.background.values_mut() {
+            g.personas.remove(name);
+        }
+        self.background.retain(|_, g| !g.personas.is_empty());
+        self.listen.retain(|_, g| g.persona != name);
         Ok(())
+    }
+
+    /// Whether `app_id` may run in the background in `persona` (`None` is
+    /// Personal) with the installed manifest hashing to `hash`. A grant
+    /// for another manifest, or a persona that is no longer the person's,
+    /// holds nowhere.
+    pub fn background_allowed(&self, app_id: &str, persona: Option<&str>, hash: &str) -> bool {
+        self.has_persona(persona)
+            && self.background.get(app_id).is_some_and(|g| {
+                g.manifest_hash == hash && g.personas.contains(persona.unwrap_or(PERSONAL))
+            })
+    }
+
+    /// The personas `app_id` may run in the background in now: none when
+    /// its grant is for another manifest.
+    pub fn background_personas(&self, app_id: &str, hash: &str) -> Vec<String> {
+        let Some(g) = self.background.get(app_id).filter(|g| g.manifest_hash == hash) else { return Vec::new() };
+        g.personas.iter()
+            .filter(|p| self.has_persona(if *p == PERSONAL { None } else { Some(p.as_str()) }))
+            .cloned().collect()
+    }
+
+    /// Turn background running for `app_id` in `persona` on or off;
+    /// whether it changed. Turning on is for the manifest hashing to
+    /// `hash`: a stale grant is replaced, so the personas it held for an
+    /// older manifest don't come back with it. The caller has checked the
+    /// press and that the manifest asks for `[background.resident]`.
+    pub fn set_background(&mut self, app_id: &str, persona: &str, hash: &str, on: bool) -> Result<bool, String> {
+        if !self.has_persona(if persona == PERSONAL { None } else { Some(persona) }) {
+            return Err(format!("{persona}: not one of your personas"));
+        }
+        if !on {
+            let Some(g) = self.background.get_mut(app_id) else { return Ok(false) };
+            let changed = g.personas.remove(persona);
+            if g.personas.is_empty() {
+                self.background.remove(app_id);
+            }
+            return Ok(changed);
+        }
+        let g = self.background.entry(app_id.into()).or_insert_with(|| BackgroundGrant {
+            manifest_hash: hash.into(), granted_at: String::new(), personas: BTreeSet::new(),
+        });
+        if g.manifest_hash != hash {
+            g.manifest_hash = hash.into();
+            g.personas.clear();
+        }
+        let changed = g.personas.insert(persona.into());
+        if changed {
+            g.granted_at = now_iso8601();
+        }
+        Ok(changed)
+    }
+
+    /// The listen grant for `app_id` if it holds for the manifest hashing
+    /// to `hash`.
+    pub fn listen_grant(&self, app_id: &str, hash: &str) -> Option<&ListenGrant> {
+        self.listen.get(app_id).filter(|g| {
+            g.manifest_hash == hash
+                && self.has_persona(if g.persona == PERSONAL { None } else { Some(g.persona.as_str()) })
+        })
+    }
+
+    /// Forget every background and listen grant for `app_id` (its access
+    /// was removed, or it was uninstalled).
+    pub fn forget_app(&mut self, app_id: &str) {
+        self.background.remove(app_id);
+        self.listen.remove(app_id);
     }
 
     /// Whether `persona` may be launched in: `None` (Personal) always; a
@@ -908,6 +1019,60 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn background_grants_are_per_persona_and_per_manifest() {
+        let mut p = Policy::default();
+        p.add_persona("work", "blue").unwrap();
+        assert!(!p.background_allowed("org.x.bar", None, "sha256:a"), "nothing until allowed");
+        assert_eq!(p.set_background("org.x.bar", PERSONAL, "sha256:a", true), Ok(true));
+        assert_eq!(p.set_background("org.x.bar", PERSONAL, "sha256:a", true), Ok(false));
+        assert!(p.background_allowed("org.x.bar", None, "sha256:a"));
+        assert!(!p.background_allowed("org.x.bar", Some("work"), "sha256:a"), "per persona");
+        // An update makes it stale: it holds nowhere, and a new Allow
+        // doesn't bring back the personas it had.
+        assert!(!p.background_allowed("org.x.bar", None, "sha256:b"));
+        assert!(p.background_personas("org.x.bar", "sha256:b").is_empty());
+        p.set_background("org.x.bar", "work", "sha256:b", true).unwrap();
+        assert_eq!(p.background_personas("org.x.bar", "sha256:b"), vec!["work".to_string()]);
+        assert!(!p.background_allowed("org.x.bar", None, "sha256:b"));
+        assert!(p.set_background("org.x.bar", "home", "sha256:b", true).is_err(), "not a persona");
+        // Turning off the last persona removes the grant.
+        assert_eq!(p.set_background("org.x.bar", "work", "sha256:b", false), Ok(true));
+        assert!(p.background.is_empty());
+        assert_eq!(p.set_background("org.x.bar", "work", "sha256:b", false), Ok(false));
+    }
+
+    #[test]
+    fn removing_a_persona_or_an_app_drops_its_background_and_listen_grants() {
+        let mut p = Policy::default();
+        p.add_persona("work", "blue").unwrap();
+        p.set_background("org.x.bar", "work", "sha256:a", true).unwrap();
+        p.set_background("org.x.srv", "work", "sha256:c", true).unwrap();
+        p.set_background("org.x.srv", PERSONAL, "sha256:c", true).unwrap();
+        p.listen.insert("org.x.srv".into(), ListenGrant {
+            manifest_hash: "sha256:c".into(), granted_at: String::new(),
+            persona: "work".into(), networks: BTreeSet::new(),
+        });
+        assert!(p.listen_grant("org.x.srv", "sha256:c").is_some());
+        assert!(p.listen_grant("org.x.srv", "sha256:d").is_none(), "stale");
+        p.remove_persona("work").unwrap();
+        assert!(!p.background.contains_key("org.x.bar"));
+        assert!(p.background_allowed("org.x.srv", None, "sha256:c"));
+        assert!(p.listen.is_empty());
+        p.forget_app("org.x.srv");
+        assert!(p.background.is_empty());
+    }
+
+    #[test]
+    fn background_grants_round_trip_and_old_files_load() {
+        let mut p = Policy::default();
+        p.set_background("org.x.bar", PERSONAL, "sha256:a", true).unwrap();
+        let back: Policy = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.background, p.background);
+        let old: Policy = toml::from_str("[grants]\n").unwrap();
+        assert!(old.background.is_empty() && old.listen.is_empty());
+    }
+
+    #[test]
     fn personas_are_added_recoloured_and_removed() {
         let mut p = Policy::default();
         p.add_persona("work", "blue").unwrap();
@@ -1082,6 +1247,7 @@ run_as = "_navpage"
             network_portal: None,
             syscalls: None,
             input: None,
+            decoders: None,
             extra:      Default::default(),
         }
     }

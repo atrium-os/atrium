@@ -75,7 +75,7 @@ restart = "on-failure"     # "on-failure" | "never"
 # Required: a background app must name its ceilings (rctl).
 [resources]
 memory = "128M"
-pcpu = 25
+cpu = 25                   # percent of one core
 ```
 
 - `entry` is the app's own `[app].entry`. There is no second binary.
@@ -337,3 +337,29 @@ findings. All nine are folded in above:
 
 The reviewer found nothing in §6 that needs app-specific code in
 portcullisd.
+
+## 10. As built
+
+**B1 (2026-11-26).**
+- `portcullis-toml` parses `[background.resident]` (`start`, `restart`,
+  default `on-failure`) and refuses any other `[background]` class as an
+  unknown key. Validation fails a resident app without `[resources]`
+  `memory` and `cpu`. `network.listen` takes at most 4 entries, ports
+  1024–65535, `tcp`/`udp`, `from` this-computer or local-network, and no
+  port twice; `expose` stays refused and its message points to `listen`.
+  `Manifest::background_lines()` holds the words every surface shows.
+- `portcullis-policy`: the person's policy has `background` (per app: the
+  manifest hash and the personas it may run in) and `listen` (per app: one
+  persona, and the networks for `local-network`). A grant for another
+  manifest holds nowhere, and allowing again doesn't bring back its old
+  personas. Removing a persona or the app's access drops both.
+- `portcullisd`: `SetBackground { app_id, persona, on, activation }` on the
+  Apps page's peer-uid path (`app-grants`). On needs an app that asks, that
+  runs as it is, a persona of the person's, the manifest trust check and
+  then the APPROVE press; off needs none. The Apps page row carries
+  `background { at_sign_in, allowed_in, stale }`.
+- Curia's Apps page: a switch per persona in the app's details.
+- The launch prompt: the dock has no prompt of its own today (it sends the
+  person to Settings › Apps), so the switch lives there. The background
+  line is in the asks the dock shows.
+

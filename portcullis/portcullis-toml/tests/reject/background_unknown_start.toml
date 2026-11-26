@@ -1,0 +1,14 @@
+# Only "sign-in" and "manual": nothing starts at boot (background-apps.md §8, G2).
+# EXPECT_ERROR: unknown variant
+[app]
+id      = "org.example.bg"
+name    = "Bg"
+version = "1"
+entry   = "bin/x"
+
+[background.resident]
+start = "boot"
+
+[resources]
+memory = "128M"
+cpu = 10

@@ -1307,6 +1307,32 @@ impl CuriaView {
                     if !e.restricted.is_empty() {
                         line(ctx, &mut y, &format!("Only the system can allow {}.", e.restricted.join(", ")), t.text_secondary());
                     }
+                    // Running in the background (background-apps.md §3.2):
+                    // a switch per persona, off until the person turns it on.
+                    if e.background.is_some() {
+                        y += em(8.0);
+                        let named = p.named();
+                        for persona in std::iter::once("personal".to_string()).chain(named.iter().map(|(n, _)| n.clone())) {
+                            let Some(words) = apps::background_words(e, &persona, !named.is_empty()) else { break };
+                            let on = apps::background_on(e, &persona);
+                            text(ctx, em(40.0), y + em(16.0), &words, type_size::SM, Weight::Regular, t.text_primary());
+                            let state = match (busy, on) {
+                                (true, _) => "Changing…",
+                                (false, true) => "On",
+                                (false, false) if e.background.as_ref().is_some_and(|b| b.stale) => "Off: it changed since you allowed it",
+                                (false, false) => "Off",
+                            };
+                            text(ctx, em(40.0), y + em(32.0), state, type_size::XS, Weight::Regular, t.text_secondary());
+                            let lab = if on { "Turn off" } else { "Turn on" };
+                            let bx = pw - em(12.0) - width(lab, type_size::SM, Weight::Medium) - em(24.0);
+                            let (pg, id) = (self.apps.clone(), e.id.clone());
+                            button(ctx, bx, y + em(5.0), lab, Look::Secondary, p.busy.is_none(), move || {
+                                let token = pergola::clipboard::current_activation();
+                                with_apps(&pg, |a| a.set_background(&id, &persona, !on, token))
+                            });
+                            y += em(40.0);
+                        }
+                    }
                     line(ctx, &mut y, &e.id, t.text_tertiary());
                     y += em(8.0);
                 }
@@ -2027,7 +2053,7 @@ mod tests {
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
-        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted, settings: false };
+        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted, settings: false, background: None };
         with_apps(&v.apps, |p| {
             p.apply(Got::List(Ok(vec![
                 e("org.atrium.player", "Player", Some(AccessBy::You), vec![], Some("2026-11-15T09:00:00Z".into()), vec![]),
