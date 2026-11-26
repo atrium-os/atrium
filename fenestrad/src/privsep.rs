@@ -152,6 +152,12 @@ pub mod jailer {
         }
         // SAFETY: both are fresh descriptors of ours, each owned once.
         let (parent, child) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        // SAFETY: getpid has no preconditions.
+        let root_side = unsafe { libc::getpid() };
+        // Both sides ignore SIGHUP (inherited across the fork): a stray
+        // "reload" must not end every session.
+        // SAFETY: SIG_IGN; no handler runs.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
         // SAFETY: no thread has started (the caller's promise), so the
         // child may run ordinary code after fork.
         let pid = unsafe { libc::fork() };
@@ -162,23 +168,24 @@ pub mod jailer {
                 // This side ends with the root side, even one killed
                 // outright: no orphan holding the mint socket and frescod's
                 // link. A root side already gone before this was set
-                // leaves us adopted: end now.
+                // leaves us adopted (by init or a reaper such as
+                // daemon(8)): end now.
                 let mut sig: libc::c_int = libc::SIGKILL;
                 // SAFETY: procctl on our own pid with a pointer to a live int.
                 let set = unsafe { libc::procctl(libc::P_PID, 0, libc::PROC_PDEATHSIG_CTL, (&mut sig as *mut libc::c_int).cast()) };
                 // SAFETY: getppid has no preconditions.
-                if set != 0 || unsafe { libc::getppid() } == 1 {
+                if set != 0 || unsafe { libc::getppid() } != root_side {
                     crate::die("the root side is gone");
                 }
                 Jailer { sock: Mutex::new(child) }
             }
             _ => {
                 drop(child);
-                // A stop (SIGTERM, SIGINT, SIGHUP from rc or daemon(8))
-                // goes to the unprivileged side; its going ends `serve`,
-                // which takes down every session jail before this exits.
+                // A stop (SIGTERM, SIGINT from rc or daemon(8)) goes to the
+                // unprivileged side; its going ends `serve`, which takes
+                // down every session jail before this exits.
                 CHILD.store(pid, std::sync::atomic::Ordering::Relaxed);
-                for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                for s in [libc::SIGTERM, libc::SIGINT] {
                     // SAFETY: an all-zero sigaction is valid to fill; the
                     // handler only calls kill(2), which is
                     // async-signal-safe, and SA_RESTART resumes the recv

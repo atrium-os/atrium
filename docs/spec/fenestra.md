@@ -1768,8 +1768,8 @@ jail, and the unprivileged side dies with the root side (`PROC_PDEATHSIG_CTL`), 
 left holding the mint socket or frescod's link. A socket left at the mint path by a fenestrad that
 died is removed; one that answers stops the new fenestrad. `FEN_SERVICE=1
 scripts/fenestra-desktop-vm.sh` (after `deploy-portcullis.sh`) commissions and starts the service,
-runs the whole per-app gate through it, kills each side in turn and checks the pair comes back
-whole, and checks a stop leaves no fenestrad and no session jail: 23/23.
+runs the whole per-app gate through it, checks a SIGHUP ends nothing, kills each side in turn and checks the pair comes back
+whole, and checks a stop leaves no fenestrad and no session jail: 24/24.
 
 **The viewer's size and scale (§4.1), first step.** The viewer asks for a remote output of its
 window's size in device pixels and its scale (`Control::Output`, sides 64 to 8192, scale 0.5 to

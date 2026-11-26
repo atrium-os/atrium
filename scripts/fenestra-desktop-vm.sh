@@ -6,7 +6,8 @@
 # FEN_WM=1 forum-wm runs and it is the whole desktop (§3.4). FEN_SERVICE=1
 # (implies FEN_JAIL=1) commissions fenestrad as the boot service
 # (fenestra-service.sh, its rc.d script) and checks it comes back whole
-# after either side is killed and that a stop leaves nothing.
+# after either side is killed, that a SIGHUP ends nothing and that a stop
+# leaves nothing.
 #
 # In the guest: frescod in split mode (each client in its own renderer
 # process, here unconfined) with the fenestra link on, an app (Officina's
@@ -28,7 +29,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
 [ "${FEN_SERVICE:-0}" = 1 ] && FEN_JAIL=1
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 3 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 4 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -163,6 +164,9 @@ if [ "${FEN_SERVICE:-0}" = 1 ]; then
             sleep 1; i=$((i+1)); done
         echo "no: root [$(side root)] _fenestra [$(side _fenestra)]"; }
     R0=$(side root); U0=$(side _fenestra)
+    # A stray "reload" (SIGHUP to both) ends nothing.
+    g "pkill -HUP -x atrium-fenestrad"; sleep 3
+    check "a SIGHUP leaves both sides running" "$R0 $U0" "$(side root) $(side _fenestra)"
     # The root side killed outright: its other side goes with it (no
     # orphan holding the mint socket and frescod's link) and daemon(8)
     # starts the pair again, which takes frescod's link again.
