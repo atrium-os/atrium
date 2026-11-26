@@ -25,6 +25,8 @@
 name          = "vinculum-controller"
 class         = "usb"
 usb_interface = [0xE0, 0x01, 0x01]
+# Interface 1 (SCO, isochronous) has the same class: one driver per controller.
+usb_interface_number = 0
 detach_kernel = true
 nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
 all_nodes     = true

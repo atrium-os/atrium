@@ -345,11 +345,17 @@ const LIFT: &[(&str, u32)] = &[
     ("BESSELY", ALL),
     ("AMORLINC", ALL),
     ("AMORDEGRC", ALL),
+    ("ODDFPRICE", ALL),
+    ("ODDFYIELD", ALL),
+    ("ODDLPRICE", ALL),
+    ("ODDLYIELD", ALL),
+    ("BAHTTEXT", ALL),
+    ("EUROCONVERT", ALL),
 ];
 
 /// Functions whose result may be an array whatever their arguments.
 const ARRAY_RESULT: &[&str] = &[
-    "INDEX", "XLOOKUP", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "FILTER", "SORT", "SORTBY", "UNIQUE", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "MAP", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "TEXTSPLIT", "MODE.MULT", "LINEST", "LOGEST", "TREND", "GROWTH", "MMULT", "MINVERSE", "MUNIT", "FREQUENCY", "REGEXEXTRACT",
+    "INDEX", "XLOOKUP", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "FILTER", "SORT", "SORTBY", "UNIQUE", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "MAP", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "TEXTSPLIT", "MODE.MULT", "LINEST", "LOGEST", "TREND", "GROWTH", "MMULT", "MINVERSE", "MUNIT", "FREQUENCY", "REGEXEXTRACT", "GROUPBY", "PIVOTBY",
 ];
 
 /// Functions whose result is an array when an argument is one.
@@ -497,6 +503,16 @@ fn multi(e: &Ev) -> bool {
 
 /// An element of an array taken to `rows` × `cols`: one row or column broadcasts,
 /// past the end is `#N/A` (Excel's rule for arrays of different sizes).
+/// The LAMBDA a built-in function's name stands for: as many parameters
+/// as the function requires (at least one), passed straight through.
+fn eta(name: &str) -> Option<Arc<Lambda>> {
+    let id = funcs::lookup(&name.to_ascii_uppercase())?;
+    let spec = &funcs::FUNCS[id as usize];
+    let params: Vec<Arc<str>> = (0..usize::from(spec.min.max(1))).map(|i| Arc::from(format!("\u{1}{i}"))).collect();
+    let args = params.iter().map(|p| Expr::Name(p.clone())).collect();
+    Some(Arc::new(Lambda { params, body: Expr::Call(crate::formula::Func::Known(id), args), scope: None }))
+}
+
 fn at(a: &Array, r: usize, c: usize) -> Value {
     a.get(r, c).clone()
 }
@@ -559,9 +575,14 @@ impl Ctx<'_> {
         }
     }
 
-    fn lambda(&self, a: &Expr) -> Result<Arc<Lambda>, ErrorKind> {
+    pub(super) fn lambda(&self, a: &Expr) -> Result<Arc<Lambda>, ErrorKind> {
         match self.eval(a) {
             Ev::F(l) => Ok(l),
+            // A built-in function's bare name (`SUM`) where a LAMBDA goes.
+            Ev::V(Value::Err(ErrorKind::Name)) => match a {
+                Expr::Name(n) => eta(n).ok_or(ErrorKind::Name),
+                _ => Err(ErrorKind::Name),
+            },
             Ev::V(Value::Err(k)) => Err(k),
             _ => Err(ErrorKind::Value),
         }

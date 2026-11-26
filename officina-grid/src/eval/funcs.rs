@@ -21,6 +21,7 @@ use super::spread::*;
 use super::database::*;
 use super::textmore::*;
 use super::convert::convert;
+use super::groupby::{groupby, pivotby};
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -557,6 +558,15 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("AREAS", 1, 1, areas),
     f!("PERCENTOF", 2, 2, percentof),
     f!("TRIMRANGE", 1, 3, trimrange),
+    f!("ODDFPRICE", 8, 9, oddfprice),
+    f!("ODDFYIELD", 8, 9, oddfyield),
+    f!("ODDLPRICE", 7, 8, oddlprice),
+    f!("ODDLYIELD", 7, 8, oddlyield),
+    f!("GROUPBY", 3, 8, groupby),
+    f!("PIVOTBY", 4, 11, pivotby),
+    f!("BAHTTEXT", 1, 1, bahttext),
+    f!("PHONETIC", 1, 1, phonetic),
+    f!("EUROCONVERT", 3, 5, euroconvert),
 ];
 
 /// The id of a function by its upper-case name.

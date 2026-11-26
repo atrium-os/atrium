@@ -113,14 +113,20 @@ add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 
 # Vinculum's Bluetooth transport (bluetooth.md §4, §5): one vinculum-hci jail
-# per controller, the basics and nothing else. dispensatord shows each jail
+# per controller, the basics and usbctl. dispensatord shows each jail
 # its own controller's ugenB.A and usb/B.A.0 through devfs_grants, checked
 # against the pin in jaild.policy.toml (id 25, atrium-vinculum-hci-*,
 # _vinculum-hci), owned by _vinculum-hci, 0600. vinculumd's own jail shows
 # no device: the radio is reached only through vinculum-hci.
+# usbctl too: FreeBSD's libusb finds devices by USB_READ_DIR on it before it
+# opens ugenB.A, so without it the jail sees no controller. It is root 0644:
+# the jail can list bus/address names (opening any but its own ugen fails,
+# none is in its devfs); its quirk ioctls need PRIV_DRIVER, which the
+# jail's non-root uid does not have.
 [atrium_bluetooth=25]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
+add path 'usbctl' unhide
 
 # Capsa's removable-storage servers (device-assignment.md §4.6): the basics
 # and nothing else. jaild opens the partition and /dev/fuse for each and

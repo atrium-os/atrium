@@ -58,6 +58,11 @@ if [ -n "$FW" ]; then
     done
 fi
 
+# arcad must know vinculumd by its uid, or the key store is refused.
+A=/etc/atrium/services.d/42-atrium-arcad.toml
+if [ -f "$A" ] && ! grep -q 'vinculumd=65024' "$A"; then
+    echo "vinculum-service: $A does not name vinculumd=65024 in ARCA_SERVICES (a test copy?); install arca/arcad/etc/services.d/42-atrium-arcad.toml and restart arcad"
+fi
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
 install -m 0644 "$HERE/vinculum/etc/services.d/46-atrium-vinculumd.toml" /etc/atrium/services.d/

@@ -93,6 +93,11 @@ mod tests {
     fn vinculum_jail_matches_its_pin() {
         let mut r = Rules::default();
         r.add_toml("v", include_str!("../../vinculum/etc/devices.d/25-vinculum.toml")).unwrap();
+        // One driver per controller: interface 0 (HCI), never interface 1
+        // (SCO), though both are class E0/01/01.
+        let bt = |number| crate::rules::UsbInterface { number, vendor: 0x2357, product: 0x0604, class: 0xE0, subclass: 1, protocol: 1 };
+        assert!(r.match_usb(&bt(0)).is_some());
+        assert!(r.match_usb(&bt(1)).is_none());
         let d = &r.drivers["vinculum-hci"];
         let v: BTreeMap<String, String> =
             [("usb", "0-3-0"), ("bus", "0"), ("addr", "3"), ("interface", "0")].iter().map(|(k, x)| (k.to_string(), x.to_string())).collect();

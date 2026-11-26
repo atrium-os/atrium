@@ -316,7 +316,7 @@ pub fn formula_in(f: &str) -> String {
     while let Some(i) = rest.find("_xl") {
         s.push_str(&rest[..i]);
         let tail = &rest[i..];
-        if let Some(t) = tail.strip_prefix("_xlfn.").or_else(|| tail.strip_prefix("_xlws.")).or_else(|| tail.strip_prefix("_xlpm.")) {
+        if let Some(t) = tail.strip_prefix("_xlfn.").or_else(|| tail.strip_prefix("_xlws.")).or_else(|| tail.strip_prefix("_xlpm.")).or_else(|| tail.strip_prefix("_xleta.")) {
             rest = t;
         } else {
             s.push_str("_xl");
@@ -1912,6 +1912,7 @@ mod tests {
     #[test]
     fn formula_prefixes() {
         assert_eq!(formula_in("_xlfn.XLOOKUP(A1,B:B,C:C)+_xlfn.IFS(A1>0,1)"), "=XLOOKUP(A1,B:B,C:C)+IFS(A1>0,1)");
+        assert_eq!(formula_in("_xlfn.BYROW(A1:B2,_xleta.SUM)"), "=BYROW(A1:B2,SUM)");
         assert_eq!(formula_in("SUM(A1:A3)"), "=SUM(A1:A3)");
     }
 

@@ -1814,7 +1814,10 @@ the show probe passes (`navigator-live-vm.sh` 0 failed); the usage probe got 3 o
 first ask came inside the first second after the start and was refused, and its jail check
 (`jls -j`, at once) missed a jail that was there, so the "gone" check proved nothing. It now
 waits for the jail by name in `jls name`'s list (printing the list if it never shows),
-then waits out the first second before asking.
+then waits out the first second before asking. Mac rerun at 7f38bdd3c: 5 of 5 (first ask 30.7 MiB of
+256 MiB, the ask at once refused, the ask after the gap answered, the jail gone on hang-up).
+All four installed checks have now passed. `navigator-live-vm.sh` counts its checks with
+`scripts/lib/gate.sh` (76 on a green run).
 
 The Mac run also showed frescod's "live code" tag, drawn in a pill just above the island,
 covering the prompt row's file name (the island started right under the row). While the

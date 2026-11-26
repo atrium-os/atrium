@@ -29,6 +29,7 @@ mod spread;
 mod database;
 mod textmore;
 mod convert;
+mod groupby;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;

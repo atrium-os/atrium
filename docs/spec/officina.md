@@ -5134,6 +5134,19 @@ Thirty-eight more functions, after §16.138's so function ids stay put:
 - Tests: 80 conformance cases (Microsoft's examples for the database functions, CONVERT, AMORLINC, AMORDEGRC and the Bessel functions), a unit test that every CONVERT name is found once and to its own unit, and Bessel checks against SciPy including large orders and small arguments.
 - Not yet: the ODD-period bond functions, FORECAST.ETS, GROUPBY and PIVOTBY, and the cube, web and RTD functions.
 
+### 16.140 Odd-period bonds, GROUPBY and PIVOTBY, and function names as values (2026-11-26)
+
+Nine more functions, after §16.139's so function ids stay put, and one language feature:
+
+- **Function names as values** (`eval/arrays.rs`): where a LAMBDA is expected, a built-in function's bare name (`BYROW(A1:B9, SUM)`, `GROUPBY(…, PERCENTOF)`) is that function as a lambda with as many parameters as it requires. Only a name that isn't a LET or defined name is taken so. `.xlsx` reads Excel's `_xleta.` prefix and writes it for a function name given as an argument of MAP, REDUCE, SCAN, BYROW, BYCOL, MAKEARRAY, GROUPBY or PIVOTBY.
+- **ODDFPRICE, ODDFYIELD, ODDLPRICE and ODDLYIELD** (`eval/bonds.rs`) on Microsoft's formulas for odd first and last periods, short or long. An odd period is cut into quasi-coupon periods on the schedule through the first coupon (or from the last interest date), each counting its days (DC), days accrued before settlement (A) and days from settlement (DSC) as fractions of its normal length on the chosen basis. ODDFYIELD inverts ODDFPRICE by bisection; ODDLYIELD has a closed form. At most 1,000 quasi periods and 32,000 coupons.
+- **GROUPBY** (`eval/groupby.rs`): the function is applied to each group's values column (a two-parameter function such as PERCENTOF also gets all the values), per value column. Keys are compared as SORT compares them (text without case). field_headers 0–3, or by default headers when the first value row is all text and the second has a number; total_depth 0, ±1 (grand total after or before), ±2 and deeper (subtotals by the leading fields); sort_order one column index, negative for descending, by key or by a value column's result, kept within the hierarchy; filter_array. field_relationship is checked (0 or 1) but both give the hierarchy.
+- **PIVOTBY**: row and column fields with the same totals and key sorting on each axis; an empty intersection is blank; several value columns sit side by side under each column key. relative_to is checked but PERCENTOF is always relative to all values.
+- **BAHTTEXT** (Thai words, ล้าน for millions, เอ็ด for a trailing one, สตางค์ or ถ้วน), **PHONETIC** (cells carry no readings here, so the cells' text), and **EUROCONVERT** (the 19 legacy euro-area currencies at their fixed rates, rounded to the target's decimals unless full_precision, triangulating through the euro with triangulation_precision ≥ 3).
+- Argument tips; lifting for the bond functions, BAHTTEXT and EUROCONVERT; GROUPBY and PIVOTBY are array results. `.xlsx` writes GROUPBY, PIVOTBY and BAHTTEXT with `_xlfn.`.
+- Tests: 50 conformance cases, including Microsoft's examples for the four odd-period functions (all match to eight places), and `.xlsx` read and write of `_xleta.`.
+- Not built, on purpose: FORECAST.ETS and its kin (Excel's AAA exponential smoothing chooses its parameters by an undocumented optimisation, so results would not match), WEBSERVICE, FILTERXML, STOCKHISTORY and IMAGE (they fetch or parse outside content in the formula engine, which §16.74 rules out), the cube and RTD functions, CALL and REGISTER.ID, and GETPIVOTDATA (until pivot tables are addressable from formulas).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

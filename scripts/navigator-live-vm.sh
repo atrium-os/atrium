@@ -34,9 +34,10 @@ SSHOPT="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o L
 g() { ssh $SSHOPT -o ConnectTimeout=30 -p "${VM_SSH_PORT:-2222}" root@localhost "$@"; }
 put() { scp $SSHOPT -P "${VM_SSH_PORT:-2222}" -q "$1" "root@localhost:$2"; }
 get() { scp $SSHOPT -P "${VM_SSH_PORT:-2222}" -q "root@localhost:$1" "$2"; }
-fails=0
-ok() { echo "  ok: $*"; }
-bad() { echo "  FAIL: $*"; fails=$((fails + 1)); }
+. "$ROOT/scripts/lib/gate.sh"
+# Every ok site below runs once on a green run; a run that stops early
+# fails on the count.
+gate_begin navigator-live 76
 
 if [ "${BUILD:-1}" = 1 ]; then
     echo "=== cross-build"
@@ -472,5 +473,4 @@ fi
 echo "=== logs"
 for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 ui10 ui11 navigatord2 navigatord3; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
-echo "navigator-live: $fails failed"
-[ "$fails" = 0 ]
+gate_end
