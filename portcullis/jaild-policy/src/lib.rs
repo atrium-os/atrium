@@ -76,6 +76,10 @@ pub struct Policy {
     /// Crypta's tunnel engines (vpn.md §3). Absent = none.
     #[serde(default)]
     pub crypta_engines: Option<CryptaEnginePolicy>,
+    /// Fenestra's per-session network jails (fenestra.md §3.2, §11.3).
+    /// Absent = none.
+    #[serde(default)]
+    pub fenestra_sessions: Option<FenestraSessionPolicy>,
     /// Per-jail system call filter profiles (jail-sysfil.md §5). Absent =
     /// no profiles, and a request that names one is refused.
     #[serde(default)]
@@ -314,6 +318,24 @@ pub struct CryptaEnginePolicy {
     /// The AnyConnect engine (vpn.md §9): TCP to its one gateway only.
     #[serde(default)]
     pub ac_exec_path: Option<String>,
+}
+
+/// `[fenestra_sessions]`: fenestrad asks for one jail per remote viewing
+/// session (fenestra.md §3.2, §11.3), named `<name_prefix><uid>` at
+/// `<instance_root_dir>/<name>`, running exactly `exec_path` as that uid
+/// with fenestrad's link as its stdio and the mint socket as fd 3. Its
+/// network is a routed vnet whose only grant is one UDP `listen` port in
+/// `port_first..=port_last`, from a local network: nothing outbound, no
+/// peers, no resolver.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FenestraSessionPolicy {
+    pub name_prefix: String,
+    pub exec_path:   String,
+    pub uid_first:   u32,
+    pub uid_last:    u32,
+    pub port_first:  u16,
+    pub port_last:   u16,
 }
 
 /// `[print_workers]`: prelumd asks for one jail per worker (printing.md

@@ -1,5 +1,6 @@
 //! `fenestrad --frescod SOCK --session BIN (--mint-sock PATH | --mint-dir DIR)
-//! [--bind ADDR] [--public-ip IP] [--seat PATH] [--grace S]`
+//! [--bind ADDR] [--public-ip IP] [--seat PATH] [--grace S]
+//! [--jaild SOCK --lan IFACE SUBNET]`
 //!
 //! Fenestra's daemon on the host (fenestra.md §3.2). It has no network:
 //! it holds the link to frescod's broker (`FRESCOD_FENESTRA_SOCK`) and
@@ -28,6 +29,11 @@
 //! started with the viewer's key on fd 3 and answers there with its mint
 //! line, which goes back with the address set to `--public-ip`.
 //!
+//! With `--jaild`, each minted session runs in its own jail (`jail.rs`):
+//! its own uid, its own vnet whose only grant is one UDP port from the
+//! local network `--lan` names. Without it a session is a plain child
+//! (other systems, and gates on a host without jaild).
+//!
 //! `--mint-dir` is the development form: one session through files, and
 //! fenestrad exits when it ends.
 
@@ -41,6 +47,9 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use fenestra_link::Rec;
+
+#[cfg(target_os = "freebsd")]
+mod jail;
 use fenestra_wire::mint::{self, DevMint};
 
 /// Records queued for one session before it counts as stuck.
@@ -63,9 +72,30 @@ fn die(why: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+/// A session's process: a plain child, or (on Atrium) its own jail.
+enum Proc {
+    Child(Child),
+    #[cfg(target_os = "freebsd")]
+    Jail(jail::Running),
+}
+
+impl Proc {
+    fn stop(&mut self) {
+        match self {
+            Proc::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            // Its jail goes when the process does (jail.rs watches it).
+            #[cfg(target_os = "freebsd")]
+            Proc::Jail(r) => r.kill(),
+        }
+    }
+}
+
 struct Session {
     tx: SyncSender<Rec>,
-    child: Child,
+    child: Proc,
     on: bool,
     /// How many of its wants are outstanding.
     wants: usize,
@@ -109,8 +139,7 @@ impl Relay {
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 eprintln!("fenestrad: session {id} stopped reading; ending it");
                 if let Some(mut s) = t.sessions.remove(&id) {
-                    let _ = s.child.kill();
-                    let _ = s.child.wait();
+                    s.child.stop();
                 }
             }
         }
@@ -200,8 +229,7 @@ impl Relay {
     fn end_session(&self, id: u32) {
         let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut s) = t.sessions.remove(&id) {
-            let _ = s.child.kill();
-            let _ = s.child.wait();
+            s.child.stop();
         }
         t.tickets.retain(|_, (s, _)| *s != id);
         self.sync_on(&mut t);
@@ -214,6 +242,9 @@ struct Config {
     public_ip: Option<std::net::IpAddr>,
     seat: String,
     grace: Option<u64>,
+    /// Sessions in jails through jaild (`--jaild SOCK --lan IFACE SUBNET`).
+    #[cfg(target_os = "freebsd")]
+    jails: Option<jail::Jails>,
 }
 
 enum MintBy {
@@ -221,6 +252,16 @@ enum MintBy {
     Dir(String),
     /// The viewer's key, handed over on fd 3.
     Key(Vec<u8>),
+}
+
+#[cfg(target_os = "freebsd")]
+fn jailed(cfg: &Config) -> Option<&jail::Jails> {
+    cfg.jails.as_ref()
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn jailed(_: &Config) -> Option<()> {
+    None
 }
 
 /// Start session `id`; returns its mint (the `Key` form) once it answers.
@@ -260,11 +301,25 @@ fn start_session(relay: &Arc<Relay>, cfg: &Config, id: u32, by: MintBy) -> Resul
             mint_ours = Some((a, b));
         }
     }
-    let child = cmd
-        .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", cfg.bin))?;
+    let child = match (jailed(cfg), &mint_ours) {
+        #[cfg(target_os = "freebsd")]
+        (Some(j), Some((_, b))) => {
+            use std::os::fd::AsFd;
+            let mut args = vec!["--mint-fd".to_string(), "3".to_string()];
+            if let Some(g) = cfg.grace {
+                args.extend(["--grace".to_string(), g.to_string()]);
+            }
+            let r = j.start(theirs.as_fd(), b.as_fd(), &args).map_err(|e| e.to_string())?;
+            eprintln!("fenestrad: session {id} in jail {}", r.port);
+            Proc::Jail(r)
+        }
+        _ => Proc::Child(
+            cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+                .stdout(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("{}: {e}", cfg.bin))?,
+        ),
+    };
     let (tx, rx) = mpsc::sync_channel::<Rec>(SESSION_QUEUE);
     relay.table.lock().unwrap_or_else(|e| e.into_inner()).sessions.insert(id, Session { tx, child, on: false, wants: 0 });
     let mut w = ours.try_clone().map_err(|e| e.to_string())?;
@@ -363,7 +418,17 @@ fn main() {
         public_ip: arg(&args, "--public-ip").map(|s| s.parse().unwrap_or_else(|_| die("--public-ip IP"))),
         seat: arg(&args, "--seat").unwrap_or_else(|| portcullis_peer::seat::ACTIVE_SESSION.into()),
         grace: arg(&args, "--grace").map(|s| s.parse().unwrap_or_else(|_| die("--grace SECONDS"))),
+        #[cfg(target_os = "freebsd")]
+        jails: arg(&args, "--jaild").map(|sock| {
+            let lan = args.iter().position(|a| a == "--lan").and_then(|i| Some((args.get(i + 1)?.clone(), args.get(i + 2)?.clone())));
+            let (iface, subnet) = lan.unwrap_or_else(|| die("--jaild needs --lan IFACE SUBNET (where viewers come from)"));
+            jail::Jails::new(&sock, &iface, &subnet)
+        }),
     };
+    #[cfg(not(target_os = "freebsd"))]
+    if arg(&args, "--jaild").is_some() {
+        die("--jaild is for Atrium only");
+    }
 
     let f = UnixStream::connect(&sock).unwrap_or_else(|e| die(format!("{sock}: {e}")));
     let fr = f.try_clone().unwrap_or_else(|e| die(e));

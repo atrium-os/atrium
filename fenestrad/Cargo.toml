@@ -12,6 +12,11 @@ fenestra-wire   = { path = "../fenestra-wire" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 libc            = "0.2"
 
+[target.'cfg(target_os = "freebsd")'.dependencies]
+jaild               = { path = "../portcullis/jaild" }
+portcullis-identity = { path = "../portcullis/portcullis-identity" }
+portcullis-mounts   = { path = "../portcullis/portcullis-mounts" }
+
 [[bin]]
 name = "fenestrad"
 path = "src/main.rs"

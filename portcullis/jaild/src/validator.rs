@@ -60,7 +60,7 @@ pub fn validate_create(
             || matches!(req.class, Some(crate::protocol::JailClass::App { .. }));
         validate_exec(exec, policy, own_tree,
                       is_courier(req, policy) || is_share_server(req, policy) || is_print_worker(req, policy)
-                          || is_crypta_engine(req, policy))?;
+                          || is_crypta_engine(req, policy) || is_fenestra_session(req, policy))?;
     }
     validate_host_identity(req)?;
     validate_class(req, policy)?;
@@ -306,6 +306,30 @@ pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
         false
     };
     network_ok && exec.stdio && without_devices_or_children(req) && !req.allow_mlock
+}
+
+/// Whether `req` is one of Fenestra's session jails (`[fenestra_sessions]`,
+/// fenestra.md §3.2, §11.3), named and rooted like a courier's, taking its
+/// caller's stdio (fenestrad's link, and the mint socket as fd 3): a routed
+/// vnet whose only grant is one UDP `listen` port in the policy's range,
+/// from a local network. Nothing outbound, no peers, no resolver, nothing
+/// `inbound`. No devices, no FUSE, no child jails, no locked memory.
+pub fn is_fenestra_session(req: &CreateJailRequest, policy: &Policy) -> bool {
+    use crate::protocol::{ListenFrom, NetworkConfig};
+    let Some(c) = policy.fenestra_sessions.as_ref() else { return false };
+    let Some((_, exec)) = service_instance(req, policy, &c.name_prefix, c.uid_first..=c.uid_last) else {
+        return false;
+    };
+    let network_ok = match &req.network {
+        NetworkConfig::Routed { grants: Some(g), fib: None, .. } => {
+            !g.outbound_any && g.no_resolver && g.outbound.is_empty() && g.peers.is_empty() && g.inbound.is_empty()
+                && g.tag.is_none()
+                && matches!(g.listen.as_slice(), [l] if l.udp && (c.port_first..=c.port_last).contains(&l.port)
+                    && matches!(l.from, ListenFrom::Lan { .. }))
+        }
+        _ => false,
+    };
+    exec.path == c.exec_path && network_ok && exec.stdio && without_devices_or_children(req) && !req.allow_mlock
 }
 
 /// The pf tag the `CRYPTA_OUTER` rules key on (vpn.md §5.4).
@@ -1676,6 +1700,68 @@ mod tests {
             (mlock, "locked memory"),
         ] {
             assert!(!is_print_worker(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+    }
+
+    /// Fenestra's sessions: exactly the policy's name, root, binary and
+    /// uid, a routed vnet with one UDP listen port in range from a local
+    /// network and nothing else; anything more is refused.
+    #[test]
+    fn a_fenestra_session_jail_and_only_a_fenestra_session_jail() {
+        use crate::protocol::{ListenFrom, NetDest, NetGrants, NetListen, NetworkConfig};
+        let p = load_sample_policy();
+        let lan = || ListenFrom::Lan { iface: "vtnet0".into(), subnet: "10.0.2.0/24".into() };
+        let grants = |listen: Vec<NetListen>| NetGrants {
+            app_key: "0123456789abcdef".into(), outbound_any: false, outbound: vec![], peers: vec![], inbound: vec![], no_resolver: true, tag: None, listen,
+        };
+        let udp = |port: u16| vec![NetListen { port, udp: true, from: lan() }];
+        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g), fib: None };
+        let session = |name: &str, exe: &str, uid: u32, net: NetworkConfig| {
+            let mut r = instance_req(name, &format!("/var/lib/atrium/jails/{name}"), exe, true);
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r.network = net;
+            r
+        };
+        let exe = "/usr/local/bin/atrium-fenestra-session";
+        let ok = session("system-fenestra-60501", exe, 60501, routed(grants(udp(24300))));
+        assert!(is_fenestra_session(&ok, &p));
+        validate_create(&ok, &p).expect("a session jail");
+        let mut out = grants(udp(24300));
+        out.outbound = vec![NetDest { cidr: "192.0.2.1/32".into(), port: Some(443), udp: false }];
+        let mut any = grants(udp(24300));
+        any.outbound_any = true;
+        let mut dns = grants(udp(24300));
+        dns.no_resolver = false;
+        let mut inbound = grants(udp(24300));
+        inbound.inbound = vec![24301];
+        let mut mlock = ok.clone();
+        mlock.allow_mlock = true;
+        let mut kids = ok.clone();
+        kids.children_max = 1;
+        let this_computer = vec![NetListen { port: 24300, udp: true, from: ListenFrom::ThisComputer { owner_uid: 1001, owner: "p".into() } }];
+        for (r, why) in [
+            (session("system-fenestra-60501", exe, 60501, routed(grants(udp(24299)))), "a port below the range"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants(udp(24316)))), "a port above the range"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants(vec![NetListen { port: 24300, udp: false, from: lan() }]))), "TCP"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants([udp(24300), udp(24301)].concat()))), "two ports"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants(vec![]))), "no port"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants(this_computer))), "from this computer"),
+            (session("system-fenestra-60501", exe, 60501, routed(out)), "an outbound grant"),
+            (session("system-fenestra-60501", exe, 60501, routed(any)), "outbound_any"),
+            (session("system-fenestra-60501", exe, 60501, routed(dns)), "a resolver"),
+            (session("system-fenestra-60501", exe, 60501, routed(inbound)), "inbound"),
+            (session("system-fenestra-60501", exe, 60501, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None, fib: None }), "a vnet with no grants"),
+            (session("system-fenestra-60501", exe, 60501, NetworkConfig::Inherit), "the host's stack"),
+            (session("system-fenestra-60501", exe, 60502, routed(grants(udp(24300)))), "uid not the name's"),
+            (session("system-fenestra-60499", exe, 60499, routed(grants(udp(24300)))), "uid below the range"),
+            (session("system-fenestra-60501", "/usr/local/bin/atrium-svc", 60501, routed(grants(udp(24300)))), "another binary"),
+            (mlock, "locked memory"),
+            (kids, "child jails"),
+        ] {
+            assert!(!is_fenestra_session(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
     }

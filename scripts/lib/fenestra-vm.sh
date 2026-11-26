@@ -5,7 +5,8 @@
 #   fen_setup              build, stage, start frescod and Sheets
 #   fen_fenestrad          start fenestrad in the guest, taking mints on its
 #                          socket from the seat's user (root here); sets
-#                          FEN_SSH, the viewer's --ssh transport into it
+#                          FEN_SSH, the viewer's --ssh transport into it.
+#                          FEN_JAIL=1: sessions in jails through jaild
 #   compare HOST.png       each placed window's interior on the viewer's
 #                          desktop ($W/view/desktop.png) against HOST.png
 #
@@ -67,8 +68,19 @@ fen_setup() {
 }
 
 fen_fenestrad() {
+    if [ "${FEN_JAIL:-0}" = 1 ]; then
+        # Each session in its own jail through jaild (deploy-portcullis.sh
+        # installs jaild and this tree's policy): its own uid and vnet, one
+        # UDP port from the guest's network. The first port of the pool is
+        # $PORT, so the forward still lands.
+        g "install -m 0755 $D/fenestra-session /usr/local/bin/atrium-fenestra-session && service atrium-jaild status >/dev/null" \
+            || gate_abort "no jaild in the guest (sh scripts/deploy-portcullis.sh)"
+        HOW="--jaild /var/run/atrium/jaild.sock --lan vtnet0 10.0.2.0/24 --public-ip 10.0.2.15 --grace 15"
+    else
+        HOW="--bind 0.0.0.0:$PORT"
+    fi
     g "echo root >$G/seat && cd $G && daemon -f -o $G/fenestrad.log $D/fenestrad --frescod $G/fenestra.sock --session $D/fenestra-session \
-        --mint-sock $G/mint.sock --seat $G/seat --bind 0.0.0.0:$PORT </dev/null"
+        --mint-sock $G/mint.sock --seat $G/seat $HOW </dev/null"
     i=0; while [ $i -lt 30 ] && ! g "test -S $G/mint.sock"; do sleep 1; i=$((i+1)); done
     g "test -S $G/mint.sock" || { g "cat $G/fenestrad.log"; gate_abort "fenestrad did not open its mint socket"; }
     # What the viewer runs to mint: ssh into the guest, then fenestra-shell.

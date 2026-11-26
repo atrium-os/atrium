@@ -497,6 +497,22 @@ uid_first   = 61000
 uid_last    = 61499
 
 # ---------------------------------------------------------------
+# Fenestra's sessions (docs/spec/fenestra.md §3.2, §11.3): fenestrad asks
+# for one jail per remote viewing session, named <name_prefix><uid> at
+# <instance_root_dir>/<name>, running exactly exec_path as that uid with
+# fenestrad's link as its stdio and the mint socket as fd 3. Its network is
+# a routed vnet whose one grant is a UDP listen port in port_first..
+# port_last from a local network: nothing outbound, no peers, no resolver.
+# ---------------------------------------------------------------
+[fenestra_sessions]
+name_prefix = "system-fenestra-"
+exec_path   = "/usr/local/bin/atrium-fenestra-session"
+uid_first   = 60500
+uid_last    = 60599
+port_first  = 24300
+port_last   = 24315
+
+# ---------------------------------------------------------------
 # Environment variable allow-list for execve. Anything not
 # matching is dropped.
 # ---------------------------------------------------------------

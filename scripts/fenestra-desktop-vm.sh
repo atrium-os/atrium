@@ -22,7 +22,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop 13
+gate_begin fenestra-desktop $([ "${FEN_JAIL:-0}" = 1 ] && echo 15 || echo 13)
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -60,6 +60,8 @@ VP=$!
 
 sleep 15
 g "cp $G/screen.png $G/before.png"
+# While the viewer is attached: the jail as the kernel has it.
+[ "${FEN_JAIL:-0}" = 1 ] && JL=$(g "jls -j system-fenestra-60500 vnet 2>/dev/null; ps -J system-fenestra-60500 -o uid= -o comm= 2>/dev/null" | tr -s ' \n' ' ')
 sleep 50
 g "cp $G/screen.png $G/middle.png"
 sleep 45
@@ -98,7 +100,18 @@ case "$r2" in
     *) bad "held windows were sent whole again (resumed/resent: $r2)" ;;
 esac
 grep -q "minted session 1 for root" "$W/fenestrad.log" && ok "the viewer minted over ssh, as the seat's user" || bad "no ssh mint in fenestrad's log"
-check "the session is still up after its viewer left" yes "$(g "pgrep -x fenestra-session >/dev/null" && echo yes || echo "no: $(tail -2 "$W/fenestrad.log")")"
+if [ "${FEN_JAIL:-0}" = 1 ]; then
+    grep -q "session 1 in jail 24300" "$W/fenestrad.log" && ok "fenestrad started the session in a jail" || bad "no jailed session in fenestrad's log"
+    # The kernel's answer: the jail exists, has its own vnet, and the
+    # session runs in it as the pool's uid.
+    case "$JL" in *new*60500\ atrium-fenestra-se*) ok "the session runs in its own vnet jail as uid 60500";; *) bad "the session jail: $JL";; esac
+    # Its grace (fen_fenestrad) ends it with no viewer; fenestrad's janitor
+    # then takes the jail and its network apart.
+    i=0; while [ $i -lt 40 ] && g "jls -j system-fenestra-60500 jid >/dev/null 2>&1"; do sleep 1; i=$((i+1)); done
+    check "after its grace the session's jail is gone" gone "$(g "jls -j system-fenestra-60500 jid >/dev/null 2>&1" && echo present || echo gone)"
+else
+    check "the session is still up after its viewer left" yes "$(g "pgrep -x fenestra-session >/dev/null" && echo yes || echo "no: $(tail -2 "$W/fenestrad.log")")"
+fi
 g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; true"
 echo "  evidence in $W"
 gate_end

@@ -1596,9 +1596,7 @@ reading is cut off, never waited on.
 **Differences from §3.2, for now.** Every window streams while a session is on (the whole
 screen mirrored, §4.2) rather than only windows on remote outputs; remote outputs with the
 viewer's sizes and scales come with the windowed viewer. The renderer answers a want with a
-difference made on demand rather than writing a ring ahead. fenestrad starts each session as
-a plain child, not through portcullisd in its own jail (that needs the `listen` grant of
-background-apps.md B4); the renderers in the gate are unconfined (`FRESCOD_RENDERER_LAUNCHER=unconfined`). The trusted
+difference made on demand rather than writing a ring ahead. The renderers in the gate are unconfined (`FRESCOD_RENDERER_LAUNCHER=unconfined`). The trusted
 strip and window 0 (the WM's background) are not streamed yet.
 
 **Gates.**
@@ -1610,7 +1608,9 @@ strip and window 0 (the WM's background) are not streamed yet.
 - `scripts/fenestra-desktop-vm.sh` (cloud VM, `NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300`):
   frescod in split mode with atrium-sheets, fenestrad and its session in the guest, the
   viewer in the container, minting over real ssh into the guest and driven only from the viewer
-(frescod has no injector). 13/13: the
+(frescod has no injector). 13/13, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 15/15
+with the session in its jail, checked from the kernel (its own vnet, uid 60500) and gone after
+its grace: the
   viewer's desktop equals frescod's own screen over every window, outside the strip and the
   focus ring; typing before and after a reconnect reaches the host and comes back; every input
   event passed on, none dropped; 0 scene bytes while idle; the second connection resumed
@@ -1645,6 +1645,20 @@ answers there with its mint line and keeps them in memory only; fenestrad sets t
 viewer for S seconds. Still to come: headless sessions and personas (the seat only, for now),
 and the view-only bounds.
 
+**Session jails (§11.3).** With `--jaild SOCK --lan IFACE SUBNET`, fenestrad starts each
+session through jaild (`fenestrad/src/jail.rs`), as prelumd does its workers: a jail
+`system-fenestra-<uid>` at `/var/lib/atrium/jails/<name>`, running
+`/usr/local/bin/atrium-fenestra-session` as a uid from its pool (60500 to 60599), its root only the
+base libraries and binaries read-only, fenestrad's link as its stdin and stdout and the mint
+socket as fd 3, system call class `networked`. Its network is its own vnet whose one grant is a
+UDP `listen` port from the pool (24300 to 24315) from that local network: nothing outbound, no
+peers, no resolver. jaild's `[fenestra_sessions]` and `is_fenestra_session` accept exactly that
+shape and nothing wider (another port, TCP, two ports, listen from this computer, an outbound
+grant, a resolver, children, locked memory are refused). When the session exits, its jail and
+network are taken apart and the uid and port go back to the pool. fenestrad itself still runs as
+root (jaild takes only root callers), not yet as `_fenestra` in its own jail; no code went into
+portcullisd. Without `--jaild` a session is a plain child (other systems, hosts without jaild).
+
 **Whole states.** A blob goes as an LZ4 block (`BLOB_LZ4`, `lz4_flex` with its safe decoder)
 when that saves an eighth or more; the reader checks the declared size against its bounds before
 it decompresses and refuses a block that does not come out at exactly that size. The glyph
@@ -1660,8 +1674,8 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** The strip and background on the viewer; renderers and the session in their
-jails (after B4's listen grant); remote outputs at the viewer's size and scale; compressing
+**Next in R2.** The strip and background on the viewer; renderers in their jails in the gate,
+and fenestrad as `_fenestra` in its own; remote outputs at the viewer's size and scale; compressing
 region updates as blobs are; the TCP fallback when UDP is blocked.
 
 ## 20. Sources
