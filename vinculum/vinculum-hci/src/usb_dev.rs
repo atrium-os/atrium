@@ -142,6 +142,7 @@ extern "C" {
     fn libusb_error_name(code: c_int) -> *const c_char;
     fn libusb_get_string_descriptor_ascii(handle: *mut Handle, index: u8, data: *mut u8, length: c_int) -> c_int;
     fn libusb_close(handle: *mut Handle);
+    fn libusb_clear_halt(handle: *mut Handle, endpoint: u8) -> c_int;
 }
 
 fn err_name(code: c_int) -> String {
@@ -397,6 +398,17 @@ fn claim(usb: &Usb, name: &str) -> std::io::Result<u8> {
     let r = unsafe { libusb_claim_interface(usb.handle, usb.iface as c_int) };
     if r < 0 {
         return Err(io_err(&format!("claim interface {} of {name}", usb.iface), r));
+    }
+    // Start every pipe from a clean data toggle and no halt: whoever had the
+    // device before us (the kernel's driver, a driver that died, the host
+    // OS before a passthrough) may have left an endpoint stalled, and a
+    // stalled interrupt IN fails every event read with a pipe error.
+    for ep in [usb.eps.events.address, usb.eps.acl_in.address, usb.eps.acl_out.address] {
+        // SAFETY: the handle is open and the interface holding `ep` is claimed.
+        let r = unsafe { libusb_clear_halt(usb.handle, ep) };
+        if r < 0 {
+            eprintln!("vinculum-hci: {name}: clear halt on endpoint 0x{ep:02x}: {}", err_name(r));
+        }
     }
     Ok(cur.clamp(0, 255) as u8)
 }
