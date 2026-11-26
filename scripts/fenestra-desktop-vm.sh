@@ -22,13 +22,12 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop 12
+gate_begin fenestra-desktop 13
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
 echo "=== session"
 W=$(mktemp -d "${TMPDIR:-/tmp}/fenestra-desktop.XXXXXX")
-mkdir -p "$W/mint"
 RUN="${RUN_SECS:-150}"
 # The viewer's input, seconds from its start (it connects within ~10 s): a
 # click on a cell and "123" Enter; it reconnects at 70 s; then right arrow
@@ -54,10 +53,10 @@ cat >"$W/input.txt" <<'EOF'
 88 KEY 40 1
 88.1 KEY 40 0
 EOF
-"$VIEW" --headless --input "$W/input.txt" --mint-dir "$W/mint" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" \
+fen_fenestrad
+"$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" \
     --reconnect-after 70 --idle-after 120 >"$W/view.log" 2>&1 &
 VP=$!
-fen_mint "$W"
 
 sleep 15
 g "cp $G/screen.png $G/before.png"
@@ -98,6 +97,7 @@ case "$r2" in
     *" 0") ok "the second connection resumed every held window (resumed/resent: $r2)" ;;
     *) bad "held windows were sent whole again (resumed/resent: $r2)" ;;
 esac
+grep -q "minted session 1 for root" "$W/fenestrad.log" && ok "the viewer minted over ssh, as the seat's user" || bad "no ssh mint in fenestrad's log"
 check "the session is still up after its viewer left" yes "$(g "pgrep -x fenestra-session >/dev/null" && echo yes || echo "no: $(tail -2 "$W/fenestrad.log")")"
 g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; true"
 echo "  evidence in $W"

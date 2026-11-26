@@ -1,5 +1,6 @@
-//! `fenestra-view --mint-dir DIR [--connect ADDR]`: a window showing the
-//! host's desktop; keyboard, pointer and wheel go to the host.
+//! `fenestra-view (--ssh "ssh -T user@host" | --mint-dir DIR) [--take-over]
+//! [--connect ADDR]`: a window showing the host's desktop; keyboard,
+//! pointer and wheel go to the host.
 //!
 //! `fenestra-view --headless --mint-dir DIR --out DIR [--run-secs N]
 //! [--reconnect-after S] [--connect ADDR] [--idle-after S] [--input FILE]`
@@ -8,8 +9,13 @@
 //! `--reconnect-after S` drops the connection after S seconds and connects
 //! again, resuming from what it holds.
 //!
-//! Either way it connects with the mint in `--mint-dir`
-//! (`fenestra_wire::mint`; it leaves its public key there first).
+//! The mint (`fenestra_wire::mint`): with `--ssh CMD`, it runs `CMD
+//! fenestra-shell mint KEY` (CMD split at spaces, no shell) and reads the
+//! `FENESTRA_MINT` line back from the SSH channel; sshd authenticates the
+//! person, and the session's keys are pinned through that channel.
+//! `--take-over` ends a session another viewer has. With `--mint-dir DIR`
+//! (gates, the host simulator) it leaves its public key in DIR and waits
+//! for `DIR/mint`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +37,12 @@ fn die(why: impl std::fmt::Display) -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "--headless");
-    let dir = PathBuf::from(arg(&args, "--mint-dir").unwrap_or_else(|| die("--mint-dir DIR is needed")));
+    let ssh = arg(&args, "--ssh");
+    let take_over = args.iter().any(|a| a == "--take-over");
+    let dir: Option<PathBuf> = arg(&args, "--mint-dir").map(PathBuf::from);
+    if ssh.is_some() == dir.is_some() {
+        die("one of --ssh CMD or --mint-dir DIR is needed");
+    }
     let out: Option<PathBuf> = arg(&args, "--out").map(PathBuf::from);
     if headless && out.is_none() {
         die("--headless needs --out DIR");
@@ -53,20 +64,26 @@ fn main() {
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Input>(1024);
     let window_input = input_tx.clone();
     let views_w = views.clone();
-    let title = format!("Fenestra: {}", dir.display());
+    let title = format!("Fenestra: {}", ssh.as_deref().and_then(|c| c.split_whitespace().last()).map_or_else(|| dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(), str::to_string));
     let session = move || rt.block_on(async move {
         let key = SessionKey::generate().unwrap_or_else(|e| die(e));
-        mint::write_viewer_key(&dir, key.public()).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
-        let mut tries = 0;
-        let m = loop {
-            match mint::DevMint::read(&dir) {
-                Ok(m) => break m,
-                Err(_) if tries < 600 => {
-                    tries += 1;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+        let m = match (&ssh, &dir) {
+            (Some(cmd), _) => ssh_mint(cmd, key.public(), take_over).unwrap_or_else(|e| die(format!("mint over ssh: {e}"))),
+            (None, Some(dir)) => {
+                mint::write_viewer_key(dir, key.public()).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
+                let mut tries = 0;
+                loop {
+                    match mint::DevMint::read(dir) {
+                        Ok(m) => break m,
+                        Err(_) if tries < 600 => {
+                            tries += 1;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Err(e) => die(format!("no mint: {e}")),
+                    }
                 }
-                Err(e) => die(format!("no mint: {e}")),
             }
+            (None, None) => unreachable!("checked above"),
         };
         let viewer = Viewer::new(&key, &m.host_key).unwrap_or_else(|e| die(e));
         let addr = connect.unwrap_or(m.addr);
@@ -205,6 +222,32 @@ fn main() {
     }
 }
 
+/// Run `cmd fenestra-shell mint KEY` (the SSH transport) and take the mint
+/// from its output: the one `FENESTRA_MINT` line, within a bound. ssh's own
+/// prompts go to the terminal (stdin and stderr are inherited).
+fn ssh_mint(cmd: &str, public: &[u8], take_over: bool) -> Result<mint::DevMint, String> {
+    use std::io::Read;
+    let mut w = cmd.split_whitespace();
+    let prog = w.next().ok_or("an empty --ssh command")?;
+    let mut c = std::process::Command::new(prog);
+    c.args(w).arg("fenestra-shell").arg("mint").arg(mint::hex(public));
+    if take_over {
+        c.arg("--take-over");
+    }
+    let mut child = c.stdout(std::process::Stdio::piped()).spawn().map_err(|e| format!("{prog}: {e}"))?;
+    let mut out = String::new();
+    let read = child.stdout.take().ok_or("no stdout")?.take(MAX_SSH_OUTPUT).read_to_string(&mut out);
+    let status = child.wait().map_err(|e| e.to_string())?;
+    read.map_err(|e| format!("reading the mint: {e}"))?;
+    if let Some(why) = out.lines().find_map(|l| l.strip_prefix("FENESTRA_REFUSED ")) {
+        return Err(format!("the host refused: {why}"));
+    }
+    let line = out.lines().find_map(|l| l.strip_prefix("FENESTRA_MINT ")).ok_or_else(|| format!("no mint in the output ({status})"))?;
+    mint::DevMint::parse_line(line).map_err(|e| e.to_string())
+}
+
+/// Most output read from the SSH command.
+const MAX_SSH_OUTPUT: u64 = 16 * 1024;
 /// How long a probe waits for its frame.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one connection attempt may take.

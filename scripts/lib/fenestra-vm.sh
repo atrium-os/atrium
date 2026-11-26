@@ -3,8 +3,9 @@
 # small sheet, fenestrad and its session, and the viewer in the container.
 #
 #   fen_setup              build, stage, start frescod and Sheets
-#   fen_mint W             after the viewer wrote W/mint/viewer.pub: start
-#                          fenestrad in the guest, bring its mint back
+#   fen_fenestrad          start fenestrad in the guest, taking mints on its
+#                          socket from the seat's user (root here); sets
+#                          FEN_SSH, the viewer's --ssh transport into it
 #   compare HOST.png       each placed window's interior on the viewer's
 #                          desktop ($W/view/desktop.png) against HOST.png
 #
@@ -35,11 +36,11 @@ fen_setup() {
     (cd "$ROOT/fenestra-view" && cargo build -q --release) || gate_abort "fenestra-view did not build"
     VIEW="$ROOT/fenestra-view/target/release/fenestra-view"
     T="$TARGET/release"
-    BINS="$ROOT/frescod/target/$T/frescod $ROOT/frescod/target/$T/fresco-renderer $ROOT/fenestrad/target/$T/fenestrad $ROOT/fenestra-session/target/$T/fenestra-session $ROOT/atrium-sheets/target/$T/atrium-sheets"
+    BINS="$ROOT/frescod/target/$T/frescod $ROOT/frescod/target/$T/fresco-renderer $ROOT/fenestrad/target/$T/fenestrad $ROOT/fenestrad/target/$T/fenestra-shell $ROOT/fenestra-session/target/$T/fenestra-session $ROOT/atrium-sheets/target/$T/atrium-sheets"
 
     D=/opt/fenestra-desk
     G=/tmp/fendesk
-    g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; sleep 1; rm -rf $D $G; mkdir -p $D $G/mint; chmod 700 $G/mint; true"
+    g "pkill -x fenestrad; pkill -x fenestra-session; pkill -x atrium-sheets; pkill -x frescod; sleep 1; rm -rf $D $G; mkdir -p $D $G; true"
     for b in $BINS; do
         put "$b" "$D/"
         [ "$(sha256sum "$b" | cut -d' ' -f1)" = "$(g "sha256 -q $D/$(basename "$b")")" ] || gate_abort "hash mismatch for $(basename "$b")"
@@ -65,13 +66,13 @@ fen_setup() {
     sleep "${WAIT:-40}"
 }
 
-fen_mint() {
-    W=$1
-    i=0; while [ $i -lt 50 ] && [ ! -s "$W/mint/viewer.pub" ]; do sleep 0.2; i=$((i+1)); done
-    put "$W/mint/viewer.pub" "$G/mint/viewer.pub" || gate_abort "could not give the guest the viewer key"
-    g "cd $G && daemon -f -o $G/fenestrad.log $D/fenestrad --frescod $G/fenestra.sock --session $D/fenestra-session --mint-dir $G/mint --bind 0.0.0.0:$PORT </dev/null"
-    i=0; while [ $i -lt 60 ] && ! g "test -s $G/mint/mint"; do sleep 1; i=$((i+1)); done
-    get "$G/mint/mint" "$W/mint/mint.tmp" && mv "$W/mint/mint.tmp" "$W/mint/mint" || gate_abort "no mint from the session"
+fen_fenestrad() {
+    g "echo root >$G/seat && cd $G && daemon -f -o $G/fenestrad.log $D/fenestrad --frescod $G/fenestra.sock --session $D/fenestra-session \
+        --mint-sock $G/mint.sock --seat $G/seat --bind 0.0.0.0:$PORT </dev/null"
+    i=0; while [ $i -lt 30 ] && ! g "test -S $G/mint.sock"; do sleep 1; i=$((i+1)); done
+    g "test -S $G/mint.sock" || { g "cat $G/fenestrad.log"; gate_abort "fenestrad did not open its mint socket"; }
+    # What the viewer runs to mint: ssh into the guest, then fenestra-shell.
+    FEN_SSH="ssh $SSHOPT -n -o ConnectTimeout=30 -p ${VM_SSH_PORT:-2222} root@localhost env PATH=$D:/bin:/usr/bin FENESTRA_MINT_SOCK=$G/mint.sock"
 }
 
 # Each placed window's interior equal on both screens. Left out: 4 px at its

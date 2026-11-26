@@ -1596,9 +1596,9 @@ reading is cut off, never waited on.
 **Differences from §3.2, for now.** Every window streams while a session is on (the whole
 screen mirrored, §4.2) rather than only windows on remote outputs; remote outputs with the
 viewer's sizes and scales come with the windowed viewer. The renderer answers a want with a
-difference made on demand rather than writing a ring ahead. fenestrad starts one session as
-a plain child, from the development mint, not through portcullisd from an SSH mint; the
-renderers in the gate are unconfined (`FRESCOD_RENDERER_LAUNCHER=unconfined`). The trusted
+difference made on demand rather than writing a ring ahead. fenestrad starts each session as
+a plain child, not through portcullisd in its own jail (that needs the `listen` grant of
+background-apps.md B4); the renderers in the gate are unconfined (`FRESCOD_RENDERER_LAUNCHER=unconfined`). The trusted
 strip and window 0 (the WM's background) are not streamed yet.
 
 **Gates.**
@@ -1609,12 +1609,18 @@ strip and window 0 (the WM's background) are not streamed yet.
   difference (Sheets 193 KB instead of 4.3 MB; navigator-ui 592 bytes instead of 9.5 MB).
 - `scripts/fenestra-desktop-vm.sh` (cloud VM, `NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300`):
   frescod in split mode with atrium-sheets, fenestrad and its session in the guest, the
-  viewer in the container, driven only from the viewer (frescod has no injector). 12/12: the
+  viewer in the container, minting over real ssh into the guest and driven only from the viewer
+(frescod has no injector). 13/13: the
   viewer's desktop equals frescod's own screen over every window, outside the strip and the
   focus ring; typing before and after a reconnect reaches the host and comes back; every input
   event passed on, none dropped; 0 scene bytes while idle; the second connection resumed
   without resending (8.8 KB for its typing).
 
+- `scripts/fenestra-mint-check.sh` (Linux or macOS, no VM): fenestrad's mint socket with a
+  stand-in for frescod. 10/10: a viewer mints through a transport command and connects; a
+  second mint is refused while it holds the desktop, a take-over ends the first session; a
+  caller who is not the seat's user, or no seat file, is refused; malformed requests are
+  refused; a session with no viewer ends on its grace.
 - `scripts/fenestra-netem-vm.sh` (cloud VM; `scripts/lib/udp-impair.py` between the viewer
   and the guest, since the container has no `tc`): one 575 s session through a schedule of
   added RTT (50, 150, 300 ms), 2 % and 10 % loss, 1 Mbit/s with a 64 KB queue, 30 ms jitter, a
@@ -1625,6 +1631,19 @@ strip and window 0 (the WM's background) are not streamed yet.
   address change kept the connection; the 3 min one past the idle timeout made exactly one
   reconnect, which resumed without resending; a key pressed during the blackout was not
   replayed; the final desktop equals frescod's screen.
+
+**The mint (§11.2).** `fenestra-view --ssh "ssh -T user@host"` runs `fenestra-shell mint KEY`
+on the host through that command (split at spaces, no shell) and takes the one `FENESTRA_MINT`
+line from the SSH channel. sshd runs `fenestra-shell` as the person; it passes one bounded line
+to `fenestrad`'s mint socket, where fenestrad reads the caller's uid from the kernel and mints
+only for the user of the seat session (Ostiarius' active-session file, `--seat`); another uid or
+an unreadable seat is refused. The whole desktop has one viewer with control: a second mint is
+refused unless it asks to take over (`--take-over`), which ends the first session. fenestrad
+starts the session with the viewer's key on fd 3; the session makes its key pair and `K_sess`,
+answers there with its mint line and keeps them in memory only; fenestrad sets the address to
+`--public-ip` and hands the line back. A session with `--grace S` ends once it has had no
+viewer for S seconds. Still to come: headless sessions and personas (the seat only, for now),
+and the view-only bounds.
 
 **Whole states.** A blob goes as an LZ4 block (`BLOB_LZ4`, `lz4_flex` with its safe decoder)
 when that saves an eighth or more; the reader checks the declared size against its bounds before
@@ -1642,7 +1661,7 @@ back in the host screen's pixels. `--headless --out DIR` is the gates' form. A c
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
 **Next in R2.** The strip and background on the viewer; renderers and the session in their
-jails; the SSH mint; remote outputs at the viewer's size and scale; compressing
+jails (after B4's listen grant); remote outputs at the viewer's size and scale; compressing
 region updates as blobs are; the TCP fallback when UDP is blocked.
 
 ## 20. Sources

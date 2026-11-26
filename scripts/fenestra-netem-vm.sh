@@ -33,7 +33,6 @@ gate_begin fenestra-netem 15
 fen_setup
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/fenestra-netem.XXXXXX")
-mkdir -p "$W/mint"
 PROXY_PORT=$((PORT + 100))
 cat >"$W/schedule.txt" <<'EOF'
 0
@@ -71,10 +70,10 @@ EOF
 python3 -I "$ROOT/scripts/lib/udp-impair.py" --listen "127.0.0.1:$PROXY_PORT" --target "127.0.0.1:$PORT" \
     --schedule "$W/schedule.txt" --log "$W/proxy.log" &
 PP=$!
-"$VIEW" --headless --input "$W/input.txt" --mint-dir "$W/mint" --out "$W/view" --run-secs 575 \
+fen_fenestrad
+"$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs 575 \
     --connect "127.0.0.1:$PROXY_PORT" >"$W/view.log" 2>&1 &
 VP=$!
-fen_mint "$W"
 wait $VP
 kill $PP; wait $PP 2>/dev/null
 sleep 3

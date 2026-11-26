@@ -7,4 +7,15 @@ publish     = false
 description = "Fenestra's session daemon on the host (fenestra.md §3.2): no network; relays frescod's scene-stream records to and from per-session jails."
 
 [dependencies]
-fenestra-link = { path = "../fenestra-link" }
+fenestra-link   = { path = "../fenestra-link" }
+fenestra-wire   = { path = "../fenestra-wire" }
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
+libc            = "0.2"
+
+[[bin]]
+name = "fenestrad"
+path = "src/main.rs"
+
+[[bin]]
+name = "fenestra-shell"
+path = "src/bin/fenestra-shell.rs"

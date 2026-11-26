@@ -185,3 +185,24 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&Control::Input(Input::Button { button: 0, pressed: true }).encode()).is_err());
     assert!(Control::decode(&[4, 1, 0, 2, 0]).is_err());
 }
+
+#[test]
+fn mint_lines_round_trip_and_refuse_the_rest() {
+    use fenestra_wire::mint::{self, DevMint};
+    let m = DevMint { addr: "192.0.2.7:24300".parse().unwrap(), host_key: vec![7; 44], secret: mint::fresh_secret().unwrap() };
+    let back = DevMint::parse_line(&m.line()).unwrap();
+    assert_eq!((back.addr, back.host_key.clone(), back.secret.id, back.secret.k_sess), (m.addr, m.host_key.clone(), m.secret.id, m.secret.k_sess));
+    let line = m.line();
+    let w: Vec<&str> = line.split(' ').collect();
+    let bad = [
+        line.replace("k_sess", "k_sess2"),                              // unknown field
+        w[..6].join(" "),                                               // a field missing
+        format!("{} addr {}", w[..6].join(" "), w[1]),                  // a field twice, one missing
+        line.replace(&format!("id {}", w[5]), &format!("id {}", &w[5][2..])), // id of the wrong length
+        line.replace(w[1], "not-an-address"),
+        format!("{line} {}", "a".repeat(mint::MAX_LINE)),
+    ];
+    for b in bad {
+        assert!(DevMint::parse_line(&b).is_err(), "took {b:?}");
+    }
+}

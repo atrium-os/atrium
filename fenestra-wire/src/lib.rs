@@ -163,7 +163,9 @@ impl Host {
 
     /// Take the next connection whose viewer proves the session. A viewer
     /// that fails the TLS pin or the proof is dropped, and `Err` says why
-    /// (the caller keeps accepting).
+    /// (the caller keeps accepting). Not cancel-safe: dropping the future
+    /// mid-handshake refuses that viewer, so run it in a task of its own
+    /// rather than as one arm of a `select!` that other events win.
     pub async fn accept(&self) -> Result<Option<HostConn>, WireError> {
         let Some(incoming) = self.endpoint.accept().await else { return Ok(None) };
         let conn = incoming.await.map_err(quic)?;
