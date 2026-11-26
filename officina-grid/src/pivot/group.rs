@@ -337,14 +337,18 @@ impl<'a> Grouping<'a> {
         if !n.is_finite() {
             return (value, None);
         }
+        self.label(wb.date_system(), n).unwrap_or((value, None))
+    }
+
+    /// The item a finite number `n` falls in, for the kinds that bucket numbers.
+    fn label(&self, calendar: DateSystem, n: f64) -> Option<(Value, Option<f64>)> {
         if let GroupKind::NumericBins { start, end, step, items } = self.kind {
             let last = items.len() - 1;
             let index = if n < *start { 0 }
                 else if n > *end { last }
                 else { (1 + ((n - start) / step).floor() as usize).min(last - 1) };
-            return (items[index].clone(), Some(index as f64));
+            return Some((items[index].clone(), Some(index as f64)));
         }
-        let calendar = wb.date_system();
         let dates = matches!(
             self.kind,
             GroupKind::Intervals { dates: true, .. } | GroupKind::DateParts { .. }
@@ -357,22 +361,22 @@ impl<'a> Grouping<'a> {
             }
         };
         if n < self.start {
-            return (
+            return Some((
                 Value::str(&format!("<{}", bound(self.start))),
                 Some(f64::NEG_INFINITY),
-            );
+            ));
         }
         if n > self.end {
-            return (
+            return Some((
                 Value::str(&format!(">{}", bound(self.end))),
                 Some(f64::INFINITY),
-            );
+            ));
         }
-        match self.kind {
+        Some(match self.kind {
             GroupKind::Intervals { step, .. } => {
                 let offset = (n - self.start) / step;
                 if !offset.is_finite() {
-                    return (value, None);
+                    return None;
                 }
                 let nearest = offset.round();
                 let on_edge =
@@ -381,10 +385,10 @@ impl<'a> Grouping<'a> {
                 let closes_at_boundary = n == self.end && on_edge && bucket > 0.0;
                 if closes_at_boundary {
                     if dates {
-                        return (
+                        return Some((
                             Value::str(&format!(">{}", bound(self.end))),
                             Some(f64::INFINITY),
-                        );
+                        ));
                     }
                     bucket -= 1.0;
                 }
@@ -402,13 +406,69 @@ impl<'a> Grouping<'a> {
                     Some(bucket),
                 )
             }
-            GroupKind::DateParts { part, .. } => date_part(calendar, n, *part)
-                .map_or((value, None), |(name, rank)| {
-                    (Value::str(&name), Some(rank as f64))
-                }),
-            GroupKind::Named(_) | GroupKind::Discrete(_) | GroupKind::NumericBins { .. } => unreachable!(),
-        }
+            GroupKind::DateParts { part, .. } => return date_part(calendar, n, *part)
+                .map(|(name, rank)| (Value::str(&name), Some(rank as f64))),
+            GroupKind::Named(_) | GroupKind::Discrete(_) | GroupKind::NumericBins { .. } => return None,
+        })
     }
+
+    /// Every item a date-part or interval grouping can show, in order: the
+    /// item below its start, each period or bucket, and the item above its
+    /// end; with the start and end it uses. `None` for other kinds, or with
+    /// no numbers to set an automatic bound.
+    pub fn domain(&self, calendar: DateSystem) -> Option<(f64, f64, Vec<Value>)> {
+        if !(self.start.is_finite() && self.end.is_finite() && self.start <= self.end) {
+            return None;
+        }
+        let (below, above) = group_bounds(calendar, matches!(self.kind, GroupKind::Intervals { dates: true, .. } | GroupKind::DateParts { .. }), self.start, self.end);
+        let mut items = vec![below];
+        match self.kind {
+            GroupKind::DateParts { part, .. } => {
+                let year = |n: f64| calendar.ymd(n).map(|(y, _, _)| y);
+                items.extend(date_part_labels(*part, year(self.start)?, year(self.end)?));
+            }
+            GroupKind::Intervals { step, .. } => {
+                for k in 0..MAX_GROUP_MEMBERS {
+                    let first = self.start + k as f64 * step;
+                    if first > self.end || (k > 0 && first == self.end) {
+                        break;
+                    }
+                    let (label, _) = self.label(calendar, first)?;
+                    if !items.contains(&label) && label != above {
+                        items.push(label);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        items.push(above);
+        Some((self.start, self.end, items))
+    }
+}
+
+/// The items below a grouping's start and above its end ("<2024-01-01").
+pub fn group_bounds(calendar: DateSystem, dates: bool, start: f64, end: f64) -> (Value, Value) {
+    let bound = |n: f64| if dates { date_label(calendar, n) } else { n.to_string() };
+    (Value::str(&format!("<{}", bound(start))), Value::str(&format!(">{}", bound(end))))
+}
+
+/// Every period of a date part, in order (years from `first` to `last`, at
+/// most 10,000 of them; days of a leap year).
+pub fn date_part_labels(part: DatePart, first: i64, last: i64) -> Vec<Value> {
+    let two = |n: i64| format!("{n:02}");
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let text: Vec<String> = match part {
+        DatePart::Seconds | DatePart::Minutes => (0..60).map(|n| format!(":{n:02}")).collect(),
+        DatePart::Hours => (0..24).map(two).collect(),
+        DatePart::Days => {
+            let days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            (0..12).flat_map(|m| (1..=days[m]).map(move |d| format!("{d:02}-{}", months[m]))).collect()
+        }
+        DatePart::Months => months.iter().map(|m| m.to_string()).collect(),
+        DatePart::Quarters => (1..=4).map(|q| format!("Q{q}")).collect(),
+        DatePart::Years => (first..=last.min(first.saturating_add(9_999))).map(|y| y.to_string()).collect(),
+    };
+    text.iter().map(|t| Value::str(t)).collect()
 }
 
 fn date_label(calendar: DateSystem, value: f64) -> String {

@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
-use officina_grid::pivot::{GroupKind, ScopeItems, Subtotal, item_key, same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
+use officina_grid::pivot::{DatePart, GroupKind, ScopeItems, Subtotal, item_key, same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
 use officina_grid::{CellAddr, Value, Workbook};
 #[cfg(feature = "read")]
 use quick_xml::events::Event;
@@ -136,15 +136,64 @@ pub fn supports(p: &Pivot) -> bool {
                 && !p.groups.iter().any(|other| other.field == group.source && !matches!(other.kind, GroupKind::Discrete(_)))
         }
         GroupKind::NumericBins { .. } => true,
+        // Date parts and intervals of a source column, alone on it but for
+        // one grouping per date part.
+        GroupKind::DateParts { part, .. } => group.source < Fields::new(p).width && p.groups.iter().all(|other| {
+            other.source != group.source || other.field == group.field
+                || matches!(other.kind, GroupKind::DateParts { part: q, .. } if q != *part)
+        }),
+        GroupKind::Intervals { .. } => group.source < Fields::new(p).width
+            && p.groups.iter().all(|other| other.source != group.source || other.field == group.field),
         _ => false,
     })
+}
+
+/// Excel's name for a date part (`rangePr groupBy`).
+fn date_part_name(part: DatePart) -> &'static str {
+    match part {
+        DatePart::Seconds => "seconds",
+        DatePart::Minutes => "minutes",
+        DatePart::Hours => "hours",
+        DatePart::Days => "days",
+        DatePart::Months => "months",
+        DatePart::Quarters => "quarters",
+        DatePart::Years => "years",
+    }
+}
+
+#[cfg(feature = "read")]
+fn date_part_of(name: &str) -> Option<DatePart> {
+    DatePart::ALL.into_iter().find(|part| date_part_name(*part) == name)
+}
+
+/// The date-part grouping of the same source one step coarser than `field`'s.
+fn coarser_part(p: &Pivot, field: u32) -> Option<u32> {
+    let group = p.groups.iter().find(|group| group.field == field)?;
+    let GroupKind::DateParts { part, .. } = group.kind else { return None };
+    p.groups.iter()
+        .filter_map(|other| match other.kind {
+            GroupKind::DateParts { part: q, .. } if other.source == group.source && q as u8 > part as u8 => Some((q as u8, other.field)),
+            _ => None,
+        })
+        .min_by_key(|(q, _)| *q)
+        .map(|(_, field)| field)
+}
+
+/// Whether `field` is the source column of a date grouping.
+fn date_base(p: &Pivot, field: u32) -> bool {
+    p.groups.iter().any(|group| group.source == field
+        && matches!(group.kind, GroupKind::DateParts { .. } | GroupKind::Intervals { dates: true, .. }))
 }
 
 /// In a grouped cache, some fields have two lists. The pivot references the group list.
 fn cache_field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
     let group = p.groups.iter().find(|g| g.field == field);
-    if let Some(GroupKind::NumericBins { items, .. }) = group.map(|g| &g.kind) {
-        return items.clone();
+    match group.map(|g| &g.kind) {
+        Some(GroupKind::NumericBins { items, .. }) => return items.clone(),
+        Some(GroupKind::DateParts { .. } | GroupKind::Intervals { .. }) => {
+            return wb.pivot_group_domain(p, field).map(|(_, _, items)| items).unwrap_or_default();
+        }
+        _ => {}
     }
     let mut items = field_items(wb, p, field);
     if p.groups.is_empty() { return items; }
@@ -186,12 +235,13 @@ fn write_cache_item(o: &mut String, v: &Value) {
 }
 
 fn write_group(o: &mut String, wb: &Workbook, p: &Pivot, ids: &Fields, field: u32) {
-    let parent = p.groups.iter().find(|group| group.source == field && matches!(group.kind, GroupKind::Discrete(_)));
+    let parent = p.groups.iter().find(|group| group.source == field && matches!(group.kind, GroupKind::Discrete(_)))
+        .map(|group| group.field).or_else(|| coarser_part(p, field));
     let group = p.groups.iter().find(|group| group.field == field);
     if parent.is_none() && group.is_none() { return; }
     o.push_str("<fieldGroup");
     if let Some(parent) = parent {
-        let _ = write!(o, r#" par="{}""#, ids.raw(parent.field));
+        let _ = write!(o, r#" par="{}""#, ids.raw(parent));
     }
     let Some(group) = group else { o.push_str("/>"); return };
     let mut base = group.source;
@@ -215,6 +265,22 @@ fn write_group(o: &mut String, wb: &Workbook, p: &Pivot, ids: &Fields, field: u3
                 let _ = write!(o, r#"<x v="{index}"/>"#);
             }
             o.push_str("</discretePr>");
+        }
+        GroupKind::DateParts { start, end, part } => {
+            let (lo, hi) = wb.pivot_group_domain(p, field).map_or((0.0, 0.0), |(lo, hi, _)| (lo, hi));
+            let date = |x: f64| crate::ods::write::date_text(wb.date_system(), x).unwrap_or_else(|| "1900-01-01T00:00:00".into());
+            let _ = write!(o, r#"<rangePr groupBy="{}" autoStart="{}" autoEnd="{}" startDate="{}" endDate="{}"/>"#,
+                date_part_name(*part), u8::from(start.is_none()), u8::from(end.is_none()), date(lo), date(hi));
+        }
+        GroupKind::Intervals { start, end, step, dates } => {
+            let (lo, hi) = wb.pivot_group_domain(p, field).map_or((0.0, 0.0), |(lo, hi, _)| (lo, hi));
+            let auto = format!(r#" autoStart="{}" autoEnd="{}""#, u8::from(start.is_none()), u8::from(end.is_none()));
+            if *dates {
+                let date = |x: f64| crate::ods::write::date_text(wb.date_system(), x).unwrap_or_else(|| "1900-01-01T00:00:00".into());
+                let _ = write!(o, r#"<rangePr groupBy="days"{auto} startDate="{}" endDate="{}" groupInterval="{step}"/>"#, date(lo), date(hi));
+            } else {
+                let _ = write!(o, r#"<rangePr{auto} startNum="{lo}" endNum="{hi}" groupInterval="{step}"/>"#);
+            }
         }
         _ => unreachable!(),
     }
@@ -276,7 +342,8 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
     let _ = write!(o, r#"<cacheFields count="{}">"#, ids.count());
     let on_axis: Vec<u32> = axis_fields(p).iter().map(|f| f.field)
         .chain(p.data.iter().filter_map(|d| d.show_as.base_field()))
-        .chain(p.groups.iter().map(|group| group.source)).collect();
+        .chain(p.groups.iter().map(|group| group.source))
+        .chain(p.filters.iter().filter(|f| !f.hidden.is_empty()).map(|f| f.field)).collect();
     let mut names: Vec<String> = Vec::new();
     for f in ids.ids() {
         let mut name = wb.pivot_field_name(p, f);
@@ -317,6 +384,28 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
             }
         }
         let mut a = String::new();
+        let dates = date_base(p, f) && !str_ && !other;
+        let iso = |x: f64| crate::ods::write::date_text(wb.date_system(), x);
+        if dates && items.iter().all(|v| match v { Value::Num(x) => iso(*x).is_some(), _ => true }) {
+            a.push_str(r#" containsSemiMixedTypes="0" containsNonDate="0" containsDate="1" containsString="0""#);
+            if nums {
+                let _ = write!(a, r#" minDate="{}" maxDate="{}""#, iso(lo).unwrap_or_default(), iso(hi).unwrap_or_default());
+            }
+            if blank {
+                a.push_str(r#" containsBlank="1""#);
+            }
+            let _ = write!(o, r#"<sharedItems{a} count="{}">"#, items.len());
+            for v in &items {
+                match v {
+                    Value::Num(x) => { let _ = write!(o, r#"<d v="{}"/>"#, iso(*x).unwrap_or_default()); }
+                    v => write_cache_item(&mut o, v),
+                }
+            }
+            o.push_str("</sharedItems>");
+            write_group(&mut o, wb, p, &ids, f);
+            o.push_str("</cacheField>");
+            continue;
+        }
         if !str_ && !other && (nums || blank) {
             a.push_str(r#" containsSemiMixedTypes="0" containsString="0""#);
         }
@@ -425,15 +514,15 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         match pf {
             Some(pf) => {
                 let items = field_items(wb, p, f);
-                let cache_indices = p.groups.iter().find(|group| group.field == f).and_then(|group| match &group.kind {
-                    GroupKind::NumericBins { items, .. } => Some(items.iter()
-                        .enumerate().map(|(i, value)| (item_key(value), i)).collect::<std::collections::HashMap<_, _>>()),
-                    _ => None,
-                });
+                let cache_indices = group_domain(wb, p, f).map(|items| items.iter().enumerate()
+                    .map(|(i, value)| (item_key(value), i)).collect::<std::collections::HashMap<_, _>>());
+                let items: Vec<_> = items.into_iter().enumerate().filter_map(|(i, v)| match &cache_indices {
+                    Some(indices) => indices.get(&item_key(&v)).map(|&x| (x, v)),
+                    None => Some((i, v)),
+                }).collect();
                 let n = items.len() + usize::from(subtotal != Subtotal::Off);
                 let _ = write!(o, r#"><items count="{n}">"#);
-                for (i, v) in items.iter().enumerate() {
-                    let x = cache_indices.as_ref().map_or(i, |indices| indices[&item_key(v)]);
+                for (x, v) in &items {
                     let hide = pf.hidden.iter().any(|h| officina_grid::pivot::same_item(h, v));
                     let _ = write!(o, r#"<item x="{x}"{}/>"#, if hide { r#" h="1""# } else { "" });
                 }
@@ -448,6 +537,20 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
                     scope.write(&mut o, wb, p, level, &ids);
                 }
                 o.push_str("</pivotField>");
+            }
+            // A field filtered only by a slicer: its items, with those hidden.
+            None if !p.hidden_of(f).is_empty() => {
+                let hidden = p.hidden_of(f);
+                let cache_indices = group_domain(wb, p, f).map(|items| items.iter().enumerate()
+                    .map(|(i, value)| (item_key(value), i)).collect::<std::collections::HashMap<_, _>>());
+                let items = cache_field_items(wb, p, f);
+                let _ = write!(o, r#"><items count="{}">"#, items.len() + 1);
+                for (i, v) in items.iter().enumerate() {
+                    let x = cache_indices.as_ref().and_then(|indices| indices.get(&item_key(v)).copied()).unwrap_or(i);
+                    let hide = hidden.iter().any(|h| same_item(h, v));
+                    let _ = write!(o, r#"<item x="{x}"{}/>"#, if hide { r#" h="1""# } else { "" });
+                }
+                o.push_str(r#"<item t="default"/></items></pivotField>"#);
             }
             None => o.push_str("/>"),
         }
@@ -490,8 +593,53 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         }
         o.push_str("</dataFields>");
     }
-    o.push_str(r#"<pivotTableStyleInfo name="PivotStyleLight16" showRowHeaders="1" showColHeaders="1" showRowStripes="0" showColStripes="0" showLastColumn="1"/></pivotTableDefinition>"#);
+    o.push_str(r#"<pivotTableStyleInfo name="PivotStyleLight16" showRowHeaders="1" showColHeaders="1" showRowStripes="0" showColStripes="0" showLastColumn="1"/>"#);
+    filters_xml(&mut o, p, &ids);
+    slicers_xml(&mut o, wb, p, &ids);
+    o.push_str("</pivotTableDefinition>");
     o
+}
+
+/// A grouped field's items as its cache lists them, where they are the group's.
+fn group_domain(wb: &Workbook, p: &Pivot, f: u32) -> Option<Vec<Value>> {
+    let group = p.groups.iter().find(|group| group.field == f)?;
+    match &group.kind {
+        GroupKind::NumericBins { items, .. } => Some(items.clone()),
+        GroupKind::DateParts { .. } | GroupKind::Intervals { .. } => Some(wb.pivot_group_domain(p, f)?.2),
+        _ => None,
+    }
+}
+
+/// Timeline date ranges as Excel's `dateBetween` pivot filters, inclusive
+/// of the last day before the range's end.
+fn filters_xml(o: &mut String, p: &Pivot, ids: &Fields) {
+    let ranges: Vec<_> = p.filters.iter().filter_map(|f| Some((f.field, f.between?))).collect();
+    if ranges.is_empty() { return; }
+    let _ = write!(o, r#"<filters count="{}">"#, ranges.len());
+    for (k, (field, (a, b))) in ranges.into_iter().enumerate() {
+        let _ = write!(o, r#"<filter fld="{}" type="dateBetween" evalOrder="-1" id="{}"><autoFilter ref="A1"><filterColumn colId="0"><customFilters and="1"><customFilter operator="greaterThanOrEqual" val="{}"/><customFilter operator="lessThan" val="{}"/></customFilters></filterColumn></autoFilter></filter>"#,
+            ids.raw(field), k + 1, num(a), num(b));
+    }
+    o.push_str("</filters>");
+}
+
+/// Officina's slicers and timelines, as an extension Excel passes over.
+const SLICER_EXT: &str = "urn:atrium:officina:pivot-slicers:1";
+
+fn slicers_xml(o: &mut String, wb: &Workbook, p: &Pivot, ids: &Fields) {
+    if p.slicers.is_empty() { return; }
+    let _ = write!(o, r#"<extLst><ext uri="{SLICER_EXT}" xmlns:of="{SLICER_EXT}">"#);
+    for s in &p.slicers {
+        let a = &s.anchor;
+        let corner = |(r, c, x, y): (u32, u32, f32, f32)| format!("{r} {c} {x} {y}");
+        let _ = write!(o, r#"<of:slicer name="{}" fld="{}" sheet="{}" from="{}" to="{}""#,
+            esc(&s.name), ids.raw(s.field), esc(&wb.sheet_name(a.sheet)), corner(a.from), corner(a.to));
+        if let Some(part) = s.timeline {
+            let _ = write!(o, r#" timeline="{}""#, date_part_name(part));
+        }
+        o.push_str("/>");
+    }
+    o.push_str("</ext></extLst>");
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +686,11 @@ fn read_table(
     let mut data_on_rows = false;
     let mut data_position = None;
     let mut active_data = None;
+    // Date ranges (`dateBetween` filters): field, lower bound, upper bound and
+    // whether it is inclusive.
+    let mut ranges: Vec<(u32, Option<f64>, Option<(f64, bool)>)> = Vec::new();
+    let mut in_range = false;
+    let mut slicers: Vec<(String, u32, String, String, String, Option<String>)> = Vec::new();
     loop {
         buf.clear();
         let event = r.read_event_into(&mut buf)?;
@@ -594,6 +747,32 @@ fn read_table(
                         field.scope = scope;
                     }
                 }
+                b"filter" => {
+                    in_range = attr(&e, b"type")?.as_deref() == Some("dateBetween") && ranges.len() < officina_grid::pivot::MAX_FIELDS;
+                    if in_range {
+                        match attr(&e, b"fld")?.and_then(|v| v.parse::<u32>().ok()) {
+                            Some(f) => ranges.push((f, None, None)),
+                            None => in_range = false,
+                        }
+                    }
+                }
+                b"customFilter" if in_range => {
+                    let val = attr(&e, b"val")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite());
+                    if let (Some(last), Some(val)) = (ranges.last_mut(), val) {
+                        match attr(&e, b"operator")?.as_deref() {
+                            Some("greaterThanOrEqual") => last.1 = Some(val),
+                            Some("lessThan") => last.2 = Some((val, false)),
+                            Some("lessThanOrEqual") => last.2 = Some((val, true)),
+                            _ => {}
+                        }
+                    }
+                }
+                b"slicer" if e.name().as_ref() == b"of:slicer" && slicers.len() < officina_grid::pivot::MAX_SLICERS => {
+                    if let (Some(name), Some(f), Some(sheet), Some(from), Some(to)) = (attr(&e, b"name")?,
+                        attr(&e, b"fld")?.and_then(|v| v.parse::<u32>().ok()), attr(&e, b"sheet")?, attr(&e, b"from")?, attr(&e, b"to")?) {
+                        slicers.push((name, f, sheet, from, to, attr(&e, b"timeline")?));
+                    }
+                }
                 b"rowFields" => list = 1,
                 b"colFields" => list = 2,
                 b"field" => {
@@ -630,6 +809,7 @@ fn read_table(
                 _ => {}
             },
             Event::End(e) if matches!(e.local_name().as_ref(), b"rowFields" | b"colFields") => list = 0,
+            Event::End(e) if e.local_name().as_ref() == b"filter" => in_range = false,
             Event::End(e) if active_data.as_ref().is_some_and(|(_, name)| e.name().as_ref() == name) => active_data = None,
             Event::Eof => break,
             _ => {}
@@ -835,6 +1015,47 @@ fn read_table(
     if area.intersects(&source) {
         why(rep, "its source overlaps the saved pivot output");
         return Ok(());
+    }
+    // Fields hidden from but not on an axis: a slicer's selection.
+    let on_axis: Vec<u32> = p.rows.iter().chain(&p.cols).chain(&p.pages).map(|f| f.field).collect();
+    for f in 0..fields.len() as u32 {
+        if on_axis.contains(&f) || fields[f as usize].hidden.is_empty() { continue; }
+        let hidden = hidden(f);
+        if hidden.len() != fields[f as usize].hidden.len() {
+            rep.note(Kind::Approximate, "pivot items hidden by a slicer with missing cache entries");
+        }
+        if !hidden.is_empty() {
+            p.set_hidden(model(f), hidden);
+        }
+    }
+    for (f, from, to) in ranges {
+        // An inclusive end of whole days is the next day's start.
+        let to = to.map(|(x, inclusive)| if !inclusive { x } else if x.fract() == 0.0 { x + 1.0 } else { x + 1e-9 });
+        match (from, to) {
+            (Some(a), Some(b)) if a < b && f < width => p.set_range(f, Some((a, b))),
+            _ => rep.note(Kind::Dropped, "pivot date filters other than a closed date range"),
+        }
+    }
+    for (name, f, sheet, from, to, timeline) in slicers {
+        let corner = |text: &str| -> Option<(u32, u32, f32, f32)> {
+            let mut it = text.split(' ');
+            let (r, c) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            let (x, y): (f32, f32) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            ((0.0..=1e6).contains(&x) && (0.0..=1e6).contains(&y) && it.next().is_none()).then_some((r, c, x, y))
+        };
+        let timeline = match timeline.as_deref() {
+            None => Some(None),
+            Some(part) => date_part_of(part).map(Some),
+        };
+        match (wb.sheet_id(&sheet), corner(&from), corner(&to), timeline) {
+            (Some(sheet), Some(from), Some(to), Some(timeline)) if (f as usize) < fields.len() => {
+                p.slicers.push(officina_grid::pivot::Slicer {
+                    name: Arc::from(name.as_str()), field: model(f),
+                    anchor: officina_grid::charts::Anchor { sheet, from, to }, timeline,
+                });
+            }
+            _ => rep.note(Kind::Dropped, "pivot slicers this engine can't place"),
+        }
     }
     for field in p.rows.iter_mut().chain(&mut p.cols).chain(&mut p.pages) {
         field.field = model(field.field);

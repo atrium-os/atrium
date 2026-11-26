@@ -126,8 +126,10 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
         ops.push(GridOp::Pictures(pictures));
     }
     let pivots = wb.pivot_state();
-    let kept_p: Vec<_> = pivots.iter().filter(|(p, _)| p.source.sheet != s && p.dest.sheet != s).cloned().collect();
-    if kept_p.len() != pivots.len() {
+    // A pivot on the sheet or reading it goes; one elsewhere loses the slicers on it.
+    let kept_p: Vec<_> = pivots.iter().filter(|(p, _)| p.source.sheet != s && p.dest.sheet != s).cloned()
+        .map(|(mut p, area)| { p.slicers.retain(|sl| sl.anchor.sheet != s); (p, area) }).collect();
+    if kept_p != pivots {
         ops.push(GridOp::Pivots(kept_p));
     }
     let cfs: Vec<_> = wb.cond_formats().iter().filter(|f| f.sheet != s).map(|f| {

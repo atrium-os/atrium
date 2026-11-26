@@ -443,7 +443,7 @@ impl Workbook {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
         let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && !sh.sheet_hidden && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.scenarios.is_empty() && sh.sparklines.is_empty() && sh.watches.is_empty() && sh.edit_ranges.is_empty() && sh.ignored.is_empty() && sh.freeze == (0, 0);
-        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
+        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s || p.slicers.iter().any(|sl| sl.anchor.sheet == s));
         if !bare || on_it {
             return None;
         }
@@ -1255,6 +1255,9 @@ impl Workbook {
         let ps: Vec<_> = self.pivot_state().into_iter().map(|(mut pv, area)| {
             pv.source = rect(pv.source);
             pv.dest = addr(pv.dest);
+            for sl in &mut pv.slicers {
+                sl.anchor.sheet = m(sl.anchor.sheet);
+            }
             (pv, area.map(rect))
         }).collect();
         self.replace_pivots(ps);

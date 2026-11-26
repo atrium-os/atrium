@@ -45,6 +45,7 @@ const NS: &str = concat!(
     r#"xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" "#,
     r#"xmlns:tableooo="http://openoffice.org/2009/table" "#,
     r#"xmlns:css3t="http://www.w3.org/TR/css3-text/" "#,
+    r#"xmlns:officina="urn:atrium:officina:pivot:1" "#,
     r#"office:version="1.3""#
 );
 
@@ -860,7 +861,7 @@ fn num_kind(wb: &Workbook, id: StyleId) -> NumKind {
     NumKind::Float
 }
 
-pub(super) fn date_text(system: dates::DateSystem, x: f64) -> Option<String> {
+pub(crate) fn date_text(system: dates::DateSystem, x: f64) -> Option<String> {
     const DAY: i64 = 86_400_000_000_000;
     if !system.contains(x) { return None; }
     let day = x.floor();

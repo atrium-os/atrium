@@ -1368,6 +1368,23 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             ..Default::default()
                         });
                     }
+                    b"officina:date-range" => {
+                        if let Some(t) = pilot.as_mut().filter(|t| t.ranges.len() < officina_grid::pivot::MAX_FIELDS) {
+                            let a = attrs(e);
+                            let get = |k: &str| a.get(k).cloned().unwrap_or_default();
+                            t.ranges.push((get("officina:field"), get("officina:from"), get("officina:to")));
+                        }
+                    }
+                    b"officina:slicer" => {
+                        if let Some(t) = pilot.as_mut().filter(|t| t.slicers.len() < officina_grid::pivot::MAX_SLICERS) {
+                            let a = attrs(e);
+                            let get = |k: &str| a.get(k).cloned().unwrap_or_default();
+                            t.slicers.push(super::pivot::SlicerIn {
+                                name: get("officina:name"), field: get("officina:field"), sheet: get("officina:sheet"),
+                                from: get("officina:from"), to: get("officina:to"), timeline: a.get("officina:timeline").cloned(),
+                            });
+                        }
+                    }
                     b"table:source-cell-range" => {
                         if let Some(t) = pilot.as_mut() {
                             t.source = attrs(e).get("table:cell-range-address").cloned().unwrap_or_default();

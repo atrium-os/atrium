@@ -45,6 +45,10 @@ impl Rect {
     pub fn contains(&self, a: CellAddr) -> bool {
         a.sheet == self.sheet && (self.r0..=self.r1).contains(&a.row) && (self.c0..=self.c1).contains(&a.col)
     }
+    /// Whether all of `o` is inside this one.
+    pub fn contains_rect(&self, o: &Rect) -> bool {
+        self.sheet == o.sheet && self.r0 <= o.r0 && o.r1 <= self.r1 && self.c0 <= o.c0 && o.c1 <= self.c1
+    }
     pub fn intersects(&self, o: &Rect) -> bool {
         self.sheet == o.sheet && self.r0 <= o.r1 && o.r0 <= self.r1 && self.c0 <= o.c1 && o.c0 <= self.c1
     }

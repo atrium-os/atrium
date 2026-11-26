@@ -89,6 +89,8 @@ pub enum Cmd {
     Tab(crate::tabs::TabCmd),
     /// The picked chart: its kind ([`ChartKind::ALL`]).
     ChartKind(usize),
+    /// A slicer's or timeline's button (its float key).
+    SlicerPress(u64),
     /// Its legend: none, or at [`LEGENDS`].
     ChartLegend(usize),
     /// Side by side, stacked, stacked to 100 %.
@@ -2714,6 +2716,8 @@ impl Sheets {
                 // The cursor cell's list button, or Alt+Down: its list.
                 GridAction::PressFloat(crate::source::KEY_FILL) => cmds.lock().unwrap().push(Cmd::FillOptions),
                 GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
+                // A slicer's or timeline's button: filter the pivot by it.
+                GridAction::PressFloat(k) if crate::source::slicer_key(k).is_some() => cmds.lock().unwrap().push(Cmd::SlicerPress(k)),
                 // A filter column's button: its value list.
                 GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen(((k >> 32) & 0xF_FFFF) as u32, k as u32)),
                 // A double-click on a column's edge: as wide as its widest entry.
@@ -4233,7 +4237,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::DataAnalysis | crate::data::DataCmd::Solver | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText | crate::data::DataCmd::FormatChart)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::DataAnalysis | crate::data::DataCmd::Solver | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText | crate::data::DataCmd::FormatChart | crate::data::DataCmd::PivotTools)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.
@@ -4654,6 +4658,27 @@ impl Sheets {
                     }
                     self.filter.set(p);
                     self.changed();
+                    false
+                }
+                Cmd::SlicerPress(k) => {
+                    if let Some((i, sl, b)) = crate::source::slicer_key(k) {
+                        let res = {
+                            let mut d = self.doc.borrow_mut();
+                            let press = match d.wb.pivots().get(i).and_then(|p| p.slicers.get(sl).map(|s| (p, s))) {
+                                _ if b == crate::source::SLICER_CLEAR => Some(crate::pivottools::Press::Clear),
+                                Some((p, s)) => crate::pivottools::buttons(&d.wb, p, s).get(b as usize).map(|x| x.press.clone()),
+                                None => None,
+                            };
+                            match press {
+                                Some(press) => crate::pivottools::press(&mut d, i, sl, &press),
+                                None => Ok(()),
+                            }
+                        };
+                        if let Err(e) = res {
+                            self.set_status(e);
+                        }
+                        self.changed();
+                    }
                     false
                 }
                 Cmd::FilterOpen(row, col) => {
@@ -6477,6 +6502,30 @@ mod tests {
         s.take_cmds();
         assert!(s.list.get_cloned().open);
         assert_eq!(s.grid.get_cloned().cursor, (2, 1));
+    }
+
+    #[test]
+    fn a_slicer_on_the_sheet_filters_its_pivot_when_pressed() {
+        let (mut d, _) = Doc::from_csv("s.csv", b"Region,Sales\nEast,1\nWest,2\nEast,4\n").unwrap();
+        let mut p = officina_grid::pivot::Pivot::new("P", officina_grid::Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 1 }, officina_grid::CellAddr::new(0, 0, 3));
+        p.rows = vec![officina_grid::pivot::PivotField::new(0)];
+        p.data = vec![officina_grid::pivot::DataField { field: 1, agg: officina_grid::pivot::Agg::Sum, name: None, show_as: Default::default() }];
+        let op = d.wb.pivot_op(None, Some(p)).unwrap();
+        d.run("t", vec![op]);
+        crate::pivottools::run(&mut d, (1, 3), "slicer Region at H2").unwrap();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let floats = || pergola::widgets::GridSource::floats(&*s.source, [0.0, 0.0, 1400.0, 800.0], &pergola::theme::Semantic::LIGHT);
+        let slicer: Vec<_> = floats().into_iter().filter_map(|f| crate::source::slicer_key(f.key).map(|k| (k, f.pressable))).collect();
+        // The frame and a button for East and West; no clear button yet.
+        assert_eq!(slicer.iter().filter(|(_, p)| *p).count(), 2, "{slicer:?}");
+        let west = slicer.iter().find(|((_, _, b), _)| *b == 1).unwrap().0;
+        s.cmds.lock().unwrap().push(Cmd::SlicerPress(crate::source::KEY_SLICER | u64::from(west.2)));
+        s.take_cmds();
+        assert_eq!(s.doc.borrow().wb.get(officina_grid::CellAddr::new(0, 1, 3)), officina_grid::Value::str("West"));
+        assert!(floats().iter().any(|f| crate::source::slicer_key(f.key).is_some_and(|k| k.2 == crate::source::SLICER_CLEAR)));
+        s.cmds.lock().unwrap().push(Cmd::SlicerPress(crate::source::KEY_SLICER | u64::from(crate::source::SLICER_CLEAR)));
+        s.take_cmds();
+        assert_eq!(s.doc.borrow().wb.get(officina_grid::CellAddr::new(0, 1, 3)), officina_grid::Value::str("East"));
     }
 
     #[test]

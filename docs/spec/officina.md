@@ -5584,6 +5584,61 @@ Tests:
 - convert: nine charts covering every new kind and every extra round-trip unchanged through `.xlsx` (with the `chartExN.xml` parts and their content type checked) and through `.ods`.
 - Sheets: Format Chart sets each extra, its bar text reads back and retyping it changes nothing, one undo takes it back; type changes to waterfall, histogram, bubble and stock with their settings; eight refusals leave the chart as it was.
 
+### 16.164 PivotTables: Show Values As, calculated fields, grouping, slicers, timelines and PivotCharts (2026-11-26)
+
+Round 3 of the six that finish Sheets. Show Values As, calculated fields and grouping were already in the pivot engine (`officina-grid/src/pivot.rs` and `pivot/`), with no way to set most of them from the app. This round adds that command, slicers and timelines, PivotCharts, and the file support the grouping lacked in `.xlsx`.
+
+**Model** (`officina-grid/src/pivot/slicer.rs`).
+
+- `Pivot.filters`: a `PivotFilter` per field filtered from outside the layout. It holds the items hidden and an optional date range `between` (source values from `.0` up to but not including `.1`). A slicer's selection is its field's hidden items: on the layout field when the field is in the layout, else in a filter of its own. A timeline's selection is a filter's range. `set_hidden` and `set_range` put each where it belongs and drop a filter left with nothing to do.
+- `Pivot.slicers`: up to 32 `Slicer`s, each a name (unique ignoring case, 1 to 255 bytes), a field and a sheet anchor, with `timeline` set to years, quarters, months or days for a timeline.
+- `pivot_output` skips source rows a filter hides, or whose raw value is outside a range, before anything is counted. Nothing of a filter shows in the pivot's cells, as in Excel.
+- `check_pivot` validates both: at most 16 filters, one per field, the field in the source or derived, a finite range with its start before its end on a source column, and an anchor inside the sheets.
+- On the wire, bit 4 of the layout tag says a section of filters and slicers follows. A pivot without them is byte for byte what it was.
+- Moving, deleting and inserting rows, columns or sheets moves slicer anchors as it moves chart anchors. Deleting a slicer's sheet deletes the slicer.
+
+**PivotCharts.** A chart whose series all sit inside a pivot's output follows that pivot. Every `pivot_op` re-points its series with `pivot_chart_series(shape, compact)`: one series per value column (grand total columns left out), rows from the body's first row to the last that isn't a total, categories from the innermost label column, and the name from the header cell above. Each series keeps its look and kind by position, so filtering, regrouping or refreshing the pivot redraws the chart from what the pivot now shows. There is no separate chart type: a PivotChart is a chart over a pivot, which is also how it is saved.
+
+**PivotTable Tools…** (Data menu, before Pivot Table Fields…, `atrium-sheets/src/pivottools.rs`). It works on the pivot at the cursor, or the pivot whose slicer is at the cursor. It takes one line, split on `;`, as one undo step, and starts with how the first value shows:
+
+`show Sum of Amount as % of parent row; group Date by quarters, years`
+`slicer Region at L3; timeline Date by months; select Region: West; dates Date from 2024-03 to 2024-05; chart column`
+
+- `show VALUE as KIND`. KIND is Excel's Show Values As list: normal, % of total, row, column, parent row, column or `% of parent FIELD`, index, `running total in FIELD`, `% running total in FIELD`, `rank largest by FIELD` and `rank smallest by FIELD`, `difference from FIELD ITEM`, `% of FIELD ITEM` and `% difference from FIELD ITEM`. ITEM can also be `previous` or `next`. `percent` is the same as `%`.
+- `calculated NAME = FORMULA` adds a calculated field and sums it (the formula names fields, as `=Amount*0.1`). `remove calculated NAME` removes it.
+- `group FIELD by PARTS`, with PARTS any of seconds, minutes, hours, days, months, quarters and years. The finest part groups the field in place, and each coarser part becomes a new field placed before it on its axis, as in Excel. `group FIELD by 7 days` makes week buckets. `group FIELD from A to B by STEP` makes numeric intervals, and without `from … to` the bounds are automatic. `ungroup FIELD` removes the field's groupings, the fields they made, and the slicers and filters on those fields.
+- `slicer FIELD [at CELL]` and `timeline FIELD [by years|quarters|months|days] [at CELL]` add one. It is named after the field ("Region", then "Region 1"…) and placed at CELL or right of the pivot. A timeline needs a field with dates. `remove slicer NAME` and `remove timeline NAME` take one away and clear what it filtered.
+- `select FIELD: ITEM, ITEM` shows only those items, and `select FIELD: all` clears the selection. `dates FIELD from 2024-03 to 2024-05` keeps March through May (a year, a month or a day at each end), and `dates FIELD: all` clears it.
+- `chart [KIND]` adds a PivotChart (column unless named) right of the pivot, or below it when a slicer is in the way.
+- These are refused, with the reason, changing nothing: an unknown field or item, a base field not on an axis, a second grouping of a grouped field, grouping text, a timeline on a field without dates, a 33rd slicer, and a calculated field name already used.
+
+**On the sheet** (`atrium-sheets/src/source.rs`). Each slicer is a framed panel with its name. Below the name is a button per item, up to 200, filled when shown and pale when hidden. A press shows only that item, and the × at the top right, present while the slicer filters, shows everything again. A timeline shows its level and a row of periods across, from the first to the last date in the source, up to the latest 400. It shows as many as fit, ending at the selection. A press keeps that period. Each press is one undo step labelled Slicer or Timeline. The panels are drawn from a cache keyed by the pivot and its output, so redrawing doesn't rescan the source.
+
+**Files.**
+
+- `.xlsx`:
+  - Date grouping is written as Excel writes it. The source column's shared items are dates (`<d>`, `containsDate`). The in-place part is a `fieldGroup` with `rangePr groupBy="months"` (or whichever part) and its start and end dates, automatic or not. Each coarser part is a `databaseField="0"` cache field with its own `fieldGroup`, chained finest to coarsest with `par`. `groupItems` list every period, with the items below the start and above the end first and last, and the pivot fields' items point into them.
+  - Interval grouping is a `rangePr` with `startNum`, `endNum` and `groupInterval`, or `groupBy="days"` with a `groupInterval` for week-style buckets.
+  - On reading, Excel's own labels ("Qtr1", "1-Jan", "<1/5/2024") are matched by position to this engine's, so hidden items still name the right periods. Automatic bounds read as automatic, and fixed numeric bins read as before.
+  - A slicer's selection on a field outside the layout is the hidden items (`h="1"`) of a pivot field with no axis, which is how Excel stores it. A timeline's range is a `dateBetween` pivot filter, with `greaterThanOrEqual` and `lessThan` custom filters. An inclusive `lessThanOrEqual`, as Excel's timelines write, is read as the next day's start.
+  - The slicers and timelines themselves are an `extLst` extension of the pivot table (`urn:atrium:officina:pivot-slicers:1`) that Excel passes over. Excel opens the file with the pivot filtered as it was, but shows no slicer panels.
+- `.ods`: filters are `hidden`-orientation data pilot fields with the hidden members `table:display="false"`. Ranges and slicers are `officina:date-range` and `officina:slicer` elements in the data pilot table, which LibreOffice ignores.
+
+**Not built yet**:
+- Excel's own slicer and timeline parts (`slicerCache`, `slicer`, `timelineCache`, and the drawing objects that place them): Excel shows the filtering but not the panels.
+- One slicer connected to several pivots.
+- A slicer's multi-select mode and its style.
+- Calculated items.
+- `c:pivotSource` on a saved PivotChart, which Excel uses to show its field buttons.
+
+Tests:
+- grid: a slicer on a field outside the layout and a timeline range filter the output without showing; both survive the wire, and every truncation of it fails cleanly. A PivotChart follows its pivot when an item is hidden and a value field removed, keeping its look; a chart elsewhere stays as it is.
+- Sheets: Show Values As and calculated fields through the bar; dates grouped by quarters and years and numbers by intervals; slicers, timelines, `select`, `dates` and a PivotChart; a press on a drawn slicer filters its pivot.
+- convert:
+  - `.xlsx` round trip of months grouped in place with years and quarters, interval bins with an automatic end, a Region slicer selection outside the layout, a 2024 timeline range and both slicers, with the same pivots and cells after reading;
+  - Excel's "Qtr1" labels and an inclusive timeline end, read as this engine's;
+  - the same book through `.ods`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -231,6 +231,8 @@ pub enum DataCmd {
     AltText,
     /// Format Chart… (type and per-series extras, typed).
     FormatChart,
+    /// PivotTable Tools… (Show Values As, calculated fields, grouping, slicers, timelines, PivotChart; typed).
+    PivotTools,
     /// Check Accessibility (a bar stepping through what it finds).
     CheckAccessibility,
     /// Insert Checkbox (or take it off, from a checkbox).
@@ -767,6 +769,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
             v.push((MenuItem::new(label).enabled(src.is_some()), Some(DataCmd::PivotColumns)));
         }
     }
+    v.push((MenuItem::new("PivotTable Tools…").enabled(crate::pivottools::can_use(d, (row, col))), Some(DataCmd::PivotTools)));
     v.push((MenuItem::new("Pivot Table Fields…").enabled(crate::pivotpane::pivot_here(wb, s, row, col).is_some()), Some(DataCmd::PivotFields)));
     v.push((MenuItem::new("Refresh All Pivot Tables").enabled(!wb.pivots().is_empty()), Some(DataCmd::RefreshAllPivots)));
     v.push((MenuItem::new("Conditional Formatting…").separated(), Some(DataCmd::CondFormats)));
@@ -3206,7 +3209,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::FormatChart | DataCmd::CheckAccessibility => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::FormatChart | DataCmd::PivotTools | DataCmd::CheckAccessibility => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);

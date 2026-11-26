@@ -258,3 +258,87 @@ fn compact_layout_as_excel_shows_it() {
     let back = officina_grid::native::load(&out).unwrap();
     assert!(back.pivots()[0].compact);
 }
+
+#[test]
+fn slicer_filters_and_timeline_ranges_filter_without_showing() {
+    use officina_grid::charts::Anchor;
+    use officina_grid::pivot::{DatePart, PivotFilter, Slicer};
+    let mut wb = book();
+    let mut p = Pivot::new("P", src(), CellAddr::new(0, 0, 7));
+    p.rows = vec![PivotField::new(0)];
+    p.data = vec![sum(3)];
+    let i = wb.add_pivot(p.clone()).unwrap();
+    assert_eq!(grid(&wb, i).last().unwrap(), &["Grand Total", "54"]);
+    // A slicer on Quarter, which isn't in the layout: Q2 left out, no page field shown.
+    let anchor = Anchor { sheet: 0, from: (0, 12, 0.0, 0.0), to: (8, 14, 0.0, 0.0) };
+    p.slicers = vec![Slicer { name: "Quarter".into(), field: 2, anchor, timeline: None }];
+    p.set_hidden(2, vec![Value::str("Q2")]);
+    assert_eq!(p.filters, vec![PivotFilter { field: 2, hidden: vec![Value::str("Q2")], between: None }]);
+    wb.set_pivot(i, p.clone()).unwrap();
+    assert_eq!(grid(&wb, i), rows(&[&["Region", "Sum of Units"], &["North", "16"], &["South", "7"], &["Grand Total", "23"]]));
+    // A slicer on a layout field keeps its selection there.
+    p.set_hidden(0, vec![Value::str("South")]);
+    assert_eq!(p.rows[0].hidden, vec![Value::str("South")]);
+    p.set_hidden(0, Vec::new());
+    // A range on the source values (a timeline's), up to but not including its end.
+    p.set_hidden(2, Vec::new());
+    assert!(p.filters.is_empty());
+    p.set_range(3, Some((5.0, 11.0)));
+    p.slicers.push(Slicer { name: "Units".into(), field: 3, anchor, timeline: Some(DatePart::Months) });
+    wb.set_pivot(i, p.clone()).unwrap();
+    assert_eq!(grid(&wb, i), rows(&[&["Region", "Sum of Units"], &["East", "8"], &["North", "15"], &["South", "7"], &["Grand Total", "30"]]));
+    // Kept in the native file.
+    let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();
+    assert_eq!(back.pivots(), wb.pivots());
+    // Refused: a bad range, a timeline by hours, two slicers of one name, a slicer off the sheets.
+    let mut bad = p.clone();
+    bad.filters[0].between = Some((3.0, 3.0));
+    assert!(wb.set_pivot(i, bad).is_err());
+    let mut bad = p.clone();
+    bad.slicers[1].timeline = Some(DatePart::Hours);
+    assert!(wb.set_pivot(i, bad).is_err());
+    let mut bad = p.clone();
+    bad.slicers[1].name = "QUARTER".into();
+    assert!(wb.set_pivot(i, bad).is_err());
+    let mut bad = p.clone();
+    bad.slicers[0].anchor.sheet = 3;
+    assert!(wb.set_pivot(i, bad).is_err());
+    // Truncated bytes never decode into something else.
+    let bytes = officina_grid::native::save_to_vec(&wb);
+    for n in (0..bytes.len()).step_by(7) {
+        let _ = officina_grid::native::load(&bytes[..n]);
+    }
+}
+
+#[test]
+fn a_pivot_chart_follows_its_pivot() {
+    use officina_grid::charts::{Anchor, Chart, ChartKind, Grouping};
+    let mut wb = book();
+    let mut p = Pivot::new("P", src(), CellAddr::new(0, 0, 7));
+    p.rows = vec![PivotField::new(0)];
+    p.data = vec![sum(3), sum(4)];
+    let i = wb.add_pivot(p.clone()).unwrap();
+    let series = officina_grid::pivot::pivot_chart_series(wb.pivot_shape(i).unwrap(), false);
+    // Two value columns, the three regions (the grand total left out), named by headers.
+    assert_eq!(series.len(), 2);
+    // (Two value fields: a Values header row over their captions.)
+    assert_eq!(series[0].vals, Rect { sheet: 0, r0: 2, c0: 8, r1: 4, c1: 8 });
+    assert_eq!(series[0].cats, Some(Rect { sheet: 0, r0: 2, c0: 7, r1: 4, c1: 7 }));
+    assert_eq!(series[1].name, Some(officina_grid::charts::ChartText::Cell(CellAddr::new(0, 1, 9))));
+    assert_eq!(wb.get(CellAddr::new(0, 1, 9)), Value::str("Sum of Price"));
+    let mut series = series;
+    series[0].look.labels = true;
+    wb.add_chart(Chart { kind: ChartKind::Column, grouping: Grouping::Standard, title: None, series, legend: None, x_title: None, y_title: None, anchor: Anchor { sheet: 0, from: (10, 7, 0.0, 0.0), to: (20, 12, 0.0, 0.0) }, alt: None }).unwrap();
+    // Another chart elsewhere stays as it is.
+    let other = Chart { series: vec![officina_grid::charts::Series { name: None, cats: None, vals: Rect { sheet: 0, r0: 1, c0: 3, r1: 7, c1: 3 }, kind: None, look: Default::default() }], ..wb.charts()[0].clone() };
+    wb.add_chart(other.clone()).unwrap();
+    // Leaving out a region (one row fewer) and a value field: the chart follows, keeping its look.
+    p.rows[0].hidden = vec![Value::str("East")];
+    p.data.pop();
+    { use officina_core::history::Op; wb.pivot_op(Some(i), Some(p)).unwrap().apply(&mut wb); }
+    let c = &wb.charts()[0];
+    assert_eq!(c.series.len(), 1);
+    assert_eq!(c.series[0].vals, Rect { sheet: 0, r0: 1, c0: 8, r1: 2, c1: 8 });
+    assert!(c.series[0].look.labels);
+    assert_eq!(wb.charts()[1], other);
+}

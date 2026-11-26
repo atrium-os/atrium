@@ -24,6 +24,8 @@ pub struct SheetSource {
     pub doc: Rc<RefCell<Doc>>,
     /// Charts as drawn, by chart: (sheet, size, data version, nodes).
     charts: RefCell<Vec<Option<(ChartKey, Rc<Vec<pergola::Node>>)>>>,
+    /// Slicer and timeline buttons, by (pivot, slicer): (the pivot's hash, buttons).
+    slicers: RefCell<std::collections::HashMap<(usize, usize), (u64, Rc<Vec<crate::pivottools::Button>>)>>,
     /// Row sizes with hidden rows zero high, while the sheet hides any, keyed by what
     /// they were built from.
     view: RefCell<Option<(ViewKey, officina_grid::column::Sizes)>>,
@@ -46,7 +48,7 @@ impl SheetSource {
     }
 
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None) }
+        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), slicers: RefCell::new(std::collections::HashMap::new()), note_at: std::cell::Cell::new(None) }
     }
 
     /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
@@ -433,6 +435,18 @@ pub const KEY_LIST: u64 = 1 << 59;
 pub fn total_cell(wb: &officina_grid::Workbook, a: CellAddr) -> bool {
     wb.table_at(a.sheet, a.row, a.col).is_some_and(|t| t.totals && a.row == t.rect.r1)
 }
+/// Float keys of slicers and timelines: the pivot (bits 40-47), the slicer
+/// (32-39) and the button (the low bits; `SLICER_CLEAR` its clear button,
+/// `SLICER_FRAME` the frame).
+pub const KEY_SLICER: u64 = 1 << 55;
+pub const SLICER_CLEAR: u32 = u32::MAX - 1;
+const SLICER_FRAME: u32 = u32::MAX;
+
+/// Which pivot, slicer and button a slicer float's key names.
+pub fn slicer_key(k: u64) -> Option<(usize, usize, u32)> {
+    (k & KEY_SLICER != 0 && k >> 56 == 0).then(|| (((k >> 40) & 0xFF) as usize, ((k >> 32) & 0xFF) as usize, k as u32))
+}
+
 /// The fill options button by the area a fill just filled.
 pub const KEY_FILL: u64 = 1 << 57;
 /// Its size, px.
@@ -454,6 +468,108 @@ fn drop_button(theme: &pergola::theme::Semantic, size: f32, lit: bool) -> Vec<pe
 }
 
 impl SheetSource {
+    /// Slicers and timelines on this sheet: a frame with the field's name, a
+    /// clear button while it filters, and a button for each item (a column
+    /// down) or period (a row across, the latest that fit).
+    fn slicer_floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
+        use pergola::theme::{font, type_size, Weight};
+        let d = self.doc.borrow();
+        let mut out = Vec::new();
+        let z = self.zoom_factor();
+        let text = |content: String, x: f32, y: f32, w: f32, color: Color, bold: bool| pergola::Node::Text {
+            rect: pergola::Rect::new(x, y, w.max(0.0), 18.0),
+            content,
+            style: pergola::TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if bold { Weight::Semibold } else { Weight::Regular }, color },
+        };
+        let mut cache = self.slicers.borrow_mut();
+        for (i, p) in d.wb.pivots().iter().enumerate().take(256) {
+            for (k, sl) in p.slicers.iter().enumerate() {
+                let a = sl.anchor;
+                if a.sheet != d.sheet {
+                    continue;
+                }
+                let x0 = self.col_left(a.from.1) + a.from.2 as f64 * 96.0 / 72.0 * z;
+                let y0 = self.row_top(a.from.0) + a.from.3 as f64 * 96.0 / 72.0 * z;
+                let x1 = self.col_left(a.to.1) + a.to.2 as f64 * 96.0 / 72.0 * z;
+                let y1 = self.row_top(a.to.0) + a.to.3 as f64 * 96.0 / 72.0 * z;
+                let (w, h) = ((x1 - x0).clamp(0.0, 4000.0), (y1 - y0).clamp(0.0, 4000.0));
+                if w < 40.0 || h < 40.0 || x0 > view[0] + view[2] || y0 > view[1] + view[3] || x0 + w < view[0] || y0 + h < view[1] {
+                    continue;
+                }
+                let hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hs = std::collections::hash_map::DefaultHasher::new();
+                    format!("{p:?}").hash(&mut hs);
+                    d.wb.pivot_shape(i).map(|s| format!("{s:?}")).hash(&mut hs);
+                    hs.finish()
+                };
+                let buttons = match cache.get(&(i, k)) {
+                    Some((h, b)) if *h == hash => b.clone(),
+                    _ => {
+                        let b = Rc::new(crate::pivottools::buttons(&d.wb, p, sl));
+                        cache.insert((i, k), (hash, b.clone()));
+                        b
+                    }
+                };
+                let key = |b: u32| KEY_SLICER | ((i as u64) << 40) | ((k as u64) << 32) | u64::from(b);
+                let (wf, hf) = (w as f32, h as f32);
+                let mut frame = vec![
+                    pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, wf, hf), fill: theme.border_default(), radius: 4.0 },
+                    pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, wf - 2.0, hf - 2.0), fill: theme.bg_surface(), radius: 3.0 },
+                    text(sl.name.to_string(), 8.0, 6.0, wf - 40.0, theme.text_primary(), true),
+                ];
+                let filtering = crate::pivottools::filtering(p, sl);
+                if sl.timeline.is_some() {
+                    let level = match sl.timeline {
+                        Some(officina_grid::pivot::DatePart::Years) => "YEARS",
+                        Some(officina_grid::pivot::DatePart::Quarters) => "QUARTERS",
+                        Some(officina_grid::pivot::DatePart::Days) => "DAYS",
+                        _ => "MONTHS",
+                    };
+                    frame.push(text(level.into(), 8.0, 26.0, wf - 16.0, theme.text_secondary(), false));
+                }
+                out.push(pergola::widgets::GridFloat { key: key(SLICER_FRAME), at: [x0, y0, w, h], nodes: Rc::new(frame), movable: false, pressable: false });
+                if filtering {
+                    let mut n = vec![pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, 20.0, 20.0), fill: theme.state_hover(), radius: 3.0 }];
+                    n.push(text("×".into(), 6.0, 1.0, 14.0, theme.text_primary(), true));
+                    out.push(pergola::widgets::GridFloat { key: key(SLICER_CLEAR), at: [x0 + w - 26.0, y0 + 5.0, 20.0, 20.0], nodes: Rc::new(n), movable: false, pressable: true });
+                }
+                let button = |label: &str, on: bool, bw: f32, bh: f32| {
+                    let (bg, fg) = if on { (theme.accent_bg(), theme.text_primary()) } else { (theme.bg_canvas(), theme.text_tertiary()) };
+                    Rc::new(vec![
+                        pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, bw, bh), fill: theme.border_default(), radius: 3.0 },
+                        pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, bw - 2.0, bh - 2.0), fill: bg, radius: 2.0 },
+                        text(label.to_string(), 6.0, (bh - 18.0) / 2.0, bw - 10.0, fg, false),
+                    ])
+                };
+                if sl.timeline.is_some() {
+                    let (bw, bh, top) = (64.0f64, 28.0f64, 48.0f64);
+                    let fit = (((w - 12.0) / (bw + 2.0)).floor() as usize).max(1);
+                    let end = buttons.iter().rposition(|b| b.on && filtering).map_or(buttons.len(), |e| e + 1);
+                    let first = end.saturating_sub(fit);
+                    for (j, b) in buttons.iter().enumerate().skip(first).take(fit) {
+                        let x = x0 + 6.0 + (j - first) as f64 * (bw + 2.0);
+                        if top + bh > h {
+                            break;
+                        }
+                        out.push(pergola::widgets::GridFloat { key: key(j as u32), at: [x, y0 + top, bw, bh], nodes: button(&b.label, b.on && filtering, bw as f32, bh as f32), movable: false, pressable: true });
+                    }
+                } else {
+                    let (bh, gap, top) = (24.0f64, 4.0f64, 30.0f64);
+                    let bw = w - 12.0;
+                    for (j, b) in buttons.iter().enumerate() {
+                        let y = y0 + top + j as f64 * (bh + gap);
+                        if y + bh > y0 + h - 4.0 {
+                            break;
+                        }
+                        out.push(pergola::widgets::GridFloat { key: key(j as u32), at: [x0 + 6.0, y, bw, bh], nodes: button(&b.label, b.on, bw as f32, bh as f32), movable: false, pressable: true });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Tables (an outline, a header tint, stripes) and the auto-filter's header marks
     /// (a filtered column's mark is lit), for the part of the sheet in `view`.
     fn data_marks(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
@@ -1077,6 +1193,7 @@ impl GridSource for SheetSource {
         out.extend(self.list_button(theme));
         out.extend(self.fill_button(theme));
         out.extend(self.invalid_rings(view));
+        out.extend(self.slicer_floats(view, theme));
         let d = self.doc.borrow();
         let charts = d.wb.charts();
         if charts.is_empty() {

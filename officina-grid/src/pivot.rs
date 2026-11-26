@@ -21,13 +21,15 @@ mod calculate;
 mod display;
 mod group;
 mod order;
+mod slicer;
 
 pub use calculate::CalculatedField;
 pub use display::{BaseItem, ReferenceCalc, ShowAs};
-pub use group::{DatePart, GroupField, GroupKind, ItemGroup};
+pub use group::{date_part_labels, group_bounds, DatePart, GroupField, GroupKind, ItemGroup};
 use display::{Display, Slot};
 use group::Grouping;
 pub use order::{AxisSort, ScopeItems, MAX_SCOPE_ITEMS};
+pub use slicer::{in_layout, slicer_name, PivotFilter, Slicer, MAX_SLICERS};
 use order::{Order, SortKey};
 
 pub const MAX_GROUPS: usize = 64;
@@ -148,6 +150,10 @@ pub struct Pivot {
     pub compact: bool,
     /// The implicit Values field is the innermost row field.
     pub values_on_rows: bool,
+    /// Filters that don't show in the cells: slicers' fields out of the
+    /// layout, and timelines' date ranges.
+    pub filters: Vec<PivotFilter>,
+    pub slicers: Vec<Slicer>,
 }
 
 impl Pivot {
@@ -189,7 +195,7 @@ impl Pivot {
     }
 
     pub fn new(name: &str, source: Rect, dest: CellAddr) -> Self {
-        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), calculations: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false, values_on_rows: false }
+        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), calculations: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false, values_on_rows: false, filters: Vec::new(), slicers: Vec::new() }
     }
 
     /// Swap value fields without changing the measure referenced by a sort.
@@ -294,6 +300,34 @@ impl Shape {
         }
         Some(if c < self.label_cols { Role::Label } else { Role::Data })
     }
+}
+
+/// A PivotChart's series for a pivot's output: one per value column (the
+/// grand total column left out), named by its header, over the body rows up to
+/// the last that isn't a total (subtotal rows inside stay points), with the
+/// innermost row labels as categories.
+pub fn pivot_chart_series(shape: &Shape, compact: bool) -> Vec<crate::charts::Series> {
+    use crate::charts::{ChartText, Series, MAX_SERIES};
+    let Some(a) = shape.area else { return Vec::new() };
+    let body = a.r0 + shape.page_rows + shape.header_rows;
+    if body > a.r1 {
+        return Vec::new();
+    }
+    let Some(last) = (body..=a.r1).rev().find(|r| !shape.total_rows.contains(&(r - body))) else { return Vec::new() };
+    let label = if compact || shape.label_cols == 0 { a.c0 } else { a.c0 + shape.label_cols - 1 };
+    let cats = (shape.label_cols > 0).then_some(Rect { sheet: a.sheet, r0: body, c0: label, r1: last, c1: label });
+    let head = body.checked_sub(1).filter(|h| *h >= a.r0 + shape.page_rows);
+    (a.c0 + shape.label_cols..=a.c1)
+        .filter(|c| !shape.total_cols.contains(&(c - a.c0)))
+        .take(MAX_SERIES)
+        .map(|c| Series {
+            name: head.map(|h| ChartText::Cell(CellAddr::new(a.sheet, h, c))),
+            cats,
+            vals: Rect { sheet: a.sheet, r0: body, c0: c, r1: last, c1: c },
+            kind: None,
+            look: Default::default(),
+        })
+        .collect()
 }
 
 /// An item's identity: text without regard to case, as Excel groups items.
@@ -639,6 +673,7 @@ impl Workbook {
             seen.push(f.field);
         }
         self.check_pivot_calculations(p)?;
+        p.check_filters(width, self.sheet_count())?;
         if p.data.iter().any(|d| d.field >= width
             && !(d.agg == Agg::Sum && p.calculations.iter().any(|field| field.field == d.field)))
         {
@@ -746,7 +781,33 @@ impl Workbook {
     /// [`refresh_pivot`]: Workbook::refresh_pivot
     pub fn pivot_op(&self, i: Option<usize>, p: Option<Pivot>) -> Result<crate::ops::GridOp, &'static str> {
         let mut state = self.pivot_state();
+        let old = i.and_then(|i| state.get(i)).and_then(|s| s.1);
         let mut ops = self.plan_pivot(&mut state, i, p)?;
+        // PivotCharts: charts drawn wholly from the old output follow the new one.
+        if let (Some(old), Some(i)) = (old, i) {
+            if let Some((p, Some(_))) = state.get(i) {
+                let follows = |c: &crate::charts::Chart| !c.series.is_empty() && c.series.iter().all(|s| old.contains_rect(&s.vals) && s.cats.is_none_or(|r| old.contains_rect(&r)));
+                if self.charts().iter().any(follows) {
+                    if let Ok(out) = self.pivot_output(p) {
+                        let fresh = pivot_chart_series(&out.shape, p.compact);
+                        if !fresh.is_empty() {
+                            let charts = self.charts().iter().map(|c| {
+                                if !follows(c) {
+                                    return c.clone();
+                                }
+                                let mut c = c.clone();
+                                c.series = fresh.iter().enumerate().map(|(k, s)| {
+                                    let was = c.series.get(k).or(c.series.last());
+                                    crate::charts::Series { look: was.map(|w| w.look.clone()).unwrap_or_default(), kind: was.and_then(|w| w.kind), ..s.clone() }
+                                }).collect();
+                                c
+                            }).collect();
+                            ops.push(crate::ops::GridOp::Charts(charts));
+                        }
+                    }
+                }
+            }
+        }
         ops.push(crate::ops::GridOp::Pivots(state));
         Ok(crate::ops::GridOp::Batch(ops))
     }
@@ -917,6 +978,14 @@ impl Workbook {
         self.axis(p, field, grouping.as_ref(), sort).map(|a| a.items).unwrap_or_default()
     }
 
+    /// A date-part or interval grouped field's every possible item in order,
+    /// with the start and end its grouping uses (see `Grouping::domain`).
+    pub fn pivot_group_domain(&self, p: &Pivot, field: u32) -> Option<(f64, f64, Vec<Value>)> {
+        p.check_groups().ok()?;
+        let group = p.groups.iter().find(|group| group.field == field)?;
+        Grouping::new(self, p, group).domain(self.date_system())
+    }
+
     /// Ungrouped cache items for a physical source column.
     pub fn pivot_source_items(&self, p: &Pivot, field: u32) -> Vec<Value> {
         self.axis(p, field, None, &AxisSort::Default).map(|axis| axis.items).unwrap_or_default()
@@ -1012,14 +1081,25 @@ impl Workbook {
         });
         let p = resolved.as_ref().unwrap_or(p);
         let s = &p.source;
-        let fields: Vec<&PivotField> = p.rows.iter().chain(&p.cols).chain(&p.pages).collect();
+        // Layout fields, then the filters' fields that aren't in it: a row
+        // counts only when each of its items is kept.
+        let filter_fields: Vec<PivotField> = p.filter_only().map(|f| PivotField { hidden: f.hidden.clone(), ..PivotField::new(f.field) }).collect();
+        let fields: Vec<&PivotField> = p.rows.iter().chain(&p.cols).chain(&p.pages).chain(&filter_fields).collect();
+        let ranges: Vec<(u32, f64, f64)> = p.filters.iter().filter_map(|f| f.between.map(|(a, b)| (f.field, a, b))).collect();
         let groups: HashMap<_, _> = p.groups.iter()
             .filter(|group| fields.iter().any(|f| f.field == group.field))
             .map(|group| (group.field, Grouping::new(self, p, group))).collect();
         let mut axes: HashMap<u32, (Axis, HashMap<Key, u32>)> = HashMap::new();
         for f in &fields {
             let ax = self.axis(p, f.field, groups.get(&f.field), &f.sort)?;
-            let hidden: Vec<Key> = f.hidden.iter().map(key).collect();
+            let mut hidden: Vec<Key> = f.hidden.iter().map(key).collect();
+            // A layout field that also has a filter (one moved into the
+            // layout after a slicer filtered it): both hide.
+            if in_layout(p, f.field) {
+                if let Some(extra) = p.filters.iter().find(|x| x.field == f.field) {
+                    hidden.extend(extra.hidden.iter().map(key));
+                }
+            }
             let kept: Vec<Value> = ax.items.into_iter().filter(|v| !hidden.contains(&key(v))).collect();
             let idx = kept.iter().enumerate().map(|(i, v)| (key(v), i as u32)).collect();
             axes.insert(f.field, (Axis { items: kept }, idx));
@@ -1036,6 +1116,12 @@ impl Workbook {
         'rows: for r in s.r0 + 1..=s.r1 {
             let at = |f: u32| self.get(CellAddr::new(s.sheet, r, s.c0 + f));
             keybuf.clear();
+            for &(f, a, b) in &ranges {
+                match at(f) {
+                    Value::Num(x) if x >= a && x < b => {}
+                    _ => continue 'rows,
+                }
+            }
             for f in &fields {
                 let (_, idx) = &axes[&f.field];
                 let (item, _) = self.pivot_item(p, r, f.field, groups.get(&f.field));
@@ -1499,13 +1585,17 @@ impl Pivot {
         }
         let layout = self.values_on_rows || self.rows.iter().chain(&self.cols)
             .any(|field| field.outline || field.subtotal != Subtotal::Default);
-        w.u8(u8::from(area.is_some()) | (u8::from(layout) << 1));
+        let extras = self.has_extras();
+        w.u8(u8::from(area.is_some()) | (u8::from(layout) << 1) | (u8::from(extras) << 2));
         if let Some(area) = area { put_rect(w, &area); }
         if layout {
             w.u8(u8::from(self.values_on_rows));
             for field in self.rows.iter().chain(&self.cols) {
                 w.u8(field.subtotal as u8 | (u8::from(field.outline) << 2));
             }
+        }
+        if extras {
+            self.encode_extras(w, put_value);
         }
     }
 
@@ -1563,7 +1653,7 @@ impl Pivot {
             }
         }
         let tag = r.u8()?;
-        if tag > 3 { return Err(WireError::Invalid("pivot layout flags")); }
+        if tag > 7 { return Err(WireError::Invalid("pivot layout flags")); }
         let area = if tag & 1 != 0 { Some(get_rect(r)?) } else { None };
         let pages = axes.pop().unwrap();
         let mut cols = axes.pop().unwrap();
@@ -1581,6 +1671,7 @@ impl Pivot {
             }
             values
         } else { false };
-        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, calculations, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0, values_on_rows }, area))
+        let (filters, slicers) = if tag & 4 != 0 { Pivot::decode_extras(r, get_field, get_value)? } else { (Vec::new(), Vec::new()) };
+        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, calculations, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0, values_on_rows, filters, slicers }, area))
     }
 }

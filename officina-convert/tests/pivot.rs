@@ -264,3 +264,130 @@ fn ods_value_sort_and_running_totals_are_independent_under_column_parents() {
     book.refresh_pivot(0).unwrap();
     check(&book, ["A", "B", "A", "B"], [10.0, 19.0, 8.0, 10.0]);
 }
+
+/// Sales by date and amount for the grouping and slicer tests (§16.164).
+fn dated_book() -> Workbook {
+    let dates = officina_grid::eval::dates::DateSystem::Excel1900;
+    let mut wb = Workbook::new();
+    wb.add_sheet("Data").unwrap();
+    for (c, h) in ["Date", "Region", "Amount"].into_iter().enumerate() {
+        wb.set_value(CellAddr::new(0, 0, c as u32), Value::str(h));
+    }
+    let rows = [((2024, 1, 5), "West", 10.0), ((2024, 2, 9), "East", 25.0), ((2024, 4, 2), "West", 40.0),
+        ((2024, 8, 20), "East", 5.0), ((2025, 3, 1), "West", 70.0), ((2025, 11, 30), "East", 15.0)];
+    for (i, ((y, m, d), region, amount)) in rows.into_iter().enumerate() {
+        let r = i as u32 + 1;
+        wb.set_value(CellAddr::new(0, r, 0), Value::Num(dates.date(y as f64, m as f64, d as f64).unwrap()));
+        wb.set_value(CellAddr::new(0, r, 1), Value::str(region));
+        wb.set_value(CellAddr::new(0, r, 2), Value::Num(amount));
+    }
+    wb.recalc();
+    wb
+}
+
+/// Two pivots of `dated_book`: by years and quarters of a date grouped by
+/// months, filtered by a Region slicer and a 2024 timeline; and by amounts
+/// in bins of 25.
+fn grouped_book() -> Workbook {
+    use officina_grid::charts::Anchor;
+    use officina_grid::pivot::{DatePart, GroupField, GroupKind, Slicer};
+    use officina_grid::addr::MAX_COLS;
+
+    let dates = officina_grid::eval::dates::DateSystem::Excel1900;
+    let mut wb = dated_book();
+    let src = Rect { sheet: 0, r0: 0, c0: 0, r1: 6, c1: 2 };
+    // Years, then quarters (derived) over the date column grouped by months in place.
+    let mut p = Pivot::new("By period", src, CellAddr::new(0, 0, 5));
+    let (years, quarters) = (MAX_COLS, MAX_COLS + 1);
+    p.groups = vec![
+        GroupField { field: 0, source: 0, name: "Date".into(), kind: GroupKind::DateParts { start: None, end: None, part: DatePart::Months } },
+        GroupField { field: years, source: 0, name: "Years".into(), kind: GroupKind::DateParts { start: None, end: None, part: DatePart::Years } },
+        GroupField { field: quarters, source: 0, name: "Quarters".into(), kind: GroupKind::DateParts { start: None, end: None, part: DatePart::Quarters } },
+    ];
+    p.rows = vec![PivotField::new(years), PivotField { hidden: vec![Value::str("Q4")], ..PivotField::new(quarters) }];
+    p.data = vec![DataField { field: 2, agg: Agg::Sum, name: None, show_as: Default::default() }];
+    // A slicer on Region (not in the layout) showing only West; a timeline on Date.
+    p.set_hidden(1, vec![Value::str("East")]);
+    let (from, to) = (dates.date(2024.0, 1.0, 1.0).unwrap(), dates.date(2025.0, 1.0, 1.0).unwrap());
+    p.set_range(0, Some((from, to)));
+    p.slicers = vec![
+        Slicer { name: "Region".into(), field: 1, anchor: Anchor { sheet: 0, from: (2, 12, 0.0, 0.0), to: (12, 14, 0.0, 0.0) }, timeline: None },
+        Slicer { name: "Date".into(), field: 0, anchor: Anchor { sheet: 0, from: (14, 12, 0.0, 0.0), to: (18, 18, 0.0, 0.0) }, timeline: Some(DatePart::Months) },
+    ];
+    wb.add_pivot(p).unwrap();
+    // Amounts in bins of 25 from 0.
+    let mut q = Pivot::new("By amount", src, CellAddr::new(0, 20, 5));
+    q.groups = vec![GroupField { field: 2, source: 2, name: "Amount".into(), kind: GroupKind::Intervals { start: Some(0.0), end: None, step: 25.0, dates: false } }];
+    q.rows = vec![PivotField::new(2)];
+    q.data = vec![DataField { field: 2, agg: Agg::Count, name: None, show_as: Default::default() }];
+    wb.add_pivot(q).unwrap();
+    wb.recalc();
+    wb
+}
+
+#[test]
+fn xlsx_date_and_interval_groups_filters_and_slicers_round_trip() {
+    let wb = grouped_book();
+    // West in 2024 only: Q1 10 and Q2 40.
+    let at = |wb: &Workbook, r, c| wb.get(CellAddr::new(0, r, c));
+    assert_eq!((at(&wb, 1, 5), at(&wb, 1, 6), at(&wb, 1, 7)), (Value::str("2024"), Value::str("Q1"), Value::Num(10.0)));
+    assert_eq!((at(&wb, 2, 6), at(&wb, 2, 7), at(&wb, 3, 7)), (Value::str("Q2"), Value::Num(40.0), Value::Num(50.0)));
+
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let c = part(&file, "xl/pivotCache/pivotCacheDefinition1.xml");
+    assert!(c.contains(r#"containsDate="1""#) && c.contains(r#"<d v="2024-01-05T00:00:00"/>"#), "{c}");
+    assert!(c.contains(r#"<rangePr groupBy="months" autoStart="1" autoEnd="1" startDate="2024-01-05T00:00:00" endDate="2025-11-30T00:00:00"/>"#), "{c}");
+    assert!(c.contains(r#"<rangePr groupBy="quarters""#) && c.contains(r#"<rangePr groupBy="years""#), "{c}");
+    let t = part(&file, "xl/pivotTables/pivotTable1.xml");
+    assert!(t.contains(r#"<filter fld="0" type="dateBetween""#) && t.contains(r#"<of:slicer name="Region" fld="1" sheet="Data" from="2 12 0 0" to="12 14 0 0"/>"#), "{t}");
+    assert!(t.contains(r#"<items count="3"><item x="0" h="1"/><item x="1"/>"#), "{t}");
+    let c2 = part(&file, "xl/pivotCache/pivotCacheDefinition2.xml");
+    assert!(c2.contains(r#"<rangePr autoStart="0" autoEnd="1" startNum="0" endNum="70" groupInterval="25"/>"#), "{c2}");
+
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.pivots(), wb.pivots());
+    assert_eq!(back.pivot_shape(0), wb.pivot_shape(0));
+    assert_eq!(cells(&back), cells(&wb));
+}
+
+#[test]
+fn ods_slicers_timelines_and_their_filters_round_trip() {
+    let wb = grouped_book();
+    let file = ods::write(&wb, Vec::new()).unwrap();
+    let content = part(&file, "content.xml");
+    assert!(content.contains(r#"<officina:slicer officina:name="Region" officina:field="Region" officina:sheet="Data""#), "{content}");
+    assert!(content.contains(r#"<table:data-pilot-member table:name="East" table:display="false""#), "{content}");
+    let (back, loaded) = ods::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    // LibreOffice lists grouped fields in its own order.
+    let sorted = |wb: &Workbook| wb.pivots().iter().cloned().map(|mut p| { p.groups.sort_by_key(|g| g.field); p }).collect::<Vec<_>>();
+    assert_eq!(sorted(&back), sorted(&wb));
+    assert_eq!(cells(&back), cells(&wb));
+}
+
+/// Excel's own names for date groups ("Qtr1"), and an inclusive end on its
+/// date filter, read as this engine's.
+#[test]
+fn excel_date_group_labels_and_inclusive_date_filters_read_as_ours() {
+    use officina_convert::zip::ZipWriter;
+    let wb = grouped_book();
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let z = Archive::open(&file).unwrap();
+    let mut w = ZipWriter::new(Vec::new());
+    for e in &z.entries {
+        let data = z.read(e).unwrap();
+        let text = String::from_utf8_lossy(&data).into_owned();
+        let text = match e.name.as_str() {
+            "xl/pivotCache/pivotCacheDefinition1.xml" => (1..=4).fold(text, |t, q| t.replace(&format!(r#"<s v="Q{q}"/>"#), &format!(r#"<s v="Qtr{q}"/>"#))),
+            "xl/pivotTables/pivotTable1.xml" => text.replace(r#"operator="lessThan" val="45658""#, r#"operator="lessThanOrEqual" val="45657""#),
+            _ => { w.add(&e.name, &data).unwrap(); continue; }
+        };
+        w.add(&e.name, text.as_bytes()).unwrap();
+    }
+    let file = w.finish().unwrap();
+    assert!(part(&file, "xl/pivotCache/pivotCacheDefinition1.xml").contains("Qtr4"));
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.pivots(), wb.pivots());
+}

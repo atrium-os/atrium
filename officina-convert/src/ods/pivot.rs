@@ -9,7 +9,7 @@ use std::sync::Arc;
 use officina_grid::addr::{col_name, Rect, MAX_COLS};
 use officina_grid::pivot::{
     same_item, Agg, AxisSort, BaseItem, DataField, DatePart, GroupField, GroupKind, ItemGroup,
-    Pivot, PivotField, ReferenceCalc, ShowAs, Subtotal, MAX_GROUPS,
+    in_layout, Pivot, PivotField, ReferenceCalc, ShowAs, Slicer, Subtotal, MAX_GROUPS, MAX_SLICERS,
 };
 use officina_grid::{CellAddr, Value, Workbook};
 
@@ -224,15 +224,35 @@ pub fn tables_xml(wb: &Workbook) -> String {
         for f in &p.pages {
             field(&mut o, f, "page", false);
         }
-        for group in &p.groups {
-            if !p.rows.iter().chain(&p.cols).chain(&p.pages).any(|f| f.field == group.field) {
-                field(&mut o, &PivotField::new(group.field), "hidden", false);
+        // Grouped and slicer-filtered fields not in the layout, with what they hide.
+        let mut others: Vec<u32> = p.groups.iter().map(|g| g.field)
+            .chain(p.filters.iter().filter(|f| !f.hidden.is_empty()).map(|f| f.field)).collect();
+        others.dedup();
+        for (k, &f) in others.iter().enumerate() {
+            if !others[..k].contains(&f) && !in_layout(p, f) {
+                field(&mut o, &PivotField { hidden: p.hidden_of(f).to_vec(), ..PivotField::new(f) }, "hidden", false);
             }
         }
         for d in &p.data {
             let _ = write!(o, r#"<table:data-pilot-field table:source-field-name="{}" tableooo:display-name="{}" table:orientation="data" table:used-hierarchy="-1" table:function="{}">"#, esc(&wb.pivot_field_name(p, d.field)), esc(&wb.data_caption(p, d)), func(d.agg));
             reference_xml(&mut o, wb, p, &d.show_as);
             o.push_str("</table:data-pilot-field>");
+        }
+        // Timeline ranges and slicers: Officina's own, which other programs pass over.
+        for f in &p.filters {
+            if let Some((a, b)) = f.between {
+                let _ = write!(o, r#"<officina:date-range officina:field="{}" officina:from="{a}" officina:to="{b}"/>"#, esc(&wb.pivot_field_name(p, f.field)));
+            }
+        }
+        for s in &p.slicers {
+            let a = &s.anchor;
+            let corner = |(r, c, x, y): (u32, u32, f32, f32)| format!("{r} {c} {x} {y}");
+            let _ = write!(o, r#"<officina:slicer officina:name="{}" officina:field="{}" officina:sheet="{}" officina:from="{}" officina:to="{}""#,
+                esc(&s.name), esc(&wb.pivot_field_name(p, s.field)), esc(&wb.sheet_name(a.sheet)), corner(a.from), corner(a.to));
+            if let Some(part) = s.timeline {
+                let _ = write!(o, r#" officina:timeline="{}""#, DATE_PARTS[part as usize]);
+            }
+            o.push_str("/>");
         }
         o.push_str("</table:data-pilot-table>");
     }
@@ -334,6 +354,20 @@ pub struct TableIn {
     pub fields: Vec<FieldIn>,
     /// A source that is a database range or another document: not modelled.
     pub other_source: bool,
+    /// Officina's timeline ranges: field name, from, to.
+    pub ranges: Vec<(String, String, String)>,
+    pub slicers: Vec<SlicerIn>,
+}
+
+/// An `officina:slicer`: name, field name, sheet name, corners, timeline level.
+#[derive(Default, Debug)]
+pub struct SlicerIn {
+    pub name: String,
+    pub field: String,
+    pub sheet: String,
+    pub from: String,
+    pub to: String,
+    pub timeline: Option<String>,
 }
 
 #[cfg(feature = "read")]
@@ -383,6 +417,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             why(rep, reason);
             continue;
         }
+        let mut hidden_fields = Vec::new();
         let mut subtotals = false;
         let mut values_position = None;
         let mut compact = None;
@@ -396,6 +431,9 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                 continue;
             }
             if f.orient == "hidden" {
+                if !f.hidden.is_empty() {
+                    hidden_fields.push(f);
+                }
                 continue;
             }
             let Some(x) = index(&f.name) else {
@@ -534,6 +572,40 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             "column" => (true, false),
             _ => (true, true),
         };
+        // What fields outside the layout hide: a slicer's selection.
+        for f in hidden_fields {
+            let Some(x) = index(&f.name) else { continue };
+            let items = wb.pivot_items(&p, x);
+            let hidden: Vec<Value> = f.hidden.iter().map(|name| items.iter()
+                .find(|value| member(value).eq_ignore_ascii_case(name)).cloned()
+                .unwrap_or_else(|| if name.is_empty() { Value::Empty } else { Value::str(name) })).collect();
+            p.set_hidden(x, hidden);
+        }
+        for (name, from, to) in &t.ranges {
+            match (index(name).filter(|&x| x < width), from.parse::<f64>(), to.parse::<f64>()) {
+                (Some(x), Ok(a), Ok(b)) if a.is_finite() && b.is_finite() && a < b => p.set_range(x, Some((a, b))),
+                _ => rep.note(Kind::Dropped, "pivot date ranges on unknown fields"),
+            }
+        }
+        for s in &t.slicers {
+            let corner = |text: &str| -> Option<(u32, u32, f32, f32)> {
+                let mut it = text.split(' ');
+                let (r, c) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+                let (x, y): (f32, f32) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+                ((0.0..=1e6).contains(&x) && (0.0..=1e6).contains(&y) && it.next().is_none()).then_some((r, c, x, y))
+            };
+            let timeline = match s.timeline.as_deref() {
+                None => Some(None),
+                Some(part) => DATE_PARTS.iter().position(|name| *name == part).map(|i| Some(DatePart::ALL[i])),
+            };
+            match (index(&s.field), wb.sheet_id(&s.sheet), corner(&s.from), corner(&s.to), timeline) {
+                (Some(field), Some(sheet), Some(from), Some(to), Some(timeline)) if p.slicers.len() < MAX_SLICERS => {
+                    p.slicers.push(Slicer { name: Arc::from(s.name.as_str()), field,
+                        anchor: officina_grid::charts::Anchor { sheet, from, to }, timeline });
+                }
+                _ => rep.note(Kind::Dropped, "pivot slicers this engine can't place"),
+            }
+        }
         if let Err(w) = wb.add_pivot_as_is(p, Some(area)) {
             why(rep, w);
         }

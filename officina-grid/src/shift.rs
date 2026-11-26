@@ -470,6 +470,10 @@ pub(crate) fn shift_with_ids(
             p.dest = CellAddr::new(sheet, r, c);
             area = area.and_then(|a| s.map_rect(a));
         }
+        for sl in p.slicers.iter_mut().filter(|sl| sl.anchor.sheet == sheet) {
+            sl.anchor.from = pin(sl.anchor.from);
+            sl.anchor.to = pin(sl.anchor.to);
+        }
         Some((p, area))
     }).collect();
     if moved != pivots {

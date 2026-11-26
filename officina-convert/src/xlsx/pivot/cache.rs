@@ -6,7 +6,7 @@ use crate::zip::Archive;
 use officina_grid::addr::{MAX_ROWS, Rect};
 use officina_grid::eval::dates::DateSystem;
 use officina_grid::formula::ast::{Coord, Expr};
-use officina_grid::pivot::{CalculatedField, GroupField, GroupKind, MAX_GROUP_MEMBERS, MAX_GROUPS, MAX_ITEMS, Pivot};
+use officina_grid::pivot::{CalculatedField, DatePart, GroupField, GroupKind, MAX_GROUP_MEMBERS, MAX_GROUPS, MAX_ITEMS, Pivot};
 use std::sync::Arc;
 use officina_grid::{ErrorKind, Value, Workbook};
 use quick_xml::events::{BytesStart, Event};
@@ -107,7 +107,7 @@ impl Cache {
     pub fn items(&self, field: u32) -> Option<&[Value]> {
         let field = self.fields.get(field as usize)?;
         match &field.group {
-            Some(group) if group.mode.is_some() => group.items.as_deref(),
+            Some(group) if group.mode.is_some() => group.labels.as_deref().or(group.items.as_deref()),
             _ => field.items.as_deref(),
         }
     }
@@ -169,6 +169,10 @@ impl Cache {
                 GroupMode::Numeric { start, end, step } => (base, GroupKind::NumericBins {
                     start: *start, end: *end, step: *step, items: items.clone(),
                 }),
+                GroupMode::Range { start, end, step, dates, .. } => (base, GroupKind::Intervals {
+                    start: *start, end: *end, step: *step, dates: *dates,
+                }),
+                GroupMode::Date { part, start, end, .. } => (base, GroupKind::DateParts { start: *start, end: *end, part: *part }),
                 GroupMode::Unsupported => return Err(invalid),
             };
             pivot.groups.push(GroupField { field: id, source: super::model_field(width, parent),
@@ -330,11 +334,18 @@ struct GroupIn {
     parent: Option<u32>,
     mode: Option<GroupMode>,
     items: Option<Vec<Value>>,
+    /// A date grouping's items as this engine names them, position for
+    /// position with Excel's ("Qtr1" is "Q1").
+    labels: Option<Vec<Value>>,
 }
 
 enum GroupMode {
     Discrete(Vec<usize>),
     Numeric { start: f64, end: f64, step: f64 },
+    /// Intervals with a bound Excel sets itself.
+    Range { start: Option<f64>, end: Option<f64>, step: f64, dates: bool },
+    /// Date parts; `shown` the bounds Excel saved, automatic or not.
+    Date { part: DatePart, start: Option<f64>, end: Option<f64>, shown: (Option<f64>, Option<f64>) },
     Unsupported,
 }
 
@@ -344,6 +355,7 @@ fn cache_group(tag: &BytesStart<'_>, data: &[u8], dates: DateSystem) -> Result<G
         parent: attr(tag, b"par")?.and_then(|v| v.parse().ok()),
         mode: None,
         items: None,
+        labels: None,
     };
     let mut reader = xml(data);
     loop {
@@ -373,15 +385,31 @@ fn cache_group(tag: &BytesStart<'_>, data: &[u8], dates: DateSystem) -> Result<G
                     });
                 }
                 b"rangePr" if group.mode.is_none() => {
-                    let numeric = attr(&tag, b"groupBy")?.is_none_or(|kind| kind == "range")
-                        && off(attr(&tag, b"autoStart")?) && off(attr(&tag, b"autoEnd")?)
+                    let by = attr(&tag, b"groupBy")?;
+                    // Excel's bounds are automatic unless it says otherwise.
+                    let (auto_start, auto_end) = (!off(attr(&tag, b"autoStart")?), !off(attr(&tag, b"autoEnd")?));
+                    let range = by.as_deref().is_none_or(|kind| kind == "range");
+                    let numeric = range && !auto_start && !auto_end
                         && group.parent.is_none() && attr(&tag, b"startDate")?.is_none();
-                    let start_num = attr(&tag, b"startNum")?.and_then(|v| v.parse().ok());
-                    let end_num = attr(&tag, b"endNum")?.and_then(|v| v.parse().ok());
-                    let step = attr(&tag, b"groupInterval")?.and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                    let finite = |v: Option<String>| v.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite());
+                    let date = |v: Option<String>| v.and_then(|v| dates.iso(&v)).map(|(n, _)| n);
+                    let start_num = finite(attr(&tag, b"startNum")?);
+                    let end_num = finite(attr(&tag, b"endNum")?);
+                    let (start_date, end_date) = (date(attr(&tag, b"startDate")?), date(attr(&tag, b"endDate")?));
+                    let step = finite(attr(&tag, b"groupInterval")?).unwrap_or(1.0);
+                    let bound = |auto: bool, value: Option<f64>| if auto { Some(None) } else { value.map(Some) };
+                    let part = by.as_deref().and_then(super::date_part_of);
                     group.mode = Some(match (numeric, start_num, end_num) {
                         (true, Some(start), Some(end)) => GroupMode::Numeric { start, end, step },
-                        _ => GroupMode::Unsupported,
+                        _ if range && step > 0.0 => match (bound(auto_start, start_num), bound(auto_end, end_num)) {
+                            (Some(start), Some(end)) => GroupMode::Range { start, end, step, dates: false },
+                            _ => GroupMode::Unsupported,
+                        },
+                        _ => match (part, bound(auto_start, start_date), bound(auto_end, end_date)) {
+                            (Some(DatePart::Days), Some(start), Some(end)) if step > 1.0 => GroupMode::Range { start, end, step, dates: true },
+                            (Some(part), Some(start), Some(end)) if step == 1.0 => GroupMode::Date { part, start, end, shown: (start_date, end_date) },
+                            _ => GroupMode::Unsupported,
+                        },
                     });
                     if start { reader.read_to_end(tag.name())?; }
                 }
@@ -390,7 +418,21 @@ fn cache_group(tag: &BytesStart<'_>, data: &[u8], dates: DateSystem) -> Result<G
                     if start { reader.read_to_end(tag.name())?; }
                 }
             },
-            Event::Eof => return Ok(group),
+            Event::Eof => {
+                if let (Some(GroupMode::Date { part, shown: (Some(lo), Some(hi)), .. }), Some(items)) = (&group.mode, &group.items) {
+                    let year = |n: f64| dates.ymd(n).map(|(y, _, _)| y);
+                    if let (Some(first), Some(last)) = (year(*lo), year(*hi)) {
+                        let (below, above) = officina_grid::pivot::group_bounds(dates, true, *lo, *hi);
+                        let labels: Vec<_> = std::iter::once(below)
+                            .chain(officina_grid::pivot::date_part_labels(*part, first, last))
+                            .chain(std::iter::once(above)).collect();
+                        if labels.len() == items.len() {
+                            group.labels = Some(labels);
+                        }
+                    }
+                }
+                return Ok(group);
+            }
             _ => {}
         }
     }
