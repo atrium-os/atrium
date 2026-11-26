@@ -17,7 +17,8 @@
 #              dropped, never replayed
 #
 # Checks: each added RTT costs about one round trip (median against the
-# clean median, between 0.6x and 1x RTT + 400 ms); every probe outside the
+# clean median, between 0.6x RTT - 50 ms, the spread of 4 TCG probes, and
+# 1x RTT + 400 ms); every probe outside the
 # blackouts gets its frame; one reconnect, after the long blackout only, and
 # it resumes without resending; the key pressed in the blackout never
 # reaches the host; at the end the viewer's desktop equals frescod's screen.
@@ -94,7 +95,7 @@ check "clean: 4 probes answered" 4 "$(answered 40 70)"
 for rtt in 50:70:100 150:100:130 300:130:160; do
     r=${rtt%%:*}; rest=${rtt#*:}; a=${rest%%:*}; b=${rest#*:}
     m=$(seg "$a" "$b" | grep -v timeout | median)
-    v=$(awk -v m="$m" -v base="$base" -v r="$r" 'BEGIN { if (m == "none" || base == "none") print "no probes"; else { d = m - base; print (d >= 0.6 * r && d <= r + 400) ? "one round trip" : "added " d " ms" } }')
+    v=$(awk -v m="$m" -v base="$base" -v r="$r" 'BEGIN { if (m == "none" || base == "none") print "no probes"; else { d = m - base; print (d >= 0.6 * r - 50 && d <= r + 400) ? "one round trip" : "added " d " ms" } }')
     check "+$r ms RTT costs about one round trip" "one round trip" "$v"
 done
 check "2 % loss: 4 probes answered" 4 "$(answered 160 190)"

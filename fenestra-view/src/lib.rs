@@ -145,7 +145,9 @@ pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), W
                 if let Err(e) = window_stream(recv, views, conn.clone()).await {
                     eprintln!("fenestra-view: window stream: {e}");
                     views_e.errors.fetch_add(1, Ordering::Relaxed);
-                    conn.close(3u32.into(), b"stream");
+                    if conn.close_reason().is_none() {
+                        conn.close(3u32.into(), b"stream");
+                    }
                 }
             });
         }
@@ -176,9 +178,11 @@ async fn window_stream(mut recv: quinn::RecvStream, views: Arc<Views>, conn: qui
         let chunk = match recv.read_chunk(CHUNK, true).await {
             Ok(Some(c)) => c,
             Ok(None) => return Ok(()),
-            // The connection ending (the host closed, or we dropped it to
-            // reconnect) ends the stream; anything else is an error.
-            Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed)) => return Ok(()),
+            // The connection ending ends the stream, however it ended: the
+            // connection's own tasks in `run` report why. Closing it from
+            // here would turn a lost connection into a local close, which
+            // `run` takes for the session's end. Anything else is an error.
+            Err(quinn::ReadError::ConnectionLost(_)) => return Ok(()),
             Err(e) => return Err(WireError::Quic(format!("{e:?}"))),
         };
         let ack = {

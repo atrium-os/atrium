@@ -1622,6 +1622,12 @@ from the kernel) and gone after its grace: the
   second mint is refused while it holds the desktop, a take-over ends the first session; a
   caller who is not the seat's user, or no seat file, is refused; malformed requests are
   refused; a session with no viewer ends on its grace.
+- `scripts/fenestra-tcp-check.sh` (Linux as root, no VM: its own network namespace with
+  iptables dropping UDP): 7/7. With UDP dropped the viewer finds no answer, connects over TCP,
+  draws every window pixel-equal, and a reconnect resumes without resending; with UDP open auto
+  stays on UDP; `--transport tcp` is pixel-equal. In the VM, `FEN_JAIL=1 FEN_TRANSPORT=tcp
+  scripts/fenestra-desktop-vm.sh` (booted with `hostfwd=tcp` too) is 17/17 with the jailed
+  session reached over TCP.
 - `scripts/fenestra-netem-vm.sh` (cloud VM; `scripts/lib/udp-impair.py` between the viewer
   and the guest, since the container has no `tc`): one 575 s session through a schedule of
   added RTT (50, 150, 300 ms), 2 % and 10 % loss, 1 Mbit/s with a 64 KB queue, 30 ms jitter, a
@@ -1660,6 +1666,18 @@ network are taken apart and the uid and port go back to the pool. fenestrad itse
 root (jaild takes only root callers), not yet as `_fenestra` in its own jail; no code went into
 portcullisd. Without `--jaild` a session is a plain child (other systems, hosts without jaild).
 
+**UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
+connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram
+`len u16 | bytes`, bounded at 16 KiB, through a `quinn::AsyncUdpSocket` that takes TCP peers (at
+most 16) on the host and is one connection on the viewer. The TLS 1.3 handshake with the pinned
+raw keys, the `K_sess` proof and every stream are unchanged; QUIC's loss recovery has nothing to
+do and head-of-line blocking returns. The host listens on both; `fenestra-view --transport
+udp|tcp|auto` (default auto) waits 4 s for an answer over UDP, then tries TCP, keeps the one that
+worked for reconnects, and reports `transport` in its stats. A session jail's listen grant is
+then its UDP port and the same port over TCP from the same network, and jaild accepts that pair
+and nothing else. Still to come: the last resort through the SSH connection, and the stats
+panel's "TCP fallback" mark (the windowed viewer has no panel yet).
+
 **Whole states.** A blob goes as an LZ4 block (`BLOB_LZ4`, `lz4_flex` with its safe decoder)
 when that saves an eighth or more; the reader checks the declared size against its bounds before
 it decompresses and refuses a block that does not come out at exactly that size. The glyph
@@ -1677,7 +1695,7 @@ to the network is tried again until `--run-secs`; input queued while disconnecte
 
 **Next in R2.** The strip and background on the viewer; fenestrad as `_fenestra` in its own jail;
 remote outputs at the viewer's size and scale; compressing
-region updates as blobs are; the TCP fallback when UDP is blocked.
+region updates as blobs are.
 
 ## 20. Sources
 

@@ -502,7 +502,8 @@ uid_last    = 61499
 # <instance_root_dir>/<name>, running exactly exec_path as that uid with
 # fenestrad's link as its stdio and the mint socket as fd 3. Its network is
 # a routed vnet whose one grant is a UDP listen port in port_first..
-# port_last from a local network: nothing outbound, no peers, no resolver.
+# port_last from a local network (and that port over TCP, for networks
+# that block UDP): nothing outbound, no peers, no resolver.
 # ---------------------------------------------------------------
 [fenestra_sessions]
 name_prefix = "system-fenestra-"

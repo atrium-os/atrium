@@ -308,11 +308,27 @@ pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
     network_ok && exec.stdio && without_devices_or_children(req) && !req.allow_mlock
 }
 
+/// A session's listen grant: one UDP port in range from a local network,
+/// and at most the same port over TCP from the same network (the
+/// UDP-blocked fallback, fenestra.md §8.6).
+fn session_listen(l: &[crate::protocol::NetListen], ports: std::ops::RangeInclusive<u16>) -> bool {
+    use crate::protocol::ListenFrom;
+    let lan = |x: &crate::protocol::NetListen| matches!(x.from, ListenFrom::Lan { .. }) && ports.contains(&x.port);
+    match l {
+        [u] => u.udp && lan(u),
+        [a, b] => {
+            let (u, t) = if a.udp { (a, b) } else { (b, a) };
+            u.udp && !t.udp && lan(u) && lan(t) && u.port == t.port && u.from == t.from
+        }
+        _ => false,
+    }
+}
+
 /// Whether `req` is one of Fenestra's session jails (`[fenestra_sessions]`,
 /// fenestra.md §3.2, §11.3), named and rooted like a courier's, taking its
 /// caller's stdio (fenestrad's link, and the mint socket as fd 3): a routed
 /// vnet whose only grant is one UDP `listen` port in the policy's range,
-/// from a local network. Nothing outbound, no peers, no resolver, nothing
+/// from a local network, and that port over TCP too ([`session_listen`]). Nothing outbound, no peers, no resolver, nothing
 /// `inbound`. No devices, no FUSE, no child jails, no locked memory.
 pub fn is_fenestra_session(req: &CreateJailRequest, policy: &Policy) -> bool {
     use crate::protocol::{ListenFrom, NetworkConfig};
@@ -324,8 +340,7 @@ pub fn is_fenestra_session(req: &CreateJailRequest, policy: &Policy) -> bool {
         NetworkConfig::Routed { grants: Some(g), fib: None, .. } => {
             !g.outbound_any && g.no_resolver && g.outbound.is_empty() && g.peers.is_empty() && g.inbound.is_empty()
                 && g.tag.is_none()
-                && matches!(g.listen.as_slice(), [l] if l.udp && (c.port_first..=c.port_last).contains(&l.port)
-                    && matches!(l.from, ListenFrom::Lan { .. }))
+                && session_listen(&g.listen, c.port_first..=c.port_last)
         }
         _ => false,
     };
@@ -1729,6 +1744,13 @@ mod tests {
         let ok = session("system-fenestra-60501", exe, 60501, routed(grants(udp(24300))));
         assert!(is_fenestra_session(&ok, &p));
         validate_create(&ok, &p).expect("a session jail");
+        let tcp = |port: u16| vec![NetListen { port, udp: false, from: lan() }];
+        for l in [[udp(24300), tcp(24300)].concat(), [tcp(24300), udp(24300)].concat()] {
+            let both = session("system-fenestra-60501", exe, 60501, routed(grants(l)));
+            assert!(is_fenestra_session(&both, &p), "UDP and its TCP fallback");
+            validate_create(&both, &p).expect("a session jail with its TCP fallback");
+        }
+        let other_net = vec![NetListen { port: 24300, udp: false, from: ListenFrom::Lan { iface: "vtnet1".into(), subnet: "10.9.0.0/24".into() } }];
         let mut out = grants(udp(24300));
         out.outbound = vec![NetDest { cidr: "192.0.2.1/32".into(), port: Some(443), udp: false }];
         let mut any = grants(udp(24300));
@@ -1746,7 +1768,10 @@ mod tests {
             (session("system-fenestra-60501", exe, 60501, routed(grants(udp(24299)))), "a port below the range"),
             (session("system-fenestra-60501", exe, 60501, routed(grants(udp(24316)))), "a port above the range"),
             (session("system-fenestra-60501", exe, 60501, routed(grants(vec![NetListen { port: 24300, udp: false, from: lan() }]))), "TCP"),
-            (session("system-fenestra-60501", exe, 60501, routed(grants([udp(24300), udp(24301)].concat()))), "two ports"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants([udp(24300), udp(24301)].concat()))), "two UDP ports"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants([udp(24300), tcp(24301)].concat()))), "TCP on another port"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants([udp(24300), other_net].concat()))), "TCP from another network"),
+            (session("system-fenestra-60501", exe, 60501, routed(grants([udp(24300), tcp(24300), tcp(24300)].concat()))), "three ports"),
             (session("system-fenestra-60501", exe, 60501, routed(grants(vec![]))), "no port"),
             (session("system-fenestra-60501", exe, 60501, routed(grants(this_computer))), "from this computer"),
             (session("system-fenestra-60501", exe, 60501, routed(out)), "an outbound grant"),

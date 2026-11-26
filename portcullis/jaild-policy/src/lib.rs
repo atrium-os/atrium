@@ -325,8 +325,8 @@ pub struct CryptaEnginePolicy {
 /// `<instance_root_dir>/<name>`, running exactly `exec_path` as that uid
 /// with fenestrad's link as its stdio and the mint socket as fd 3. Its
 /// network is a routed vnet whose only grant is one UDP `listen` port in
-/// `port_first..=port_last`, from a local network: nothing outbound, no
-/// peers, no resolver.
+/// `port_first..=port_last`, from a local network, and that port over TCP
+/// (the UDP-blocked fallback): nothing outbound, no peers, no resolver.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FenestraSessionPolicy {

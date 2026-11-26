@@ -58,6 +58,12 @@ fn main() {
     // `PROBE` also times the input to the next frame (`probe AT MS`).
     let script = arg(&args, "--input");
     let idle_after: Option<u64> = arg(&args, "--idle-after").and_then(|s| s.parse().ok());
+    // `--transport udp|tcp|auto`: QUIC over UDP, over TCP on the same port
+    // (UDP blocked, §8.6), or UDP first and TCP when UDP gets no answer.
+    let transport = arg(&args, "--transport").unwrap_or_else(|| "auto".into());
+    if !["udp", "tcp", "auto"].contains(&transport.as_str()) {
+        die("--transport udp|tcp|auto");
+    }
     let connect: Option<std::net::SocketAddr> = arg(&args, "--connect").map(|a| a.parse().unwrap_or_else(|_| die("--connect ADDR:PORT")));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap_or_else(|e| die(e));
     let views = Arc::new(Views::default());
@@ -131,6 +137,10 @@ fn main() {
         }
         let mut first = true;
         let mut connections = 0u32;
+        // The transport that last worked; auto tries it first.
+        let mut tcp = transport == "tcp";
+        let auto = transport == "auto";
+        let mut used_tcp = false;
         'session: loop {
             // A connection lost to the network (a blackout past the idle
             // timeout, a host gone a while) is tried again until the
@@ -139,8 +149,31 @@ fn main() {
                 if tokio::time::Instant::now() >= deadline {
                     break 'session;
                 }
-                match tokio::time::timeout(CONNECT_TIMEOUT, viewer.connect(addr, &m.secret)).await {
-                    Ok(Ok(hc)) => break hc,
+                let attempt = |over_tcp: bool| {
+                    let (viewer, secret) = (&viewer, &m.secret);
+                    async move {
+                        // UDP gets a short wait under auto: no answer at all is
+                        // what a blocked path looks like.
+                        let wait = if auto && !over_tcp { UDP_PROBE } else { CONNECT_TIMEOUT };
+                        let r = if over_tcp {
+                            tokio::time::timeout(wait, viewer.connect_tcp(addr, secret)).await
+                        } else {
+                            tokio::time::timeout(wait, viewer.connect(addr, secret)).await
+                        };
+                        r
+                    }
+                };
+                let mut r = attempt(tcp).await;
+                if auto && !matches!(r, Ok(Ok(_))) && !matches!(r, Ok(Err(WireError::Proof | WireError::Protocol(_) | WireError::Tls(_)))) {
+                    eprintln!("fenestra-view: no answer over {}; trying {}", if tcp { "TCP" } else { "UDP" }, if tcp { "UDP" } else { "TCP" });
+                    tcp = !tcp;
+                    r = attempt(tcp).await;
+                }
+                match r {
+                    Ok(Ok(hc)) => {
+                        used_tcp |= tcp;
+                        break hc;
+                    }
                     Ok(Err(e @ (WireError::Proof | WireError::Protocol(_) | WireError::Tls(_)))) => die(e),
                     Ok(Err(e)) => eprintln!("fenestra-view: connect: {e}; trying again"),
                     Err(_) => eprintln!("fenestra-view: connect timed out; trying again"),
@@ -148,7 +181,7 @@ fn main() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             };
             connections += 1;
-            eprintln!("fenestra-view: connected to {addr}");
+            eprintln!("fenestra-view: connected to {addr} over {}", if tcp { "tcp" } else { "udp" });
             let cut = match (first, reconnect) {
                 (true, Some(s)) => tokio::time::Instant::now() + Duration::from_secs(s),
                 _ => deadline,
@@ -179,7 +212,7 @@ fn main() {
             return;
         };
         let mut report = snapshot(&views, &out).unwrap_or_else(|e| die(e));
-        let mut extra = format!("connections {connections}\n");
+        let mut extra = format!("connections {connections}\ntransport {}\n", if used_tcp { "tcp" } else { "udp" });
         let mut ps = probes.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ps.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (at, ms) in ps {
@@ -250,6 +283,8 @@ fn ssh_mint(cmd: &str, public: &[u8], take_over: bool) -> Result<mint::DevMint, 
 const MAX_SSH_OUTPUT: u64 = 16 * 1024;
 /// How long a probe waits for its frame.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long auto waits for an answer over UDP before trying TCP.
+const UDP_PROBE: Duration = Duration::from_secs(4);
 /// How long one connection attempt may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 

@@ -3,9 +3,10 @@
 //! `system-fenestra-<uid>` at `/var/lib/atrium/jails/<name>`, running
 //! `atrium-fenestra-session` as a uid from fenestrad's pool, with
 //! fenestrad's link as its stdin and stdout and the mint socket as fd 3.
-//! Its network is its own vnet (`Routed`) whose one grant is a UDP listen
-//! port from the pool, from the local network fenestrad was told of
-//! (`--lan IFACE SUBNET`); nothing outbound, no resolver.
+//! Its network is its own vnet (`Routed`) whose one grant is a listen port
+//! from the pool, UDP and the same port over TCP (the UDP-blocked
+//! fallback), from the local network fenestrad was told of (`--lan IFACE
+//! SUBNET`); nothing outbound, no resolver.
 //!
 //! The root holds the base libraries and the installed binaries, read-only,
 //! and nothing else. A session's jail is removed when it exits; a janitor
@@ -144,7 +145,10 @@ impl Jails {
             inbound: vec![],
             no_resolver: true,
             tag: None,
-            listen: vec![NetListen { port, udp: true, from: ListenFrom::Lan { iface: self.iface.clone(), subnet: self.subnet.clone() } }],
+            // UDP, and the same port over TCP for networks that block UDP.
+            listen: [true, false]
+                .map(|udp| NetListen { port, udp, from: ListenFrom::Lan { iface: self.iface.clone(), subnet: self.subnet.clone() } })
+                .to_vec(),
         };
         let mut argv = vec![EXEC.to_string()];
         argv.extend(args.iter().cloned());

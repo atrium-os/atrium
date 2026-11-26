@@ -206,3 +206,41 @@ fn mint_lines_round_trip_and_refuse_the_rest() {
         assert!(DevMint::parse_line(&b).is_err(), "took {b:?}");
     }
 }
+
+/// UDP blocked (§8.6): the same connection over TCP on the session's
+/// port, the same pins and proof; a wrong secret is refused there too,
+/// and a peer that sends an oversized datagram is cut off.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tcp_fallback_carries_the_same_session() {
+    let k = keys();
+    let host = bind(&k.host_key, k.viewer_key.public(), secret(1));
+    assert!(host.has_tcp());
+    let viewer = Viewer::new(&k.viewer_key, k.host_key.public()).unwrap();
+    let addr = host.local_addr().unwrap();
+    let s1 = secret(1);
+    let (hc, vc) = tokio::join!(host.accept(), viewer.connect_tcp(addr, &s1));
+    let hc = hc.unwrap().expect("a connection over TCP");
+    let vc = vc.unwrap();
+    let mut uni = hc.conn.open_uni().await.unwrap();
+    uni.write_all(&vec![9u8; 300_000]).await.unwrap();
+    uni.finish().unwrap();
+    let mut r = vc.conn.accept_uni().await.unwrap();
+    assert_eq!(r.read_to_end(1 << 20).await.unwrap(), vec![9u8; 300_000]);
+    drop((hc, vc));
+
+    let bad = secret(2);
+    let (h, v) = tokio::join!(
+        async { tokio::time::timeout(Duration::from_secs(15), host.accept()).await.unwrap_or(Err(WireError::Timeout)) },
+        viewer.connect_tcp(addr, &bad)
+    );
+    assert!(matches!(h, Err(WireError::Proof)), "{:?}", h.map(|c| c.is_some()));
+    assert!(v.is_err());
+
+    // A raw TCP peer declaring a datagram past the bound is dropped.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&((fenestra_wire::tcp::MAX_DATAGRAM + 1) as u16).to_be_bytes()).await.unwrap();
+    let mut b = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await.expect("cut off, not left open");
+    assert!(matches!(r, Ok(0) | Err(_)));
+}

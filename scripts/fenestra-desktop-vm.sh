@@ -22,7 +22,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop $([ "${FEN_JAIL:-0}" = 1 ] && echo 16 || echo 13)
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 16 || echo 13) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -54,7 +54,7 @@ cat >"$W/input.txt" <<'EOF'
 88.1 KEY 40 0
 EOF
 fen_fenestrad
-"$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" \
+"$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" --transport "${FEN_TRANSPORT:-auto}" \
     --reconnect-after 70 --idle-after 120 >"$W/view.log" 2>&1 &
 VP=$!
 
@@ -100,6 +100,9 @@ case "$r2" in
     *" 0") ok "the second connection resumed every held window (resumed/resent: $r2)" ;;
     *) bad "held windows were sent whole again (resumed/resent: $r2)" ;;
 esac
+# FEN_TRANSPORT=tcp: the whole run over the TCP fallback (the VM booted
+# with hostfwd=tcp:127.0.0.1:$PORT-:$PORT as well).
+[ "${FEN_TRANSPORT:-auto}" = tcp ] && check "the viewer ran over the TCP fallback" tcp "$(awk '$1 == "transport" { print $2 }' "$W/view/viewer.txt")"
 grep -q "minted session 1 for root" "$W/fenestrad.log" && ok "the viewer minted over ssh, as the seat's user" || bad "no ssh mint in fenestrad's log"
 if [ "${FEN_JAIL:-0}" = 1 ]; then
     grep -q "session 1 in jail 24300" "$W/fenestrad.log" && ok "fenestrad started the session in a jail" || bad "no jailed session in fenestrad's log"

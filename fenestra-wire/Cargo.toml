@@ -10,9 +10,9 @@ description = "Fenestra's network layer (docs/spec/fenestra.md §8, §11.2): QUI
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 ring = "0.17"
-tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
 log = "0.4"
 
 [dev-dependencies]
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util"] }

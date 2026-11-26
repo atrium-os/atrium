@@ -23,6 +23,7 @@ pub mod keys;
 pub mod mint;
 pub mod pin;
 pub mod scene;
+pub mod tcp;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -135,6 +136,9 @@ pub fn connection_binding(conn: &quinn::Connection, id: &[u8; 16]) -> Result<[u8
 /// and the session secret.
 pub struct Host {
     endpoint: quinn::Endpoint,
+    /// The same server over TCP on the same port (§8.6), when it could be
+    /// bound.
+    tcp: Option<quinn::Endpoint>,
     secret: SessionSecret,
 }
 
@@ -153,8 +157,28 @@ impl Host {
         cfg.transport_config(Arc::new(transport(true)));
         // A stateless retry costs a round trip and buys address validation
         // the pinned key gives anyway; keep the default (off).
-        let endpoint = quinn::Endpoint::server(cfg, addr)?;
-        Ok(Host { endpoint, secret })
+        let endpoint = quinn::Endpoint::server(cfg.clone(), addr)?;
+        // TCP on the port UDP got (a port of 0 was chosen just now).
+        let at = endpoint.local_addr()?;
+        let tcp = match std::net::TcpListener::bind(at).and_then(|l| {
+            l.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(l)
+        }) {
+            Ok(l) => {
+                let t = tcp::Tunnel::listen(l)?;
+                Some(quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), Some(cfg), t, Arc::new(quinn::TokioRuntime))?)
+            }
+            Err(e) => {
+                log::warn!("fenestra: no TCP fallback on {at}: {e}");
+                None
+            }
+        };
+        Ok(Host { endpoint, tcp, secret })
+    }
+
+    /// Whether the TCP fallback is listening.
+    pub fn has_tcp(&self) -> bool {
+        self.tcp.is_some()
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {
@@ -167,7 +191,16 @@ impl Host {
     /// mid-handshake refuses that viewer, so run it in a task of its own
     /// rather than as one arm of a `select!` that other events win.
     pub async fn accept(&self) -> Result<Option<HostConn>, WireError> {
-        let Some(incoming) = self.endpoint.accept().await else { return Ok(None) };
+        // Endpoint::accept is cancel-safe: the one not taken keeps its
+        // incoming connection for the next call.
+        let incoming = match &self.tcp {
+            Some(t) => tokio::select! {
+                i = self.endpoint.accept() => i,
+                i = t.accept() => i,
+            },
+            None => self.endpoint.accept().await,
+        };
+        let Some(incoming) = incoming else { return Ok(None) };
         let conn = incoming.await.map_err(quic)?;
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.prove(&conn)).await {
             Ok(Ok(control)) => Ok(Some(HostConn { conn, control })),
@@ -212,19 +245,31 @@ impl Host {
 
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"bye");
+        if let Some(t) = &self.tcp {
+            t.close(0u32.into(), b"bye");
+        }
     }
 
     /// Close every connection and wait (bounded) until the peers were
     /// told, so a viewer sees the session end rather than a lost peer.
     pub async fn close_and_wait(&self) {
         self.close();
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.endpoint.wait_idle()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            self.endpoint.wait_idle().await;
+            if let Some(t) = &self.tcp {
+                t.wait_idle().await;
+            }
+        })
+        .await;
     }
 }
 
 /// The viewer's end.
 pub struct Viewer {
     endpoint: quinn::Endpoint,
+    cfg: quinn::ClientConfig,
+    /// Endpoints of TCP connections made (§8.6), closed with the viewer.
+    tcp: std::sync::Mutex<Vec<quinn::Endpoint>>,
 }
 
 impl Viewer {
@@ -238,14 +283,36 @@ impl Viewer {
             Ok(e) => e,
             Err(_) => quinn::Endpoint::client("0.0.0.0:0".parse().map_err(|_| WireError::Protocol("address"))?)?,
         };
-        endpoint.set_default_client_config(cfg);
-        Ok(Viewer { endpoint })
+        endpoint.set_default_client_config(cfg.clone());
+        Ok(Viewer { endpoint, cfg, tcp: Default::default() })
+    }
+
+    /// As [`Viewer::connect`], with QUIC carried over TCP to the same
+    /// address (UDP blocked, §8.6).
+    pub async fn connect_tcp(&self, addr: SocketAddr, secret: &SessionSecret) -> Result<HostConn, WireError> {
+        let t = tcp::Tunnel::connect(addr).await?;
+        let mut ep = quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), None, t, Arc::new(quinn::TokioRuntime))?;
+        ep.set_default_client_config(self.cfg.clone());
+        let conn = ep.connect(addr, "fenestra").map_err(quic)?.await.map_err(quic);
+        let r = match conn {
+            Ok(conn) => Viewer::prove(conn, secret).await,
+            Err(e) => Err(e),
+        };
+        let mut eps = self.tcp.lock().unwrap_or_else(|e| e.into_inner());
+        // Endpoints whose connections are over are let go.
+        eps.retain(|e| e.open_connections() > 0);
+        eps.push(ep);
+        r
     }
 
     /// Connect and prove the session. The server name is not checked (the
     /// pinned key is the identity); "fenestra" is sent.
     pub async fn connect(&self, addr: SocketAddr, secret: &SessionSecret) -> Result<HostConn, WireError> {
         let conn = self.endpoint.connect(addr, "fenestra").map_err(quic)?.await.map_err(quic)?;
+        Viewer::prove(conn, secret).await
+    }
+
+    async fn prove(conn: quinn::Connection, secret: &SessionSecret) -> Result<HostConn, WireError> {
         let (send, recv) = conn.open_bi().await.map_err(quic)?;
         let mut control = frame::Control::new(send, recv);
         let work = async {
@@ -270,5 +337,8 @@ impl Viewer {
 
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"bye");
+        for e in self.tcp.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            e.close(0u32.into(), b"bye");
+        }
     }
 }
