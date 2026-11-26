@@ -85,7 +85,7 @@ pub struct Views {
     /// Whole-desktop sessions: the host's trusted chrome and background,
     /// and the chrome as last drawn here.
     pub chrome: Mutex<Option<Chrome>>,
-    chrome_drawn: Mutex<Option<(Chrome, (u32, u32), Vec<u32>)>>,
+    chrome_drawn: Mutex<ChromeDrawn>,
 }
 
 impl Views {
@@ -262,18 +262,46 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, px: &[u32]) -> std::io::Res
     wr.write_image_data(&rgba).map_err(std::io::Error::other)
 }
 
+/// The chrome as last drawn here, and the budget for drawing it again.
+#[derive(Default)]
+struct ChromeDrawn {
+    last: Option<(Chrome, (u32, u32), (u32, u32, Vec<u32>))>,
+    budget: f64,
+    at: Option<std::time::Instant>,
+}
+
+/// Chrome redraws a second, and the burst saved up: a host that changes
+/// its chrome every frame costs the viewer no more than this.
+const CHROME_PER_S: f64 = 10.0;
+const CHROME_BURST: f64 = 5.0;
+/// The most the chrome's rects may cover, in screens: past it the chrome
+/// is not drawn (the host's frescod draws thin strips and rings).
+const CHROME_COVER: u64 = 8;
+
 /// The host's chrome drawn for a `screen`-sized desktop: its pixels from
 /// the top left, `width` x `height` (premultiplied BGRA). Drawn by the
-/// same reference rasterizer as the windows, and again only when the
-/// chrome or the screen changed.
+/// same reference rasterizer as the windows, again only when the chrome or
+/// the screen changed and the redraw budget allows (else the last one).
 fn chrome_pixels(views: &Views, chrome: &Chrome, screen: (u32, u32)) -> (u32, u32, Vec<u32>) {
-    let mut drawn = views.chrome_drawn.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((c, s, px)) = drawn.as_ref() {
-        if c == chrome && *s == screen {
-            return (u32::from(c.size.0).min(s.0), u32::from(c.size.1).min(s.1), px.clone());
+    let mut d = views.chrome_drawn.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let since = d.at.map_or(CHROME_BURST / CHROME_PER_S, |t| now.duration_since(t).as_secs_f64());
+    d.budget = (d.budget + since * CHROME_PER_S).min(CHROME_BURST);
+    d.at = Some(now);
+    if let Some((c, s, px)) = d.last.as_ref() {
+        if (c == chrome && *s == screen) || d.budget < 1.0 {
+            return px.clone();
         }
     }
+    d.budget -= 1.0;
     let (w, h) = (u32::from(chrome.size.0).min(screen.0), u32::from(chrome.size.1).min(screen.1));
+    let cover: u64 = chrome.rects.iter().map(|r| u64::from(r.w).min(u64::from(w)) * u64::from(r.h).min(u64::from(h))).sum();
+    if cover > CHROME_COVER * u64::from(screen.0) * u64::from(screen.1) {
+        log::warn!("fenestra-view: the host's chrome covers {cover} px; not drawn");
+        let none = (0, 0, Vec::new());
+        d.last = Some((chrome.clone(), screen, none.clone()));
+        return none;
+    }
     let rects = chrome
         .rects
         .iter()
@@ -290,7 +318,7 @@ fn chrome_pixels(views: &Views, chrome: &Chrome, screen: (u32, u32)) -> (u32, u3
         let f = fresco_compute::Frame::pack(&fresco_compute::Scene { rects, ..Default::default() }, w, h, w);
         fresco_compute::reference::render(&f)
     };
-    *drawn = Some((chrome.clone(), screen, px.clone()));
+    d.last = Some((chrome.clone(), screen, (w, h, px.clone())));
     (w, h, px)
 }
 
@@ -403,9 +431,32 @@ mod tests {
         assert_eq!(px[0], 0xffff_ffff, "the strip");
         assert_eq!(px[8 * 2], 0xff0a_808c, "under the strip, inside the layer: the background");
         assert_eq!(px[8 * 5 + 7], 0xff0a_808c, "the background");
+        // A chrome that covers the screen many times over is not drawn.
+        let heavy = Chrome::from_rects([0, 0, 0], (8, 6), (0..9).map(|_| ([0.0, 0.0, 8.0, 6.0], white, 0.0))).unwrap();
+        *views.chrome.lock().unwrap() = Some(heavy);
+        assert_eq!(desktop(&views).unwrap().0 .2[0], 0xff00_0000, "no chrome over the background");
         // A chrome larger than the screen is cut to it.
         let big = Chrome::from_rects([0, 0, 0], (100, 100), [([0.0, 0.0, 100.0, 100.0], white, 0.0)]).unwrap();
         *views.chrome.lock().unwrap() = Some(big);
         assert!(desktop(&views).unwrap().0 .2.iter().all(|&p| p == 0xffff_ffff));
+    }
+
+    #[test]
+    fn a_host_changing_its_chrome_every_frame_is_redrawn_at_most_the_budget() {
+        let views = Views::default();
+        *views.layout.lock().unwrap() = Some(((4, 4), Vec::new()));
+        let mut redrawn = 0;
+        let mut last = 0u32;
+        for i in 0..50u32 {
+            let grey = (i % 2) as f32 * 0.5 + 0.25;
+            let c = Chrome::from_rects([0, 0, 0], (4, 4), [([0.0, 0.0, 4.0, 4.0], [grey, grey, grey, 1.0], 0.0)]).unwrap();
+            *views.chrome.lock().unwrap() = Some(c);
+            let p = desktop(&views).unwrap().0 .2[0];
+            if p != last {
+                redrawn += 1;
+            }
+            last = p;
+        }
+        assert!(redrawn as f64 <= CHROME_BURST + 1.0, "{redrawn} redraws");
     }
 }

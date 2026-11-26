@@ -78,7 +78,8 @@ allow_rctl = true
             >"${W:-/tmp}/renderer-bundle.log" 2>&1 || { tail -5 "${W:-/tmp}/renderer-bundle.log"; gate_abort "the renderer bundle did not install"; }
         # As _frescod (portcullisd starts no worker for root), in a
         # directory it owns.
-        LAUNCH=""; AS_USER="-u _frescod"; g "chown _frescod $G"
+        # fenestrad connects as _fenestra (65057), never root.
+        LAUNCH="FRESCOD_FENESTRA_UIDS=65057"; AS_USER="-u _frescod"; g "chown _frescod $G"
     else
         LAUNCH="FRESCOD_RENDERER_LAUNCHER=unconfined"; AS_USER=""
     fi

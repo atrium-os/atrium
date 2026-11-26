@@ -1,13 +1,13 @@
 //! fenestrad as `_fenestra` (fenestra.md §11.3).
 //!
-//! What needs root is done first, as root: the link to frescod is opened
-//! (frescod checks the peer's uid when it connects) and the mint socket is
-//! bound. Then fenestrad drops to its own user ([`drop_to`]) and everything
-//! that reads a peer's bytes (mint requests, frescod's records, sessions'
-//! records) runs there.
+//! What needs root is done first, as root: the mint socket is bound in
+//! root's directory. Then fenestrad drops to its own user ([`drop_to`]),
+//! connects to frescod as that user (frescod takes its uid, not root's),
+//! and everything that reads a peer's bytes (mint requests, frescod's
+//! records, sessions' records) runs there.
 //!
 //! Session jails need jaild, which takes only root callers. With `--jaild`,
-//! fenestrad first forks ([`jailer::split`]): the root side keeps nothing
+//! fenestrad first forks, before it opens anything else, ([`jailer::split`]): the root side keeps nothing
 //! but jaild and a socket to the unprivileged side, and answers two fixed
 //! 32-byte requests on it, `START` (with the session's link and mint
 //! sockets attached) and `STOP PORT`. The session's arguments, its jail's
@@ -172,6 +172,17 @@ pub mod jailer {
         }
     }
 
+    /// Whether `fd` is a local (AF_UNIX) socket: all a session is given.
+    fn unix_socket(fd: BorrowedFd<'_>) -> bool {
+        // SAFETY: an all-zero sockaddr_storage is valid for getsockname to
+        // fill; it writes at most `len` bytes.
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: getsockname on a descriptor we hold, into our buffer.
+        let r = unsafe { libc::getsockname(fd.as_raw_fd(), (&mut ss as *mut libc::sockaddr_storage).cast(), &mut len) };
+        r == 0 && i32::from(ss.ss_family) == libc::AF_UNIX
+    }
+
     /// The root side: one request at a time until the other side goes.
     fn serve(sock: BorrowedFd<'_>, jails: &Jails, args: &[String]) {
         let mut running: HashMap<u16, Running> = HashMap::new();
@@ -191,6 +202,7 @@ pub mod jailer {
             };
             running.retain(|_, r| r.alive());
             let answer = match (text(&buf), got.fds.as_slice()) {
+                (Some("START"), [link, mint]) if !unix_socket(link.as_fd()) || !unix_socket(mint.as_fd()) => "ERR not local sockets".into(),
                 (Some("START"), [link, mint]) if running.len() < MAX_RUNNING => match jails.start(link.as_fd(), mint.as_fd(), args) {
                     Ok(r) => {
                         let port = r.port;

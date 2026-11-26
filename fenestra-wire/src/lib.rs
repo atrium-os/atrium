@@ -138,7 +138,7 @@ pub struct Host {
     endpoint: quinn::Endpoint,
     /// The same server over TCP on the same port (§8.6), when it could be
     /// bound.
-    tcp: Option<quinn::Endpoint>,
+    tcp: Option<(quinn::Endpoint, Arc<tcp::Tunnel>)>,
     secret: SessionSecret,
 }
 
@@ -166,7 +166,7 @@ impl Host {
         }) {
             Ok(l) => {
                 let t = tcp::Tunnel::listen(l)?;
-                Some(quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), Some(cfg), t, Arc::new(quinn::TokioRuntime))?)
+                Some((quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), Some(cfg), t.clone(), Arc::new(quinn::TokioRuntime))?, t))
             }
             Err(e) => {
                 log::warn!("fenestra: no TCP fallback on {at}: {e}");
@@ -194,7 +194,7 @@ impl Host {
         // Endpoint::accept is cancel-safe: the one not taken keeps its
         // incoming connection for the next call.
         let incoming = match &self.tcp {
-            Some(t) => tokio::select! {
+            Some((t, _)) => tokio::select! {
                 i = self.endpoint.accept() => i,
                 i = t.accept() => i,
             },
@@ -203,7 +203,15 @@ impl Host {
         let Some(incoming) = incoming else { return Ok(None) };
         let conn = incoming.await.map_err(quic)?;
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.prove(&conn)).await {
-            Ok(Ok(control)) => Ok(Some(HostConn { conn, control })),
+            Ok(Ok(control)) => {
+                // Over TCP, the peer may now stay past its deadline. (A
+                // UDP address that a TCP peer happens to share is not
+                // one: the tunnel's peers are TCP addresses only.)
+                if let Some((_, t)) = &self.tcp {
+                    t.confirm(conn.remote_address());
+                }
+                Ok(Some(HostConn { conn, control }))
+            }
             Ok(Err(e)) => {
                 conn.close(1u32.into(), b"proof");
                 Err(e)
@@ -245,7 +253,7 @@ impl Host {
 
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"bye");
-        if let Some(t) = &self.tcp {
+        if let Some((t, _)) = &self.tcp {
             t.close(0u32.into(), b"bye");
         }
     }
@@ -256,7 +264,7 @@ impl Host {
         self.close();
         let _ = tokio::time::timeout(Duration::from_secs(3), async {
             self.endpoint.wait_idle().await;
-            if let Some(t) = &self.tcp {
+            if let Some((t, _)) = &self.tcp {
                 t.wait_idle().await;
             }
         })

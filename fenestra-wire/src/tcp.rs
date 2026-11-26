@@ -9,14 +9,24 @@
 //! viewer it is one connection to the host. A peer that sends a datagram
 //! past [`MAX_DATAGRAM`] is cut off; a peer whose queue is full has the
 //! datagram dropped, which QUIC treats as loss.
+//!
+//! The port is open to anyone on the network before any proof, so a host's
+//! peers are bounded: [`MAX_PEERS`] in all, [`PER_SOURCE`] from one
+//! address, and a peer whose connection has not proved the session
+//! ([`Tunnel::confirm`]) within [`PROVE_WITHIN`] is closed, as is any peer
+//! silent for [`IDLE`] (QUIC's keep-alive is far shorter). One peer that
+//! floods while proven still shares the receive queue with the others; the
+//! desktop has one viewer with control.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
@@ -28,12 +38,23 @@ use tokio::sync::mpsc;
 pub const MAX_DATAGRAM: usize = 16 * 1024;
 /// TCP peers a host takes at once.
 pub const MAX_PEERS: usize = 16;
+/// TCP peers from one address at once.
+pub const PER_SOURCE: usize = 2;
+/// How long a host's peer has to prove the session.
+pub const PROVE_WITHIN: Duration = Duration::from_secs(10);
+/// A peer that sends nothing for this long is closed.
+pub const IDLE: Duration = Duration::from_secs(40);
 /// Datagrams queued for one peer before more are dropped.
 const PEER_QUEUE: usize = 1024;
 /// Datagrams received and not yet read by QUIC.
 const RECV_QUEUE: usize = 1024;
 
-type Peers = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
+struct Peer {
+    out: mpsc::Sender<Vec<u8>>,
+    proven: Arc<AtomicBool>,
+}
+
+type Peers = Arc<Mutex<HashMap<SocketAddr, Peer>>>;
 
 pub struct Tunnel {
     local: SocketAddr,
@@ -47,7 +68,7 @@ impl fmt::Debug for Tunnel {
     }
 }
 
-fn run_peer(stream: TcpStream, addr: SocketAddr, peers: Peers, tx: mpsc::Sender<(SocketAddr, Vec<u8>)>, out: mpsc::Receiver<Vec<u8>>) {
+fn run_peer(stream: TcpStream, addr: SocketAddr, peers: Peers, tx: mpsc::Sender<(SocketAddr, Vec<u8>)>, out: mpsc::Receiver<Vec<u8>>, proven: Arc<AtomicBool>) {
     let _ = stream.set_nodelay(true);
     let (mut r, mut w) = stream.into_split();
     let mut out = out;
@@ -63,9 +84,21 @@ fn run_peer(stream: TcpStream, addr: SocketAddr, peers: Peers, tx: mpsc::Sender<
         let _ = w.shutdown().await;
     });
     tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + PROVE_WITHIN;
         loop {
+            // Until proven, the deadline; then the idle limit.
+            let wait = if proven.load(Ordering::Relaxed) { tokio::time::Instant::now() + IDLE } else { deadline };
             let mut h = [0u8; 2];
-            if r.read_exact(&mut h).await.is_err() {
+            match tokio::time::timeout_at(wait, r.read_exact(&mut h)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    log::warn!("fenestra tcp: {addr} {}; closed", if proven.load(Ordering::Relaxed) { "went quiet" } else { "did not prove the session in time" });
+                    break;
+                }
+            }
+            if !proven.load(Ordering::Relaxed) && tokio::time::Instant::now() >= deadline {
+                log::warn!("fenestra tcp: {addr} did not prove the session in time; closed");
                 break;
             }
             let n = u16::from_be_bytes(h) as usize;
@@ -93,16 +126,30 @@ impl Tunnel {
         (Arc::new(Tunnel { local, peers: Arc::default(), rx: Mutex::new(rx) }), tx)
     }
 
-    fn add(&self, stream: TcpStream, addr: SocketAddr, tx: mpsc::Sender<(SocketAddr, Vec<u8>)>) -> bool {
+    fn add(&self, stream: TcpStream, addr: SocketAddr, tx: mpsc::Sender<(SocketAddr, Vec<u8>)>, proven: bool) -> bool {
         let mut p = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-        if p.len() >= MAX_PEERS || p.contains_key(&addr) {
+        if p.len() >= MAX_PEERS || p.contains_key(&addr) || p.keys().filter(|a| a.ip() == addr.ip()).count() >= PER_SOURCE {
             return false;
         }
         let (otx, orx) = mpsc::channel(PEER_QUEUE);
-        p.insert(addr, otx);
+        let proven = Arc::new(AtomicBool::new(proven));
+        p.insert(addr, Peer { out: otx, proven: proven.clone() });
         drop(p);
-        run_peer(stream, addr, self.peers.clone(), tx, orx);
+        run_peer(stream, addr, self.peers.clone(), tx, orx, proven);
         true
+    }
+
+    /// The connection from `addr` proved the session: it may stay as long
+    /// as it is not silent for [`IDLE`].
+    pub fn confirm(&self, addr: SocketAddr) {
+        if let Some(p) = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(&addr) {
+            p.proven.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Peers held now.
+    pub fn peers(&self) -> usize {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// The host's side: take connections on `listener` as they come.
@@ -117,8 +164,8 @@ impl Tunnel {
                     continue;
                 };
                 let Some(t) = weak.upgrade() else { return };
-                if !t.add(s, addr, tx.clone()) {
-                    log::warn!("fenestra tcp: refused {addr} (peers full)");
+                if !t.add(s, addr, tx.clone(), false) {
+                    log::warn!("fenestra tcp: refused {addr} (too many peers, or from that address)");
                 }
             }
         });
@@ -129,7 +176,8 @@ impl Tunnel {
     pub async fn connect(addr: SocketAddr) -> io::Result<Arc<Tunnel>> {
         let s = TcpStream::connect(addr).await?;
         let (t, tx) = Tunnel::new(s.local_addr()?);
-        t.add(s, addr, tx);
+        // The viewer's one peer is the host it chose: no deadline.
+        t.add(s, addr, tx, true);
         Ok(t)
     }
 }
@@ -151,7 +199,7 @@ impl AsyncUdpSocket for Tunnel {
     fn try_send(&self, t: &Transmit) -> io::Result<()> {
         let p = self.peers.lock().unwrap_or_else(|e| e.into_inner());
         // A peer that is gone, or behind: the datagram is lost, as on UDP.
-        if let Some(q) = p.get(&t.destination) {
+        if let Some(q) = p.get(&t.destination).map(|p| &p.out) {
             let seg = t.segment_size.unwrap_or(t.contents.len()).max(1);
             for d in t.contents.chunks(seg) {
                 if d.len() <= MAX_DATAGRAM {

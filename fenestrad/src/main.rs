@@ -34,8 +34,8 @@
 //! local network `--lan` names. Without it a session is a plain child
 //! (other systems, and gates on a host without jaild).
 //!
-//! With `--user` (on Atrium, `_fenestra`) fenestrad opens frescod's link
-//! and binds the mint socket as root, then runs as that user; with
+//! With `--user` (on Atrium, `_fenestra`) fenestrad binds the mint socket
+//! as root, then runs as that user, and connects to frescod as it; with
 //! `--jaild` too, a root side forked first keeps jaild (`privsep.rs`).
 //!
 //! `--mint-dir` is the development form: one session through files, and
@@ -484,9 +484,13 @@ fn main() {
         let (iface, subnet) = lan.unwrap_or_else(|| die("--jaild needs --lan IFACE SUBNET (where viewers come from)"));
         (sock, iface, subnet)
     });
-    // What needs root, as root: frescod checks our uid when we connect,
-    // and the mint socket's directory is root's.
-    let f = UnixStream::connect(&sock).unwrap_or_else(|e| die(format!("{sock}: {e}")));
+    // The root side first, so it holds nothing but what it is given here.
+    #[cfg(target_os = "freebsd")]
+    let jails = jaild_at.map(|(sock, iface, subnet)| match &user {
+        Some(_) => Jailing::Root(Arc::new(privsep::jailer::split(move || jail::Jails::new(&sock, &iface, &subnet), jail_args(grace)))),
+        None => Jailing::Here(jail::Jails::new(&sock, &iface, &subnet)),
+    });
+    // The mint socket's directory is root's: bound before the drop.
     let mint_listener = arg(&args, "--mint-sock").map(|path| {
         // A fresh socket in fenestrad's own directory; any local user
         // may connect, and the uid check in mint_request decides.
@@ -494,15 +498,13 @@ fn main() {
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap_or_else(|e| die(format!("{path}: {e}")));
         (path, l)
     });
-    #[cfg(target_os = "freebsd")]
-    let jails = jaild_at.map(|(sock, iface, subnet)| match &user {
-        Some(_) => Jailing::Root(Arc::new(privsep::jailer::split(move || jail::Jails::new(&sock, &iface, &subnet), jail_args(grace)))),
-        None => Jailing::Here(jail::Jails::new(&sock, &iface, &subnet)),
-    });
     if let Some(u) = &user {
         privsep::drop_to(u).unwrap_or_else(|e| die(format!("dropping to {}: {e}", u.name)));
         eprintln!("fenestrad: running as {} (uid {})", u.name, u.uid);
     }
+    // After the drop: frescod sees this user's uid on the link (it must be
+    // in its FRESCOD_FENESTRA_UIDS), never root's.
+    let f = UnixStream::connect(&sock).unwrap_or_else(|e| die(format!("{sock}: {e}")));
     let cfg = Config {
         bin: arg(&args, "--session").unwrap_or_else(|| die("--session BIN is needed")),
         bind: arg(&args, "--bind"),

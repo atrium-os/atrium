@@ -1605,6 +1605,8 @@ its trusted chrome layer (the strip, the focus ring, slot frames, hosted-panel l
 solid rects, text included as coverage runs) and the background colour as one `Chrome` record
 when it changed (`fenestra_link::chrome`: a palette of at most 64 linear colours and at most 6000
 rects of 10 bytes in whole pixels, checked in full on decode, under one 64 KiB control message).
+The viewer redraws a changed chrome at most 10 times a second (5 saved up), and does not draw one
+whose rects cover more than 8 screens.
 fenestrad keeps the last layout and chrome for a session that joins later. The viewer draws the
 background, the windows, then the chrome, with the same reference rasterizer as the windows, so
 its desktop equals frescod's screen pixel for pixel. On the viewer the chrome is host content,
@@ -1676,22 +1678,25 @@ shape and nothing wider (another port, TCP, two ports, listen from this computer
 grant, a resolver, children, locked memory are refused). When the session exits, its jail and
 network are taken apart and the uid and port go back to the pool. No code went into portcullisd.
 
-**fenestrad as `_fenestra` (uid 65057).** With `--user _fenestra` fenestrad opens frescod's
-link (frescod checks the uid at connect) and binds the mint socket as root, then drops to
-`_fenestra` and checks the drop from the kernel (uid, gid, groups, and that `setuid(0)` fails).
-Everything that reads a peer's bytes (mint requests, frescod's records, sessions' records) runs
-there. jaild still takes only root callers, so with `--jaild` fenestrad forks first
-(`fenestrad/src/privsep.rs`): the root side holds jaild and one `SOCK_SEQPACKET` socket to the
-unprivileged side, and answers only two fixed 32-byte requests, `START` with the session's link
-and mint sockets attached and `STOP PORT`. The session's arguments, uid, port and network are the
+**fenestrad as `_fenestra` (uid 65057).** With `--user _fenestra` fenestrad binds the mint
+socket as root, then drops to `_fenestra`, checks the drop from the kernel (uid, gid, groups, and
+that `setuid(0)` fails), and only then connects to frescod, whose `FRESCOD_FENESTRA_UIDS` names
+`_fenestra`'s uid and not root's. Everything that reads a peer's bytes (mint requests, frescod's
+records, sessions' records) runs there. jaild still takes only root callers, so with `--jaild`
+fenestrad forks before it opens anything else (`fenestrad/src/privsep.rs`): the root side holds
+jaild and one `SOCK_SEQPACKET` socket to the unprivileged side, and answers only two fixed
+32-byte requests, `START` with the session's link and mint sockets attached (refused unless both
+are local sockets) and `STOP PORT`. The session's arguments, uid, port and network are the
 root side's own; the unprivileged side can ask for a jail but not say what is in it, and may hold
 at most two (one more during a take-over). The root side ends with the other side. fenestrad is not
 yet in a jail of its own (it would need jaild to pass it the frescod link and mint socket). Without `--jaild` a session is a plain child (other systems, hosts without jaild).
 
 **UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
 connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram
-`len u16 | bytes`, bounded at 16 KiB, through a `quinn::AsyncUdpSocket` that takes TCP peers (at
-most 16) on the host and is one connection on the viewer. The TLS 1.3 handshake with the pinned
+`len u16 | bytes`, bounded at 16 KiB, through a `quinn::AsyncUdpSocket` that takes TCP peers on the
+host and is one connection on the viewer. The port is open before any proof, so the host holds at
+most 16 peers and 2 from one address, closes a peer whose connection has not proved the session
+within 10 s, and closes a proven one silent for 40 s (QUIC keeps alive every 5 s). The TLS 1.3 handshake with the pinned
 raw keys, the `K_sess` proof and every stream are unchanged; QUIC's loss recovery has nothing to
 do and head-of-line blocking returns. The host listens on both; `fenestra-view --transport
 udp|tcp|auto` (default auto) waits 4 s for an answer over UDP, then tries TCP, keeps the one that

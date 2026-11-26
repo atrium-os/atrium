@@ -244,3 +244,42 @@ async fn the_tcp_fallback_carries_the_same_session() {
     let r = tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await.expect("cut off, not left open");
     assert!(matches!(r, Ok(0) | Err(_)));
 }
+
+/// The TCP port is open before any proof: one address holds at most
+/// PER_SOURCE peers, and a peer that proves nothing is closed after
+/// PROVE_WITHIN, so the real viewer gets in afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_peers_that_prove_nothing_are_bounded_and_closed() {
+    use fenestra_wire::tcp::{PER_SOURCE, PROVE_WITHIN};
+    use tokio::io::AsyncReadExt;
+    let k = keys();
+    let host = std::sync::Arc::new(bind(&k.host_key, k.viewer_key.public(), secret(1)));
+    let addr = host.local_addr().unwrap();
+    let mut squatters = Vec::new();
+    for _ in 0..PER_SOURCE {
+        squatters.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    // One more from the same address is closed at once.
+    let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut b = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut b)).await.expect("refused, not held");
+    assert!(matches!(r, Ok(0) | Err(_)));
+    // The squatters are closed once their time to prove is up.
+    for s in &mut squatters {
+        let r = tokio::time::timeout(PROVE_WITHIN + Duration::from_secs(5), s.read(&mut b)).await.expect("closed after the deadline");
+        assert!(matches!(r, Ok(0) | Err(_)));
+    }
+    // And the viewer gets in, and stays past the deadline once proven.
+    let viewer = Viewer::new(&k.viewer_key, k.host_key.public()).unwrap();
+    let s1 = secret(1);
+    let h = host.clone();
+    let accepting = tokio::spawn(async move { h.accept().await });
+    let vc = viewer.connect_tcp(addr, &s1).await.expect("the viewer over TCP");
+    let hc = accepting.await.unwrap().unwrap().expect("a connection");
+    tokio::time::sleep(PROVE_WITHIN + Duration::from_secs(2)).await;
+    let mut uni = hc.conn.open_uni().await.unwrap();
+    uni.write_all(b"still here").await.unwrap();
+    uni.finish().unwrap();
+    let mut r = vc.conn.accept_uni().await.unwrap();
+    assert_eq!(r.read_to_end(64).await.unwrap(), b"still here");
+}
