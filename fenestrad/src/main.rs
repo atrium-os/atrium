@@ -109,6 +109,9 @@ struct Session {
     on: bool,
     /// How many of its wants are outstanding.
     wants: usize,
+    /// Who minted it, as the host's records name them (fenestra-shell's
+    /// `label=`), for frescod's viewed screen.
+    label: Option<String>,
 }
 
 #[derive(Default)]
@@ -215,7 +218,7 @@ impl Relay {
                     }
                     t.tickets.clear();
                 }
-                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } | Rec::Viewer { .. } => unreachable!("from_broker() refused it"),
             }
             // A session ended for not reading may have been the one on.
             self.sync_on(&mut t);
@@ -237,6 +240,15 @@ impl Relay {
             match rec {
                 Rec::Session { on } => {
                     let joins = on && !s.on && was_on;
+                    // Who is viewing, before frescod hears the session is on.
+                    if on && !s.on {
+                        if let Some(label) = s.label.clone() {
+                            if let Err(e) = self.to_frescod(&Rec::Viewer { label }) {
+                                die(format!("frescod: {e}"));
+                            }
+                        }
+                    }
+                    let Some(s) = t.sessions.get_mut(&id) else { return "ended".into() };
                     s.on = on;
                     self.sync_on(&mut t);
                     if joins {
@@ -276,6 +288,8 @@ impl Relay {
                         die(format!("frescod: {e}"));
                     }
                 }
+                // fenestrad's own word to frescod, never a session's.
+                Rec::Viewer { .. } => return "sent a Viewer record (fenestrad's own)".into(),
                 _ => unreachable!("from_broker() refused it"),
             }
         }
@@ -399,7 +413,7 @@ fn start_session(relay: &Arc<Relay>, cfg: &Config, id: u32, by: MintBy) -> Resul
         ),
     };
     let (tx, rx) = mpsc::sync_channel::<Rec>(SESSION_QUEUE);
-    relay.table.lock().unwrap_or_else(|e| e.into_inner()).sessions.insert(id, Session { tx, child, on: false, wants: 0 });
+    relay.table.lock().unwrap_or_else(|e| e.into_inner()).sessions.insert(id, Session { tx, child, on: false, wants: 0, label: None });
     let mut w = ours.try_clone().map_err(|e| e.to_string())?;
     std::thread::spawn(move || {
         for rec in rx.iter() {
@@ -558,11 +572,26 @@ fn mint_request(relay: &Arc<Relay>, cfg: &Config, next: &mut u32, mut c: UnixStr
         return refuse("a request that is not one short line");
     }
     let w: Vec<&str> = line.split_ascii_whitespace().collect();
-    let (key, take_over) = match w.as_slice() {
-        ["MINT", k] => (*k, false),
-        ["MINT", k, "take-over"] => (*k, true),
+    // `MINT KEY [take-over] [label=HEX]`: the label is who the person
+    // is to the host (fenestra-shell reads it from their authorized_keys),
+    // shown at the seat while they view it.
+    let (key, rest) = match w.as_slice() {
+        ["MINT", k, rest @ ..] if rest.len() <= 2 => (*k, rest),
         _ => return refuse("not a mint request"),
     };
+    let mut take_over = false;
+    let mut label = None;
+    for r in rest {
+        match r.strip_prefix("label=") {
+            None if *r == "take-over" && !take_over => take_over = true,
+            Some(h) if label.is_none() => {
+                let l = mint::unhex(h).ok().and_then(|b| String::from_utf8(b).ok()).filter(|l| fenestra_link::viewer_label_ok(l));
+                let Some(l) = l else { return refuse("a label that is not 1 to 64 printable characters, in hex") };
+                label = Some(l);
+            }
+            _ => return refuse("not a mint request"),
+        }
+    }
     let Ok(key) = mint::unhex(key) else { return refuse("a viewer key that is not hex") };
     if key.is_empty() || key.len() > 128 {
         return refuse("a viewer key of the wrong size");
@@ -580,7 +609,10 @@ fn mint_request(relay: &Arc<Relay>, cfg: &Config, next: &mut u32, mut c: UnixStr
     *next += 1;
     match start_session(relay, cfg, *next, MintBy::Key(key)) {
         Ok(Some(m)) => {
-            eprintln!("fenestrad: minted session {} for {user} on {}", *next, m.addr);
+            if let Some(s) = relay.table.lock().unwrap_or_else(|e| e.into_inner()).sessions.get_mut(&*next) {
+                s.label = label.clone();
+            }
+            eprintln!("fenestrad: minted session {} for {user} on {}{}", *next, m.addr, label.as_deref().map(|l| format!(" ({l:?})")).unwrap_or_default());
             format!("FENESTRA_MINT {}\n", m.line())
         }
         Ok(None) => refuse("no mint"),

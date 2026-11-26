@@ -45,8 +45,12 @@ struct State {
     /// The seat's size, device pixels, and its scale.
     seat: (u32, u32),
     scale_milli: u32,
-    /// Who is viewing: the seat's user, as the chrome's font shows it.
+    /// The account the session runs as: the seat's user, as the chrome's
+    /// font shows it.
     who: String,
+    /// Who is viewing, as fenestrad named them (their SSH key's comment,
+    /// else their address); empty until it does.
+    viewer: String,
     /// The seat's pointer on this screen; shown once it moves.
     cursor: (f32, f32),
     cursor_shown: bool,
@@ -64,11 +68,12 @@ struct State {
     cache: Vec<((u32, u32, u32, u64), std::sync::Arc<Vec<u8>>)>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
+const FRESH: State = State {
     phase: Phase::Off,
     seat: (0, 0),
     scale_milli: 1000,
     who: String::new(),
+    viewer: String::new(),
     cursor: (0.0, 0.0),
     cursor_shown: false,
     button: None,
@@ -78,12 +83,24 @@ static STATE: Mutex<State> = Mutex::new(State {
     gen: 0,
     primary: None,
     cache: Vec::new(),
-});
+};
+
+#[cfg(not(test))]
+static STATE: Mutex<State> = Mutex::new(FRESH);
 
 static WAKE: Mutex<Option<crate::redraw::Redraw>> = Mutex::new(None);
 
+#[cfg(not(test))]
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// In tests each thread has its own seat, so a test that is viewed does not
+/// take the input of tests running beside it.
+#[cfg(test)]
+fn state() -> std::sync::MutexGuard<'static, State> {
+    thread_local!(static STATE: &'static Mutex<State> = Box::leak(Box::new(Mutex::new(FRESH))));
+    STATE.with(|s| *s).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn changed(s: &mut State) {
@@ -117,6 +134,18 @@ pub fn gen() -> u64 {
     state().gen
 }
 
+/// Who is viewing: `label` is fenestrad's (a checked [`fenestra_link::Rec::Viewer`]),
+/// shown from now until the session ends.
+pub fn set_viewer(label: &str) {
+    let name = chrome::viewer_name(label);
+    let mut s = state();
+    if s.viewer != name {
+        eprintln!("frescod: viewed: the viewer is {name}");
+        s.viewer = name;
+        changed(&mut s);
+    }
+}
+
 /// A viewer took the session: the seat (`w` x `h` at `scale_milli`) shows
 /// this screen from now.
 pub fn begin(w: u32, h: u32, scale_milli: u32) {
@@ -143,6 +172,7 @@ pub fn begin_on(primary: Option<u32>, w: u32, h: u32, scale_milli: u32) {
 /// The session ended: lock the seat, and keep this screen until it is.
 pub fn end() {
     let mut s = state();
+    s.viewer.clear();
     if s.phase != Phase::Viewed {
         return;
     }
@@ -313,14 +343,24 @@ pub fn picture_for(output: u32, w: u32, h: u32) -> Option<std::sync::Arc<Vec<u8>
     Some(p)
 }
 
+/// The screen's words: who views it and as whom, or that it is locking.
+fn draw_lines(s: &State) -> Vec<String> {
+    let lines = match s.phase {
+        Phase::Viewed => vec![
+            "this screen is being viewed remotely".to_string(),
+            if s.viewer.is_empty() { String::new() } else { format!("by {}", s.viewer) },
+            if s.who.is_empty() { "full control".to_string() } else { format!("full control as {}", s.who) },
+        ],
+        _ => vec!["the remote session ended".to_string(), "locking".to_string()],
+    };
+    lines.into_iter().filter(|l| !l.is_empty()).collect()
+}
+
 fn draw(s: &mut State, w: u32, h: u32, primary: bool) -> Vec<u8> {
     let px = Px::new(s.scale_milli);
-    let by = if s.who.is_empty() { String::new() } else { format!("by {}", s.who) };
-    let (lines, button): (Vec<&str>, Option<&str>) = match s.phase {
-        Phase::Viewed => (vec!["this screen is being viewed remotely", by.as_str(), "full control"], Some("disconnect")),
-        _ => (vec!["the remote session ended", "locking"], None),
-    };
-    let lines: Vec<&str> = lines.into_iter().filter(|l| !l.is_empty()).collect();
+    let owned = draw_lines(s);
+    let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let button = (s.phase == Phase::Viewed).then_some("disconnect");
     let cursor = (primary && s.cursor_shown).then_some((s.cursor.0 as i32, s.cursor.1 as i32));
     let (nodes, hit) = chrome::viewed_screen(px, w, h, &lines, button.filter(|_| primary), cursor);
     if primary {
@@ -340,6 +380,21 @@ mod tests {
         let mut s = state();
         s.phase = Phase::Off;
         s.disconnect = false;
+        s.viewer.clear();
+    }
+
+    #[test]
+    fn the_screen_names_the_viewer_not_only_the_account() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        set_viewer("Shankar@MacBook (work)\u{202e}");
+        begin(640, 360, 1000);
+        assert_eq!(state().viewer, "shankar@macbook work");
+        let lines = |s: &State| draw_lines(s);
+        assert!(lines(&state()).iter().any(|l| l == "by shankar@macbook work"), "{:?}", lines(&state()));
+        end();
+        assert!(state().viewer.is_empty(), "the next session starts unnamed");
+        reset();
     }
 
     #[test]

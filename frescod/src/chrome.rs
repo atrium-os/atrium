@@ -696,6 +696,19 @@ pub fn chrome_name(s: &str) -> String {
     s.chars().map(|c| c.to_ascii_lowercase()).filter(|c| c.is_ascii() && fresco_split::chrome::origin_char(*c as u8)).take(32).collect()
 }
 
+/// The characters the chrome has glyphs for: an origin's, and `@` and `+`
+/// for a viewer's label (an SSH key's comment, `user@host`).
+pub fn viewer_char(c: u8) -> bool {
+    fresco_split::chrome::origin_char(c) || c == b'@' || c == b'+'
+}
+
+/// A viewer's label as the chrome can draw it: lowercased, spaces kept
+/// (as gaps), anything else dropped, at most 40 characters.
+pub fn viewer_name(s: &str) -> String {
+    let n: String = s.chars().map(|c| c.to_ascii_lowercase()).filter(|c| c.is_ascii() && (*c == ' ' || viewer_char(*c as u8))).take(40).collect();
+    n.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,7 +766,7 @@ mod tests {
     fn every_origin_character_has_a_glyph() {
         for font in glyphs::FONTS {
             for c in 0u8..=127 {
-                assert_eq!(super::glyph(font, c).is_some(), fresco_split::chrome::origin_char(c), "{:?}", c as char);
+                assert_eq!(super::glyph(font, c).is_some(), super::viewer_char(c), "{:?}", c as char);
             }
             // Every glyph fits the strip's line, at every scale.
             let strip = Px::new(font.scale_milli).strip();

@@ -100,6 +100,11 @@ use fresco_render_core::pack;
 #[path = "../chrome.rs"]
 #[allow(dead_code)]
 mod chrome;
+// The seat's input goes to the viewed screen while a viewer has the
+// session (tactus_client); this binary never starts one, so it stays off.
+#[path = "../viewed.rs"]
+#[allow(dead_code)]
+mod viewed;
 #[path = "../socket_server.rs"]
 mod socket_server;
 #[path = "../fenrec.rs"]

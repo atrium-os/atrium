@@ -26,6 +26,8 @@ fn samples() -> Vec<Rec> {
         Rec::Input(Input::Focus { window: 3 }),
         Rec::Input(Input::Resize { window: 3, width: 900, height: 600 }),
         Rec::Disconnect,
+        Rec::Viewer { label: "shankar@mac".into() },
+        Rec::Viewer { label: "x".repeat(64) },
     ]
 }
 
@@ -101,6 +103,16 @@ fn hostile_records_are_refused() {
         Rec::Output { width: 63, height: 900, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 9000, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 900, scale_milli: 4001 }.encode(),
+        Rec::Viewer { label: String::new() }.encode(),
+        Rec::Viewer { label: "a\u{202e}b".into() }.encode(),
+        Rec::Viewer { label: "a\nb".into() }.encode(),
+        {
+            // A label past its bound is refused before it is read.
+            let mut b = Rec::Viewer { label: "x".repeat(64) }.encode();
+            b[32..36].copy_from_slice(&65u32.to_le_bytes());
+            b.push(b'x');
+            b
+        },
         {
             // A Disconnect that carries anything.
             let mut b = Rec::Disconnect.encode();

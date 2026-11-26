@@ -1801,8 +1801,8 @@ viewer's desktop equals it pixel for pixel.
 **A host with monitors of its own (§4.2, §11.4, decision 3).** Blank by default: while a remote
 session is on, the desktop takes the viewer's output exactly as on a headless host, and the seat's
 monitors show only frescod's viewed screen (`frescod/src/viewed.rs`): "this screen is being viewed
-remotely", by whom (the seat's user, from the host's own seat file), "full control", and a
-Disconnect, drawn by frescod from its build-time glyphs, with nothing of the session. The seat's
+remotely", by whom, "full control as" the account the session runs as (the seat's user, from
+the host's own seat file), and a Disconnect, drawn by frescod from its build-time glyphs, with nothing of the session. The seat's
 keys and pointer act on that screen alone (tactusd's and the injector's paths both stop there;
 modifiers are followed, and a key or button held from before is released where it went); its one
 control is Disconnect, a click on it or Return. Disconnect sends `Disconnect` (a new link record,
@@ -1815,10 +1815,18 @@ lock screen, so nobody at the desk gets the session by waiting the viewer out.
 `FRESCOD_FENESTRA_LIVE=1` is the per-host opt-in to keep the session on the seat while viewed (the
 seat keeps its outputs; the viewer sees the host's layout). Headless frescod stands in for a seat
 with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture saved as
-`PNG-seat.png`): `scripts/fenestra-seat-vm.sh` 13/13 runs it with forum-wm, a viewer at
+`PNG-seat.png`): `scripts/fenestra-seat-vm.sh` 14/14 runs it with forum-wm, a viewer at
 1600x900@1.5 and a stub lock socket. On the display path each monitor scans out the viewed screen
 (the button and pointer on the first) and a spanning window's direct scanout stops; that path
 still keeps the desktop at the monitors' size while viewed, and has not run on a real display yet.
+"By whom" is the viewer as the host knows them, never words the viewer chose: `fenestra-shell`
+takes the comment on the `authorized_keys` line of the key sshd accepted (sshd's `ExposeAuthInfo
+yes` gives that key in `$SSH_USER_AUTH`), else the address the connection came from, cleaned to
+printable ASCII of at most 64 bytes, and sends it with the mint (`MINT KEY [take-over]
+[label=HEX]`). fenestrad keeps it on the session and, when the session first turns on, sends it to
+frescod in a `Viewer` record (kind 5, fenestrad to frescod only; fenestra-link refuses an empty,
+oversized or non-printable label, and a session sending one is dropped). frescod draws it in its
+chrome's glyphs (lowercased; `@` and `+` added to them) and forgets it when the session ends.
 
 **UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
 connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram
@@ -1860,8 +1868,7 @@ back in the host screen's pixels. `--headless --out DIR` is the gates' form. A c
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
 **Next in R2.** On the display path, the desktop at the viewer's output while viewed (as headless
-does) and a run on a real display; the §11.4 indicator on a live (opt-in) seat; the viewer's name
-from the SSH key's comment rather than the seat's user.
+does) and a run on a real display; the §11.4 indicator on a live (opt-in) seat.
 
 ## 20. Sources
 

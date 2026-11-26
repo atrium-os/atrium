@@ -5,7 +5,8 @@
 # what they show is saved as screen-seat.png. forum-wm runs (a whole
 # desktop); the viewer asks for a 1600x900 output at 1.5.
 #
-# Checks: while viewed, the desktop takes the viewer's output and the
+# Checks: the seat's screen names the viewer by the comment on their key
+# in authorized_keys (sshd's ExposeAuthInfo, turned on here); while viewed, the desktop takes the viewer's output and the
 # viewer's desktop equals it after typing sent from the viewer; the seat's
 # monitors show frescod's viewed screen (who, and a Disconnect), nothing
 # of the session; typing at the seat reaches nothing; a click on
@@ -18,7 +19,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-seat 13
+gate_begin fenestra-seat 14
 FEN_WM=1
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 G=/tmp/fendesk
@@ -49,6 +50,11 @@ cat >"$W/input.txt" <<'EOF'
 23 KEY 40 1
 23.1 KEY 40 0
 EOF
+# Who the viewer is to the host: the comment on its key's line.
+BLOB=$(cut -d' ' -f2 "$KEY.pub")
+g "sed -i '' 's|$BLOB.*|$BLOB Fenestra-Gate@viewer|' /root/.ssh/authorized_keys; grep -q '^ExposeAuthInfo yes' /etc/ssh/sshd_config || echo 'ExposeAuthInfo yes' >>/etc/ssh/sshd_config; service sshd reload >/dev/null"
+# sshd restarts on the reload: wait (bounded) until it answers again.
+i=0; while [ $i -lt 30 ] && ! g true 2>/dev/null; do sleep 2; i=$((i+1)); done
 fen_fenestrad
 "$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs 75 --connect "127.0.0.1:$PORT" --output 1600x900@1.5 >"$W/view.log" 2>&1 &
 VP=$!
@@ -108,6 +114,7 @@ button = sum(1 for p in d if p == (38, 140, 255))
 print("yes" if field > 0.9 and text > 300 and button > 500 else f"no (field {field:.3f}, text {text}, button {button})")
 EOF
 )"
+check "the seat's screen names the viewer by their key" yes "$(grep -q 'viewed: the viewer is fenestra-gate@viewer' "$W/frescod.log" && grep -qF 'Fenestra-Gate@viewer' "$W/fenestrad.log" && echo yes || echo no)"
 check "the seat switched to it when the session began" yes "$(grep -q "viewed: the seat's monitors show the viewed screen" "$W/frescod.log" && echo yes || echo no)"
 check "typing at the seat reached nothing on the desktop" "yes yes" "$(cmp -s "$W/after-seat-keys.png" "$W/viewed.png" && echo yes || echo no) $(grep -q 'inject KEY 38 1 -> the viewed screen' "$W/frescod.log" && echo yes || echo no)"
 check "Disconnect at the seat ended the session" "yes gone" "$([ -n "$B" ] && grep -q 'disconnected at the host' "$W/fenestrad.log" && echo yes || echo "no (button at '$B')") $(g "pgrep -x fenestra-session >/dev/null" && echo running || echo gone)"

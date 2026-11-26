@@ -14,8 +14,9 @@ const SIZE: f32 = 14.0;
 /// to 4.0, the range a monitor's scale takes. The chrome draws with the
 /// largest table not above its scale.
 const SCALES: &[u32] = &[1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000];
-/// Must match `fresco_split::chrome::origin_char`.
-const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.:/-[]_";
+/// Must match `chrome::viewer_char`: `fresco_split::chrome::origin_char`
+/// and the two more a viewer's label may hold.
+const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.:/-[]_@+";
 
 fn main() {
     let font = "../fonts/ibm-plex/IBMPlexMono-Regular.ttf";

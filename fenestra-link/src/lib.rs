@@ -29,6 +29,14 @@ pub const MAX_SCREEN: u32 = 65536;
 /// in thousandths (fenestra.md §4.1).
 pub const OUTPUT_SIDE: std::ops::RangeInclusive<u32> = 64..=8192;
 pub const OUTPUT_SCALE: std::ops::RangeInclusive<u32> = 500..=4000;
+/// The longest `Viewer` label.
+pub const MAX_VIEWER: usize = 64;
+
+/// Whether `s` may be a `Viewer` label: printable ASCII, not empty, at
+/// most [`MAX_VIEWER`] bytes.
+pub fn viewer_label_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_VIEWER && s.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
 
 pub type Version = (u64, u64);
 
@@ -81,6 +89,11 @@ pub enum Rec {
     /// fenestrad → frescod: the viewer's input, in the host screen's
     /// pixels, routed as frescod routes its own input devices'.
     Input(Input),
+    /// fenestrad → frescod: who is viewing, as the host's own records name
+    /// them (the SSH key's comment in the person's authorized_keys, else
+    /// the address they came from), for the seat's viewed screen (§11.4).
+    /// Printable ASCII, 1 to [`MAX_VIEWER`] bytes.
+    Viewer { label: String },
     /// frescod → fenestrad: the person at the host's seat pressed
     /// Disconnect on the screen it shows while viewed (§11.4): end every
     /// session now.
@@ -126,6 +139,7 @@ mod kind {
     pub const LAYOUT: u32 = 0x13;
     pub const CHROME: u32 = 0x14;
     pub const DISCONNECT: u32 = 0x15;
+    pub const VIEWER: u32 = 5;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +252,10 @@ impl Rec {
                 Head { kind: CHROME, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
             }
             Rec::Disconnect => Head { kind: DISCONNECT, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: 0 },
+            Rec::Viewer { label } => {
+                payload.extend_from_slice(label.as_bytes());
+                Head { kind: VIEWER, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
+            }
         };
         let mut out = h.bytes().to_vec();
         out.extend_from_slice(&payload);
@@ -253,6 +271,7 @@ impl Rec {
             kind::DATA => MAX_DATA,
             kind::LAYOUT => MAX_LAYOUT * PLACED,
             kind::CHROME => chrome::MAX_BODY,
+            kind::VIEWER => MAX_VIEWER,
             kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT | kind::OUTPUT | kind::DISCONNECT => 0,
             _ => return Err(Refused("unknown kind")),
         };
@@ -412,6 +431,11 @@ impl Rec {
             CHROME => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
                 Rec::Chrome(chrome::Chrome::decode(payload).map_err(|e| Refused(e.0))?)
+            }
+            VIEWER => {
+                unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
+                let label = std::str::from_utf8(payload).ok().filter(|l| viewer_label_ok(l)).ok_or(Refused("viewer label"))?;
+                Rec::Viewer { label: label.to_string() }
             }
             DISCONNECT => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
