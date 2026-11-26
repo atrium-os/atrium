@@ -76,6 +76,30 @@ fn serve(sink: Sender<DisplayEvent>, comp: Arc<Mutex<Compositor>>, sw: f32, sh: 
 
 fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, sh: f32, line: &str) {
     let mut it = line.split_whitespace();
+    // The seat's input while the session is viewed from elsewhere acts on
+    // the viewed screen alone (viewed.rs), as tactus_client's does.
+    if crate::viewed::active() {
+        match it.next().unwrap_or("") {
+            "MOVE" => {
+                if let (Some(x), Some(y)) = (next_f32(&mut it), next_f32(&mut it)) {
+                    crate::viewed::pointer_to(x, y);
+                }
+            }
+            "BTN" => {
+                if let (Some(b), Some(p)) = (it.next().and_then(|s| s.parse::<u8>().ok()), next_bool(&mut it)) {
+                    crate::viewed::button(b, p);
+                }
+            }
+            "KEY" => {
+                if let (Some(u), Some(p)) = (it.next().and_then(parse_u16), next_bool(&mut it)) {
+                    crate::viewed::key(u, p);
+                }
+            }
+            _ => {}
+        }
+        eprintln!("frescod: inject {} -> the viewed screen", line.trim());
+        return;
+    }
     match it.next().unwrap_or("") {
         "MOVE" => {
             if let (Some(x), Some(y)) = (next_f32(&mut it), next_f32(&mut it)) {

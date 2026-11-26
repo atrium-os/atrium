@@ -344,6 +344,19 @@ impl Broker {
         Ok(())
     }
 
+    /// Disconnect pressed at the seat (viewed.rs): fenestrad ends every
+    /// session, and frescod stops this one itself at once (no stream, no
+    /// input), whatever fenestrad does.
+    pub(crate) fn disconnect(&self) {
+        self.to_fenestra(Rec::Disconnect);
+        self.set_remote(false);
+    }
+
+    /// Whether a remote session is on (the seat shows the viewed screen).
+    pub(crate) fn viewed(&self) -> bool {
+        self.remote_on()
+    }
+
     /// The viewer's output, if it changed since the last call: `Some(None)`
     /// when the session that set it ended (fenestra.md §4.1).
     pub(crate) fn take_output(&self) -> Option<Option<(u32, u32, u32)>> {

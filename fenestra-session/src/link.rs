@@ -166,6 +166,8 @@ impl LinkSource {
                     }
                     let _ = p.done.send(Ok(now.map(|v| (p.bytes, v))));
                 }
+                // fenestrad acts on it (ends this session); it is never relayed.
+                Rec::Disconnect => return "fenestrad relayed a Disconnect".into(),
                 Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } => unreachable!("from_broker() refused it"),
             }
         }

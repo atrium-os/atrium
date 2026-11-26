@@ -373,6 +373,9 @@ impl Seat {
     }
 
     fn handle(&mut self, m: Message, sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>) {
+        if crate::viewed::active() && self.to_viewed(&m) {
+            return;
+        }
         match m {
             Message::Device { id, bus, classes, name, vendor, product } => {
                 eprintln!("frescod: input device {id} {name:?} ({bus:?}, {classes:?})");
@@ -584,6 +587,47 @@ impl Seat {
     /// Hand every gamepad to the focused window, if focus moved (a click
     /// or a key usually moves it, so this runs after each), unless a
     /// window holds it.
+    /// While the session is viewed from elsewhere and the seat shows the
+    /// viewed screen (viewed.rs), the seat's input acts on that screen
+    /// alone: true when `m` was taken. Modifiers are still followed, and a
+    /// key or button held from before is still released where it went.
+    fn to_viewed(&mut self, m: &Message) -> bool {
+        match *m {
+            Message::Key { usage, down, repeat, .. } => {
+                let (page, id) = ((usage >> 16) as u16, (usage & 0xffff) as u16);
+                let modifier = page == 0x07 && (0xe0..=0xe7).contains(&id);
+                let release = !down && page == 0x07 && self.keys.iter().any(|&(_, k)| k == id);
+                if modifier || release {
+                    return false;
+                }
+                if page == 0x07 && !repeat {
+                    crate::viewed::key(id, down);
+                }
+                true
+            }
+            Message::Button { usage, down, .. } => {
+                let b = (usage & 0xffff) as u8;
+                if !down && usage >> 16 == 0x09 && self.buttons.contains(&b) {
+                    return false;
+                }
+                if usage >> 16 == 0x09 {
+                    crate::viewed::button(b, down);
+                }
+                true
+            }
+            Message::Motion { dx, dy, .. } => {
+                crate::viewed::pointer_by(dx, dy);
+                true
+            }
+            Message::Absolute { x, y, .. } => {
+                crate::viewed::pointer_at(x, y);
+                true
+            }
+            Message::Scroll { .. } | Message::ScrollPixels { .. } | Message::Gesture { .. } | Message::PadButton { .. } | Message::PadAxis { .. } => true,
+            _ => false,
+        }
+    }
+
     fn pads_follow(&mut self, sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>) {
         let mut pads = self.pads.lock().unwrap();
         let Pads { map, claims, .. } = &mut *pads;

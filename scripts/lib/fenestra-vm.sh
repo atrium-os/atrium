@@ -5,7 +5,8 @@
 #   fen_setup              build, stage, start frescod and Sheets.
 #                          FEN_WM=1: forum-wm too, so the host shows a
 #                          whole desktop; without it each app is a window
-#                          of its own on the viewer (fenestra.md §3.4)
+#                          of its own on the viewer (fenestra.md §3.4).
+#                          FEN_FRESCOD_ENV: more VAR=value words for frescod
 #   fen_fenestrad          start fenestrad in the guest, taking mints on its
 #                          socket from the seat's user (root here); sets
 #                          FEN_SSH, the viewer's --ssh transport into it.
@@ -103,7 +104,7 @@ allow_rctl = true
     echo "=== host"
     g "cd $G && env FRESCOD_SPLIT=1 $LAUNCH FRESCOD_RENDERER_BIN=$D/fresco-renderer \
         FRESCOD_HEADLESS_PNG=$G/screen FRESCOD_SOCK=$G/fresco.sock FRESCOD_WM_SOCK=$G/wm.sock \
-        FRESCOD_FENESTRA_SOCK=$FSOCK daemon -f -o $G/frescod.log $AS_USER $D/frescod </dev/null"
+        FRESCOD_FENESTRA_SOCK=$FSOCK ${FEN_FRESCOD_ENV:-} daemon -f -o $G/frescod.log $AS_USER $D/frescod </dev/null"
     i=0; while [ $i -lt 90 ] && ! g "test -S $G/fresco.sock && test -S $FSOCK"; do sleep 2; i=$((i+1)); done
     g "test -S $FSOCK" || { g "tail -20 $G/frescod.log"; gate_abort "frescod did not open the fenestra link"; }
     g "chmod 666 $G/fresco.sock"

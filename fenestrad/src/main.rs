@@ -204,6 +204,17 @@ impl Relay {
                         Relay::to_session(&mut t, id, Rec::End { window, ticket: theirs, now });
                     }
                 }
+                // The person at the host's seat pressed Disconnect (§11.4).
+                Rec::Disconnect => {
+                    let ids: Vec<u32> = t.sessions.keys().copied().collect();
+                    for id in ids {
+                        eprintln!("fenestrad: session {id} disconnected at the host's seat");
+                        if let Some(mut s) = t.sessions.remove(&id) {
+                            s.child.stop();
+                        }
+                    }
+                    t.tickets.clear();
+                }
                 Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } => unreachable!("from_broker() refused it"),
             }
             // A session ended for not reading may have been the one on.

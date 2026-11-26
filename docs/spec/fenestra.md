@@ -1795,9 +1795,30 @@ A **headless** host (no monitor of its own) makes it its one output: the desktop
 viewer's size and scale (renderer resized, outputs and display mode republished, a
 `DisplayChanged` to every client), so apps lay out and rasterise text at the viewer's scale, and
 it gets its own outputs back when the session ends. `FEN_OUTPUT=1600x900@1.5
-scripts/fenestra-desktop-vm.sh` 15/15: the host's screen is 1600x900 with Sheets at 1.5 and the
-viewer's desktop equals it pixel for pixel. A host with its own monitors does not take it yet: a
-remote output beside them (or mirroring at the viewer's scale, §4.2) is the next step.
+scripts/fenestra-desktop-vm.sh` 16/16: the host's screen is 1600x900 with Sheets at 1.5 and the
+viewer's desktop equals it pixel for pixel.
+
+**A host with monitors of its own (§4.2, §11.4, decision 3).** Blank by default: while a remote
+session is on, the desktop takes the viewer's output exactly as on a headless host, and the seat's
+monitors show only frescod's viewed screen (`frescod/src/viewed.rs`): "this screen is being viewed
+remotely", by whom (the seat's user, from the host's own seat file), "full control", and a
+Disconnect, drawn by frescod from its build-time glyphs, with nothing of the session. The seat's
+keys and pointer act on that screen alone (tactusd's and the injector's paths both stop there;
+modifiers are followed, and a key or button held from before is released where it went); its one
+control is Disconnect, a click on it or Return. Disconnect sends `Disconnect` (a new link record,
+broker to fenestrad), on which fenestrad ends every session, and frescod also stops the session's
+streams and input itself at once, whatever fenestrad does. When the session ends for any reason,
+frescod asks ostiarius to lock the seat (its lock socket, as the bar's Lock does; again every 2 s
+until it holds) and keeps the viewed screen ("the remote session ended, locking") until the lock
+file says the seat is locked; only then does the desktop go back to the seat's monitors, behind the
+lock screen, so nobody at the desk gets the session by waiting the viewer out.
+`FRESCOD_FENESTRA_LIVE=1` is the per-host opt-in to keep the session on the seat while viewed (the
+seat keeps its outputs; the viewer sees the host's layout). Headless frescod stands in for a seat
+with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture saved as
+`PNG-seat.png`): `scripts/fenestra-seat-vm.sh` 13/13 runs it with forum-wm, a viewer at
+1600x900@1.5 and a stub lock socket. On the display path each monitor scans out the viewed screen
+(the button and pointer on the first) and a spanning window's direct scanout stops; that path
+still keeps the desktop at the monitors' size while viewed, and has not run on a real display yet.
 
 **UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
 connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram
@@ -1838,7 +1859,9 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** A remote output on a host with its own monitors.
+**Next in R2.** On the display path, the desktop at the viewer's output while viewed (as headless
+does) and a run on a real display; the §11.4 indicator on a live (opt-in) seat; the viewer's name
+from the SSH key's comment rather than the seat's user.
 
 ## 20. Sources
 

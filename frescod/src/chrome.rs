@@ -627,6 +627,75 @@ pub fn sheet_frames(c: &mut WindowFrame, px: Px, sheets: &[Sheet], top: i32) {
     c.size = (right.max(1) as u32, bottom.max(1) as u32);
 }
 
+/// The host's own monitors while a viewer has the session (fenestra.md
+/// §11.4, decision 3): `lines` centred on a plain field, a `button` under
+/// them when there is one, and the seat's pointer at `cursor` when it is
+/// on screen. Returns the nodes, in screen coordinates, and the button's
+/// rect. Everything here is frescod's own: no app is shown or drawn.
+pub fn viewed_screen(px: Px, w: u32, h: u32, lines: &[&str], button: Option<&str>, cursor: Option<(i32, i32)>) -> (Vec<SceneNode>, Option<[i32; 4]>) {
+    let (w, h) = (w as i32, h as i32);
+    let mut out = vec![rect(0, 0, w, h, VIEWED_FIELD)];
+    let lh = line(px) + px.p(8);
+    let bh = line(px) + 2 * px.p(10);
+    let total = lines.len() as i32 * lh + button.map_or(0, |_| px.p(16) + bh);
+    let mut y = (h - total) / 2;
+    for l in lines {
+        let tw = text_width(px, l).min(w);
+        text(&mut out, px, l, (w - tw) / 2, y, w);
+        y += lh;
+    }
+    let hit = button.map(|b| {
+        y += px.p(16);
+        let bw = text_width(px, b) + 2 * px.p(24);
+        let r = [(w - bw) / 2, y, (w + bw) / 2, y + bh];
+        out.push(rect(r[0], r[1], bw, bh, RING_COLOR));
+        text(&mut out, px, b, r[0] + px.p(24), y + px.p(10), bw);
+        r
+    });
+    if let Some((cx, cy)) = cursor {
+        let s = px.p(10);
+        for i in 0..s {
+            out.push(rect(cx, cy + i, (i + 1).min(s / 2 + 1), 1, TEXT_COLOR));
+        }
+    }
+    (out, hit)
+}
+
+const VIEWED_FIELD: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
+
+/// `nodes` (square rects, over each other in order) painted on a black
+/// `w` x `h` BGRA screen: the host's own monitors are scanned out from
+/// this while it is viewed, with no renderer involved.
+pub fn paint(nodes: &[SceneNode], w: u32, h: u32) -> Vec<u8> {
+    let mut px = vec![0u8; w as usize * h as usize * 4];
+    for i in 0..(w as usize * h as usize) {
+        px[i * 4 + 3] = 255;
+    }
+    for n in nodes {
+        let x0 = (n.position[0].max(0.0) as u32).min(w);
+        let y0 = (n.position[1].max(0.0) as u32).min(h);
+        let x1 = ((n.position[0] + n.size[0]).max(0.0) as u32).min(w);
+        let y1 = ((n.position[1] + n.size[1]).max(0.0) as u32).min(h);
+        let a = n.color[3].clamp(0.0, 1.0);
+        let c = [n.color[2], n.color[1], n.color[0]].map(|v| v.clamp(0.0, 1.0) * 255.0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let o = (y as usize * w as usize + x as usize) * 4;
+                for k in 0..3 {
+                    px[o + k] = (f32::from(px[o + k]) * (1.0 - a) + c[k] * a).round() as u8;
+                }
+            }
+        }
+    }
+    px
+}
+
+/// A name as the chrome's font can show it: lower case, its characters
+/// only (others dropped), at most 32.
+pub fn chrome_name(s: &str) -> String {
+    s.chars().map(|c| c.to_ascii_lowercase()).filter(|c| c.is_ascii() && fresco_split::chrome::origin_char(*c as u8)).take(32).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,5 +887,27 @@ mod tests {
         assert!(tie.position[0] > pill.position[0] + pill.size[0], "origin after the chip");
         let none = build(Px::ONE, 1280, Some(5), |_| Some("mail.example".into()), None, &shown, &[], &[], &[], &[]);
         assert!(!none.rects.iter().any(|n| n.color == rgb(blue)));
+    }
+
+    #[test]
+    fn the_viewed_screen_shows_its_words_and_a_button_and_no_more() {
+        let (w, h) = (640u32, 360u32);
+        let (nodes, hit) = viewed_screen(Px::ONE, w, h, &["this screen is being viewed remotely", "by shankar"], Some("disconnect"), None);
+        let [x0, y0, x1, y1] = hit.expect("a button");
+        assert!(x0 > 0 && y0 > h as i32 / 2 && x1 < w as i32 && y1 < h as i32, "{:?}", hit);
+        let px = paint(&nodes, w, h);
+        let at = |x: i32, y: i32| { let o = (y as usize * w as usize + x as usize) * 4; [px[o], px[o + 1], px[o + 2]] };
+        let field = at(2, 2);
+        // The button's colour inside it, the field's at the corners, and
+        // the words lighter than the field somewhere above the button.
+        assert_ne!(at(x0 + 2, y0 + 2), field);
+        assert_eq!(at(w as i32 - 2, h as i32 - 2), field);
+        let lit = (0..y0).flat_map(|y| (0..w as i32).map(move |x| (x, y))).filter(|&(x, y)| at(x, y)[0] > 128).count();
+        assert!(lit > 200, "{lit} lit pixels of text");
+        // No button, no hit; a pointer draws.
+        let (n2, none) = viewed_screen(Px::ONE, w, h, &["locking"], None, Some((10, 10)));
+        assert!(none.is_none());
+        assert!(paint(&n2, w, h)[(12 * w as usize + 10) * 4] > 128);
+        assert_eq!(chrome_name("Shankar G\u{202e}iri!"), "shankargiri");
     }
 }

@@ -81,6 +81,10 @@ pub enum Rec {
     /// fenestrad → frescod: the viewer's input, in the host screen's
     /// pixels, routed as frescod routes its own input devices'.
     Input(Input),
+    /// frescod → fenestrad: the person at the host's seat pressed
+    /// Disconnect on the screen it shows while viewed (§11.4): end every
+    /// session now.
+    Disconnect,
 }
 
 /// A viewer's input event (fenestra.md §9).
@@ -121,6 +125,7 @@ mod kind {
     pub const END: u32 = 0x12;
     pub const LAYOUT: u32 = 0x13;
     pub const CHROME: u32 = 0x14;
+    pub const DISCONNECT: u32 = 0x15;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +237,7 @@ impl Rec {
                 payload = c.encode();
                 Head { kind: CHROME, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
             }
+            Rec::Disconnect => Head { kind: DISCONNECT, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: 0 },
         };
         let mut out = h.bytes().to_vec();
         out.extend_from_slice(&payload);
@@ -247,7 +253,7 @@ impl Rec {
             kind::DATA => MAX_DATA,
             kind::LAYOUT => MAX_LAYOUT * PLACED,
             kind::CHROME => chrome::MAX_BODY,
-            kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT | kind::OUTPUT => 0,
+            kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT | kind::OUTPUT | kind::DISCONNECT => 0,
             _ => return Err(Refused("unknown kind")),
         };
         if len > max {
@@ -407,13 +413,17 @@ impl Rec {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
                 Rec::Chrome(chrome::Chrome::decode(payload).map_err(|e| Refused(e.0))?)
             }
+            DISCONNECT => {
+                unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
+                Rec::Disconnect
+            }
             _ => return Err(Refused("unknown kind")),
         })
     }
 
     /// Records the broker sends; it takes only the others.
     pub fn from_broker(&self) -> bool {
-        matches!(self, Rec::Changed { .. } | Rec::Data { .. } | Rec::End { .. } | Rec::Layout { .. } | Rec::Chrome(_))
+        matches!(self, Rec::Changed { .. } | Rec::Data { .. } | Rec::End { .. } | Rec::Layout { .. } | Rec::Chrome(_) | Rec::Disconnect)
     }
 }
 

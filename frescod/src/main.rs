@@ -56,6 +56,7 @@ mod outputs;
 mod video;
 mod span;
 mod lock;
+mod viewed;
 mod frame_stats;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
@@ -239,6 +240,7 @@ fn main() -> std::io::Result<()> {
     let redraw = redraw::RedrawSignal::new();
     activation::set_redraw(redraw.clone());
     lock::watch(comp.clone(), redraw.clone());
+    viewed::set_redraw(redraw.clone());
     route::watch(redraw.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
@@ -600,6 +602,35 @@ fn main() -> std::io::Result<()> {
                 scale_milli: info.scale_milli,
             });
             last_gen = 0; /* repaint at once */
+        }
+
+        /* Viewed from elsewhere (viewed.rs, decision 3): the monitors
+         * show the viewed screen while a session is on, and until the
+         * seat is locked after it; Disconnect pressed there ends it. The
+         * desktop keeps the monitors' size here (the viewer's size on a
+         * host with monitors is the headless path's, for now). */
+        if let Some(b) = split.as_deref() {
+            if viewed::take_disconnect() {
+                b.disconnect();
+            }
+            let _ = b.take_output();
+            if !viewed::live() {
+                let on = b.viewed();
+                match viewed::phase() {
+                    viewed::Phase::Viewed if !on => viewed::end(),
+                    p if on && p != viewed::Phase::Viewed => {
+                        let first = heads.iter().find(|h| h.present);
+                        let (o, w, h) = first.map_or((None, dw, dh), |h| (Some(h.output), h.mode.width, h.mode.height));
+                        let sc = frontend.lock().unwrap().display_info().scale_milli;
+                        viewed::begin_on(o, w, h, sc);
+                        last_gen = 0;
+                    }
+                    _ => {}
+                }
+                if viewed::poll(lock::current().is_some()) {
+                    last_gen = 0;
+                }
+            }
         }
 
         let multi = heads.len() > 1;
@@ -984,6 +1015,18 @@ fn upload_head(
     if let Some(x) = h.direct.get_mut(back) {
         *x = None;
     }
+    /* Viewed from elsewhere (viewed.rs, decision 3): the monitor shows
+     * frescod's viewed screen, never the desktop. */
+    if let Some(p) = viewed::picture_for(h.output, h.mode.width, h.mode.height).filter(|p| p.len() == h.staging.len()) {
+        h.staging.copy_from_slice(&p);
+        if h.hdr_on {
+            enc.encode(&mut h.staging);
+        }
+        h.scan.upload_range(back, &h.staging, 0..h.staging.len(), deadline_ns, Some((&h.copy_done, next)))?;
+        /* The buffer holds no desktop frame. */
+        h.dirty.forget();
+        return Ok((back, next));
+    }
     /* Only the rows this buffer lacks go up. */
     let lacks = heads::Dirty::take(h, back);
     match renderer {
@@ -1062,7 +1105,7 @@ fn present_span(
 ) -> std::io::Result<()> {
     let mut up = Vec::with_capacity(group.len());
     for &k in group {
-        up.push(match direct {
+        up.push(match direct.filter(|_| !viewed::active()) {
             Some(d) => upload_direct(&mut heads[k], d, deadline_ns, enc)?,
             None => upload_head(&mut heads[k], None, desktop, desktop_w, deadline_ns, enc)?,
         });
@@ -1308,11 +1351,21 @@ fn headless_outputs() -> Vec<fresco_protocol::WmOutput> {
     out
 }
 
+/// The remote output's identity ("FEN").
+const REMOTE_OUTPUT_ID: u64 = 0x4645_4e00;
+
+/// `FRESCOD_HEADLESS_SEAT=1`: the headless outputs stand for a seat's
+/// monitors (a host with monitors of its own, for gates): while viewed
+/// they show the viewed screen, saved as `PNG-seat.png`.
+fn headless_seat() -> bool {
+    std::env::var("FRESCOD_HEADLESS_SEAT").is_ok_and(|v| v == "1")
+}
+
 /// A viewer's window or screen as the headless desktop's one output
 /// (fenestra.md §4.1): `w` x `h` device pixels at its scale.
 fn remote_output(w: u32, h: u32, scale_milli: u32) -> fresco_protocol::WmOutput {
     fresco_protocol::WmOutput {
-        output: 0, identity: 0x4645_4e00, rect: fresco_protocol::WmRect { x: 0, y: 0, w: w as i32, h: h as i32 },
+        output: 0, identity: REMOTE_OUTPUT_ID, rect: fresco_protocol::WmRect { x: 0, y: 0, w: w as i32, h: h as i32 },
         refresh_mhz: 60_000, present: true, scale_milli: fresco_protocol::output_scale(scale_milli, 1000), auto_scale_milli: scale_milli,
         ui_size_milli: 1000, ui_size_set: false, internal: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
     }
@@ -1362,6 +1415,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let redraw2 = redraw::RedrawSignal::new();
     lock::watch(comp.clone(), redraw2.clone());
     route::watch(redraw2.clone());
+    viewed::set_redraw(redraw2.clone());
+    let seat = headless_seat();
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
     if renderer.takes_pixels() {
@@ -1444,12 +1499,42 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     loop {
         /* A viewer's remote output (fenestra.md §4.1): with no monitor of
          * its own, the headless desktop takes the viewer's size and scale
-         * while its session is on, and its own outputs back after. */
-        if let Some(change) = split.as_ref().and_then(|b| b.take_output()) {
-            let outs = match change {
-                Some((w, h, s)) => vec![remote_output(w, h, s)],
-                None => headless_outputs(),
-            };
+         * while its session is on, and its own outputs back after. A
+         * host with a seat (FRESCOD_HEADLESS_SEAT=1 here: the outputs are
+         * its monitors) does the same, and its monitors show the viewed
+         * screen meanwhile (viewed.rs, decision 3); after the session the
+         * seat is locked before they show the desktop again. With
+         * FRESCOD_FENESTRA_LIVE=1 a seat keeps its own outputs. */
+        let mut apply: Option<Vec<fresco_protocol::WmOutput>> = None;
+        if let Some(b) = split.as_ref() {
+            if viewed::take_disconnect() {
+                b.disconnect();
+            }
+            let blank = seat && !viewed::live();
+            if blank {
+                let on = b.viewed();
+                match viewed::phase() {
+                    viewed::Phase::Viewed if !on => viewed::end(),
+                    p if on && p != viewed::Phase::Viewed => {
+                        let own = headless_outputs();
+                        let sw = own.iter().map(|o| (o.rect.x + o.rect.w) as u32).max().unwrap_or(W);
+                        let sh = own.iter().map(|o| o.rect.h as u32).max().unwrap_or(H);
+                        viewed::begin(sw, sh, own.first().map_or(1000, |o| o.scale_milli));
+                    }
+                    _ => {}
+                }
+            }
+            match b.take_output() {
+                Some(Some((w, h, s))) if !(seat && viewed::live()) => apply = Some(vec![remote_output(w, h, s)]),
+                Some(None) if !seat => apply = Some(headless_outputs()),
+                _ => {}
+            }
+            if blank && viewed::poll(lock::current().is_some()) {
+                apply = Some(headless_outputs());
+            }
+        }
+        if let Some(outs) = apply {
+            let remote = outs.first().is_some_and(|o| o.identity == REMOTE_OUTPUT_ID);
             let nw: u32 = outs.iter().map(|o| (o.rect.x + o.rect.w) as u32).max().unwrap_or(W);
             let nh: u32 = outs.iter().map(|o| o.rect.h as u32).max().unwrap_or(H);
             if (nw, nh) != (W, H) {
@@ -1464,7 +1549,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
                 fe.display_info()
             };
             screen::set(W, H, 60_000);
-            eprintln!("frescod-headless: {} {W}x{H} at scale {}", if change.is_some() { "the viewer's output:" } else { "own outputs again:" }, info.scale_milli);
+            eprintln!("frescod-headless: {} {W}x{H} at scale {}", if remote { "the viewer's output:" } else { "own outputs again:" }, info.scale_milli);
             let _ = ev_tx.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
                 width: info.width, height: info.height,
                 refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
@@ -1525,6 +1610,19 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         let mut rgba = vec![0u8; (W * H * 4) as usize];
         renderer.read_pixels(&mut rgba).map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
+        /* The seat's monitors: the viewed screen, or the desktop. */
+        if seat {
+            let (sw, sh, mut px) = viewed::picture().unwrap_or_else(|| (W, H, rgba.clone()));
+            if viewed::active() {
+                for p in px.chunks_exact_mut(4) { p.swap(0, 2); }
+            }
+            if let Some(img) = image::RgbaImage::from_raw(sw, sh, px) {
+                let (seat_out, tmp) = (format!("{png}-seat.png"), format!("{png}-seat.png.new"));
+                if img.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {
+                    let _ = std::fs::rename(&tmp, &seat_out);
+                }
+            }
+        }
         if let Some(img) = image::RgbaImage::from_raw(W, H, rgba) {
             let tmp = format!("{out}.new");
             if img.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {

@@ -29,7 +29,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
 [ "${FEN_SERVICE:-0}" = 1 ] && FEN_JAIL=1
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 5 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 19 || echo 15) + $([ "${FEN_SERVICE:-0}" = 1 ] && echo 5 || echo 0) + $([ "${FEN_WM:-0}" = 1 ] || [ -n "${FEN_OUTPUT:-}" ] && echo 0 || echo 1) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -65,8 +65,9 @@ cat >"$W/input.txt" <<'EOF'
 95 RESIZE 900 600
 EOF
 # Per app: at 100 s a click on Sheets' Data button opens its menu, a pop-up
-# that must arrive placed against its window.
-[ "${FEN_WM:-0}" = 1 ] || printf '100 MOVE 594 48\n100.2 BTN 1 1\n100.3 BTN 1 0\n' >>"$W/input.txt"
+# that must arrive placed against its window (at scale 1.0: with FEN_OUTPUT
+# the button is elsewhere, and the check is left out).
+[ "${FEN_WM:-0}" = 1 ] || [ -n "${FEN_OUTPUT:-}" ] || printf '100 MOVE 594 48\n100.2 BTN 1 1\n100.3 BTN 1 0\n' >>"$W/input.txt"
 fen_fenestrad
 "$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" --transport "${FEN_TRANSPORT:-auto}" ${FEN_OUTPUT:+--output "$FEN_OUTPUT"} \
     --reconnect-after 70 --idle-after 120 >"$W/view.log" 2>&1 &
@@ -107,7 +108,7 @@ if [ "${FEN_WM:-0}" = 1 ]; then
     check "a resize from the viewer refused on a WM's desktop" "1280 658" "$(awk '$1 == "placed" { print $5, $6; exit }' "$V")"
 else
     check "the app took the size the viewer's window was given" "900 600" "$(awk '$1 == "placed" { print $5, $6; exit }' "$V")"
-    check "the app's menu arrived as a pop-up of its window, drawn" yes "$(awk '$1 == "placed" && $8 == 2 && $7 == 1 { print $2 }' "$V" | while read p; do grep -q "^window $p " "$V" && echo yes; done | head -1)"
+    [ -n "${FEN_OUTPUT:-}" ] || check "the app's menu arrived as a pop-up of its window, drawn" yes "$(awk '$1 == "placed" && $8 == 2 && $7 == 1 { print $2 }' "$V" | while read p; do grep -q "^window $p " "$V" && echo yes; done | head -1)"
 fi
 if [ "${FEN_WM:-0}" = 1 ]; then
     check "the whole screen equal, the strip, focus ring and background included" equal "$(compare_all "$W/host.png")"
@@ -120,7 +121,7 @@ check "the typing reached the viewer (its desktop differs from the screen before
 check "the viewer's input changed the host's screen" yes "$(cmp -s "$W/host-middle.png" "$W/host-before.png" && echo no || echo yes)"
 check "input sent after the reconnect changed it again" yes "$(cmp -s "$W/host.png" "$W/host-middle.png" && echo no || echo yes)"
 ins=$(grep 'viewer [0-9] gone' "$W/fenestrad.log" | sed 's/.*inputs \([0-9]*\) dropped \([0-9]*\).*/\1:\2/' | tr '\n' ' ')
-check "the session passed on every input event, on both connections, none dropped" "11:0 $([ "${FEN_WM:-0}" = 1 ] && echo 10 || echo 13):0 " "$ins"
+check "the session passed on every input event, on both connections, none dropped" "11:0 $([ "${FEN_WM:-0}" = 1 ] || [ -n "${FEN_OUTPUT:-}" ] && echo 10 || echo 13):0 " "$ins"
 grep 'fenestra-session' "$W/fenestrad.log" | tail -5
 check "the viewer reconnected" yes "$(grep -c 'connected to' "$W/view.log" | awk '{ print ($1 >= 2) ? "yes" : "no (" $1 ")" }')"
 r2=$(grep 'viewer 2 gone' "$W/fenestrad.log" | sed 's/.*resumed \([0-9]*\) resent \([0-9]*\).*/\1 \2/')

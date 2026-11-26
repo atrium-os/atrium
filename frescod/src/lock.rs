@@ -25,7 +25,7 @@ pub fn locked() -> bool {
     LOCKED.load(Ordering::Relaxed)
 }
 
-fn seat_path() -> String {
+pub fn seat_path() -> String {
     std::env::var("FRESCOD_SEAT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| portcullis_peer::seat::ACTIVE_SESSION.to_string())
 }
 

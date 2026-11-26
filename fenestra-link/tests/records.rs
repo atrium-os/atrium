@@ -25,6 +25,7 @@ fn samples() -> Vec<Rec> {
         Rec::Input(Input::MotionIn { window: 3, x: 10.5, y: 0.0 }),
         Rec::Input(Input::Focus { window: 3 }),
         Rec::Input(Input::Resize { window: 3, width: 900, height: 600 }),
+        Rec::Disconnect,
     ]
 }
 
@@ -100,6 +101,12 @@ fn hostile_records_are_refused() {
         Rec::Output { width: 63, height: 900, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 9000, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 900, scale_milli: 4001 }.encode(),
+        {
+            // A Disconnect that carries anything.
+            let mut b = Rec::Disconnect.encode();
+            b[8] = 1;
+            b
+        },
         {
             // A chrome whose rect names a colour it does not have.
             let c = fenestra_link::chrome::Chrome::from_rects([0; 3], (9, 9), [([0.0, 0.0, 9.0, 9.0], [0.1, 0.1, 0.1, 1.0], 0.0)]).unwrap();
