@@ -196,8 +196,8 @@ on those outputs into scanout, each renderer jail emits its window's scene as a 
  ┌─────────────────────────────┐ records                  ▼
  │ frescod broker (no network) │◄────────────────┐ ┌──────────────────┐ QUIC over UDP   ┌────────────────────┐
  │ windows, z, focus, outputs, │  input, acks,   └─┤ fenestrad (jail, ├────────────────►│ fenestra-net (jail,│
- │ input routing, chrome       │  output changes   │ own uid, one     │◄────────────────┤ own uid, connect   │
- └─────────────────────────────┘                   │ listen port)     │  input, acks    │ only)              │
+ │ input routing, chrome       │  output changes   │ fenestra-session │◄────────────────┤ own uid, connect   │
+ └─────────────────────────────┘                   │ (jail/session)   │  input, acks    │ only)              │
                                                    └──────────────────┘                 └─────────┬──────────┘
                                                                                                   │ per window
                                                                                                   ▼
@@ -227,14 +227,20 @@ on those outputs into scanout, each renderer jail emits its window's scene as a 
   ring that the broker hands to `fenestrad`. The writer serialises from the renderer's own
   validated structures, never by copying the client's bytes, so only canonical records leave
   the jail.
-- **fenestrad** is a new jailed daemon, its own uid (`_fenestra`), no filesystem but its socket
-  directory, a `listen` grant on a small UDP port range (background-apps.md: local network by
-  default, wider only by the person's choice). There is **no standing listener**: a port is
-  opened only by a successful SSH mint, for that one session (Stoa's per-session port model,
-  stoa.md §2), and closed when the session ends (§11.9). It terminates QUIC, authenticates the session (§11.2),
-  schedules what to send (§8), runs the fallback encoders in a child jail (§7.4), and carries
-  input and acks back to frescod as fixed-size records. It parses nothing but its own transport
-  framing and the viewer's fixed-size input and ack records.
+- **fenestrad** is a new jailed daemon, its own uid (`_fenestra`), with **no network** and no
+  filesystem but its socket directory. It takes mints from `aqueduct-shell` (§11.2), keeps the
+  session table, starts and ends the per-session network jails, runs the fallback encoders in
+  child jails (§7.4), and passes input and acks to frescod. It reads only fixed-size records,
+  from frescod, from renderers' rings and from session jails.
+- **fenestra-session** is one jail per session, started by `fenestrad` through portcullisd for a
+  successful mint, its own uid per session, no filesystem, a `listen` grant on **one** UDP port
+  from a small range (background-apps.md: local network by default, wider only by the person's
+  choice). It holds that one session's keys and nothing else, terminates QUIC, checks the
+  handshake (§11.2), schedules what to send (§8), and turns the viewer's input and acks into
+  fixed-size records for `fenestrad`. There is **no standing listener**: the port exists only
+  while the session does (§11.9). A bug in quinn or rustls therefore gives an attacker one
+  session's jail, which holds no other session's keys, cannot mint, and can inject only the
+  bounded input records that session's capabilities allow.
 
 ### 3.3 The viewer side
 
@@ -686,7 +692,7 @@ Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet
 | **Address change** (Wi-Fi to wired, roaming between access points, NAT rebinding) | QUIC connection migration, path validation, congestion state reset for the new path. | Usually nothing; at worst a short "reconnecting". |
 | **Flapping link** | Degrade ladder steps down at once and up only after 10 s of stable rate (hysteresis). Grace period means windows never move home on a flap. A reconnect never resends full state when acked versions are valid. | Quality settles instead of oscillating. |
 | **Bufferbloat** (a full upload elsewhere on the same link) | Delay-based congestion control keeps bytes in flight near the bandwidth-delay product; Fenestra itself never adds a queue. RTT rise is the signal to step down. | Latency stays near the base RTT instead of growing to seconds. |
-| **UDP blocked** (some corporate and hotel networks) | Fallback: the session's streams run over TLS over TCP to the same port family (or through the SSH connection itself as a last resort), with media datagrams turned into a single latest-frame-wins stream. Head-of-line blocking returns, so the stats panel says "TCP fallback". Concursus's relay (R9) covers networks that allow only 443. | Works, with more latency under loss; marked. |
+| **UDP blocked** (some corporate and hotel networks) | Fallback: the session's streams run over TLS 1.3 over TCP on the same per-session port, with the same pinned raw public keys and `K_sess` proof (or, last resort, tunnelled through the SSH connection itself, still inside that same pinned TLS), with media datagrams turned into a single latest-frame-wins stream. Head-of-line blocking returns, so the stats panel says "TCP fallback". Concursus's relay (R9) covers networks that allow only 443. | Works, with more latency under loss; marked. |
 | **Tiny uplink** (asymmetric mobile) | The viewer sends only input, acks and stats: a few kbit/s. | No effect. |
 
 ## 9. Input
@@ -702,24 +708,51 @@ Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet
 - Input becomes ordinary host input in frescod, injected as from a Tactus device with the
   session's device ids. It is routed by the host's compositor-owned geometry (H7). A view-only
   session sends no input at all; the viewer's frescod does not even forward it.
-- **Remote presses are not local presses for everything.** frescod tags every input event with
-  its source (seat or a session id). Presses from a full-input session mint activation tokens
-  (tabula.md §2) for ordinary purposes (paste, open, pick a file), since a remote person is the
-  person (aqueduct-remote.md §1). They do **not** satisfy the purposes that grant authority:
-  Arca approvals, Curia and Portcullis grant sheets (`background allow`, `listen allow`, app
-  permissions), the unlock sheet, Fenestra's own host settings, and pairing. Those need either
-  a press on the host's own seat or a security-key touch through Sigillum on the viewer (a FIDO
-  assertion relayed to the host's sigillumd, bound to that sheet). A stolen viewer key then
-  gives the session's use, but not the power to widen it.
+- **Remote presses count only for an allowlist of ordinary purposes.** frescod tags every
+  input event with its source (seat or a session id). Activation tokens (tabula.md §2) carry a
+  purpose, and a press from a full-input session mints tokens only for purposes on a fixed
+  **allowlist**: paste, open a link or file in an app, a choice in the file picker, share,
+  print, drag and drop, window focus and raise. Every other purpose, including every sheet added
+  later unless it is put on the list in review, **denies remote presses by default**: Arca
+  approvals, Curia and Portcullis grant sheets (`background allow`, `listen allow`, app
+  permissions), the unlock sheet, Fenestra's own host settings, pairing, Sigillum PIN entry.
+- **Authority sheets raised by a remote session need a security-key touch on the viewer.**
+  Such a sheet is shown only on that session's remote outputs, never on the host's seat
+  monitors, so nobody at the host's desk can press it for the remote person; a seat press only
+  counts for sheets the seat itself raised. The sheet is drawn by the host's trusted chrome with
+  "Requested from <viewer device>, remote" in its purpose text. The person satisfies it with a
+  FIDO touch through Sigillum on the viewer, relayed as follows: the host sends only a sheet id
+  and a 32-byte nonce; the viewer's sigillumd builds the relying-party id itself from the
+  **pinned host identity** (`fenestra:<host key fingerprint>`, a per-host RP the viewer
+  registered at first connect) and the client data from that RP, the nonce and the sheet id, and
+  never signs for an RP id or client data the host supplied. A hostile host can therefore never
+  obtain an assertion for the viewer's own unlock RP, for a web RP, or for another host. A
+  headless host has no seat, so for it the key touch is the only path; a person without a
+  security key cannot approve authority sheets remotely and gets a refusal that says why. A
+  stolen viewer key gives the session's use, but not the power to widen it.
 - **A scoped session's input stays in scope.** For `scope = "app:<id>"` or `"window:<id>"`,
-  frescod routes the session's input only to windows in scope; it never reaches system sheets,
-  chrome, the WM or windows outside the scope, even if one is on top. Anything else is dropped
-  and counted.
+  frescod routes the session's input only to windows in scope; it never reaches chrome, the WM
+  or windows outside the scope, even if one is on top. Anything else is dropped and counted.
+  What is in scope:
+  - `window:<id>`: that window only. No popups of other windows, no system sheets at all (the
+    file picker, share and print sheets are not shown and the app's request for them is
+    refused for that viewer), no notifications, no audio. It is a viewing scope.
+  - `app:<id>`: that app's windows and popups; its notifications and audio only. System sheets
+    the app raises (picker, share, print) are shown in scope **only if the mint sets
+    `sheets = true`** (default false), because the picker shows the persona's files beyond the
+    app's own. Authority sheets follow the key-touch rule above.
 - Every input record is fixed-size, bounded and rate-limited (at most one pointer motion per
   viewer frame, a key-event cap per second); `fenestrad` drops a viewer that exceeds the caps.
 - Local shortcuts on the viewer (switch away, release the keyboard, leave full screen) are
   caught by the viewer's frescod first and never sent; a "send keys to host" mode in full
-  screen sends everything except one escape chord.
+  screen sends everything except the **secure attention key**: one chord the viewer's frescod
+  handles below every client and never forwards (the same key that brings up the viewer's own
+  lock and switcher), so a host can never trap the person in a full-screen session.
+- **Full screen keeps an edge strip.** Even in full screen the viewer's frescod draws a thin
+  host-coloured strip along one edge (default top, 4 px, the host's colour, the name on hover),
+  so a host painting a fake viewer lock screen or Arca sheet across the whole display is still
+  visibly remote. The viewer's own lock screen and sheets are never shown without first leaving
+  the remote area, and they appear only after the secure attention key or a local event.
 
 ## 10. Audio, clipboard, files
 
@@ -734,8 +767,13 @@ Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet
   pastes (the paste on one side asks the other side for the bytes), so the clipboard is not
   streamed. **Viewer to host** is the dangerous direction (a compromised host could claim a
   paste at any time and pull whatever the person copied on the viewer): the viewer releases its
-  clipboard bytes only within a short window (one second) after it forwarded a paste gesture
-  (the paste shortcut or a press on a paste control) to that session, once per gesture. Host to
+  clipboard bytes only to a request that **cites the input sequence number** of an input event
+  the viewer forwarded within the last second and itself classified as a paste gesture: the
+  viewer's own paste chord in its own layout, or a press the host's trusted chrome marked as a
+  paste control. One release per cited event. A key that is a paste chord to the viewer but
+  something else to the host app (vim, another layout) can at most release the clipboard once,
+  for that keystroke, which the person made; a request citing any other event, or none, is
+  refused. Host to
   viewer needs a paste gesture on the viewer, as for any app. This is the channel Check Point used against RDP clients, so the viewer's Tabula
   treats remote clipboard data like any untrusted input and paths are never interpreted.
 - **Files.** Not a Fenestra feature. Drag and drop of files between viewer and host goes
@@ -808,10 +846,14 @@ Rules (each one is checked in §11.18):
   pairing mints a device key in the viewer's Arca and registers its public half on the host
   through a code shown on the host's own screen and typed on the viewer (or a QR code); the host
   keeps paired device keys per persona in Arca, revocable in Curia and `fenestra devices`.
-  Paired devices mint the same session token; the PSK binding is unchanged.
-- **What `fenestrad` keeps.** Per session: `H(K_sess)` to check handshake proofs
-  (aqueduct-remote.md §6), the two pinned public keys, and its session private key, all in
-  memory only. `K_sess` itself is not stored.
+  Paired devices mint the same session token, and the key pinning is unchanged (the device key
+  is the pinned viewer key). Pairing details are in §11.2a.
+- **What the host keeps.** The binding that matters is the pinned keys; the `K_sess` proof ties
+  the aqueduct session token to this TLS connection. Checking an HMAC needs `K_sess` itself, so
+  the session's `fenestra-session` jail holds `K_sess`, the two pinned public keys and its
+  session private key **in memory only**, for the session's life, and nothing is written at
+  rest (aqueduct-remote.md §6's "store only `H(K_sess)`" is about at-rest records; Fenestra has
+  none). `K_sess` crosses the network only inside the SSH channel, at mint.
 - **Reconnect** within the token's expiry is a new QUIC handshake with the same pinned keys and
   a fresh `K_sess` proof; after expiry the viewer re-mints over SSH. If `fenestrad` restarts,
   its session keys are gone with it, so the viewer re-mints over SSH and resumes from version 0
@@ -829,13 +871,35 @@ Rules (each one is checked in §11.18):
   64 MiB, or that has not acked for 30 s while data waits, is dropped and must reconnect
   (from version 0).
 
+### 11.2a Pairing a device without SSH (R9)
+
+Pairing needs a listener before any key is pinned, which is the one exception to "no standing
+listener", so it is narrow:
+
+- It starts only from a **press on the host's own seat** ("Pair a device" in Fenestra's host
+  settings, or `fenestra pair` run from a seat session, which raises that sheet). A remote
+  session cannot start pairing (it is not on the allowlist, §9), so a stolen viewer cannot pair
+  more devices. A headless host pairs only over SSH (a device that can do SSH), never by code.
+- The sheet shows a pairing code **only on seat monitors**, never on remote outputs: 10
+  characters of base32 (50 bits), valid for 2 minutes, and a QR code of the same.
+- For those 2 minutes one `fenestra-session`-shaped pairing jail listens on one port and runs a
+  PAKE keyed by the code (SPAKE2, from a permissive crate chosen by the licence audit), so the
+  code itself never crosses the network and an offline guess is impossible. Three failed
+  attempts close the port and void the code.
+- On success the viewer's new device public key (its private half made in the viewer's Arca) is
+  stored in the host persona's Arca with the name typed on the host's sheet (32 characters,
+  sanitised as in §11.4), and the host's public key is pinned on the viewer. Later sessions from
+  that device mint through a signed request to that device key instead of SSH, and are pinned
+  exactly as in §11.2.
+
 ### 11.3 Jails, uids and grants
 
 | Process | Machine | uid | Network | Filesystem | Parses |
 |---|---|---|---|---|---|
 | frescod broker | host | `_frescod` | none (unchanged) | none | fixed records from `fenestrad` |
 | fresco-renderer | both | `_fresco-render` | none | none | client wire (host); scene stream (viewer) |
-| `fenestrad` | host | `_fenestra` | `listen` on a port range, one port per minted session, local network unless widened | its socket dir | QUIC framing; fixed input and ack records |
+| `fenestrad` | host | `_fenestra` | none | its socket dir | fixed records only (mints, session jails, frescod) |
+| `fenestra-session` | host | one per session | `listen` on one UDP port of the range, local network unless widened | none | QUIC and TLS framing, handshake proof, viewer input and ack records |
 | `fenestra-enc` | host | `_fenestra-enc` | none | none | its memfd ring (pixels, no structure) |
 | `fenestra-net` | viewer | per viewing persona | outbound UDP to one host address | none | QUIC framing; stream demux |
 | decoder workers | viewer | player's decoder uid | none | none | compressed video (hostile) |
@@ -849,8 +913,9 @@ portcullisd for Fenestra: the jails use existing manifest grants (AGENTS.md revi
 ### 11.4 The host always shows that it is being viewed
 
 When a viewer is attached to a session, the host's frescod draws a trusted indicator in the
-chrome lane (F4d) on every local monitor of that session: who (key comment or paired device
-name), view-only or full control, and a one-press Disconnect. The bar shows it too, but the
+chrome lane (F4d) on every local monitor of that session: who (the SSH key's comment or the paired device name, both from the host's own records, never
+from the viewer at connect time, cut to 32 characters, printable characters only, shown as
+plain text), view-only or full control, and a one-press Disconnect. The bar shows it too, but the
 indicator is frescod's, so an app cannot cover or fake its absence (H7). A host with the screen
 locked (decision 3) shows the indicator on the lock screen.
 
@@ -872,10 +937,10 @@ H7 applies across the network:
 
 - Session capabilities from aqueduct-remote.md §4: `input = "full" | "none"`, `scope =
   "session" | "app:<id>" | "window:<id>"`, `clipboard`, plus Fenestra's `audio`, `microphone`
-  and `layout` keys. A scoped session's remote outputs show only the windows in scope; the
+  `layout` and `sheets` keys (§9). A scoped session's remote outputs show only the windows in scope; the
   host's renderer for other apps never emits a stream for that viewer.
 - `fenestra sessions` and `fenestra revoke <id>` on the host (and the indicator's Disconnect)
-  end a session at once: `fenestrad` closes the connection and forgets the PSK; the remote
+  end a session at once: `fenestrad` ends the session's `fenestra-session` jail, and its keys go with it; the remote
   outputs go and Forum moves the windows back to local monitors (or keeps them parked on a
   headless host).
 - Chained remoting (viewing a host from a session that is itself remote) needs a fresh consent
@@ -903,10 +968,10 @@ Every place one machine parses bytes the other wrote, where it runs, and how it 
 
 | Parser | Runs on | In | Input from | Bounded by | Test |
 |---|---|---|---|---|---|
-| QUIC + TLS handshake (quinn, rustls) | host | `fenestrad` | anyone who can reach an open per-session port | rustls/quinn limits; port open only after a mint; handshake rate limit per source (§11.10) | upstream fuzzing; R3 handshake flood |
+| QUIC + TLS handshake (quinn, rustls) | host | `fenestra-session` (one per session) | anyone who can reach an open per-session port | rustls/quinn limits; port open only after a mint; handshake rate limit per source (§11.10) | upstream fuzzing; R3 handshake flood |
 | QUIC + TLS handshake | viewer | `fenestra-net` | the host address the mint named | same | same |
-| `SESSION_HANDSHAKE` proof | host | `fenestrad` | authenticated peer | fixed size | unit tests, wrong-proof gate |
-| Input, ack and stats records | host | `fenestrad`, then frescod | the viewer | fixed size, every field ranged, rate caps (§9) | `fenestra-split-fuzz` style fuzzer on fenestrad's records |
+| `SESSION_HANDSHAKE` proof | host | `fenestra-session` | authenticated peer | fixed size | unit tests, wrong-proof gate |
+| Input, ack and stats records | host | `fenestra-session`, re-checked as fixed records by `fenestrad`, then frescod | the viewer | fixed size, every field ranged, rate caps (§9) | `fenestra-split-fuzz` style fuzzer on fenestrad's records |
 | Scene stream records | viewer | fresco-renderer (full validator, H1 to H6, F4h budgets) | the host | per-client budgets, cost limits | stream fuzzer (R1), R3 hostile-host gate |
 | Blobs (images, atlases, fills) | viewer | fresco-renderer | the host | size caps per class, hash checked (H2) | same |
 | Image decoding (if the host sends encoded images) | viewer | the existing jailed image decoder (`org.atrium.image-decode`) | the host | its own caps | its own fuzzers |
@@ -922,12 +987,13 @@ opens on the host, never on the viewer).
 
 ### 11.9 Network exposure on the host
 
-- `fenestrad` has no open port while no session exists. A successful SSH mint opens one UDP
-  port from its range for that session, bound to the address family the mint came in on, and
-  `fenestrad` accepts on it only a QUIC handshake presenting the viewer key pinned in that mint.
+- No port is open while no session exists. A successful SSH mint makes `fenestrad` start that
+  session's `fenestra-session` jail with one UDP port from the range, bound to the address
+  family the mint came in on, and it accepts only a QUIC handshake presenting the viewer key
+  pinned in that mint.
   The port closes when the session ends, is revoked, or its token expires with no connection.
 - A minted port with no successful handshake within 30 s is closed and the mint is void.
-- QUIC address validation (Retry tokens) is on, so a spoofed source cannot make `fenestrad`
+- QUIC address validation (Retry tokens) is on, so a spoofed source cannot make the session jail
   send large responses (no amplification); stateless reset tokens are per session.
 - The grant is local network by default. Widening it to "any network" is a Curia setting with
   a warning, and `fenestra host status` says which it is.
@@ -938,8 +1004,10 @@ opens on the host, never on the viewer).
 ### 11.10 Denial of service and resource limits
 
 Host:
-- Sessions, viewers and backlog bounds as in §11.2. Handshake attempts: 10 a minute per source
-  address per port, then the port closes.
+- Sessions, viewers and backlog bounds as in §11.2. Handshake attempts are counted only **after**
+  Retry address validation (so spoofed floods cannot close a real session's port): 10 failed
+  validated handshakes a minute per source address, then that source is refused for the rest of
+  the mint window; 30 from all sources and the port closes and the mint is void.
 - Diffing for a viewer runs in that client's renderer jail and counts against the renderer's
   CPU limit, so a viewer that forces full resyncs slows only the app's own remote view, never
   the local seat's compose or other apps.
@@ -1040,12 +1108,18 @@ correlated alert. `fenestra sessions --history` shows the last 100 on the host.
 1. frescod has no network and never reads network bytes.
 2. Every parser of the other machine's bytes runs in a jail with no network it does not need,
    no files and no secrets (§11.8).
-3. The host has no listening port without a live mint.
+3. The host has no listening port without a live mint, except a seat-started pairing port for
+   2 minutes (§11.2a); the process that parses network bytes holds one session's keys only.
 4. The QUIC peer key is pinned through SSH; no certificate, no trust on first use, no 0-RTT.
-5. `K_sess` is never stored or sent; only `H(K_sess)` and in-memory session keys exist.
-6. Remote presses never satisfy authority purposes; scoped input never leaves its scope.
-7. Viewer clipboard bytes leave only right after a forwarded paste gesture.
-8. Remote content can never take a viewer trusted role and always carries the host strip.
+5. `K_sess` crosses the network only inside SSH, lives only in the memory of that session's
+   `fenestra-session` jail and the viewer's `fenestra-net`, and is never written at rest.
+6. Remote presses mint tokens only for allowlisted purposes; authority sheets raised remotely
+   are shown only to that viewer and need a key touch whose RP and client data the viewer built;
+   scoped input never leaves its scope.
+7. Viewer clipboard bytes leave only to a request citing a forwarded paste gesture's input
+   sequence number, once per gesture.
+8. Remote content can never take a viewer trusted role and always carries the host strip, in
+   full screen too; the secure attention key is never forwarded.
 9. The host always shows that it is being viewed, drawn by frescod.
 10. Personal data at rest on the viewer lives only in the viewing persona's key group.
 11. Every count, size and rate from the other side is bounded before it is buffered.
@@ -1117,7 +1191,7 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
 | 5. Apps stop speaking the command protocol | RDP orders, SPICE QXL, X11 | Atrium apps already speak Fresco and nothing else; frescod refuses foreign vocabularies. The fallback is per region, so one 3D viewport does not turn the whole window into video (§7.2). |
 | 6. Round trips on the drawing path | X11 | No request in the stream waits for the viewer; text measurement and shaping are in the app (resolution-independence.md, pergola). Cursor, animation, scrolling and rootless window management are local (§6.2, §6.3). |
 | 7. Stale frames under congestion | TCP protocols | Diff against acked state, skip intermediates; QUIC streams per window; datagrams for media (§5.2, §8). |
-| 8. Unconfined viewers, weak auth, side channels | VNC and RDP CVEs, Reverse RDP | Every host-supplied byte is parsed in an empty jail on the viewer; SSH-anchored PSK, no passwords; clipboard by paste only, no file paths, no device redirection; trusted host strip and host indicator (§11). |
+| 8. Unconfined viewers, weak auth, side channels | VNC and RDP CVEs, Reverse RDP | Every host-supplied byte is parsed in an empty jail on the viewer; peer keys pinned over SSH, no passwords; clipboard by paste only, no file paths, no device redirection; trusted host strip and host indicator (§11). |
 
 ## 17. Decisions for Shankar
 
@@ -1233,7 +1307,7 @@ VM runs only with the coordinator's go.
   https://parsec.app/blog/a-networking-protocol-built-for-the-lowest-latency-interactive-game-streaming-1fd5a03a6007
 - K. Winstein, H. Balakrishnan, *Mosh: An Interactive Remote Shell for Mobile Clients*, USENIX
   ATC 2012: https://mosh.org/mosh-paper.pdf
-- RFC 9000 (QUIC), RFC 9221 (QUIC datagrams), RFC 8446 §2.2 (TLS 1.3 PSK with (EC)DHE).
+- RFC 9000 (QUIC), RFC 9221 (QUIC datagrams), RFC 7250 (raw public keys in TLS), RFC 8446 (TLS 1.3).
 
 ## 21. Review log
 
@@ -1250,3 +1324,22 @@ VM runs only with the coordinator's go.
   key and re-hashed from disk (§5.4). Local screen blanked by default while viewed (decision 3).
 - Low: what `fenestrad` stores and reconnect after its restart (§11.2); passthrough named as
   decision 9's exception; §6.1 marked as structural, not a measurement.
+
+2026-11-26, review thread, security-only pass on 95c7d92 (asked by Shankar). Verdict: sound once
+the three high findings are fixed. All folded in:
+
+- High: network parsing moved out of `fenestrad` into a per-session `fenestra-session` jail
+  holding one session's keys (§3.2, §11.3, §11.8, §11.9). Remote presses count only for an
+  allowlist of ordinary purposes, so new sheets deny by default; headless hosts need a key touch
+  (§9). The FIDO relay has the viewer build the RP id and client data from the pinned host
+  identity, taking only a nonce and a sheet id (§9).
+- Medium: full screen keeps an edge strip and a never-forwarded secure attention key (§9).
+  Pairing starts only from a seat press, the code shows only on seat monitors, 50-bit code with
+  a PAKE and 3 attempts (§11.2a). Scopes spell out sheets, popups, notifications and audio (§9).
+  `K_sess` handling corrected: held in memory by the session jail, crosses only inside SSH
+  (§11.2, invariant 5). Clipboard released only to a request citing a forwarded paste gesture's
+  input sequence (§10).
+- Low: handshakes counted after Retry validation (§11.10); names in host chrome bounded and
+  sanitised from the host's own records (§11.4); TCP and SSH fallback keep the same pinned TLS
+  and per-session port (§8.6); remotely raised authority sheets show only on that viewer's
+  outputs (§9).
