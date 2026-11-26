@@ -184,6 +184,14 @@ pub enum DataCmd {
     AutoFitCols,
     /// The cursor's formula brought to a value by changing one input cell.
     GoalSeek,
+    /// The typed-bar tools of [`crate::whatif`]: iterative calculation for
+    /// circular formulas, Subtotal, Advanced Filter, Consolidate and the
+    /// What-If Data Table.
+    Iteration,
+    Subtotal,
+    AdvancedFilter,
+    Consolidate,
+    DataTable,
     /// Formulas at the cursor reading the cells last copied, one for each.
     PasteLink,
     /// The selection's text centred across its columns without merging
@@ -507,6 +515,11 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
         (MenuItem::new("Calculate Sheet").shortcut("Shift+F9"), Some(DataCmd::CalculateSheet)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
+        (MenuItem::new("Data Table…").enabled(nr > 1 && nc > 1), Some(DataCmd::DataTable)),
+        (MenuItem::new("Iterative Calculation…").checked(wb.iteration().is_some()), Some(DataCmd::Iteration)),
+        (MenuItem::new("Subtotal…").enabled(some).separated(), Some(DataCmd::Subtotal)),
+        (MenuItem::new("Advanced Filter…").enabled(some), Some(DataCmd::AdvancedFilter)),
+        (MenuItem::new("Consolidate…"), Some(DataCmd::Consolidate)),
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
         v.insert(i + 1, (MenuItem::new("Freeze Top Row"), Some(DataCmd::FreezeTopRow)));
@@ -1603,7 +1616,7 @@ pub fn remove_duplicates(d: &mut Doc, sel: CellRange, cursor: (u32, u32), by: Op
 
 /// The columns of `rect` that `spec` lists: letters or headers (of table
 /// `t`'s first row), separated by commas.
-fn columns_named(d: &Doc, t: &Target, rect: Rect, spec: &str) -> Result<Vec<u32>, String> {
+pub(crate) fn columns_named(d: &Doc, t: &Target, rect: Rect, spec: &str) -> Result<Vec<u32>, String> {
     let header = |c: u32| t.header.then(|| d.wb.formatted(CellAddr::new(rect.sheet, t.rect.r0, c)).text.trim().to_lowercase());
     let mut cols = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -2939,7 +2952,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

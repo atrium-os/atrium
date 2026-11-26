@@ -26,7 +26,7 @@ mod matrix;
 mod complex;
 mod mathx;
 mod spread;
-mod database;
+pub mod database;
 mod textmore;
 mod convert;
 mod groupby;

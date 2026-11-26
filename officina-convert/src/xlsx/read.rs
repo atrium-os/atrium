@@ -1375,6 +1375,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     let mut external_ids = Vec::new();
     // Defined names: (name, sheet index it is local to, formula text).
     let mut names: Vec<(String, Option<u32>, String)> = Vec::new();
+    let mut iteration: Option<officina_grid::book::Iteration> = None;
     {
         let mut r = xml(&wb_xml);
         let mut buf = Vec::new();
@@ -1408,6 +1409,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                             }).or_insert(Some(rel));
                         }
                     }
+                    b"calcPr" if attr(&e, b"iterate")?.is_some_and(|v| v == "1" || v == "true") => {
+                        // ECMA-376's defaults: 100 times, 0.001.
+                        let count = attr(&e, b"iterateCount")?.and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
+                        let change = attr(&e, b"iterateDelta")?.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.001);
+                        iteration = Some(officina_grid::book::Iteration { count, change });
+                    }
                     b"workbookPr" => out.date1904 = attr(&e, b"date1904")?.is_some_and(|v| v == "1" || v == "true"),
                     b"definedName" => {
                         let name = attr(&e, b"name")?.unwrap_or_default();
@@ -1438,6 +1445,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     use officina_grid::eval::dates::DateSystem;
     let system = if out.date1904 { DateSystem::Excel1904 } else { DateSystem::Excel1900 };
     let mut wb = Workbook::with_date_system(system);
+    if let Some(it) = iteration {
+        if !wb.set_iteration(Some(it)) {
+            out.report.note(Kind::Dropped, "iteration settings");
+        }
+    }
     for (name, _) in &sheets {
         // Names Excel allows and we don't get a safe stand-in.
         let mut n: String = name.chars().filter(|c| !"[]:*?/\\".contains(*c)).collect();

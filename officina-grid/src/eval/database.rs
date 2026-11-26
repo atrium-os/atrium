@@ -74,31 +74,41 @@ fn select(c: &Ctx, a: &[Expr]) -> Result<Vec<Option<Value>>, ErrorKind> {
         }),
     };
     let crit = c.to_array(c.eval(&a[2]))?;
-    if crit.rows < 2 {
-        return Err(ErrorKind::Value);
-    }
-    // Each criteria row: (database column, criterion) pairs.
-    let mut rows: Vec<Vec<(usize, Criterion)>> = Vec::new();
-    for r in 1..crit.rows {
-        let mut conds = Vec::new();
-        for j in 0..crit.cols {
-            let Some(cr) = criterion(&crit.vals[r * crit.cols + j]) else { continue };
-            // A condition under a label that isn't a field (Excel's computed
-            // criteria) isn't supported.
-            let name = label(&crit.vals[j]).ok_or(ErrorKind::Value)?;
-            let col = (0..db.cols).find(|&k| same_label(&db.vals[k], &name)).ok_or(ErrorKind::Value)?;
-            conds.push((col, cr));
-        }
-        rows.push(conds);
-    }
+    let picked = picks(&db.vals, db.cols, &crit.vals, crit.cols).ok_or(ErrorKind::Value)?;
     let mut out = Vec::new();
-    for r in 1..db.rows {
-        let rec = &db.vals[r * db.cols..(r + 1) * db.cols];
-        if rows.iter().any(|conds| conds.iter().all(|(col, cr)| cr.test(&rec[*col]))) {
-            out.push(field.map(|f| rec[f].clone()));
-        }
+    for (r, _) in picked.iter().enumerate().filter(|p| *p.1) {
+        let rec = &db.vals[(r + 1) * db.cols..(r + 2) * db.cols];
+        out.push(field.map(|f| rec[f].clone()));
     }
     Ok(out)
+}
+
+/// Which records (the rows after the first) of the database `db`, `cols`
+/// wide with its field names first, the criteria range `crit` (`ccols`
+/// wide, labels first) picks: every condition of one criteria row holds,
+/// for any row. `None` when the criteria are malformed: fewer than two
+/// rows, or a condition under a label that names no field (Excel's
+/// computed criteria aren't supported). Advanced Filter shares it.
+pub fn picks(db: &[Value], cols: usize, crit: &[Value], ccols: usize) -> Option<Vec<bool>> {
+    if cols == 0 || ccols == 0 || db.len() < cols || crit.len() < 2 * ccols {
+        return None;
+    }
+    let (rows, crows) = (db.len() / cols, crit.len() / ccols);
+    let mut conds_by_row: Vec<Vec<(usize, Criterion)>> = Vec::new();
+    for r in 1..crows {
+        let mut conds = Vec::new();
+        for j in 0..ccols {
+            let Some(cr) = criterion(&crit[r * ccols + j]) else { continue };
+            let name = label(&crit[j])?;
+            let col = (0..cols).find(|&k| same_label(&db[k], &name))?;
+            conds.push((col, cr));
+        }
+        conds_by_row.push(conds);
+    }
+    Some((1..rows).map(|r| {
+        let rec = &db[r * cols..(r + 1) * cols];
+        conds_by_row.iter().any(|conds| conds.iter().all(|(col, cr)| cr.test(&rec[*col])))
+    }).collect())
 }
 
 fn numbers(v: &[Option<Value>]) -> Vec<f64> {

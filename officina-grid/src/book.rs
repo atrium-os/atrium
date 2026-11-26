@@ -184,8 +184,32 @@ impl LookupIndex {
 
 type LookupKey = (u16, u32, u32, u32);
 
+/// Iterative calculation (Excel's File ▸ Options ▸ Formulas): cells on a
+/// circular reference are calculated over and over, up to `count` times or
+/// until no number changes by more than `change`, instead of being
+/// `#CIRC!`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Iteration {
+    pub count: u32,
+    pub change: f64,
+}
+
+impl Iteration {
+    /// The most times Excel iterates.
+    pub const MAX_COUNT: u32 = 32_767;
+    /// Excel's defaults: 100 times, 0.001.
+    pub const DEFAULT: Iteration = Iteration { count: 100, change: 0.001 };
+
+    /// Whether the settings are ones a file may hold: 1 to 32,767 times,
+    /// a finite change of 0 or more.
+    pub fn valid(&self) -> bool {
+        (1..=Self::MAX_COUNT).contains(&self.count) && self.change.is_finite() && self.change >= 0.0
+    }
+}
+
 pub struct Workbook {
     pub(crate) date_system: crate::eval::dates::DateSystem,
+    pub(crate) iteration: Option<Iteration>,
     pub(crate) sheets: Vec<Sheet>,
     pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
@@ -245,6 +269,7 @@ impl Workbook {
     pub fn with_date_system(date_system: crate::eval::dates::DateSystem) -> Self {
         Workbook {
             date_system,
+            iteration: None,
             sheets: Vec::new(),
             tracked_cells: None,
             strings: StringPool::new(),
@@ -982,6 +1007,25 @@ impl Workbook {
 
     pub fn date_system(&self) -> crate::eval::dates::DateSystem {
         self.date_system
+    }
+
+    /// Iterative calculation, when on.
+    pub fn iteration(&self) -> Option<Iteration> {
+        self.iteration
+    }
+
+    /// Turns iterative calculation on (with its settings) or off, and marks
+    /// every formula for calculation. Invalid settings are refused (false).
+    /// Use [`crate::ops::GridOp::Iteration`] for an undoable change.
+    pub fn set_iteration(&mut self, it: Option<Iteration>) -> bool {
+        if it.is_some_and(|i| !i.valid()) {
+            return false;
+        }
+        if self.iteration != it {
+            self.iteration = it;
+            self.mark_all(None);
+        }
+        true
     }
 
     /// How a cell shows: its value through its number format.

@@ -1463,6 +1463,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             rep.note(Kind::Dropped, "database ranges");
                         }
                     }
+                    b"table:iteration" => {
+                        // OpenFormula's defaults: 100 steps, 0.001.
+                        let a = attrs(e);
+                        if a.get("table:status").is_some_and(|v| v == "enable") {
+                            let count = a.get("table:steps").and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
+                            let change = a.get("table:minimum-difference").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.001);
+                            if !wb.set_iteration(Some(officina_grid::book::Iteration { count, change })) {
+                                rep.note(Kind::Dropped, "iteration settings");
+                            }
+                        }
+                    }
                     b"table:calculation-settings" => {
                         if let Some(value) = attrs(e).get("table:search-criteria-must-apply-to-whole-cell") {
                             whole_cell_filter = !matches!(value.as_str(), "false" | "0");

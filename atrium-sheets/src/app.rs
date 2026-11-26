@@ -1793,6 +1793,10 @@ impl Sheets {
                     TabCmd::SortDone => crate::data::custom_sort(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
                     TabCmd::AngleDone => crate::format::set_angle(&mut self.doc.borrow_mut(), g.selection(), &typed),
                     _ if self.splitting.get() == Some(crate::data::DataCmd::RemoveDuplicatesBy) => crate::data::remove_duplicates(&mut self.doc.borrow_mut(), g.selection(), g.cursor, Some(&typed)),
+                    _ if self.splitting.get().is_some_and(|k| k != crate::data::DataCmd::TextToColumnsAt) => {
+                        let kind = self.splitting.get().unwrap_or(crate::data::DataCmd::TextToColumnsAt);
+                        crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
+                    }
                     _ => crate::data::text_to_columns_at(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
                 };
                 match res {
@@ -2231,15 +2235,14 @@ impl Sheets {
             return;
         }
         if let Some(kind) = self.splitting.get() {
-            let dedup = kind == crate::data::DataCmd::RemoveDuplicatesBy;
+            let (label, example, button, hint) = crate::whatif::bar(kind);
             let st = crate::tabs::style(t.text_primary(), true);
-            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: if dedup { "Compare" } else { "Split at" }.into(), style: st });
-            let fw = 180.0;
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: label.into(), style: st });
+            let fw = (w - 112.0 - 520.0).clamp(180.0, 320.0);
             let cmds = self.cmds.clone();
-            TextField::new(self.split_text.clone()).key(0x5348_5350).placeholder(if dedup { "Name, City" } else { "comma, -+, fixed 3, 8" }).autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SplitDone))).render(ctx);
-            Button::primary(if dedup { "Remove" } else { "Split" }).at(112.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitDone)).render(ctx);
+            TextField::new(self.split_text.clone()).key(0x5348_5350).placeholder(example).autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SplitDone))).render(ctx);
+            Button::primary(button).at(112.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitDone)).render(ctx);
             Button::secondary("Cancel").at(192.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitCancel)).render(ctx);
-            let hint = if dedup { "columns (letters or headers) that make a row a duplicate" } else { "a name or characters (+ after: runs count as one), fixed 3, 8 for widths, or empty to find one" };
             ctx.add(Node::Text { rect: Rect::new(272.0 + fw, y + 6.0, (w - 284.0 - fw).max(0.0), 18.0), content: hint.into(), style: crate::tabs::style(t.text_secondary(), false) });
             return;
         }
@@ -3903,9 +3906,12 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable)) => {
                     self.close_bars();
-                    self.split_text.set(TextEdit::new(""));
+                    let g = self.grid.get_cloned();
+                    let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));
+                    ed.select_all();
+                    self.split_text.set(ed);
                     self.splitting.set(Some(c));
                     self.changed();
                     false
@@ -7251,6 +7257,27 @@ mod tests {
         let mut d = s.doc.borrow_mut();
         d.wb.recalc();
         d.wb.formatted(officina_grid::addr::CellAddr::new(d.sheet, r, c)).text.to_string()
+    }
+
+    #[test]
+    fn subtotal_bar_starts_with_the_cursor_column_and_adds_totals() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"Region,Sales\nEast,10\nEast,20\nWest,5\n");
+        select(&s, (1, 0), (1, 0));
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::Subtotal));
+        s.take_cmds();
+        assert_eq!(s.splitting.get(), Some(DataCmd::Subtotal));
+        assert_eq!(s.split_text.get_cloned().text(), "Region; Sum; Sales");
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+        s.take_cmds();
+        assert!(s.splitting.get().is_none(), "{}", s.doc.borrow().status);
+        let col = |c| (0..7).map(|r| shown(&s, r, c)).collect::<Vec<_>>();
+        assert_eq!(col(0), ["Region", "East", "East", "East Total", "West", "West Total", "Grand Total"]);
+        assert_eq!(col(1), ["Sales", "10", "20", "30", "5", "5", "35"]);
+        // Iterative Calculation's bar starts from Excel's defaults.
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::Iteration));
+        s.take_cmds();
+        assert_eq!(s.split_text.get_cloned().text(), "100, 0.001");
     }
 
     #[test]

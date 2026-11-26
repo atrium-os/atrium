@@ -105,6 +105,9 @@ pub enum GridOp {
     HiddenWidths { sheet: u16, list: Vec<(u32, f64)> },
     Outline { sheet: u16, axis: crate::shift::Axis, outline: crate::outline::Outline },
     AxisIdentities { sheet: u16, axis: crate::shift::Axis, ids: crate::axis_ids::AxisIds },
+    /// Iterative calculation on (with its settings) or off
+    /// ([`crate::book::Workbook::set_iteration`]).
+    Iteration(Option<crate::book::Iteration>),
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -314,6 +317,18 @@ impl GridOp {
                 w.u16(*sheet);
                 w.u8(axis.index() as u8);
                 outline.encode(&mut w);
+                return w.into_bytes();
+            }
+            GridOp::Iteration(it) => {
+                w.u8(28);
+                match it {
+                    Some(it) => {
+                        w.u8(1);
+                        w.u32(it.count);
+                        w.f64(it.change);
+                    }
+                    None => w.u8(0),
+                }
                 return w.into_bytes();
             }
             GridOp::AxisIdentities { sheet, axis, ids } => {
@@ -542,6 +557,23 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::HideSheet { sheet, hidden });
+        }
+        if kind == 28 {
+            let it = match r.u8()? {
+                0 => None,
+                1 => {
+                    let it = crate::book::Iteration { count: r.u32()?, change: r.f64()? };
+                    if !it.valid() {
+                        return Err(WireError::Invalid("iteration settings"));
+                    }
+                    Some(it)
+                }
+                _ => return Err(WireError::Invalid("iteration")),
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Iteration(it));
         }
         if kind == 22 {
             let sheet = r.u16()?;
@@ -795,6 +827,13 @@ impl Op<Workbook> for GridOp {
                     }
                 }
                 GridOp::Outline { sheet, axis, outline }
+            }
+            GridOp::Iteration(it) => {
+                let old = wb.iteration();
+                if !wb.set_iteration(it) {
+                    return GridOp::Batch(Vec::new());
+                }
+                GridOp::Iteration(old)
             }
             GridOp::AxisIdentities { sheet, axis, ids } => {
                 if sheet as usize >= wb.sheet_count() {

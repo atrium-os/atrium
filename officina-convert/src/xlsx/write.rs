@@ -936,6 +936,9 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         w.extend_from_slice(b"</definedNames>");
     }
+    if let Some(it) = wb.iteration() {
+        let _ = write!(w, r#"<calcPr iterate="1" iterateCount="{}" iterateDelta="{}"/>"#, it.count, it.change);
+    }
     if !pivots.is_empty() {
         w.extend_from_slice(b"<pivotCaches>");
         for &(i, _) in &pivots {

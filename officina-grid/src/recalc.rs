@@ -562,6 +562,12 @@ impl Workbook {
             }
         }
         for (comp, circ) in comps {
+            if circ {
+                if let Some(it) = self.iteration {
+                    self.iterate(&cells, &comp, it, stats);
+                    continue;
+                }
+            }
             for v in comp {
                 let (g, r) = cells[v as usize];
                 let val = if circ { Value::Err(ErrorKind::Circ) } else { self.eval_cell(g, r, None).0 };
@@ -570,6 +576,49 @@ impl Workbook {
                 self.store(sheet, r, col, &val);
                 stats.cells += 1;
                 stats.demand_cells += 1;
+            }
+        }
+    }
+
+    /// A circular component under iterative calculation: its cells are
+    /// calculated in turn, each reading the others' latest values (a cell
+    /// still showing `#CIRC!` starts as blank), until a pass changes no
+    /// number by more than `it.change` and nothing else changes, or after
+    /// `it.count` passes; the last values stay.
+    fn iterate(&mut self, cells: &[(GroupId, u32)], comp: &[u32], it: crate::book::Iteration, stats: &mut RecalcStats) {
+        // Cells in the order they were laid out (rows down, columns across),
+        // as Excel walks a sheet.
+        let mut order: Vec<(u16, u32, u32, GroupId)> = comp
+            .iter()
+            .map(|&v| {
+                let (g, r) = cells[v as usize];
+                let grp = self.group(g);
+                (grp.sheet, r, grp.col, g)
+            })
+            .collect();
+        order.sort_unstable_by_key(|&(s, r, c, _)| (s, r, c));
+        for &(sheet, r, col, _) in &order {
+            if self.get(crate::addr::CellAddr::new(sheet, r, col)) == Value::Err(ErrorKind::Circ) {
+                self.store(sheet, r, col, &Value::Empty);
+            }
+        }
+        for _ in 0..it.count {
+            let mut settled = true;
+            for &(sheet, r, col, g) in &order {
+                let old = self.get(crate::addr::CellAddr::new(sheet, r, col));
+                let new = self.eval_cell(g, r, None).0;
+                let close = match (&old, &new) {
+                    (Value::Num(a), Value::Num(b)) => (a - b).abs() <= it.change,
+                    (Value::Empty, Value::Num(b)) => b.abs() <= it.change,
+                    (a, b) => a == b,
+                };
+                settled &= close;
+                self.store(sheet, r, col, &new);
+                stats.cells += 1;
+                stats.demand_cells += 1;
+            }
+            if settled {
+                break;
             }
         }
     }

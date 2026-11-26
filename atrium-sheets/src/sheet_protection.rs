@@ -15,6 +15,8 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         GridOp::Batch(ops) => ops.iter().all(|op| allows_op(wb, op)),
         GridOp::Restyle(style) => !wb.sheet_protected(style.rect.sheet),
         GridOp::Filter(state) => !wb.sheet_protected(state.sheet),
+        // A calculation setting of the workbook, not a sheet's contents.
+        GridOp::Iteration(_) => true,
         GridOp::Sizes { sheet, .. }
         | GridOp::LayoutSizes { sheet, .. }
         | GridOp::RenameSheet { sheet, .. }

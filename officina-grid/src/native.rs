@@ -145,7 +145,7 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     // Older files end after the sheet settings and use the 1900 calendar.
     let date1904 = wb.date_system() == crate::eval::dates::DateSystem::Excel1904;
     let protected = wb.sheets.iter().filter(|s| s.protection.is_some()).count();
-    let flags = u8::from(date1904) | (u8::from(protected != 0) << 1);
+    let flags = u8::from(date1904) | (u8::from(protected != 0) << 1) | (u8::from(wb.iteration.is_some()) << 2);
     if flags != 0 {
         w.u8(flags);
     }
@@ -157,6 +157,10 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
                 protection.encode(&mut w);
             }
         }
+    }
+    if let Some(it) = wb.iteration {
+        w.u32(it.count);
+        w.f64(it.change);
     }
     c.add(WORKBOOK, &w.into_bytes())?;
     if wb.sheets.iter().any(|sheet| sheet.identity != 0) {
@@ -565,7 +569,7 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     }
     if r.remaining() != 0 {
         let flags = r.u8()?;
-        if flags & !3 != 0 {
+        if flags & !7 != 0 {
             return Err(LoadError::Bad("unknown workbook settings"));
         }
         if flags & 1 != 0 {
@@ -581,6 +585,13 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
                 }
                 sheet.protection = Some(crate::protection::SheetProtection::decode(&mut r)?);
             }
+        }
+        if flags & 4 != 0 {
+            let it = crate::book::Iteration { count: r.u32()?, change: r.f64()? };
+            if !it.valid() {
+                return Err(LoadError::Bad("invalid iteration settings"));
+            }
+            wb.iteration = Some(it);
         }
     }
     done(&r)?;

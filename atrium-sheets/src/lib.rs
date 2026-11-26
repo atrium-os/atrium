@@ -21,3 +21,4 @@ pub mod source;
 mod sheet_protection;
 pub mod tabs;
 pub mod validation;
+pub mod whatif;

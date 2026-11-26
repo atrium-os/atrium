@@ -1587,6 +1587,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     if wb.date_system() == dates::DateSystem::Excel1904 {
         content.push_str(r#"<table:null-date table:date-value="1904-01-01"/>"#);
     }
+    if let Some(it) = wb.iteration() {
+        let _ = write!(content, r#"<table:iteration table:status="enable" table:steps="{}" table:minimum-difference="{}"/>"#, it.count, it.change);
+    }
     content.push_str("</table:calculation-settings>");
     content.push_str(&super::validation::content_xml(wb));
     content.push_str(&tables);
