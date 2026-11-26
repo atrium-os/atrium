@@ -3995,8 +3995,12 @@ impl Sheets {
         }
         let cmds = std::mem::take(&mut *self.cmds.lock().unwrap());
         cmds.into_iter()
-            // The Format menu's Borders… is a Data bar.
-            .map(|c| if c == Cmd::Format(crate::format::FormatCmd::BordersBar) { Cmd::Data(crate::data::DataCmd::BordersBar) } else { c })
+            // The Format menu's Borders… and Pattern Fill… are Data bars.
+            .map(|c| match c {
+                Cmd::Format(crate::format::FormatCmd::BordersBar) => Cmd::Data(crate::data::DataCmd::BordersBar),
+                Cmd::Format(crate::format::FormatCmd::PatternBar) => Cmd::Data(crate::data::DataCmd::PatternFill),
+                c => c,
+            })
             .filter(|&c| match c {
                 Cmd::Undo => {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Undo);
@@ -4114,7 +4118,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.

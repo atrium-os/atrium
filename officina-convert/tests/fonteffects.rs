@@ -125,3 +125,30 @@ fn border_line_styles_and_diagonals_round_trip() {
         assert_eq!(got.diagonals.map(|e| e.line != officina_grid::style::Line::None), want.diagonals.map(|e| e.line != officina_grid::style::Line::None), "ods row {r}");
     }
 }
+
+#[test]
+fn gridline_colours_round_trip() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("A").unwrap();
+    wb.add_sheet("B").unwrap();
+    wb.add_sheet("C").unwrap();
+    // A palette colour, one near a palette colour, and none.
+    wb.sheet_mut(0).grid_color = Some(0xFF0000);
+    wb.sheet_mut(1).grid_color = Some(0x0070C0);
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let zip = officina_convert::zip::Archive::open(&file).unwrap();
+    let xml = String::from_utf8(zip.read(zip.entries.iter().find(|e| e.name == "xl/worksheets/sheet1.xml").unwrap()).unwrap()).unwrap();
+    assert!(xml.contains(r#"defaultGridColor="0" colorId="10""#), "{xml}");
+    let back = xlsx::read(&file).unwrap().0;
+    assert_eq!(back.sheet(0).grid_color, Some(0xFF0000));
+    let near = back.sheet(1).grid_color.unwrap();
+    assert!(near != 0x0070C0 && officina_grid::numfmt::PALETTE.contains(&near), "{near:06X}: snapped to Excel's palette");
+    assert_eq!(back.sheet(2).grid_color, None);
+    // .ods keeps each sheet's exactly; LibreOffice's own grey is automatic.
+    let back = ods::read(&ods::write(&wb, Vec::new()).unwrap()).unwrap().0;
+    assert_eq!((back.sheet(0).grid_color, back.sheet(1).grid_color, back.sheet(2).grid_color), (Some(0xFF0000), Some(0x0070C0), None));
+    let mut plain = Workbook::new();
+    plain.add_sheet("A").unwrap();
+    plain.sheet_mut(0).grid_color = Some(0xC0C0C0);
+    assert_eq!(ods::read(&ods::write(&plain, Vec::new()).unwrap()).unwrap().0.sheet(0).grid_color, None);
+}

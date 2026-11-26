@@ -420,6 +420,8 @@ struct Seg {
     zoom: Option<u16>,
     /// `<sheetView showGridLines="0">` and `showRowColHeaders="0"`.
     no_grid: bool,
+    /// `<sheetView defaultGridColor="0" colorId>`: an indexed palette colour.
+    grid_color: Option<u32>,
     no_headings: bool,
     no_zeros: bool,
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
@@ -811,6 +813,9 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                 seg.zoom = attr(&e, b"zoomScale")?.and_then(|v| v.parse::<u16>().ok()).filter(|z| (officina_grid::book::ZOOM_MIN..=officina_grid::book::ZOOM_MAX).contains(z));
                 let off = |v: Option<String>| v.is_some_and(|v| v == "0" || v == "false");
                 seg.no_grid = off(attr(&e, b"showGridLines")?);
+                if off(attr(&e, b"defaultGridColor")?) {
+                    seg.grid_color = attr(&e, b"colorId")?.and_then(|v| v.parse::<usize>().ok()).and_then(|i| officina_grid::numfmt::PALETTE.get(i).copied());
+                }
                 seg.no_headings = off(attr(&e, b"showRowColHeaders")?);
                 seg.no_zeros = off(attr(&e, b"showZeros")?);
             }
@@ -972,6 +977,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 }
                 if seg.no_grid {
                     wb.sheet_mut(s).show_grid = false;
+                }
+                if seg.grid_color.is_some() {
+                    wb.sheet_mut(s).grid_color = seg.grid_color;
                 }
                 if seg.no_headings {
                     wb.sheet_mut(s).show_headings = false;

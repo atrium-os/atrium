@@ -316,6 +316,10 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
     if !sh.show_zeros {
         view.push_str(r#" showZeros="0""#);
     }
+    // A gridline colour is one of the 56 colours of Excel's palette.
+    if let Some(c) = sh.grid_color {
+        let _ = std::fmt::Write::write_fmt(&mut view, format_args!(r#" defaultGridColor="0" colorId="{}""#, nearest_indexed(c)));
+    }
     if zoom != 100 {
         view.push_str(&format!(r#" zoomScale="{zoom}""#));
     }
@@ -1164,4 +1168,12 @@ mod tests {
         assert_eq!(formula_out("='IFS(x'!A1"), "'IFS(x'!A1");
         assert_eq!(formula_out("=MYIFS(1)"), "MYIFS(1)");
     }
+}
+
+/// The index (8 to 63) of the palette colour nearest `rgb`, as Excel's
+/// gridline colour takes only those.
+pub(crate) fn nearest_indexed(rgb: u32) -> usize {
+    let part = |c: u32, shift: u32| ((c >> shift) & 0xFF) as i64;
+    let dist = |a: u32, b: u32| (0..3).map(|k| (part(a, k * 8) - part(b, k * 8)).pow(2)).sum::<i64>();
+    (8..64).min_by_key(|&i| dist(officina_grid::numfmt::PALETTE[i], rgb)).unwrap_or(8)
 }

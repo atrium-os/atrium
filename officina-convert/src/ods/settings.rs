@@ -1,6 +1,6 @@
 //! `settings.xml`: the view settings LibreOffice keeps per sheet. Frozen panes
 //! (a split position with mode 2), the zoom, and whether gridlines,
-//! headings and zero values show are read and written. LibreOffice keeps the last three for the
+//! headings and zero values show, and the gridline colour, are read and written. LibreOffice keeps the last three for the
 //! whole view as well; a `false` there turns them off on every sheet.
 //! LibreOffice ignores the file's view settings unless the root declares the
 //! `xlink` and `ooo` namespaces as its own do.
@@ -13,7 +13,7 @@ use officina_grid::Workbook;
 /// `settings.xml` for `wb`'s frozen panes and zooms; None when no sheet has
 /// either.
 pub fn settings_xml(wb: &Workbook) -> Option<String> {
-    let frozen: Vec<(u16, (u32, u32), (u32, u32))> = (0..wb.sheet_count() as u16).map(|s| (s, wb.sheet(s).freeze, wb.sheet(s).freeze_from)).filter(|x| x.1 != (0, 0) || wb.sheet(x.0).zoom != 100 || !wb.sheet(x.0).show_grid || !wb.sheet(x.0).show_headings || !wb.sheet(x.0).show_zeros).collect();
+    let frozen: Vec<(u16, (u32, u32), (u32, u32))> = (0..wb.sheet_count() as u16).map(|s| (s, wb.sheet(s).freeze, wb.sheet(s).freeze_from)).filter(|x| x.1 != (0, 0) || wb.sheet(x.0).zoom != 100 || !wb.sheet(x.0).show_grid || !wb.sheet(x.0).show_headings || !wb.sheet(x.0).show_zeros || wb.sheet(x.0).grid_color.is_some()).collect();
     if frozen.is_empty() {
         return None;
     }
@@ -35,6 +35,11 @@ pub fn settings_xml(wb: &Workbook) -> Option<String> {
     if sheets().all(|sh| !sh.show_zeros) {
         flag(&mut o, "ShowZeroValues", false);
     }
+    // LibreOffice keeps one gridline colour for the whole view: written
+    // when every sheet has the same one. Each sheet's is in its own entry.
+    if let Some(c) = wb.sheet(0).grid_color.filter(|&c| sheets().all(|sh| sh.grid_color == Some(c))) {
+        item(&mut o, "GridColor", "int", c & 0xFF_FFFF);
+    }
     o.push_str(r#"<config:config-item-map-named config:name="Tables">"#);
     for (s, (rows, cols), (top, left)) in frozen {
         let _ = write!(o, r#"<config:config-item-map-entry config:name="{}">"#, crate::xml::esc(&wb.sheet(s).name));
@@ -51,6 +56,9 @@ pub fn settings_xml(wb: &Workbook) -> Option<String> {
         }
         if !wb.sheet(s).show_zeros {
             flag(&mut o, "ShowZeroValues", false);
+        }
+        if let Some(c) = wb.sheet(s).grid_color {
+            item(&mut o, "GridColor", "int", c & 0xFF_FFFF);
         }
         if (rows, cols) == (0, 0) {
             o.push_str("</config:config-item-map-entry>");
@@ -84,13 +92,17 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
     // entry is open; the item open, and its text.
     let mut tables: Option<usize> = None;
     let mut depth = 0usize;
-    let mut sheet: Option<(String, [Option<u32>; 10])> = None;
+    let mut sheet: Option<(String, [Option<u32>; 11])> = None;
     // ShowGrid, HasColumnRowHeaders and ShowZeroValues outside the sheets' entries.
     let mut whole: Option<(usize, String)> = None;
     let mut whole_off = [false; 3];
+    let mut whole_grid: Option<u32> = None;
     let mut item: Option<(usize, String)> = None;
     let name = |e: &quick_xml::events::BytesStart| e.attributes().with_checks(false).flatten().find(|a| a.key.local_name().as_ref() == b"name").and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()));
-    let keys = ["HorizontalSplitMode", "VerticalSplitMode", "HorizontalSplitPosition", "VerticalSplitPosition", "PositionLeft", "PositionTop", "ZoomValue", "ShowGrid", "HasColumnRowHeaders", "ShowZeroValues"];
+    let keys = ["HorizontalSplitMode", "VerticalSplitMode", "HorizontalSplitPosition", "VerticalSplitPosition", "PositionLeft", "PositionTop", "ZoomValue", "ShowGrid", "HasColumnRowHeaders", "ShowZeroValues", "GridColor"];
+    // LibreOffice's own gridline colour, written always: automatic.
+    const LO_GRID: u32 = 0xC0C0C0;
+    let grid_color = |v: Option<u32>| v.filter(|&c| c <= 0xFF_FFFF && c != LO_GRID);
     // A number, or a boolean as 0 or 1.
     let value = |v: &str| v.trim().parse().ok().or(match v.trim() {
         "true" => Some(1),
@@ -105,7 +117,7 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
                 depth += 1;
                 match e.local_name().as_ref() {
                     b"config-item-map-named" if tables.is_none() && name(&e).as_deref() == Some("Tables") => tables = Some(depth),
-                    b"config-item-map-entry" if tables == Some(depth - 1) => sheet = name(&e).map(|n| (n, [None; 10])),
+                    b"config-item-map-entry" if tables == Some(depth - 1) => sheet = name(&e).map(|n| (n, [None; 11])),
                     b"config-item" if sheet.is_some() => item = name(&e).and_then(|n| keys.iter().position(|k| *k == n)).map(|i| (i, String::new())),
                     b"config-item" if tables.is_none() => whole = name(&e).and_then(|n| keys[7..].iter().position(|k| *k == n)).map(|i| (i, String::new())),
                     _ => {}
@@ -125,13 +137,17 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
                             vals[i] = value(&v);
                         }
                         if let Some((i, v)) = whole.take() {
-                            whole_off[i] |= value(&v) == Some(0);
+                            match i {
+                                3 => whole_grid = grid_color(value(&v)),
+                                _ => whole_off[i] |= value(&v) == Some(0),
+                            }
                         }
                     }
                     b"config-item-map-entry" if tables == Some(depth - 1) => {
-                        if let Some((n, [hm, vm, hp, vp, pl, pt, zoom, grid, headings, zeros])) = sheet.take() {
+                        if let Some((n, [hm, vm, hp, vp, pl, pt, zoom, grid, headings, zeros, color])) = sheet.take() {
                             if let Some(s) = wb.sheet_id(&n) {
                                 let sh = wb.sheet_mut(s);
+                                sh.grid_color = grid_color(color).or(sh.grid_color);
                                 sh.show_grid &= grid != Some(0);
                                 sh.show_headings &= headings != Some(0);
                                 sh.show_zeros &= zeros != Some(0);
@@ -166,5 +182,6 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
         sh.show_grid &= !whole_off[0];
         sh.show_headings &= !whole_off[1];
         sh.show_zeros &= !whole_off[2];
+        sh.grid_color = sh.grid_color.or(whole_grid);
     }
 }

@@ -43,6 +43,9 @@ pub struct Sheet {
     pub filter: Option<crate::filter::AutoFilter>,
     /// The colour of its tab, 0xRRGGBB.
     pub tab_color: Option<u32>,
+    /// The colour gridlines draw in (0xRRGGBB); `None` is automatic. A
+    /// view setting, as gridlines are.
+    pub grid_color: Option<u32>,
     /// The sheet is hidden: no tab shows it. At least one sheet always shows
     /// ([`crate::ops::GridOp::HideSheet`] refuses to hide the last).
     pub sheet_hidden: bool,
@@ -93,7 +96,7 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, show_zeros: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new(), watches: Vec::new(), edit_ranges: Vec::new(), ignored: Vec::new() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, grid_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, show_zeros: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new(), watches: Vec::new(), edit_ranges: Vec::new(), ignored: Vec::new() }
     }
     /// Allow Edit Ranges on this sheet.
     pub fn edit_ranges(&self) -> &[crate::sheetareas::EditRange] {

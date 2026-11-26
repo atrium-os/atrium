@@ -44,6 +44,10 @@ pub enum FormatCmd {
     Rotate(i16),
     /// Opens the bar for a rotation angle of one's own; the window runs it.
     Angle,
+    /// One of [`SPECIAL_FORMATS`] (Excel's Special category).
+    Special(usize),
+    /// Opens the Pattern Fill bar; the window runs it: [`pattern_typed`].
+    PatternBar,
     /// Opens the Borders bar (edges, line and colour typed); the window
     /// runs it: [`borders_typed`].
     BordersBar,
@@ -83,6 +87,14 @@ pub enum BorderKind {
     DiagonalDown,
     DiagonalUp,
 }
+
+/// Excel's Special formats (United States): name and format code.
+pub const SPECIAL_FORMATS: [(&str, &str); 4] = [
+    ("Zip Code", "00000"),
+    ("Zip Code + 4", "00000-0000"),
+    ("Phone Number", "[<=9999999]###-####;(###) ###-####"),
+    ("Social Security Number", "000-00-0000"),
+];
 
 /// The number formats the menu offers: name and format code.
 pub const NUMBER_FORMATS: [(&str, &str); 12] = [
@@ -196,6 +208,7 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Font: Mono").radio(mono), Some(FormatCmd::Mono(true))),
         (MenuItem::new("Text Colour…"), Some(FormatCmd::Colors(false))),
         (MenuItem::new("Fill Colour…"), Some(FormatCmd::Colors(true))),
+        (MenuItem::new("Pattern Fill…"), Some(FormatCmd::PatternBar)),
         (MenuItem::new("Align Left").checked(st.h_align == HAlign::Left).separated(), Some(FormatCmd::Align(HAlign::Left))),
         (MenuItem::new("Align Centre").checked(st.h_align == HAlign::Center), Some(FormatCmd::Align(HAlign::Center))),
         (MenuItem::new("Align Right").checked(st.h_align == HAlign::Right), Some(FormatCmd::Align(HAlign::Right))),
@@ -216,6 +229,9 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
             item = item.shortcut(keys[i]);
         }
         v.push((item, Some(FormatCmd::Number(i))));
+    }
+    for (i, (name, code)) in SPECIAL_FORMATS.iter().enumerate() {
+        v.push((MenuItem::new(format!("Special: {name}")).radio(&*st.num_fmt == *code), Some(FormatCmd::Special(i))));
     }
     v.push((MenuItem::new("Custom Format…").shortcut("Ctrl+1"), Some(FormatCmd::Custom)));
     v.push((MenuItem::new("More Decimals"), Some(FormatCmd::MoreDecimals)));
@@ -444,7 +460,12 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
             d.run("Borders", ops);
             Ok(border_done(kind).into())
         }
-        FormatCmd::BordersBar => Ok(String::new()),
+        FormatCmd::BordersBar | FormatCmd::PatternBar => Ok(String::new()),
+        FormatCmd::Special(i) => {
+            let (name, code) = *SPECIAL_FORMATS.get(i).ok_or("Unknown format.")?;
+            one(d, "Number Format", &|st| Style { num_fmt: code.into(), ..st.clone() });
+            Ok(format!("Formatted as a {}.", name.to_lowercase()))
+        }
     }
 }
 
@@ -599,10 +620,122 @@ fn border_clause(t: &str, pen: (Line, Option<u32>)) -> Result<(BorderKind, Edge)
     let line = LINE_WORDS.iter().find(|(w, _)| take(&mut rest, w)).map_or(pen.0, |e| e.1);
     let color = match rest.trim() {
         "" => pen.1,
-        "automatic" | "auto" | "black" => None,
-        c => Some(crate::tabs::COLORS.iter().find(|(_, n)| n.eq_ignore_ascii_case(c)).map(|e| e.0).or_else(|| hex_color(c)).ok_or_else(|| format!("\"{c}\" isn't a colour: use a name such as red or blue, or six hex digits."))?),
+        c => typed_color(c)?,
     };
     Ok((kind, Edge { line, color }))
+}
+
+/// A typed colour: a tab colour's name, six hex digits (`#` optional),
+/// or `automatic` (`None`).
+fn typed_color(c: &str) -> Result<Option<u32>, String> {
+    let c = c.trim();
+    if ["automatic", "auto", "black"].iter().any(|w| c.eq_ignore_ascii_case(w)) {
+        return Ok(None);
+    }
+    crate::tabs::COLORS.iter().find(|(_, n)| n.eq_ignore_ascii_case(c)).map(|e| e.0).or_else(|| hex_color(c)).map(Some).ok_or_else(|| format!("\"{c}\" isn't a colour: use a name such as red or blue, or six hex digits."))
+}
+
+/// Excel's Pattern Style names (Format Cells > Fill), with the names files
+/// give them.
+pub const PATTERNS: [(&str, &str); 17] = [
+    ("75% gray", "darkGray"),
+    ("50% gray", "mediumGray"),
+    ("25% gray", "lightGray"),
+    ("12.5% gray", "gray125"),
+    ("6.25% gray", "gray0625"),
+    ("thick horizontal stripe", "darkHorizontal"),
+    ("thick vertical stripe", "darkVertical"),
+    ("thick reverse diagonal stripe", "darkDown"),
+    ("thick diagonal stripe", "darkUp"),
+    ("thick diagonal crosshatch", "darkTrellis"),
+    ("diagonal crosshatch", "darkGrid"),
+    ("thin horizontal stripe", "lightHorizontal"),
+    ("thin vertical stripe", "lightVertical"),
+    ("thin reverse diagonal stripe", "lightDown"),
+    ("thin diagonal stripe", "lightUp"),
+    ("thin horizontal crosshatch", "lightGrid"),
+    ("thin diagonal crosshatch", "lightTrellis"),
+];
+
+/// The longest text the Pattern bar reads.
+const MAX_PATTERN_TYPED: usize = 256;
+
+/// The Pattern bar's starting text: the first cell's pattern as typed.
+pub fn pattern_start(d: &Doc, sel: CellRange) -> String {
+    let st = d.wb.style(CellAddr::new(d.sheet, sel.r0, sel.c0));
+    let Some(p) = st.pattern else { return "50% gray".into() };
+    let name = PATTERNS.iter().find(|x| x.1 == p.name()).map_or(p.name(), |x| x.0);
+    let hex = |c: Option<u32>| c.map(|c| format!("{c:06X}"));
+    match (hex(p.foreground), hex(p.background)) {
+        (Some(f), Some(b)) => format!("{name} {f} on {b}"),
+        (Some(f), None) => format!("{name} {f}"),
+        (None, Some(b)) => format!("{name} on {b}"),
+        (None, None) => name.into(),
+    }
+}
+
+/// Pattern Fill…: `PATTERN [COLOUR] [on COLOUR]`, as Excel's Pattern Style,
+/// Pattern Color and Background Color (`thin diagonal stripe red on
+/// FFF2CC`); `none` takes a pattern off. The pattern replaces a plain or
+/// gradient fill, as Excel's Fill tab does. One step.
+pub fn pattern_typed(d: &mut Doc, sel: CellRange, typed: &str) -> Result<String, String> {
+    use officina_grid::style::PatternFill;
+    if typed.len() > MAX_PATTERN_TYPED {
+        return Err("That's too long.".into());
+    }
+    let t = typed.trim().to_ascii_lowercase();
+    let r = Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    if t == "none" || t == "no pattern" {
+        if !d.run_action("Pattern Fill", vec![GridOp::restyle(&d.wb, r, |st| Style { pattern: None, ..st.clone() })]) {
+            return Err(std::mem::take(&mut d.status));
+        }
+        return Ok("Pattern taken off.".into());
+    }
+    // The longest name that starts the text, so "thick diagonal crosshatch"
+    // is not read as "diagonal crosshatch".
+    let found = PATTERNS.iter().filter(|(n, file)| t == *n || t.starts_with(&format!("{n} ")) || t == file.to_ascii_lowercase() || t.starts_with(&format!("{} ", file.to_ascii_lowercase()))).max_by_key(|(n, file)| if t.starts_with(n) { n.len() } else { file.len() });
+    let Some(&(name, file)) = found else {
+        return Err(format!("Name a pattern first: {}, or none.", PATTERNS.iter().map(|p| p.0).collect::<Vec<_>>().join(", ")));
+    };
+    let rest = if t.starts_with(name) { &t[name.len()..] } else { &t[file.len()..] };
+    let (fore, back) = match rest.split_once(" on ") {
+        Some((f, b)) => (f, Some(b)),
+        None if rest.trim_start().starts_with("on ") => ("", Some(&rest.trim_start()[3..])),
+        None => (rest, None),
+    };
+    let fore = if fore.trim().is_empty() { None } else { typed_color(fore)? };
+    let back = match back {
+        Some(b) => typed_color(b)?,
+        None => None,
+    };
+    let p = PatternFill::new(file, fore, back).ok_or("That pattern can't be saved.")?;
+    if !d.run_action("Pattern Fill", vec![GridOp::restyle(&d.wb, r, |st| Style { pattern: Some(p), fill: None, gradient: None, ..st.clone() })]) {
+        return Err(std::mem::take(&mut d.status));
+    }
+    Ok(format!("Pattern: {name}."))
+}
+
+/// The Gridline Colour bar's starting text: the sheet's colour or
+/// `automatic`.
+pub fn grid_color_start(d: &Doc) -> String {
+    d.wb.sheet(d.sheet).grid_color.map_or("automatic".into(), |c| format!("{c:06X}"))
+}
+
+/// Gridline Colour…: the sheet's gridlines in a colour (a name or six hex
+/// digits), or `automatic`. A view setting, as Gridlines is: no undo step,
+/// but the file keeps it.
+pub fn grid_color_typed(d: &mut Doc, typed: &str) -> Result<String, String> {
+    if typed.len() > MAX_PATTERN_TYPED {
+        return Err("That's too long.".into());
+    }
+    let c = typed_color(typed)?;
+    let s = d.sheet;
+    d.wb.sheet_mut(s).grid_color = c;
+    d.dirty = true;
+    Ok(match c {
+        Some(c) => format!("Gridlines in {}.", crate::tabs::COLORS.iter().find(|x| x.0 == c).map_or(format!("{c:06X}"), |x| x.1.to_lowercase())),
+        None => "Gridlines in their own colour.".into(),
+    })
 }
 
 fn hex_color(c: &str) -> Option<u32> {
@@ -685,6 +818,60 @@ pub fn decimals(code: &str, more: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::decimals;
+
+    #[test]
+    fn patterns_special_formats_and_gridline_colours() {
+        use super::{grid_color_start, grid_color_typed, pattern_start, pattern_typed, run, FormatCmd};
+        use officina_grid::CellAddr;
+        use pergola::widgets::{CellRange, GridSource};
+        let d = std::rc::Rc::new(std::cell::RefCell::new(crate::doc::Doc::from_csv("p.csv", b"5551234,123456789\n2125551234,12345\n").unwrap().0));
+        let src = crate::source::SheetSource::new(d.clone());
+        let sel = CellRange { r0: 0, c0: 0, r1: 1, c1: 1 };
+        let st = |r: u32, c: u32| d.borrow().wb.style(CellAddr::new(0, r, c)).clone();
+        // Pattern Fill: Excel's names, the files' names, colours, none.
+        assert_eq!(pattern_typed(&mut d.borrow_mut(), sel, "thick diagonal crosshatch red on FFF2CC").unwrap(), "Pattern: thick diagonal crosshatch.");
+        let p = st(1, 1).pattern.unwrap();
+        assert_eq!((p.name(), p.foreground, p.background), ("darkTrellis", Some(0xC62828), Some(0xFFF2CC)));
+        assert!(st(0, 0).fill.is_none() && src.cell(0, 0).unwrap().pattern.is_some_and(|x| x.0 == "darkTrellis"));
+        assert_eq!(pattern_start(&d.borrow(), sel), "thick diagonal crosshatch C62828 on FFF2CC");
+        pattern_typed(&mut d.borrow_mut(), sel, "diagonal crosshatch").unwrap();
+        assert_eq!(st(0, 0).pattern.unwrap().name(), "darkGrid");
+        pattern_typed(&mut d.borrow_mut(), sel, "lightUp on blue").unwrap();
+        let p = st(0, 0).pattern.unwrap();
+        assert_eq!((p.name(), p.foreground, p.background.is_some()), ("lightUp", None, true));
+        pattern_typed(&mut d.borrow_mut(), sel, "12.5% gray").unwrap();
+        assert_eq!(st(0, 0).pattern.unwrap().name(), "gray125");
+        pattern_typed(&mut d.borrow_mut(), sel, "none").unwrap();
+        assert!(st(0, 0).pattern.is_none());
+        d.borrow_mut().undo();
+        assert_eq!(st(0, 0).pattern.unwrap().name(), "gray125");
+        for bad in ["plaid", "50% gray mauve", "thin diagonal stripe on nothing", ""] {
+            assert!(pattern_typed(&mut d.borrow_mut(), sel, bad).is_err(), "{bad}");
+        }
+        // Special formats: as Excel shows them.
+        let shown = |r: u32, c: u32| src.cell(r, c).unwrap().text;
+        run(&mut d.borrow_mut(), sel, FormatCmd::Special(2));
+        assert_eq!((shown(0, 0), shown(1, 0)), ("555-1234".to_string(), "(212) 555-1234".to_string()));
+        run(&mut d.borrow_mut(), sel, FormatCmd::Special(3));
+        assert_eq!(shown(0, 1), "123-45-6789");
+        run(&mut d.borrow_mut(), sel, FormatCmd::Special(0));
+        assert_eq!(shown(1, 1), "12345");
+        run(&mut d.borrow_mut(), CellRange { r0: 1, c0: 1, r1: 1, c1: 1 }, FormatCmd::Special(1));
+        assert_eq!(shown(1, 1), "00001-2345");
+        assert!(super::menu(&d.borrow(), CellRange { r0: 1, c0: 1, r1: 1, c1: 1 }).iter().any(|(m, c)| *c == Some(FormatCmd::Special(1)) && m.label == "Special: Zip Code + 4"));
+        // Gridline colour: a view setting the sheet keeps and draws.
+        assert_eq!(grid_color_start(&d.borrow()), "automatic");
+        assert_eq!(grid_color_typed(&mut d.borrow_mut(), "blue").unwrap(), "Gridlines in blue.");
+        assert!(src.grid_color().is_some());
+        assert_eq!(grid_color_start(&d.borrow()), format!("{:06X}", d.borrow().wb.sheet(0).grid_color.unwrap()));
+        grid_color_typed(&mut d.borrow_mut(), "#00FF80").unwrap();
+        assert_eq!(d.borrow().wb.sheet(0).grid_color, Some(0x00FF80));
+        let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&d.borrow().wb)).unwrap();
+        assert_eq!(back.sheet(0).grid_color, Some(0x00FF80));
+        assert!(grid_color_typed(&mut d.borrow_mut(), "chartreuse-ish").is_err());
+        grid_color_typed(&mut d.borrow_mut(), "automatic").unwrap();
+        assert!(src.grid_color().is_none());
+    }
 
     #[test]
     fn side_inside_and_diagonal_borders_and_the_borders_bar() {

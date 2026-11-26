@@ -24,6 +24,7 @@ fn main() {
         }
         let p = wb.properties();
         println!("properties: {:?}", (0..6).map(|i| p.get(i)).collect::<Vec<_>>());
+        println!("grid colours: {:?}; pattern {:?}", (0..wb.sheet_count() as u16).map(|s| wb.sheet(s).grid_color.map(|c| format!("{c:06X}"))).collect::<Vec<_>>(), wb.style(CellAddr::new(0, 0, 2)).pattern.map(|p| (p.name(), p.foreground, p.background)));
         for r in 0..LINES.len() as u32 {
             let st = wb.style(CellAddr::new(0, r, 1));
             println!("border {r}: {:?} {:?} diagonals {:?}", st.borders[3].line, st.borders[3].color, st.diagonals.map(|e| e.line));
@@ -59,6 +60,11 @@ fn main() {
         wb.set_value(CellAddr::new(0, i as u32, 1), Value::Num(i as f64));
         wb.set_style(&Rect { sheet: 0, r0: i as u32, c0: 1, r1: i as u32, c1: 1 }, st);
     }
+    wb.sheet_mut(0).grid_color = Some(0xFF0000);
+    let mut pat = Style::default();
+    pat.pattern = officina_grid::style::PatternFill::new("darkTrellis", Some(0xC62828), Some(0xFFF2CC));
+    wb.set_value(CellAddr::new(0, 0, 2), Value::Num(1.0));
+    wb.set_style(&Rect { sheet: 0, r0: 0, c0: 2, r1: 0, c1: 2 }, pat);
     let bytes = if path.ends_with(".ods") { officina_convert::ods::write(&wb, Vec::new()).unwrap() } else { officina_convert::xlsx::write(&wb, Vec::new()).unwrap() };
     std::fs::write(path, bytes).unwrap();
 }

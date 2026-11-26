@@ -214,6 +214,52 @@ pub fn series(d: &mut Doc, sel: CellRange, typed: &str) -> Result<String, String
     Ok(format!("{filled} {} filled {}.", if filled == 1 { "cell" } else { "cells" }, if down { "down" } else { "across" }))
 }
 
+/// Which way Fill ▸ Down, Right, Up or Left copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillWay {
+    Down,
+    Right,
+    Up,
+    Left,
+}
+
+/// Fill ▸ Down, Right, Up or Left: the selection's first row (Down),
+/// first column (Right), last row (Up) or last column (Left) copied over
+/// the rest of it. A selection one row (column) deep takes the row
+/// (column) beside it on the side it comes from, as Ctrl+D does.
+pub fn fill_way(d: &mut Doc, sel: CellRange, way: FillWay) -> Result<String, String> {
+    use officina_grid::addr::{Rect, MAX_COLS, MAX_ROWS};
+    let s = d.sheet;
+    let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    let (from, to) = match way {
+        FillWay::Down if r.r0 == r.r1 => {
+            let up = r.r0.checked_sub(1).ok_or("There's no row above to copy.")?;
+            (Rect { r0: up, r1: up, ..r }, Rect { r0: up, ..r })
+        }
+        FillWay::Down => (Rect { r1: r.r0, ..r }, r),
+        FillWay::Up if r.r0 == r.r1 => {
+            let down = Some(r.r1 + 1).filter(|&x| x < MAX_ROWS).ok_or("There's no row below to copy.")?;
+            (Rect { r0: down, r1: down, ..r }, Rect { r1: down, ..r })
+        }
+        FillWay::Up => (Rect { r0: r.r1, ..r }, r),
+        FillWay::Right if r.c0 == r.c1 => {
+            let left = r.c0.checked_sub(1).ok_or("There's no column to the left to copy.")?;
+            (Rect { c0: left, c1: left, ..r }, Rect { c0: left, ..r })
+        }
+        FillWay::Right => (Rect { c1: r.c0, ..r }, r),
+        FillWay::Left if r.c0 == r.c1 => {
+            let right = Some(r.c1 + 1).filter(|&x| x < MAX_COLS).ok_or("There's no column to the right to copy.")?;
+            (Rect { c0: right, c1: right, ..r }, Rect { c1: right, ..r })
+        }
+        FillWay::Left => (Rect { c0: r.c1, ..r }, r),
+    };
+    d.status.clear();
+    if !d.fill(from, to, true) {
+        return Err(if d.status.is_empty() { "Nothing to fill.".into() } else { std::mem::take(&mut d.status) });
+    }
+    Ok(format!("Filled {}.", match way { FillWay::Down => "down", FillWay::Right => "right", FillWay::Up => "up", FillWay::Left => "left" }))
+}
+
 /// Fill ▸ Justify: the text in the selection's first column joined and
 /// broken into lines that fit the selection's width, written down that
 /// column from its top; the rows left over are emptied.
@@ -468,5 +514,34 @@ mod color_sort_tests {
         assert!(crate::data::custom_sort(&mut d, sel, (1, 0), "Name fill pink").unwrap_err().contains("isn't a colour"));
         assert!(d.undo());
         assert_eq!(names(&d), ["c", "a", "d", "b"]);
+    }
+
+    #[test]
+    fn fill_up_left_down_and_right_copy_the_far_edge() {
+        use super::{fill_way, FillWay};
+        use officina_grid::Value;
+        let mut d = Doc::from_csv("f.csv", b"1,2,3\n4,5,6\n7,8,9\n").unwrap().0;
+        d.wb.recalc();
+        let v = |d: &Doc, r: u32, c: u32| d.wb.value(0, r, c);
+        let all = CellRange { r0: 0, c0: 0, r1: 2, c1: 2 };
+        fill_way(&mut d, all, FillWay::Up).unwrap();
+        assert_eq!((v(&d, 0, 0), v(&d, 1, 2)), (Value::Num(7.0), Value::Num(9.0)));
+        d.undo();
+        fill_way(&mut d, all, FillWay::Left).unwrap();
+        assert_eq!((v(&d, 0, 0), v(&d, 2, 1)), (Value::Num(3.0), Value::Num(9.0)));
+        d.undo();
+        fill_way(&mut d, all, FillWay::Down).unwrap();
+        assert_eq!(v(&d, 2, 2), Value::Num(3.0));
+        d.undo();
+        fill_way(&mut d, all, FillWay::Right).unwrap();
+        assert_eq!(v(&d, 2, 2), Value::Num(7.0));
+        d.undo();
+        // One row (column): the one beside it, on the side it comes from.
+        fill_way(&mut d, CellRange { r0: 1, c0: 0, r1: 1, c1: 2 }, FillWay::Up).unwrap();
+        assert_eq!(v(&d, 1, 1), Value::Num(8.0));
+        fill_way(&mut d, CellRange { r0: 0, c0: 1, r1: 2, c1: 1 }, FillWay::Left).unwrap();
+        assert_eq!(v(&d, 0, 1), Value::Num(3.0));
+        assert!(fill_way(&mut d, CellRange { r0: 0, c0: 0, r1: 0, c1: 2 }, FillWay::Down).is_err());
+        assert!(fill_way(&mut d, CellRange { r0: 0, c0: 0, r1: 2, c1: 0 }, FillWay::Right).is_err());
     }
 }

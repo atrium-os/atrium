@@ -1154,6 +1154,9 @@ impl GridSource for SheetSource {
     fn show_grid(&self) -> bool {
         self.doc.try_borrow().map_or(true, |d| d.wb.sheet(d.sheet).show_grid)
     }
+    fn grid_color(&self) -> Option<Color> {
+        self.doc.try_borrow().ok().and_then(|d| d.wb.sheet(d.sheet).grid_color).map(rgb)
+    }
     fn show_headings(&self) -> bool {
         self.doc.try_borrow().map_or(true, |d| d.wb.sheet(d.sheet).show_headings)
     }

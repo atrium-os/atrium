@@ -203,6 +203,11 @@ pub enum DataCmd {
     /// Fill ▸ Series… (a bar) and Fill ▸ Justify ([`crate::series`]).
     Series,
     Justify,
+    /// Fill ▸ Down, Right, Up and Left; [`crate::series::fill_way`].
+    FillDown,
+    FillRight,
+    FillUp,
+    FillLeft,
     /// Formula auditing ([`crate::audit`]): the next error, the source of
     /// the error at the cursor, and the cursor's formula step by step (a bar).
     ErrorChecking,
@@ -279,6 +284,10 @@ pub enum DataCmd {
     StandardHeight,
     /// The Borders bar; [`crate::format::borders_typed`].
     BordersBar,
+    /// The Pattern Fill bar; [`crate::format::pattern_typed`].
+    PatternFill,
+    /// The sheet's gridline colour (a bar); [`crate::format::grid_color_typed`].
+    GridColor,
     /// The workbook's dates counted from 1904 (as old Mac Excel), or 1900.
     DateSystem1904,
     /// Zero values shown or left blank on this sheet (a view setting).
@@ -527,11 +536,16 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Zoom to 100%"), Some(DataCmd::Zoom100)),
         (MenuItem::new("Zoom to Selection"), Some(DataCmd::ZoomSelection)),
         (MenuItem::new("Gridlines").checked(wb.sheet(s).show_grid), Some(DataCmd::Gridlines)),
+        (MenuItem::new("Gridline Colour…").enabled(wb.sheet(s).show_grid), Some(DataCmd::GridColor)),
         (MenuItem::new("Headings").checked(wb.sheet(s).show_headings), Some(DataCmd::Headings)),
         (MenuItem::new("Zero Values").checked(wb.sheet(s).show_zeros), Some(DataCmd::ZeroValues)),
         (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()).separated(), Some(DataCmd::FillCopy)),
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Series…").enabled(nr > 1 || nc > 1), Some(DataCmd::Series)),
+        (MenuItem::new("Fill: Down").shortcut("Ctrl+D"), Some(DataCmd::FillDown)),
+        (MenuItem::new("Fill: Right").shortcut("Ctrl+R"), Some(DataCmd::FillRight)),
+        (MenuItem::new("Fill: Up"), Some(DataCmd::FillUp)),
+        (MenuItem::new("Fill: Left"), Some(DataCmd::FillLeft)),
         (MenuItem::new("Fill: Justify"), Some(DataCmd::Justify)),
         (MenuItem::new("Fill: Across Worksheets…").enabled(d.wb.sheet_count() > 1), Some(DataCmd::FillAcross)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
@@ -1021,7 +1035,7 @@ pub fn repeatable(c: DataCmd) -> bool {
         | HideRows | HideCols | Merge | MergeAcross | Unmerge | CenterAcross | WrapText | AlignTop | AlignMiddle | AlignBottom | AlignJustifyV | AlignDistributedV
         | ClearFormats | ClearAll | ClearComments | DeleteComments | RemoveLinks | PasteValues | PasteFormulas | PasteFormats
         | PasteTransposed | PasteComments | PasteSkipBlanks | PasteAdd | PasteSubtract | PasteMultiply | PasteDivide | PasteLink
-        | SortAsc | SortDesc | AutoSum | FillCopy | FillSeries | FillFormats | FillNoFormats)
+        | SortAsc | SortDesc | AutoSum | FillDown | FillRight | FillUp | FillLeft | FillCopy | FillSeries | FillFormats | FillNoFormats)
 }
 
 /// The row and column command for an Excel key (Ctrl+9, Ctrl+0, Ctrl+Shift+(,
@@ -3160,7 +3174,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3260,6 +3274,10 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         // The window opens its value list for this one.
         DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable | DataCmd::Scenarios | DataCmd::Series | DataCmd::ErrorChecking | DataCmd::TraceError | DataCmd::EvaluateFormula | DataCmd::Sparklines | DataCmd::FillAcross => Ok(String::new()),
         DataCmd::Justify => crate::series::justify(d, sel),
+        DataCmd::FillDown | DataCmd::FillRight | DataCmd::FillUp | DataCmd::FillLeft => {
+            use crate::series::FillWay;
+            crate::series::fill_way(d, sel, match cmd { DataCmd::FillDown => FillWay::Down, DataCmd::FillRight => FillWay::Right, DataCmd::FillUp => FillWay::Up, _ => FillWay::Left })
+        }
         DataCmd::ProtectWorkbook => protect_workbook(d),
         DataCmd::ManualCalc => crate::formulas::toggle_manual(d),
         DataCmd::DateSystem1904 => {

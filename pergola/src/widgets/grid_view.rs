@@ -498,6 +498,10 @@ pub trait GridSource {
     fn show_grid(&self) -> bool {
         true
     }
+    /// The gridlines' colour, when not the theme's.
+    fn grid_color(&self) -> Option<Color> {
+        None
+    }
     /// Whether the row and column headings show (View > Headings). Without
     /// them the cells start at the view's top left.
     fn show_headings(&self) -> bool {
@@ -2112,7 +2116,7 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
 /// Cells `rr` × `cr` (inclusive): grid lines, contents and the merged areas
 /// meeting them, placed by `at`, in groups keyed by tile as the body's.
 fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, rr: (u32, u32), cr: (u32, u32), at: &dyn Fn(f64, f64) -> (f32, f32)) {
-    let line = t.border_default();
+    let line = src.grid_color().unwrap_or(t.border_default());
     let grid = src.show_grid();
     let mut spills: Vec<(u32, u32, (u32, u32), CellView)> = Vec::new();
     for tr in rr.0 / TILE_ROWS..=rr.1 / TILE_ROWS {

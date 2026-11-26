@@ -30,6 +30,7 @@
 //! | 29 | ZOOM | sheets' view zoom other than 100 %: count; per sheet, its index and percent (10–400) |
 //! | 30 | VIEW_HIDDEN | sheets showing no gridlines, headings or zeros: count; per sheet, its index and flags (1 gridlines off, 2 headings off, 4 zero values hidden) |
 //! | 36 | PROPERTIES | document properties: title, subject, author, keywords, category, comments |
+//! | 37 | GRID_COLORS | sheets' gridline colours other than automatic: count; per sheet, its index and 0xRRGGBB |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -74,6 +75,7 @@ pub const WATCHES: u16 = 33;
 pub const EDIT_RANGES: u16 = 34;
 pub const IGNORED_ERRORS: u16 = 35;
 pub const PROPERTIES: u16 = 36;
+pub const GRID_COLORS: u16 = 37;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -449,6 +451,16 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u32(c & 0xFF_FFFF);
         }
         c.add(TAB_COLORS, &w.into_bytes())?;
+    }
+    let grids: Vec<(usize, u32)> = wb.sheets.iter().enumerate().filter_map(|(i, sh)| sh.grid_color.map(|c| (i, c))).collect();
+    if !grids.is_empty() {
+        let mut w = Writer::new();
+        w.var(grids.len() as u64);
+        for (i, c) in grids {
+            w.u16(i as u16);
+            w.u32(c & 0xFF_FFFF);
+        }
+        c.add(GRID_COLORS, &w.into_bytes())?;
     }
     let frozen: Vec<(usize, (u32, u32))> = wb.sheets.iter().enumerate().filter(|(_, sh)| sh.freeze != (0, 0)).map(|(i, sh)| (i, sh.freeze)).collect();
     if !frozen.is_empty() {
@@ -1161,6 +1173,22 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         done(&r)?;
     }
 
+    for i in of(GRID_COLORS) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n > wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("more gridline colours than sheets"));
+        }
+        for _ in 0..n {
+            let s = r.u16()? as usize;
+            let color = r.u32()?;
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("a gridline colour for a sheet that does not exist")) };
+            if color > 0xFF_FFFF || sh.grid_color.replace(color).is_some() {
+                return Err(LoadError::Bad("a sheet's gridline colour"));
+            }
+        }
+        done(&r)?;
+    }
     for i in of(TAB_COLORS) {
         let mut r = Reader::new(c.chunk(i)?);
         let n = r.var()?;
