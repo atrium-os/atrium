@@ -40,7 +40,9 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         GridOp::Restyle(style) => !wb.sheet_protected(style.rect.sheet),
         GridOp::Filter(state) => !wb.sheet_protected(state.sheet),
         // A calculation setting of the workbook, not a sheet's contents.
-        GridOp::Iteration(_) | GridOp::Structure(_) => true,
+        GridOp::Iteration(_) | GridOp::Structure(_) | GridOp::Calculation(_) => true,
+        // What the Watch Window shows is no part of the sheet's contents.
+        GridOp::Watches { .. } => true,
         GridOp::Sizes { sheet, .. }
         | GridOp::LayoutSizes { sheet, .. }
         | GridOp::RenameSheet { sheet, .. }

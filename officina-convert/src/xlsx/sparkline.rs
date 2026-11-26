@@ -6,8 +6,11 @@
 use std::fmt::Write as _;
 
 use officina_grid::addr::a1;
-use officina_grid::sparkline::{SparkKind, Sparkline, DEFAULT_COLOR, DEFAULT_NEGATIVE, MAX_SPARKLINES};
+use officina_grid::sparkline::{SparkKind, Sparkline};
+#[cfg(feature = "read")]
+use officina_grid::sparkline::{DEFAULT_COLOR, DEFAULT_NEGATIVE, MAX_SPARKLINES};
 use officina_grid::Workbook;
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
 
 use crate::xml::esc;
@@ -65,6 +68,7 @@ pub fn extension_xml(wb: &Workbook, s: u16, o: &mut Vec<u8>) {
     o.extend_from_slice(x.as_bytes());
 }
 
+#[cfg(feature = "read")]
 /// A sparkline as read, its source range not yet resolved to a sheet.
 #[derive(Debug, Clone)]
 pub struct Raw {
@@ -76,6 +80,7 @@ pub struct Raw {
     pub sqref: String,
 }
 
+#[cfg(feature = "read")]
 fn rgb(e: &quick_xml::events::BytesStart) -> Option<u32> {
     let v = super::read::attr(e, b"rgb").ok()??;
     let v = v.trim();
@@ -83,6 +88,7 @@ fn rgb(e: &quick_xml::events::BytesStart) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok().filter(|&c| c <= 0xFF_FFFF)
 }
 
+#[cfg(feature = "read")]
 /// The sparklines in an `<ext>`'s inner XML, at most [`MAX_SPARKLINES`].
 pub fn read_extension(xml: &[u8], out: &mut Vec<Raw>) -> Result<(), quick_xml::Error> {
     let mut r = quick_xml::Reader::from_reader(xml);
@@ -128,6 +134,7 @@ pub fn read_extension(xml: &[u8], out: &mut Vec<Raw>) -> Result<(), quick_xml::E
     Ok(())
 }
 
+#[cfg(feature = "read")]
 /// Sheet `s`'s sparklines from what was read; `false` when any couldn't be
 /// resolved (an unknown sheet, a bad range) and was left out.
 pub fn resolve(wb: &Workbook, s: u16, raws: &[Raw]) -> (Vec<Sparkline>, bool) {

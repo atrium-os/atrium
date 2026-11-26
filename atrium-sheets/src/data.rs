@@ -206,6 +206,16 @@ pub enum DataCmd {
     Sparklines,
     /// Protect Workbook: the structure locked, or unlocked.
     ProtectWorkbook,
+    /// Formulas tab ([`crate::formulas`]): manual or automatic calculation,
+    /// the Watch Window and Add Watch, names from labels (a bar) and into
+    /// formulas, Auto Outline and Workbook Statistics.
+    ManualCalc,
+    AddWatch,
+    WatchWindow,
+    CreateNames,
+    ApplyNames,
+    AutoOutline,
+    WorkbookStats,
     /// Fill ▸ Across Worksheets (a bar, [`crate::series::fill_across`]).
     FillAcross,
     /// Formulas at the cursor reading the cells last copied, one for each.
@@ -536,6 +546,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste Name…").shortcut("F3").enabled(!paste_names(d).is_empty()), Some(DataCmd::PasteName)),
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
         (MenuItem::new("Calculate Sheet").shortcut("Shift+F9"), Some(DataCmd::CalculateSheet)),
+        (MenuItem::new("Manual Calculation").checked(wb.manual_calc()), Some(DataCmd::ManualCalc)),
+        (MenuItem::new("Add Watch"), Some(DataCmd::AddWatch)),
+        (MenuItem::new("Watch Window…"), Some(DataCmd::WatchWindow)),
+        (MenuItem::new("Workbook Statistics…"), Some(DataCmd::WorkbookStats)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
         (MenuItem::new("Protect Workbook Structure").checked(wb.structure_protected()), Some(DataCmd::ProtectWorkbook)),
@@ -593,6 +607,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let validated = wb.validations().iter().any(|v| v.ranges.iter().any(|r| r.sheet == s && r.r0 <= sel_rect.r1 && sel_rect.r0 <= r.r1 && r.c0 <= sel_rect.c1 && sel_rect.c0 <= r.c1));
     v.push((MenuItem::new("Define Name…").separated(), Some(DataCmd::DefineName)));
     v.push((MenuItem::new("Name Manager…").shortcut("Ctrl+F3"), Some(DataCmd::NameManager)));
+    v.push((MenuItem::new("Create Names from Selection…").shortcut("Ctrl+Shift+F3").enabled(sel.r0 != sel.r1 || sel.c0 != sel.c1), Some(DataCmd::CreateNames)));
+    v.push((MenuItem::new("Apply Names").enabled(wb.names().iter().next().is_some()), Some(DataCmd::ApplyNames)));
     v.push((MenuItem::new("Data Validation…"), Some(DataCmd::Validation)));
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
@@ -628,6 +644,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     ] {
         authoring.push((MenuItem::new(label), Some(DataCmd::Author(AuthorCmd::Outline(axis, op)))));
     }
+    authoring.push((MenuItem::new("Auto Outline"), Some(DataCmd::AutoOutline)));
     authoring.push((MenuItem::new("Edit Selected Chart…").enabled(d.wb.charts().iter().any(|c| c.anchor.sheet == s)),
         Some(DataCmd::Author(AuthorCmd::ChartOpen))));
     v.splice(5..5, authoring);
@@ -2934,8 +2951,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::InsertCellsDown | DataCmd::InsertCellsRight | DataCmd::DeleteCellsUp | DataCmd::DeleteCellsLeft => shift_cells(d, sel, cmd),
         DataCmd::CustomSort | DataCmd::GoalSeek | DataCmd::AutoFitRows | DataCmd::AutoFitCols => Ok(String::new()),
         DataCmd::CalculateNow | DataCmd::CalculateSheet => {
-            d.wb.mark_all((cmd == DataCmd::CalculateSheet).then_some(s));
-            d.recalc();
+            d.calculate_now((cmd == DataCmd::CalculateSheet).then_some(s));
             Ok(if cmd == DataCmd::CalculateNow { "Calculated every sheet.".into() } else { "Calculated this sheet.".into() })
         }
         DataCmd::InsertFunction | DataCmd::PasteName | DataCmd::Precedents | DataCmd::Dependents => Ok(String::new()),
@@ -3039,6 +3055,11 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable | DataCmd::Scenarios | DataCmd::Series | DataCmd::ErrorChecking | DataCmd::TraceError | DataCmd::EvaluateFormula | DataCmd::Sparklines | DataCmd::FillAcross => Ok(String::new()),
         DataCmd::Justify => crate::series::justify(d, sel),
         DataCmd::ProtectWorkbook => protect_workbook(d),
+        DataCmd::ManualCalc => crate::formulas::toggle_manual(d),
+        DataCmd::AddWatch => crate::formulas::add_watches(d, sel),
+        DataCmd::ApplyNames => crate::formulas::apply_names(d, sel),
+        DataCmd::AutoOutline => crate::formulas::auto_outline(d, sel),
+        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

@@ -106,6 +106,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
             ops.push(GridOp::Sparklines { sheet: other, list: kept });
         }
     }
+    if !wb.sheet(s).watches().is_empty() {
+        ops.push(GridOp::Watches { sheet: s, list: Vec::new() });
+    }
     if !wb.sheet(s).scenarios().is_empty() {
         ops.push(GridOp::Scenarios { sheet: s, list: Vec::new() });
     }

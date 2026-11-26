@@ -734,7 +734,14 @@ impl Doc {
     }
 
     /// Recalculates within the budget; what's left waits for [`Doc::settle`].
+    /// Under manual calculation only the changed cells' own formulas are
+    /// worked out; their readers wait for [`Doc::calculate_now`].
     pub fn recalc(&mut self) {
+        if self.wb.manual_calc() {
+            let changed = self.wb.changed_rects().to_vec();
+            self.wb.recalc_cells(&changed);
+            return;
+        }
         match self.recalc_budget {
             Some(b) => {
                 let view = self.calculation_view.as_slice();
@@ -752,11 +759,28 @@ impl Doc {
 
     /// Another slice of unfinished recalculation: true when work remains.
     pub fn settle(&mut self) -> bool {
-        if !self.wb.recalc_pending() {
+        if !self.wb.recalc_pending() || self.wb.manual_calc() {
             return false;
         }
         self.recalc();
         self.wb.recalc_pending()
+    }
+
+    /// Calculate Now (F9), or this sheet only (Shift+F9): every formula
+    /// worked out again, at once under manual calculation.
+    pub fn calculate_now(&mut self, sheet: Option<u16>) {
+        self.wb.mark_all(sheet);
+        if self.wb.manual_calc() {
+            self.wb.recalc();
+        } else {
+            self.recalc();
+        }
+    }
+
+    /// Whether manual calculation has edits waiting (Excel's "Calculate" on
+    /// the status bar).
+    pub fn needs_calculate(&self) -> bool {
+        self.wb.manual_calc() && self.wb.recalc_pending()
     }
 
     pub fn start_tracking(&mut self, author: &str) -> Result<(), &'static str> {

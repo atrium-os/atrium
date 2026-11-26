@@ -639,6 +639,37 @@ impl Workbook {
         self.recalc()
     }
 
+    /// The cells changed since the last recalculation, oldest first.
+    pub fn changed_rects(&self) -> &[Rect] {
+        &self.changed
+    }
+
+    /// Works out the formulas in `rects` (the last 64) alone, not the cells
+    /// that read them: under manual calculation an entered formula shows its
+    /// value while the rest waits for Calculate Now. What changed stays
+    /// pending, so the next full recalculation still reaches every reader.
+    pub fn recalc_cells(&mut self, rects: &[Rect]) -> RecalcStats {
+        let mut stats = RecalcStats::default();
+        let mut todo: Vec<(GroupId, crate::deps::RowSet)> = Vec::new();
+        for r in rects.iter().rev().take(64) {
+            for (g, grp) in self.groups() {
+                if grp.sheet != r.sheet || !(r.c0..=r.c1).contains(&grp.col) || grp.r0 > r.r1 || r.r0 > grp.r1 {
+                    continue;
+                }
+                let mut rows = crate::deps::RowSet::default();
+                let _ = rows.add(grp.r0.max(r.r0), grp.r1.min(r.r1));
+                todo.push((g, rows));
+            }
+        }
+        for (g, rows) in todo {
+            if self.groups.get(g as usize).is_some_and(|x| x.is_some()) {
+                let _ = self.eval_parallel(g, &rows, &mut stats, None);
+            }
+        }
+        self.apply_spills();
+        stats
+    }
+
     /// Marks every formula (or only `sheet`'s) as needing calculation, for
     /// a later [`Workbook::recalc`] or slices of it (Excel's F9, Shift+F9).
     pub fn mark_all(&mut self, sheet: Option<u16>) {

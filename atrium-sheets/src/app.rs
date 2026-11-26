@@ -135,6 +135,10 @@ pub enum Cmd {
     ListsClose,
     /// The Name Manager panel.
     Names(crate::data::NamesCmd),
+    /// The Watch Window.
+    Watch(crate::formulas::WatchCmd),
+    /// Workbook Statistics closed.
+    StatsClose,
     /// The conditional-format panel.
     Cond(CondCmd),
     /// The pivot field list.
@@ -340,6 +344,10 @@ pub struct Sheets {
     pub lists_open: Mutable<bool>,
     /// The Name Manager panel is open.
     pub names_open: Mutable<bool>,
+    /// The Watch Window is open.
+    pub watch_open: Mutable<bool>,
+    /// Workbook Statistics is showing.
+    pub stats_open: Mutable<bool>,
     pub password: Mutable<PasswordBar>,
     pub password_text: Mutable<TextEdit>,
     pub chart_title: Mutable<TextEdit>,
@@ -467,7 +475,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), filter_cond2_menu: Mutable::new(MenuState::default()) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), filter_cond2_menu: Mutable::new(MenuState::default()), watch_open: Mutable::new(false), stats_open: Mutable::new(false) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -518,6 +526,7 @@ impl Sheets {
             (0x13, true, false) => Cmd::Print,
             (0x09 | 0x0b, true, _) => Cmd::Author(AuthorCmd::FindOpen),
             (0x3c, true, false) => Cmd::Data(crate::data::DataCmd::NameManager),
+            (0x3c, true, true) => Cmd::Data(crate::data::DataCmd::CreateNames),
             _ => return None,
         };
         let mut grid = self.grid.get_cloned();
@@ -3290,6 +3299,65 @@ impl View for Sheets {
             Button::primary("Close").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::Names(NamesCmd::Close))).render(ctx);
         }
 
+        // The Watch Window, at the right over the grid: each watched cell's
+        // place, value and formula, with Go and Delete.
+        if self.watch_open.get() && !pb.open {
+            use crate::formulas::WatchCmd;
+            let (x0, y0) = ((w - FILTER_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(160.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, FILTER_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: "Watch Window".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let rows = crate::formulas::watch_rows(&self.doc.borrow().wb);
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            if rows.is_empty() {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 40.0, FILTER_W - 24.0, 40.0), content: "No cells watched. Select cells, then Add Watch.".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            let room = ((ph - 40.0 - 56.0) / (2.0 * FILTER_ROW_H)).max(0.0) as usize;
+            let clip = |s: &str, n: usize| if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() };
+            for (i, r) in rows.iter().enumerate().take(room) {
+                let y = y0 + 40.0 + i as f32 * 2.0 * FILTER_ROW_H;
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0, FILTER_W - 180.0, 18.0), content: format!("{} = {}", clip(&r.place, 30), clip(&r.value, 24)), style: st(type_size::SM, Weight::Semibold, t.text_primary()) });
+                if let Some(f) = &r.formula {
+                    ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0 + FILTER_ROW_H, FILTER_W - 24.0, 18.0), content: clip(f, 60), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                }
+                Button::secondary("Go").at(x0 + FILTER_W - 156.0, y + 2.0).width(64.0).on_click(push(Cmd::Watch(WatchCmd::Go(i)))).render(ctx);
+                Button::secondary("Delete").at(x0 + FILTER_W - 84.0, y + 2.0).width(72.0).on_click(push(Cmd::Watch(WatchCmd::Delete(i)))).render(ctx);
+            }
+            let by = y0 + ph - 44.0;
+            if rows.len() > room {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, by + 6.0, FILTER_W - 190.0, 18.0), content: format!("{} more not shown", rows.len() - room), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            Button::secondary("Add Watch").at(x0 + FILTER_W - 184.0, by).width(92.0).on_click(push(Cmd::Watch(WatchCmd::Add))).render(ctx);
+            Button::primary("Close").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::Watch(WatchCmd::Close))).render(ctx);
+        }
+
+        // Workbook Statistics, at the right over the grid.
+        if self.stats_open.get() && !pb.open {
+            let (x0, y0) = ((w - FILTER_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(160.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, FILTER_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: "Workbook Statistics".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let lines = crate::formulas::statistics(&self.doc.borrow());
+            for (i, (label, n)) in lines.iter().enumerate() {
+                let y = y0 + 40.0 + i as f32 * FILTER_ROW_H;
+                if y > y0 + ph - 60.0 {
+                    break;
+                }
+                let head = label.contains(':');
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0, FILTER_W - 120.0, 18.0), content: label.clone(), style: st(type_size::SM, if head { Weight::Semibold } else { Weight::Regular }, t.text_primary()) });
+                ctx.add(Node::Text { rect: Rect::new(x0 + FILTER_W - 100.0, y + 3.0, 88.0, 18.0), content: n.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            let cmds = self.cmds.clone();
+            Button::primary("Close").at(x0 + FILTER_W - 84.0, y0 + ph - 44.0).width(72.0).on_click(move || cmds.lock().unwrap().push(Cmd::StatsClose)).render(ctx);
+        }
+
         // The custom lists, at the right over the grid: each with Forget.
         if self.lists_open.get() && !pb.open {
             let (x0, y0) = ((w - FILTER_W).max(0.0), TOOLBAR_H + FORMULA_H);
@@ -3945,7 +4013,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames)) => {
                     self.close_bars();
                     let g = self.grid.get_cloned();
                     let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));
@@ -4199,6 +4267,61 @@ impl Sheets {
                             self.grid.set(g);
                         }
                         Err(why) => self.set_status(why),
+                    }
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::WatchWindow) => {
+                    self.lists_open.set(false);
+                    self.names_open.set(false);
+                    self.stats_open.set(false);
+                    self.watch_open.set(true);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::WorkbookStats) => {
+                    self.lists_open.set(false);
+                    self.names_open.set(false);
+                    self.watch_open.set(false);
+                    self.stats_open.set(true);
+                    self.changed();
+                    false
+                }
+                Cmd::StatsClose => {
+                    self.stats_open.set(false);
+                    self.changed();
+                    false
+                }
+                Cmd::Watch(w) => {
+                    use crate::formulas::WatchCmd;
+                    match w {
+                        WatchCmd::Close => self.watch_open.set(false),
+                        WatchCmd::Add => {
+                            let sel = self.grid.get_cloned().selection();
+                            let res = crate::formulas::add_watches(&mut self.doc.borrow_mut(), sel);
+                            match res {
+                                Ok(m) | Err(m) => self.set_status(m),
+                            }
+                            self.rev.set(self.rev.get().wrapping_add(1));
+                        }
+                        WatchCmd::Delete(i) => {
+                            let res = crate::formulas::delete_watch(&mut self.doc.borrow_mut(), i);
+                            match res {
+                                Ok(m) | Err(m) => self.set_status(m),
+                            }
+                            self.rev.set(self.rev.get().wrapping_add(1));
+                        }
+                        WatchCmd::Go(i) => {
+                            let at = crate::formulas::watch_rows(&self.doc.borrow().wb).get(i).map(|r| (r.sheet, r.row, r.col));
+                            if let Some((sheet, row, col)) = at {
+                                self.show_sheet(sheet);
+                                self.show_cell(row, col);
+                                let mut g = self.grid.get_cloned();
+                                g.anchor = (row, col);
+                                g.cursor = (row, col);
+                                self.grid.set(g);
+                            }
+                        }
                     }
                     self.changed();
                     false

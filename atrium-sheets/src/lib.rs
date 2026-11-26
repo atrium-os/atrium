@@ -26,3 +26,4 @@ pub mod scenarios;
 pub mod series;
 pub mod audit;
 pub mod sparkbar;
+pub mod formulas;

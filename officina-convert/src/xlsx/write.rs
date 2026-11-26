@@ -634,6 +634,14 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         }
         o.extend_from_slice(b"</hyperlinks>");
     }
+    let watches = wb.sheet(s).watches();
+    if !watches.is_empty() {
+        o.extend_from_slice(b"<cellWatches>");
+        for &(r, c) in watches {
+            let _ = write!(o, r#"<cellWatch r="{}"/>"#, a1(r, c));
+        }
+        o.extend_from_slice(b"</cellWatches>");
+    }
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
     if wb.charts().iter().any(|c| c.anchor.sheet == s) || wb.pictures().iter().any(|p| p.anchor.sheet == s) {
         let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
@@ -962,8 +970,15 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         w.extend_from_slice(b"</definedNames>");
     }
-    if let Some(it) = wb.iteration() {
-        let _ = write!(w, r#"<calcPr iterate="1" iterateCount="{}" iterateDelta="{}"/>"#, it.count, it.change);
+    if wb.iteration().is_some() || wb.manual_calc() {
+        w.extend_from_slice(b"<calcPr");
+        if wb.manual_calc() {
+            w.extend_from_slice(br#" calcMode="manual""#);
+        }
+        if let Some(it) = wb.iteration() {
+            let _ = write!(w, r#" iterate="1" iterateCount="{}" iterateDelta="{}""#, it.count, it.change);
+        }
+        w.extend_from_slice(b"/>");
     }
     if !pivots.is_empty() {
         w.extend_from_slice(b"<pivotCaches>");

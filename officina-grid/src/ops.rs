@@ -114,6 +114,10 @@ pub enum GridOp {
     Structure(Option<crate::protection::SheetProtection>),
     /// A sheet's sparklines, the whole list replaced.
     Sparklines { sheet: u16, list: Vec<crate::sparkline::Sparkline> },
+    /// Manual (true) or automatic calculation.
+    Calculation(bool),
+    /// A sheet's watched cells, the whole list replaced.
+    Watches { sheet: u16, list: Vec<(u32, u32)> },
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -346,6 +350,17 @@ impl GridOp {
                 w.u8(29);
                 w.u16(*sheet);
                 crate::scenario::encode(list, &mut w);
+                return w.into_bytes();
+            }
+            GridOp::Calculation(manual) => {
+                w.u8(32);
+                w.u8(u8::from(*manual));
+                return w.into_bytes();
+            }
+            GridOp::Watches { sheet, list } => {
+                w.u8(33);
+                w.u16(*sheet);
+                crate::watch::encode(list, &mut w);
                 return w.into_bytes();
             }
             GridOp::Iteration(it) => {
@@ -597,6 +612,25 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::Structure(p));
+        }
+        if kind == 32 {
+            let manual = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Invalid("calculation mode")),
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Calculation(manual));
+        }
+        if kind == 33 {
+            let sheet = r.u16()?;
+            let list = crate::watch::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Watches { sheet, list });
         }
         if kind == 30 {
             let sheet = r.u16()?;
@@ -902,6 +936,22 @@ impl Op<Workbook> for GridOp {
                     _ => return GridOp::Batch(Vec::new()),
                 }
                 GridOp::Scenarios { sheet, list }
+            }
+            GridOp::Calculation(manual) => {
+                let old = wb.manual_calc();
+                wb.set_manual_calc(manual);
+                // Back to automatic: what waited is worked out now.
+                if old && !manual {
+                    wb.mark_all(None);
+                }
+                GridOp::Calculation(old)
+            }
+            GridOp::Watches { sheet, mut list } => {
+                match wb.sheets.get_mut(sheet as usize) {
+                    Some(sh) if crate::watch::valid_list(&list) => std::mem::swap(&mut sh.watches, &mut list),
+                    _ => return GridOp::Batch(Vec::new()),
+                }
+                GridOp::Watches { sheet, list }
             }
             GridOp::Iteration(it) => {
                 let old = wb.iteration();

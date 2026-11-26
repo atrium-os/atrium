@@ -429,6 +429,8 @@ struct Seg {
     sparks: Vec<super::sparkline::Raw>,
     /// `<scenarios><scenario><inputCells>`.
     scenarios: Vec<officina_grid::scenario::Scenario>,
+    /// `<cellWatches><cellWatch r>`, at most a sheet's worth.
+    watches: Vec<(u32, u32)>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -697,6 +699,16 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     seg.rep.note(Kind::Dropped, "scenarios past the 256th on a sheet");
                 }
             }
+            b"cellWatch" => {
+                match attr(&e, b"r")?.as_deref().and_then(parse_a1) {
+                    Some(at) if seg.watches.len() < officina_grid::watch::MAX_WATCHES => {
+                        if !seg.watches.contains(&at) {
+                            seg.watches.push(at);
+                        }
+                    }
+                    _ => seg.rep.note(Kind::Dropped, "watched cells past 1,000 on a sheet, or unreadable"),
+                }
+            }
             b"inputCells" => {
                 let at = attr(&e, b"r")?.as_deref().and_then(parse_a1);
                 let val = attr(&e, b"val")?.unwrap_or_default();
@@ -933,6 +945,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     if !all || !set {
                         seg.rep.note(Kind::Dropped, "sparklines with an unknown sheet, a bad range or a cell used twice");
                     }
+                }
+                if !seg.watches.is_empty() && !wb.set_watches(s, seg.watches) {
+                    seg.rep.note(Kind::Dropped, "watched cells");
                 }
                 if !seg.scenarios.is_empty() && !wb.set_scenarios(s, seg.scenarios) {
                     seg.rep.note(Kind::Dropped, "scenarios with no name, a name twice, no cells or a cell twice");
@@ -1412,6 +1427,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     // Defined names: (name, sheet index it is local to, formula text).
     let mut names: Vec<(String, Option<u32>, String)> = Vec::new();
     let mut iteration: Option<officina_grid::book::Iteration> = None;
+    let mut manual = false;
     let mut structure = None;
     {
         let mut r = xml(&wb_xml);
@@ -1446,11 +1462,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                             }).or_insert(Some(rel));
                         }
                     }
-                    b"calcPr" if attr(&e, b"iterate")?.is_some_and(|v| v == "1" || v == "true") => {
-                        // ECMA-376's defaults: 100 times, 0.001.
-                        let count = attr(&e, b"iterateCount")?.and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
-                        let change = attr(&e, b"iterateDelta")?.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.001);
-                        iteration = Some(officina_grid::book::Iteration { count, change });
+                    b"calcPr" => {
+                        if attr(&e, b"iterate")?.is_some_and(|v| v == "1" || v == "true") {
+                            // ECMA-376's defaults: 100 times, 0.001.
+                            let count = attr(&e, b"iterateCount")?.and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
+                            let change = attr(&e, b"iterateDelta")?.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.001);
+                            iteration = Some(officina_grid::book::Iteration { count, change });
+                        }
+                        // "autoNoTable" is automatic here: data tables are values.
+                        manual = attr(&e, b"calcMode")?.is_some_and(|v| v == "manual");
                     }
                     b"workbookProtection" if attr(&e, b"lockStructure")?.is_some_and(|v| v == "1" || v == "true") => {
                         let attrs = e.attributes().with_checks(false).flatten().filter_map(|a| {
@@ -1489,6 +1509,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     use officina_grid::eval::dates::DateSystem;
     let system = if out.date1904 { DateSystem::Excel1904 } else { DateSystem::Excel1900 };
     let mut wb = Workbook::with_date_system(system);
+    wb.set_manual_calc(manual);
     if let Some(it) = iteration {
         if !wb.set_iteration(Some(it)) {
             out.report.note(Kind::Dropped, "iteration settings");
