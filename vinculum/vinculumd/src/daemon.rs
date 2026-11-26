@@ -61,6 +61,8 @@ pub struct Config {
     /// Where Bluetooth being off is kept across restarts (the file holds
     /// `off`); without one, vinculumd starts on.
     pub power_file: Option<String>,
+    /// The Classic local name.
+    pub name: String,
 }
 
 struct Daemon {
@@ -835,6 +837,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
     let _ = std::fs::set_permissions(&cfg.control_path, std::fs::Permissions::from_mode(0o660));
     let hid = Hid::new(cfg.hid_path.as_deref(), cfg.hid_uids.clone());
     let mut host = Host::new();
+    host.set_local_name(&cfg.name);
     if hid.enabled() {
         host.register_psm(hid::PSM_CONTROL);
         host.register_psm(hid::PSM_INTERRUPT);

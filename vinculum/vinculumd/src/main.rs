@@ -156,6 +156,8 @@ struct Opts {
     control_uids: Vec<u32>,
     control_apps: Option<(String, String)>,
     power_file: Option<String>,
+    /// The Classic name others see (`--name`, default "Atrium").
+    name: String,
     hid: Option<String>,
     hid_uids: Vec<u32>,
     classic: Option<vinculum_control::Addr>,
@@ -163,7 +165,7 @@ struct Opts {
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]]");
+        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]] [--name NAME]");
         std::process::exit(2)
     };
     let mut o = Opts { transport: String::new(), transport_uids: Vec::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
@@ -176,6 +178,7 @@ fn opts() -> Opts {
         control_uids: Vec::new(),
         control_apps: None,
         power_file: None,
+        name: "Atrium".into(),
         hid: None,
         hid_uids: Vec::new(),
         classic: None,
@@ -205,6 +208,7 @@ fn opts() -> Opts {
                 o.control_apps = Some((r, d));
             }
             "--power-file" => o.power_file = Some(a.next().unwrap_or_else(|| usage())),
+            "--name" => o.name = a.next().unwrap_or_else(|| usage()),
             "--control-uid" => o.control_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
@@ -281,13 +285,14 @@ fn main() {
         std::process::exit(1)
     });
     if let Some(path) = o.control.clone() {
-        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), allowed_apps: o.control_apps.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone(), power_file: o.power_file.clone() };
+        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), allowed_apps: o.control_apps.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone(), power_file: o.power_file.clone(), name: o.name.clone() };
         daemon::run(cfg, link, store, bonds);
     }
     let t0 = Instant::now();
     let now = || t0.elapsed().as_millis() as u64;
     let give_up = o.timeout_secs * 1000;
     let mut host = Host::new();
+    host.set_local_name(&o.name);
     let mut dec = Decoder::new();
     let mut buf = vec![0u8; 8192];
     let mut phase = Phase::BringUp;

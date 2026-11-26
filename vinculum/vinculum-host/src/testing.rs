@@ -98,6 +98,7 @@ pub fn answer(cmd: &Frame, le_buffers: u8) -> Option<Frame> {
         OpCode::WriteSecureConnectionsHostSupport => {
             complete(hci::WriteSecureConnectionsHostSupportComplete { status: ok, num_hci_command_packets: 1 })
         }
+        OpCode::WriteLocalName => complete(hci::WriteLocalNameComplete { status: ok, num_hci_command_packets: 1 }),
         _ => return None,
     })
 }

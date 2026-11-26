@@ -261,3 +261,23 @@ fn bredr_secure_connections_comes_from_features_page_2() {
     assert!(h.is_ready());
     assert!(!h.info().bredr_secure_connections());
 }
+
+#[test]
+fn bring_up_sets_the_classic_local_name() {
+    let mut h = Host::new();
+    h.set_local_name("Atrium");
+    h.start(0);
+    let mut name = None;
+    for _ in 0..32 {
+        let Some(cmd) = h.poll_frame() else { break };
+        let c = hci::Command::decode_full(&cmd.packet).unwrap();
+        if c.op_code == OpCode::WriteLocalName {
+            name = Some(c.payload.clone());
+        }
+        h.on_frame(vinculum_host::testing::answer(&cmd, 4).expect("canned answer"), 0);
+    }
+    assert!(h.is_ready());
+    let n = name.expect("Write Local Name sent");
+    assert_eq!(n.len(), 248);
+    assert_eq!(&n[..7], b"Atrium\0");
+}

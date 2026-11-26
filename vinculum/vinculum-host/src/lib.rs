@@ -192,6 +192,7 @@ enum Step {
     LeSetEventMask,
     WriteSimplePairingMode,
     WriteScHostSupport,
+    WriteLocalName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +250,8 @@ pub struct Host {
     out_frames: VecDeque<Frame>,
     out_events: VecDeque<HostEvent>,
     stats: Stats,
+    /// The Classic name others see in inquiry and pairing (set at bring-up).
+    local_name: Option<String>,
 }
 
 /// Event mask: the spec default (bits 0–44, which hold Inquiry Result with
@@ -296,7 +299,18 @@ impl Host {
             out_frames: VecDeque::new(),
             out_events: VecDeque::new(),
             stats: Stats::default(),
+            local_name: None,
         }
+    }
+
+    /// The Classic local name to set at bring-up (call before `start`);
+    /// cut to the controller's 248 bytes at a character boundary.
+    pub fn set_local_name(&mut self, name: &str) {
+        let mut n = name.to_string();
+        while n.len() > 247 {
+            n.pop();
+        }
+        self.local_name = Some(n);
     }
 
     /// Starts bring-up. Call once, then drive with the other methods.
@@ -858,7 +872,7 @@ impl Host {
         }
         // BR/EDR security setup is optional: without it Classic pairing
         // fails (and policy refuses non-SC keys anyway); LE still works.
-        if matches!(step, WriteSimplePairingMode | WriteScHostSupport) && status != hci::ErrorCode::Success {
+        if matches!(step, WriteSimplePairingMode | WriteScHostSupport | WriteLocalName) && status != hci::ErrorCode::Success {
             return self.finish_bring_up();
         }
         // A controller with no page 2 (pre-4.1) has no BR/EDR Secure
@@ -982,7 +996,12 @@ impl Host {
                 to_cmd(hci::WriteSecureConnectionsHostSupport { secure_connections_host_support: hci::Enable::Enabled }),
                 WriteScHostSupport,
             )),
-            WriteScHostSupport => None,
+            WriteScHostSupport => self.local_name.as_ref().map(|n| {
+                let mut local_name = [0u8; 248];
+                local_name[..n.len()].copy_from_slice(n.as_bytes());
+                (to_cmd(hci::WriteLocalName { local_name }), WriteLocalName)
+            }),
+            WriteLocalName => None,
         };
         match next {
             Some((c, s)) => self.issue(c, Tag::Init(s)),
