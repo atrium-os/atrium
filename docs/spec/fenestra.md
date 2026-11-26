@@ -48,7 +48,7 @@ pixels the way RDP and VNC must.
 | **Shared view** | Show one window into a meeting, or let a colleague watch; view only. | Yes, as a restricted mint (aqueduct-remote.md §4) |
 | **Headless host** | A server or cloud VM with no monitor and no GPU runs a session that only remote viewers see. | Yes, and it is the cheapest case (§4.4) |
 | **Atrium viewing a foreign desktop** (Windows, Linux, macOS) | | No. That is an RDP or VNC client app, a separate project. |
-| **A foreign viewer** (macOS, Windows, a browser) viewing an Atrium host | | Later (§14). The viewer is portable Rust; nothing in the protocol assumes FreeBSD. |
+| **A portable viewer** on macOS and Linux viewing an Atrium host | Shankar's Mac viewing the Atrium VM; a Linux cloud container viewing a cloud VM | **Yes, first** (§14, decided by Shankar 2026-11-26): it is how Fenestra is developed and tested while Atrium runs in a VM. Windows and a browser viewer later. |
 
 ## 2. What goes wrong with existing remote viewers
 
@@ -1209,17 +1209,88 @@ correlated alert. `fenestra sessions --history` shows the last 100 on the host.
   host needs no knowledge of the viewer's panel beyond what the output declares.
 - Span groups (fresco-span.md) are not offered on remote outputs in v1.
 
-## 14. Viewers that are not Atrium (later)
+## 14. The portable viewer (macOS and Linux first), and later Windows and browsers
 
-The viewer side is three parts: QUIC, the renderer (`fresco-compute`, Rust, with a CPU
-reference path and the compute kernels), and composition. A portable `fenestra` viewer for
-macOS (insula-host-macos.md's layer) and later a browser viewer (WebGPU, the compute kernels
-compiled for it, WebTransport for QUIC) are plausible because nothing in the stream is
-FreeBSD-specific. They would run the renderer in-process without Atrium's jails, so they get
-the validator but not the containment; their spec must say how they confine it (a macOS
-sandbox profile, the browser's process). Not in v1.
+Shankar (2026-11-26): the non-Atrium viewer is needed **from the start**, because during
+development Atrium runs in a VM while the person sits at macOS (the Mac and its shared VM) and
+the cloud threads sit in a Linux container (with `scripts/cloud-vm.sh`'s VM). So the first
+viewer is `fenestra-view`, a portable Rust program for macOS and Linux; the Atrium viewer of
+§3.3 reuses its core and follows.
 
-Input on such viewers needs no Tactus *daemon*. The contract with the host is the typed event
+### 14.1 What it is made of
+
+- **Network**: the same `fenestra-net` code (quinn, rustls, the pinned-key handshake, stream
+  demux), built for macOS and Linux.
+- **Renderer**: the scene-stream reader and the window raster. Today that code sits in
+  frescod's `fresco-renderer` binary, which does not build off FreeBSD (kqueue, the split
+  channel). R1 therefore moves the renderer's scene state, validator, stream apply and raster
+  calls into a **portable crate** (working name `fresco-render-core`) used by both the FreeBSD
+  renderer jail and `fenestra-view`. `fresco-compute` already builds on Linux and macOS (its
+  CPU path through atrium-spv on arm64 and x86_64).
+- **Presentation**: one native window per session (whole desktop) through `winit` and
+  `softbuffer` (both MIT/Apache-2.0, licence-audited in R0), drawing the compute renderer's
+  pixels; a GPU path through Metal or Vulkan later. Rootless mode on macOS (one native window
+  per remote window) comes after the Atrium rootless step.
+- **Input**: the adapters of §14.6 (AppKit and GameController on macOS; evdev-free Linux input
+  through the windowing system, plus `hidraw` via the `tactus` crate for wheels and pads).
+- **Audio**: Opus decode and CoreAudio or ALSA/PipeWire output through a permissive crate
+  (`cpal`, Apache-2.0), audited in R0.
+- **CLI**: the same `fenestra connect|list|stats|disconnect ...` commands (§15), and the same
+  `--json`.
+
+### 14.2 Headless mode, for gates
+
+`fenestra-view --headless --png-every N --input-script FILE` renders without a window, writes
+frames as PNGs, plays scripted input and prints stats as JSON. The cloud gates use it: the
+Atrium host runs in `cloud-vm.sh`'s VM, the viewer runs in the Linux container, and a gate
+compares the viewer's frames bit for bit against the host's own local raster of the same
+scene. This replaces the "two cloud VMs" rig R2 had planned, so Fenestra gates need only one VM
+under TCG.
+
+### 14.3 Containment off Atrium
+
+Off Atrium there are no jails, so the viewer splits itself into processes and confines each
+with what the OS has, keeping §11's rule that host bytes are parsed only where nothing is held:
+
+- **Linux**: `fenestra-net` and one renderer process per remote client, each with Landlock (no
+  filesystem), seccomp (no socket creation in the renderer, no `exec`), its own network
+  namespace for the renderer (no network), and memory limits by `setrlimit`; the presenting
+  process holds the window and the input devices and reads only fixed-size records from the
+  renderers (the `fresco-split` record format).
+- **macOS**: the same split, with each helper under a sandbox profile (`sandbox_init` with a
+  deny-default profile, or XPC services with App Sandbox entitlements when it is packaged as
+  an app): no network for renderers, no file access, no other app's data.
+- Until the confinement gate (R3's hostile-host checks run against `fenestra-view`) passes on
+  a platform, the viewer prints and shows "development viewer: connect only to hosts you
+  control" on every connection there. Connecting to your own VM is the development case and is
+  fine without it.
+- Secrets on the viewer: the SSH key stays in the person's own agent (macOS Keychain-backed
+  `ssh-agent`, or the Linux agent); `fenestra-view` never reads key files. Its cache on disk
+  (§5.4) goes in the OS's per-user cache directory, encrypted with a key held in the macOS
+  Keychain or the Linux Secret Service, or stays in memory where neither exists.
+
+### 14.4 Reaching a VM
+
+- **Mac VM** (`scripts/run-vm.sh`, QEMU user networking): SSH is already forwarded on 2222.
+  Fenestra adds a UDP forward for a small fixed session port range (default 24300 to 24303;
+  `FENESTRA_PORTS` in `run-vm.sh` and `cloud-vm.sh` via `NETDEV_EXTRA`), and the mint returns
+  the address the client used for SSH with the same port, so no address rewriting is needed.
+  Changing `run-vm.sh` touches the shared VM, so it goes through the coordinator like any VM
+  change.
+- **Cloud VM** (`scripts/cloud-vm.sh`): the same forward on 127.0.0.1, and the viewer in the
+  container connects to it.
+- Under TCG every timing is a functional check, never a product number (AGENTS.md).
+
+### 14.5 Later: Windows and a browser
+
+A Windows build of `fenestra-view` (the same crates; AppContainer for confinement) and a
+browser viewer (WebGPU for the compute kernels, WebTransport for QUIC, the browser's process
+model for confinement) are plausible because nothing in the stream is FreeBSD-specific. Not
+in v1.
+
+### 14.6 Input adapters
+
+Input on non-Atrium viewers needs no Tactus *daemon*. The contract with the host is the typed event
 set of §9.1 (Tactus's event shapes), so each platform needs an **input adapter** from its own
 APIs to those events:
 
@@ -1322,6 +1393,10 @@ Shankar's rule: every GUI action has a command. `fenestra` on both ends:
     app, LAN only, for apps that declare no GPU readbacks** (§7.2a). *Recommend yes.* Remoted
     Vulkan caps frame rate by RTT and stalls on readbacks, and it puts the host one driver bug
     from the viewer's kernel; retained 3D gets the benefits without either.
+16. **Decided by Shankar (2026-11-26): the portable viewer for macOS and Linux comes first**
+    (§14), because development runs Atrium in a VM. R1 moves the renderer core into a portable
+    crate; R2's first viewer is `fenestra-view`, headless in the cloud gates and windowed on
+    the Mac; the Atrium viewer follows on the same core.
 
 ## 18. Out of scope, and honest limits
 
@@ -1347,8 +1422,8 @@ VM runs only with the coordinator's go.
 | Step | What | Gate |
 |---|---|---|
 | R0 | This spec reviewed and decided. QUIC crates licence-audited. | review thread sign-off |
-| R1 | Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
-| R2 | `fenestrad` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode with a session window on the viewer, input, cursor, stats. Two cloud VMs on one host network with `netem` delay and loss. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
+| R1 | The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
+| R2 | `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
 | R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |
 | R5 | Viewer-scrollable SCROLL groups in frescod (local and remote), Pergola ScrollView and Navigator documents set the flag. | `scroll_bench` locally; scroll latency at 150 ms RTT in the R2 rig |
