@@ -40,6 +40,93 @@ const FORMAT_PAINTER_W: f32 = 124.0;
 /// The status bar's zoom control: −, the percent, +.
 const ZOOM_BAR_W: f32 = 96.0;
 
+/// The View menu's window commands (Excel's New Window, Arrange All, View
+/// Side by Side), on a second window into the same workbook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCmd {
+    New,
+    /// Arrange the two windows side by side.
+    Across,
+    /// Arrange them one above the other.
+    Stacked,
+    /// View Side by Side: scroll together, or not.
+    Sync,
+    /// The other window becomes the active one.
+    Switch,
+    Close,
+}
+
+/// A window's grid state without its in-cell editor: switching windows
+/// leaves an edit, as Excel commits nothing it wasn't told to.
+fn not_editing(mut g: GridState) -> GridState {
+    g.edit = None;
+    g
+}
+
+/// How far apart the two windows' grid keys are, so a window keeps its
+/// focus where it is on screen when it becomes the active one.
+const WINDOW_KEY: u64 = 0x1000;
+/// A window's caption strip, px.
+const CAPTION_H: f32 = 20.0;
+
+/// The second window: its own sheet, cursor and scroll on the live document.
+pub struct Twin {
+    source: Rc<crate::source::WindowSource>,
+    scroll: Mutable<ScrollState>,
+    state: Mutable<GridState>,
+    /// Side by side (else one above the other).
+    across: bool,
+    /// Whether the active window is the first (left or top) one.
+    first: bool,
+    /// View Side by Side's synchronous scrolling.
+    sync: bool,
+    /// The scroll position both windows had at the last sync.
+    synced: std::cell::Cell<Option<(f64, f64)>>,
+    /// The active window's number (1 or 2), as Excel's "Book:2".
+    number: u8,
+}
+
+impl Twin {
+    /// The active and the other window's grid rectangles within `rect`,
+    /// each below its caption.
+    fn rects(&self, rect: Rect) -> (Rect, Rect) {
+        let gap = 4.0;
+        let (a, b) = if self.across {
+            let w = ((rect.w() - gap) / 2.0).max(40.0);
+            (Rect::new(rect.x(), rect.y(), w, rect.h()), Rect::new(rect.x() + w + gap, rect.y(), w, rect.h()))
+        } else {
+            let h = ((rect.h() - gap) / 2.0).max(40.0);
+            (Rect::new(rect.x(), rect.y(), rect.w(), h), Rect::new(rect.x(), rect.y() + h + gap, rect.w(), h))
+        };
+        let under = |r: Rect| Rect::new(r.x(), r.y() + CAPTION_H, r.w(), (r.h() - CAPTION_H).max(20.0));
+        if self.first { (under(a), under(b)) } else { (under(b), under(a)) }
+    }
+
+    /// Synchronous scrolling: whichever window moved since the last sync
+    /// takes the other along.
+    fn follow(&self, active: &Mutable<ScrollState>) {
+        let (mut a, mut b) = (active.get(), self.scroll.get());
+        let pos = |s: &ScrollState| (s.physics_x.y, s.physics.y);
+        let last = self.synced.get();
+        let (from_active, to) = match last {
+            Some(l) if pos(&a) == l && pos(&b) != l => (false, pos(&b)),
+            _ => (true, pos(&a)),
+        };
+        if from_active {
+            if pos(&b) != to {
+                b.physics_x.set_position(to.0);
+                b.physics.set_position(to.1);
+                self.scroll.set(b);
+            }
+        } else {
+            a.physics_x.set_position(to.0);
+            a.physics.set_position(to.1);
+            active.set(a);
+        }
+        self.synced.set(Some(to));
+    }
+}
+
 /// What the toolbar asks the event loop for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
@@ -367,6 +454,8 @@ pub struct Sheets {
     pub stats_open: Mutable<bool>,
     /// The Document Inspector is showing.
     pub inspect_open: Mutable<bool>,
+    /// A second window on the workbook (New Window), while open.
+    twin: Rc<RefCell<Option<Twin>>>,
     pub password: Mutable<PasswordBar>,
     pub password_text: Mutable<TextEdit>,
     pub chart_title: Mutable<TextEdit>,
@@ -494,7 +583,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), filter_cond2_menu: Mutable::new(MenuState::default()), watch_open: Mutable::new(false), stats_open: Mutable::new(false), inspect_open: Mutable::new(false) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), filter_cond2_menu: Mutable::new(MenuState::default()), watch_open: Mutable::new(false), stats_open: Mutable::new(false), inspect_open: Mutable::new(false), twin: Rc::new(RefCell::new(None)) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1262,7 +1351,7 @@ impl Sheets {
         use pergola::widgets::GridSource;
         let sel = self.grid.get_cloned().selection();
         let (w, h) = self.size.get();
-        let rect = Self::grid_rect(w, h);
+        let rect = self.work_rect(w, h);
         let old = self.source.zoom_factor();
         let (sw, sh) = ((self.source.col_left(sel.c1 + 1) - self.source.col_left(sel.c0)) / old, (self.source.row_top(sel.r1 + 1) - self.source.row_top(sel.r0)) / old);
         let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::GridView::headings_size(&*self.source, 0).1 - 16.0).max(40.0));
@@ -2661,7 +2750,7 @@ impl Sheets {
         };
         // Content px to window px, as the grid places its body.
         use pergola::widgets::grid_view::TILE_ROWS;
-        let rect = Self::grid_rect(w, h);
+        let rect = self.work_rect(w, h);
         let active = self.authoring.active(rect);
         let Some((_, r, scroll)) = self.authoring.panes(self, rect).nth(active) else { return };
         let st = scroll.get();
@@ -2685,7 +2774,105 @@ impl Sheets {
         Rect::new(0.0, top, w, (h - top - STATUS_H - crate::tabs::TABS_H).max(40.0))
     }
 
+    /// Where the active window's grid sits: the whole grid area, or its half
+    /// below a caption while a second window is open.
+    pub fn work_rect(&self, w: f32, h: f32) -> Rect {
+        let rect = Self::grid_rect(w, h);
+        match self.twin.borrow().as_ref() {
+            Some(t) => t.rects(rect).0,
+            None => rect,
+        }
+    }
+
+    /// New Window, Arrange, View Side by Side, Switch and Close Window: what
+    /// happened, for the status line.
+    pub fn window_cmd(&self, cmd: WindowCmd) -> String {
+        let mut twin = self.twin.borrow_mut();
+        match (cmd, twin.as_mut()) {
+            (WindowCmd::New, None) => {
+                let sheet = self.doc.borrow().sheet;
+                let state = self.grid.get_cloned();
+                *twin = Some(Twin {
+                    source: Rc::new(crate::source::WindowSource::new(self.doc.clone(), sheet)),
+                    scroll: Mutable::new(self.scroll.get()),
+                    state: Mutable::new(not_editing(state)),
+                    across: true,
+                    first: true,
+                    sync: false,
+                    synced: std::cell::Cell::new(None),
+                    number: 1,
+                });
+                "A second window on this workbook: click in either to work there.".into()
+            }
+            (WindowCmd::New, Some(_)) => "Two windows are open; close one to open another.".into(),
+            (WindowCmd::Across | WindowCmd::Stacked, Some(t)) => {
+                t.across = cmd == WindowCmd::Across;
+                if t.across { "Windows side by side.".into() } else { "Windows one above the other.".into() }
+            }
+            (WindowCmd::Sync, Some(t)) => {
+                t.sync = !t.sync;
+                t.synced.set(None);
+                if t.sync { "Side by side: the windows scroll together.".into() } else { "The windows scroll on their own.".into() }
+            }
+            (WindowCmd::Switch, Some(_)) if self.grid.get_cloned().edit.is_some() => "Finish the cell first (Enter or Esc), then switch windows.".into(),
+            (WindowCmd::Switch, Some(t)) => {
+                // The other window becomes the active one, where it is on screen.
+                let mut d = self.doc.borrow_mut();
+                let other = t.source.sheet.get().min(d.wb.sheet_count().saturating_sub(1) as u16);
+                t.source.sheet.set(d.sheet);
+                d.sheet = other;
+                drop(d);
+                let mine = self.grid.get_cloned();
+                let theirs = t.state.get_cloned();
+                self.grid.set(not_editing(theirs));
+                t.state.set(not_editing(mine));
+                let (a, b) = (self.scroll.get(), t.scroll.get());
+                self.scroll.set(b);
+                t.scroll.set(a);
+                t.first = !t.first;
+                t.number = 3 - t.number;
+                t.synced.set(None);
+                format!("Window {}.", t.number)
+            }
+            (WindowCmd::Close, Some(_)) => {
+                *twin = None;
+                "One window.".into()
+            }
+            (_, None) => "Open a New Window first.".into(),
+        }
+    }
+
+    /// The second window: its caption and live grid, and both captions.
+    /// A press in it makes it the active window.
+    fn emit_twin(&self, ctx: &mut Ctx, w: f32, h: f32) {
+        let twin = self.twin.borrow();
+        let Some(t) = twin.as_ref() else { return };
+        let (mine, theirs) = t.rects(Self::grid_rect(w, h));
+        if t.sync {
+            t.follow(&self.scroll);
+        }
+        let theme = ctx.theme;
+        let name = self.doc.borrow().name.clone();
+        let caption = |ctx: &mut Ctx, r: Rect, number: u8, sheet: u16, active: bool| {
+            let sheet_name = self.doc.borrow().wb.sheet_name(sheet.min(self.doc.borrow().wb.sheet_count().saturating_sub(1) as u16)).to_string();
+            let top = Rect::new(r.x(), r.y() - CAPTION_H, r.w(), CAPTION_H);
+            ctx.add(Node::Rect { rect: top, fill: if active { theme.selection_bg() } else { theme.bg_surface() }, radius: 0.0 });
+            let style = TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if active { Weight::Semibold } else { Weight::Regular }, color: theme.text_primary() };
+            ctx.add(Node::Text { rect: Rect::new(top.x() + 8.0, top.y() + 2.0, (top.w() - 16.0).max(0.0), CAPTION_H - 4.0), content: format!("{name}:{number} — {sheet_name}"), style });
+        };
+        caption(ctx, mine, t.number, self.doc.borrow().sheet, true);
+        caption(ctx, theirs, 3 - t.number, t.source.sheet.get(), false);
+        let cmds = self.cmds.clone();
+        let slot = u64::from(t.first);
+        GridView::new(t.source.clone(), t.scroll.clone(), t.state.clone(), theirs)
+            .key(0x6772_6964 + slot * WINDOW_KEY)
+            .display_editor(false)
+            .on_activate(move || cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Window(WindowCmd::Switch))))
+            .render(ctx);
+    }
+
     fn emit_grid(&self, ctx: &mut Ctx, rect: Rect, scroll: Mutable<ScrollState>, pane: usize, editor: bool) {
+        let slot = self.twin.borrow().as_ref().map_or(0, |t| u64::from(!t.first));
         let doc = self.doc.clone();
         let rev = self.rev.clone();
         let src = self.source.clone();
@@ -2694,7 +2881,7 @@ impl Sheets {
         let active = self.authoring.activation();
         let viewport_doc = self.doc.clone();
         GridView::new(self.source.clone(), scroll, self.grid.clone(), rect)
-            .key(0x6772_6964 + pane as u64 * 16)
+            .key(0x6772_6964 + slot * WINDOW_KEY + pane as u64 * 16)
             .display_editor(editor)
             .on_visible(move |r| {
                 let mut doc = viewport_doc.borrow_mut();
@@ -3144,11 +3331,12 @@ impl View for Sheets {
         // The grid, with the cursor cell's comment beside it while not editing.
         self.source.note_at.set((g.edit.is_none() && self.commenting.get().is_none() && self.linking.get().is_none()).then_some(g.cursor));
         self.doc.borrow_mut().calculation_view.clear();
-        let rect = Self::grid_rect(w, h);
+        let rect = self.work_rect(w, h);
         let active = self.authoring.active(rect);
         for (pane, bounds, scroll) in self.authoring.panes(self, rect) {
             self.emit_grid(ctx, bounds, scroll, pane, pane == active);
         }
+        self.emit_twin(ctx, w, h);
         // While a formula is typed: the arguments of the function at the caret.
         if let Some(parts) = g.edit.as_ref().and_then(|e| crate::fnhelp::tip(e.text(), e.caret())) {
             let style = |on: bool| TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if on { Weight::Semibold } else { Weight::Regular }, color: t.text_primary() };
@@ -4327,6 +4515,12 @@ impl Sheets {
                 }
                 Cmd::Data(crate::data::DataCmd::RenameSheet) => {
                     self.tab_cmd(crate::tabs::TabCmd::Rename);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::Window(w)) => {
+                    let said = self.window_cmd(w);
+                    self.set_status(said);
+                    self.changed();
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::TabColor) => {
@@ -6944,6 +7138,60 @@ mod tests {
         commit(4, "one\ntwo");
         Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Clear(pergola::widgets::CellRange { r0: 4, c0: 0, r1: 4, c1: 0 }));
         assert_eq!(height(4), 20.0);
+    }
+
+    #[test]
+    fn a_second_window_keeps_its_own_sheet_cursor_and_scroll() {
+        use crate::app::WindowCmd;
+        let mut d = Doc::new("Book");
+        d.wb.add_sheet("Plan").unwrap();
+        d.wb.set_value(officina_grid::CellAddr::new(1, 0, 0), officina_grid::Value::Num(7.0));
+        let grid = Mutable::new(GridState::default());
+        let scroll = Mutable::new(ScrollState::default());
+        let s = Sheets::new(d, scroll.clone(), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |w: WindowCmd| {
+            s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Window(w)));
+            s.take_cmds();
+            s.doc.borrow().status.clone()
+        };
+        let texts = || pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<_>>();
+        assert!(run(WindowCmd::Switch).contains("New Window first"));
+        let whole = Sheets::grid_rect(1200.0, 800.0);
+        assert_eq!(s.work_rect(1200.0, 800.0), whole);
+        assert!(run(WindowCmd::New).contains("second window"));
+        let half = s.work_rect(1200.0, 800.0);
+        assert!(half.w() < whole.w() / 2.0 + 1.0 && half.x() == whole.x(), "{half:?}");
+        assert!(texts().iter().any(|t| t == "Book:1 — Sheet1") && texts().iter().any(|t| t == "Book:2 — Sheet1"));
+        // This window moves to Plan at B3; the other stays on Sheet1 at A1.
+        s.doc.borrow_mut().sheet = 1;
+        let mut g = grid.get_cloned();
+        g.select(2, 1);
+        grid.set(g);
+        assert!(texts().iter().any(|t| t == "Book:1 — Plan"));
+        assert_eq!(run(WindowCmd::Switch), "Window 2.");
+        assert_eq!((s.doc.borrow().sheet, grid.get_cloned().cursor), (0, (0, 0)));
+        let now = s.work_rect(1200.0, 800.0);
+        assert!(now.x() > whole.x(), "the active window is now the right one: {now:?}");
+        assert_eq!(run(WindowCmd::Switch), "Window 1.");
+        assert_eq!((s.doc.borrow().sheet, grid.get_cloned().cursor), (1, (2, 1)));
+        // Stacked, then scrolling together.
+        run(WindowCmd::Stacked);
+        let top = s.work_rect(1200.0, 800.0);
+        assert!(top.w() == whole.w() && top.h() < whole.h() / 2.0);
+        run(WindowCmd::Sync);
+        let mut st = scroll.get();
+        st.physics.set_position(400.0);
+        scroll.set(st);
+        texts();
+        let twin_y = s.twin.borrow().as_ref().unwrap().scroll.get().physics.y;
+        assert_eq!(twin_y, 400.0);
+        // Editing: no switch until the cell is done.
+        let mut g = grid.get_cloned();
+        g.edit = Some(pergola::text_edit::TextEdit::new("5"));
+        grid.set(g);
+        assert!(run(WindowCmd::Switch).contains("Finish the cell"));
+        assert_eq!(run(WindowCmd::Close), "One window.");
+        assert_eq!(s.work_rect(1200.0, 800.0), whole);
     }
 
     #[test]

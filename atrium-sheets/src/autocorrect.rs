@@ -6,6 +6,8 @@
 //! one undo keeps what was typed, as in Excel.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use officina_grid::book::Input;
 use officina_grid::{Rect, Value};
@@ -42,6 +44,17 @@ pub const MAX_WITH: usize = 255;
 /// The longest text corrected; longer text is left as typed.
 const MAX_TEXT: usize = 32_768;
 
+/// The file the person's settings are kept in, once [`init`] has run.
+static FILE: OnceLock<PathBuf> = OnceLock::new();
+/// The largest settings file read, bytes.
+const MAX_FILE: u64 = 1 << 20;
+
+/// Use the settings kept in `dir` (beside the custom lists); each document
+/// opened after starts with them, and changes are kept there.
+pub fn init(dir: &Path) {
+    let _ = FILE.set(dir.join("autocorrect"));
+}
+
 #[derive(Debug, Clone)]
 pub struct AutoCorrect {
     pub on: bool,
@@ -57,6 +70,54 @@ impl Default for AutoCorrect {
 }
 
 impl AutoCorrect {
+    /// The kept settings, or the defaults when there are none (or no file
+    /// was set up). A malformed line is skipped.
+    pub fn load() -> AutoCorrect {
+        let mut ac = AutoCorrect::default();
+        let Some(file) = FILE.get() else { return ac };
+        let Some(text) = std::fs::metadata(file).ok().filter(|m| m.len() <= MAX_FILE).and_then(|_| std::fs::read_to_string(file).ok()) else { return ac };
+        ac.parse(&text);
+        ac
+    }
+
+    fn parse(&mut self, text: &str) {
+        for line in text.lines() {
+            let mut f = line.split('\t');
+            match (f.next(), f.next(), f.next(), f.next()) {
+                (Some("off"), None, ..) => self.on = false,
+                (Some("on"), None, ..) => self.on = true,
+                (Some("add"), Some(w), Some(with), None) if check(w, MAX_WORD, "word").is_ok() && check(with, MAX_WITH, "replacement").is_ok() && self.own.len() < MAX_ENTRIES => {
+                    self.own.insert(w.to_string(), Some(with.to_string()));
+                }
+                (Some("remove"), Some(w), None, _) if check(w, MAX_WORD, "word").is_ok() && self.own.len() < MAX_ENTRIES => {
+                    self.own.insert(w.to_string(), None);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut o = String::from(if self.on { "on\n" } else { "off\n" });
+        for (w, with) in &self.own {
+            match with {
+                Some(with) => o.push_str(&format!("add\t{w}\t{with}\n")),
+                None => o.push_str(&format!("remove\t{w}\n")),
+            }
+        }
+        o
+    }
+
+    /// Keeps the settings for later documents, when a file was set up.
+    fn keep(&self) -> Result<(), String> {
+        let Some(file) = FILE.get() else { return Ok(()) };
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't keep AutoCorrect's settings: {e}"))?;
+        }
+        let tmp = file.with_extension("new");
+        std::fs::write(&tmp, self.text()).and_then(|_| std::fs::rename(&tmp, file)).map_err(|e| format!("Couldn't keep AutoCorrect's settings: {e}"))
+    }
+
     fn replacement(&self, lower: &str) -> Option<&str> {
         match self.own.get(lower) {
             Some(entry) => entry.as_deref(),
@@ -194,8 +255,15 @@ pub fn type_corrected(d: &mut Doc, area: Rect, text: &str) -> bool {
     true
 }
 
-/// AutoCorrect Options…: `on`, `off`, `add WORD WITH`, `remove WORD`.
+/// AutoCorrect Options…: `on`, `off`, `add WORD WITH`, `remove WORD`. The
+/// settings belong to the app, as in Excel: kept for later documents.
 pub fn options(d: &mut Doc, typed: &str) -> Result<String, String> {
+    let said = change(d, typed)?;
+    d.autocorrect.keep()?;
+    Ok(said)
+}
+
+fn change(d: &mut Doc, typed: &str) -> Result<String, String> {
     let t = typed.trim();
     let ac = &mut d.autocorrect;
     let (verb, rest) = t.split_once(char::is_whitespace).map_or((t, ""), |(v, r)| (v, r.trim()));
@@ -247,6 +315,23 @@ fn check(s: &str, max: usize, what: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use officina_grid::CellAddr;
+
+    #[test]
+    fn settings_are_kept_as_lines_and_bad_lines_skipped() {
+        let mut ac = AutoCorrect::default();
+        ac.on = false;
+        ac.own.insert("brb".into(), Some("be right back".into()));
+        ac.own.insert("teh".into(), None);
+        let text = ac.text();
+        assert_eq!(text, "off\nadd\tbrb\tbe right back\nremove\tteh\n");
+        let mut back = AutoCorrect::default();
+        back.parse(&format!("{text}add\tno space\tx\nadd\tw\t\u{7}\nwhat\nremove\n"));
+        assert!(!back.on);
+        assert_eq!(back.own, ac.own);
+        assert_eq!(back.correct("teh brb").map(|c| c.0), None, "off corrects nothing");
+        back.on = true;
+        assert_eq!(back.correct("teh brb").map(|c| c.0).as_deref(), Some("teh be right back"));
+    }
 
     #[test]
     fn the_list_is_sorted_for_the_search() {

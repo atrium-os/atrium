@@ -5682,6 +5682,44 @@ Tests:
   - hostile `officina:look` parts (an unknown sheet, an oversized camera source, a built-in style name, a bad colour) are dropped one by one;
   - LibreOffice opens both files and saves them again, and the callout's outline, text and fill and the text box come back (and the theme, through `.xlsx`).
 
+### 16.166 Files and leftovers: checkboxes and Custom Views in files, AutoCorrect kept, Convert Notes to Comments, New Window (2026-11-27)
+Round 5 of the six-round finishing plan.
+
+**Checkboxes in cells** (§16.159) now go through files.
+- `.xlsx` is written as Excel 365 writes them. Each checkbox style's `xf` carries an `xfpb:xfComplement` extension (`{C7286773-470A-42A8-94C5-96B5CB345126}`) that points into `xl/featurePropertyBag/featurePropertyBag.xml` (a Checkbox bag, the XFControls cell control, the XFComplement and its mapper). The part has its content type and a workbook relationship, written only when a style has a checkbox. Reading takes an `xf` with an `xfComplement` as a checkbox, which is the one feature Excel stores that way.
+- `.ods` has no cell checkbox. The cell style gets `officina:checkbox="true"` on its `style:table-cell-properties`, and LibreOffice shows the TRUE or FALSE value.
+
+**Custom Views** (§16.158) now go through files.
+- `.xlsx` gives Excel its own elements: a `customWorkbookView` for each view (its name, a GUID derived from its position, and its sheet as `activeSheetId`), and in every sheet a `customSheetView` with that GUID and the zoom. The view's own sheet also gets the selected cell. Excel can list and show them by name with their sheet, zoom and cell. Each view's hidden rows, filter and columns ride in our workbook extension as `officina:views`: the views' wire form (`GridOp::CustomViews`) in hex, decoded under the wire limits. A malformed element gives no views and a note, and a view on a sheet the file doesn't have is dropped with a note.
+- `.ods` keeps the same `officina:views` element at the end of `office:spreadsheet`.
+
+**AutoCorrect** settings (on or off, entries added and built-in entries taken out) are kept in a file named `autocorrect` beside the custom lists, in the person's own Sheets state. Each document opened afterwards starts with them, as Excel's are the app's and not the file's. The file holds one setting a line (`on`/`off`, `add⇥WORD⇥WITH`, `remove⇥WORD`), at most 1 MiB is read, a line that fails the bar's own limits is skipped, and it is replaced by a write and rename.
+
+**Convert Notes to Comments** (Data menu, after New Comment Thread…), as Excel's Review ▸ Notes ▸ Convert to Comments. Every note in the workbook becomes a comment thread. Its first message is the note's text, with a leading "Author:" line dropped as Excel writes one, by the note's author, or by the person for a note without one. Formatting in a note doesn't carry over, and existing threads stay as they are. It is one undo step labelled Convert Notes to Comments, and is refused when there are no notes.
+
+**Windows** (Data menu, after the split commands), as Excel's View ▸ Window group, within Sheets' one window.
+- **New Window** opens a second window on the same workbook. Each window has its own sheet, selection and scroll, and both show the live document. A caption reads "Book:1 — Sheet1" and "Book:2 — Plan", with the active window highlighted. A press in the other window makes it active where it is on screen and keeps its keyboard focus there. The switch is refused while a cell is being edited.
+- **Arrange Windows Side by Side** and **Arrange Windows Stacked** place them left and right, or above and below. Split panes and frozen panes work inside the active window.
+- **View Side by Side (Scroll Together)** toggles synchronous scrolling. Whichever window moved takes the other along.
+- **Close Window** goes back to one.
+- The second window is a view: typing and commands go to the active one. Zoom belongs to each sheet as before. A drag that starts in the other window switches on the press, and the rest of that drag isn't kept.
+
+**Not built yet**:
+- Excel's own Custom Views from another program's files. They are read only from our extension.
+- Separate desktop windows for New Window, a Cascade arrangement, and comparing two different workbooks side by side (one workbook per Sheets window).
+- Note formatting carried into the converted comment.
+
+Tests:
+- Sheets:
+  - `autocorrect`: the settings round-trip as lines, and bad lines are skipped.
+  - `comment`: notes on two sheets become threads with their authors, an "Ana:" line is dropped, a thread is left alone, a second run is refused, and the conversion undoes.
+  - `app`: New Window, captions, a window on another sheet with its own cursor, switching both ways with the active window moving on screen, stacked, scrolling together, no switch while editing, and Close Window.
+- convert `leftovers`:
+  - checkboxes and two views (one with a zoom of 150 and a cell on the second sheet, one with an ampersand in its name) survive `.xlsx` and `.ods`;
+  - the `.xlsx` holds the feature property bag, its relationship, the `xfComplement`, the `customWorkbookView` names and the `customSheetView` scale and selection;
+  - a plain book has neither;
+  - odd, non-hex and truncated `officina:views` give no views and a note.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

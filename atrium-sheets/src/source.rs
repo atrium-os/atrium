@@ -1761,3 +1761,67 @@ mod tests {
         assert_eq!(cv.text, "");
     }
 }
+/// A second window on the same workbook (View ▸ New Window): the grid of its
+/// own sheet, drawn from the live document. Each call shows `sheet` by
+/// standing it in as the document's sheet for the call's length; a call made
+/// while the document is being changed shows the document's own sheet.
+pub struct WindowSource {
+    pub inner: SheetSource,
+    pub sheet: std::cell::Cell<u16>,
+}
+
+impl WindowSource {
+    pub fn new(doc: Rc<RefCell<Doc>>, sheet: u16) -> Self {
+        Self { inner: SheetSource::new(doc), sheet: std::cell::Cell::new(sheet) }
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&SheetSource) -> T) -> T {
+        let saved = match self.inner.doc.try_borrow_mut() {
+            Ok(mut d) => {
+                let want = self.sheet.get();
+                if (want as usize) < d.wb.sheet_count() {
+                    Some(std::mem::replace(&mut d.sheet, want))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        let out = f(&self.inner);
+        if let Some(s) = saved {
+            if let Ok(mut d) = self.inner.doc.try_borrow_mut() {
+                d.sheet = s;
+            }
+        }
+        out
+    }
+}
+
+impl GridSource for WindowSource {
+    fn rows(&self) -> u32 { self.with(|s| s.rows()) }
+    fn cols(&self) -> u32 { self.with(|s| s.cols()) }
+    fn row_top(&self, r: u32) -> f64 { self.with(|s| s.row_top(r)) }
+    fn row_at(&self, y: f64) -> u32 { self.with(|s| s.row_at(y)) }
+    fn col_left(&self, c: u32) -> f64 { self.with(|s| s.col_left(c)) }
+    fn col_at(&self, x: f64) -> u32 { self.with(|s| s.col_at(x)) }
+    fn cell(&self, r: u32, c: u32) -> Option<CellView> { self.with(|s| s.cell(r, c)) }
+    fn edit_text(&self, r: u32, c: u32) -> String { self.with(|s| s.edit_text(r, c)) }
+    fn col_label(&self, c: u32) -> String { self.with(|s| s.col_label(c)) }
+    fn row_label(&self, r: u32) -> String { self.with(|s| s.row_label(r)) }
+    fn outline_control(&self, rows: bool, at: u32) -> Option<(u32, u32, bool)> { self.with(|s| s.outline_control(rows, at)) }
+    fn merge_at(&self, r: u32, c: u32) -> Option<CellRange> { self.with(|s| s.merge_at(r, c)) }
+    fn merges_in(&self, g: CellRange) -> Vec<CellRange> { self.with(|s| s.merges_in(g)) }
+    fn zoom(&self) -> f32 { self.with(|s| s.zoom()) }
+    fn show_grid(&self) -> bool { self.with(|s| s.show_grid()) }
+    fn grid_color(&self) -> Option<Color> { self.with(|s| s.grid_color()) }
+    fn show_headings(&self) -> bool { self.with(|s| s.show_headings()) }
+    fn now_text(&self, time: bool) -> Option<String> { self.with(|s| s.now_text(time)) }
+    fn complete(&self, r: u32, c: u32, prefix: &str) -> Option<String> { self.with(|s| s.complete(r, c, prefix)) }
+    fn data_edge(&self, r: u32, c: u32, dr: i32, dc: i32) -> (u32, u32) { self.with(|s| s.data_edge(r, c, dr, dc)) }
+    fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> { self.with(|s| s.floats(view, theme)) }
+    fn frozen(&self) -> (u32, u32) { self.with(|s| s.frozen()) }
+    fn frozen_from(&self) -> (u32, u32) { self.with(|s| s.frozen_from()) }
+    fn tab_target(&self, from: (u32, u32), back: bool) -> Option<(u32, u32)> { self.with(|s| s.tab_target(from, back)) }
+    fn last_used(&self) -> (u32, u32) { self.with(|s| s.last_used()) }
+    fn fills(&self) -> bool { false }
+}

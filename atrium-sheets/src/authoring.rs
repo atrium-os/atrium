@@ -153,7 +153,7 @@ impl Authoring {
 
     pub(super) fn active_scroll(&self, s: &Sheets) -> Mutable<ScrollState> {
         let (w, h) = s.size.get();
-        self.scroll(s, self.active(Sheets::grid_rect(w, h)))
+        self.scroll(s, self.active(s.work_rect(w, h)))
     }
 
     pub(super) fn reset_scrolls(&self, s: &Sheets) {
@@ -419,7 +419,7 @@ impl Authoring {
             AuthorCmd::Split(mode) => {
                 if self.split.get() != mode {
                     let (w, h) = s.size.get();
-                    let current = self.scroll(s, self.active(Sheets::grid_rect(w, h))).get();
+                    let current = self.scroll(s, self.active(s.work_rect(w, h))).get();
                     for scroll in std::iter::once(&s.scroll).chain(self.extra_scrolls.iter()) {
                         let mut state = current;
                         state.extent = None;

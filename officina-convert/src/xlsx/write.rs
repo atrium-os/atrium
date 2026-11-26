@@ -37,6 +37,11 @@ const FUTURE: &[&str] = &[
 const FUTURE_WS: &[&str] = &["FILTER", "SORT"];
 
 /// The cell-metadata part dynamic array formulas point at (`cm="1"`).
+/// The GUID Excel's custom view `i` is known by in the file.
+fn view_guid(i: usize) -> String {
+    format!("{{0FF1C1A1-0000-4000-8000-{i:012X}}}")
+}
+
 /// Whether sheet `s` has a drawing: charts, pictures or shapes.
 fn has_drawing(wb: &Workbook, s: u16) -> bool {
     wb.charts().iter().any(|c| c.anchor.sheet == s) || wb.pictures().iter().any(|p| p.anchor.sheet == s) || wb.workbook_look().shapes.iter().any(|x| x.anchor.sheet == s)
@@ -638,6 +643,21 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
     if let Some(f) = &sh.filter {
         write_filter(&mut o, f, wb.date_system(), dxfs);
     }
+    // Custom Views as Excel lists them: one customSheetView per view in each sheet.
+    if !wb.custom_views().is_empty() {
+        o.extend_from_slice(b"<customSheetViews>");
+        for (i, v) in wb.custom_views().iter().enumerate() {
+            let zoom = if v.sheet == s { v.zoom } else { wb.sheet(s).zoom };
+            let _ = write!(o, r#"<customSheetView guid="{}" scale="{}""#, view_guid(i), zoom.clamp(10, 400));
+            if v.sheet == s {
+                let cell = a1(v.cursor.0, v.cursor.1);
+                let _ = write!(o, r#"><selection activeCell="{cell}" sqref="{cell}"/></customSheetView>"#);
+            } else {
+                o.extend_from_slice(b"/>");
+            }
+        }
+        o.extend_from_slice(b"</customSheetViews>");
+    }
     let merges = wb.merges(s);
     if !merges.is_empty() {
         let _ = write!(o, r#"<mergeCells count="{}">"#, merges.len());
@@ -953,6 +973,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         ct.push_str(r#"<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/>"#);
     }
     let themed = *wb.theme() != officina_grid::look::Theme::default();
+    let checkboxes = wb.styles.iter().any(|(_, st)| st.checkbox);
+    if checkboxes {
+        ct.push_str(&format!(r#"<Override PartName="/xl/featurePropertyBag/featurePropertyBag.xml" ContentType="{}"/>"#, super::styles::FEATURE_BAGS_TYPE));
+    }
     if themed {
         ct.push_str(&format!(r#"<Override PartName="/xl/theme/theme1.xml" ContentType="{}"/>"#, super::theme::TYPE));
     }
@@ -1066,6 +1090,15 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         w.extend_from_slice(b"/>");
     }
+    if !wb.custom_views().is_empty() {
+        w.extend_from_slice(b"<customWorkbookViews>");
+        for (i, v) in wb.custom_views().iter().enumerate() {
+            w.extend_from_slice(b"<customWorkbookView name=\"");
+            esc(&mut w, &v.name);
+            let _ = write!(w, r#"" guid="{}" includePrintSettings="0" windowWidth="1200" windowHeight="800" activeSheetId="{}"/>"#, view_guid(i), v.sheet + 1);
+        }
+        w.extend_from_slice(b"</customWorkbookViews>");
+    }
     if !pivots.is_empty() {
         w.extend_from_slice(b"<pivotCaches>");
         for &(i, _) in &pivots {
@@ -1073,8 +1106,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         w.extend_from_slice(b"</pivotCaches>");
     }
-    // What Excel has no place for (custom table styles, Camera pictures), for us.
-    let ours = crate::lookxml::write(wb, crate::lookxml::Parts { theme: false, shapes: false });
+    // What Excel has no place for (custom table styles, Camera pictures, the
+    // views' rows, filters and columns), for us.
+    let mut ours = crate::lookxml::write(wb, crate::lookxml::Parts { theme: false, shapes: false });
+    ours.push_str(&crate::lookxml::views(wb));
     if !ours.is_empty() {
         let _ = write!(w, r#"<extLst><ext uri="{{{LOOK_EXT}}}">{ours}</ext></extLst>"#);
     }
@@ -1100,6 +1135,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     if threads.has_people() {
         r.push_str(&format!(r#"<Relationship Id="rIdPeople" Type="{}" Target="persons/person.xml"/>"#, super::threaded::PERSON_REL));
         z.add("xl/persons/person.xml", threads.persons_xml().as_bytes())?;
+    }
+    if checkboxes {
+        r.push_str(&format!(r#"<Relationship Id="rIdFpb" Type="{}" Target="featurePropertyBag/featurePropertyBag.xml"/>"#, super::styles::FEATURE_BAGS_REL));
+        z.add("xl/featurePropertyBag/featurePropertyBag.xml", super::styles::FEATURE_BAGS.as_bytes())?;
     }
     if themed {
         r.push_str(&format!(r#"<Relationship Id="rIdTheme" Type="{}" Target="theme/theme1.xml"/>"#, super::theme::REL));

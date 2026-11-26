@@ -251,6 +251,7 @@ struct CellStyle {
     v: Option<VAlign>,
     wrap: Option<bool>,
     protection: Option<(bool, bool, bool)>,
+    checkbox: Option<bool>,
 }
 
 #[derive(Default)]
@@ -417,6 +418,9 @@ impl Styles {
                         }
                         "style:table-cell-properties" => {
                             if let Some((_, c)) = cur_cell.as_mut() {
+                                if let Some(v) = a.get("officina:checkbox") {
+                                    c.checkbox = Some(v == "true");
+                                }
                                 if let Some(protection) = a.get("style:cell-protect") {
                                     c.protection = match protection.as_str() {
                                         "none" => Some((true, false, false)),
@@ -850,6 +854,9 @@ impl Styles {
             }
             if let Some(flags) = c.protection {
                 (s.unlocked, s.hide_formula, s.hide_value) = flags;
+            }
+            if let Some(b) = c.checkbox {
+                s.checkbox = b;
             }
         }
         s
@@ -2130,6 +2137,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut look = officina_grid::look::Look { shapes: super::chart::read_frames(&mut wb, &z, frames, &mut rep), ..Default::default() };
     // The theme, custom table styles and cameras, from our element.
     crate::lookxml::read(&content, &wb, &mut look, &mut rep);
+    crate::lookxml::read_views(&content, &mut wb, &mut rep);
     if !look.is_default() {
         officina_core::history::Op::apply(officina_grid::ops::GridOp::Look(Box::new(look)), &mut wb);
     }

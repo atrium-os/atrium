@@ -75,6 +75,23 @@ pub(crate) fn write(wb: &Workbook, parts: Parts) -> String {
     o
 }
 
+/// The workbook's Custom Views as an `officina:views` element: their wire
+/// form (`GridOp::CustomViews`) in hex, which carries each view's hidden
+/// rows, filter and columns exactly. Nothing when there are none.
+pub(crate) fn views(wb: &Workbook) -> String {
+    let list = wb.custom_views();
+    if list.is_empty() {
+        return String::new();
+    }
+    let bytes = officina_grid::ops::GridOp::CustomViews(list.to_vec()).encode();
+    let mut o = format!(r#"<officina:views xmlns:officina="{NS}">"#);
+    for b in bytes {
+        let _ = write!(o, "{b:02x}");
+    }
+    o.push_str("</officina:views>");
+    o
+}
+
 #[cfg(feature = "read")]
 mod read {
     use super::*;
@@ -224,10 +241,39 @@ mod read {
         }
     }
 
+    /// The Custom Views in `part`'s `officina:views` element, if any: views on
+    /// sheets the workbook doesn't have are dropped, and a malformed element
+    /// is reported and gives none.
+    pub(crate) fn views(part: &[u8], wb: &mut Workbook, rep: &mut Report) {
+        let Some(at) = find(part, b"<officina:views") else { return };
+        let Some(start) = part[at..].iter().position(|&b| b == b'>').map(|p| at + p + 1) else { return };
+        let Some(end) = find(&part[start..], b"</officina:views>").map(|e| start + e) else {
+            rep.note(Kind::Dropped, "malformed custom views");
+            return;
+        };
+        let hex = &part[start..end];
+        let digit = |b: u8| (b as char).to_digit(16);
+        let bytes: Option<Vec<u8>> = (hex.len() % 2 == 0).then(|| hex.chunks(2).map(|p| Some((digit(p[0])? * 16 + digit(p[1])?) as u8)).collect()).flatten();
+        let Some(op) = bytes.and_then(|b| officina_grid::ops::GridOp::decode(&b).ok()) else {
+            rep.note(Kind::Dropped, "malformed custom views");
+            return;
+        };
+        let officina_grid::ops::GridOp::CustomViews(mut list) = op else {
+            rep.note(Kind::Dropped, "malformed custom views");
+            return;
+        };
+        let n = list.len();
+        list.retain(|v| (v.sheet as usize) < wb.sheet_count());
+        if list.len() < n {
+            rep.note(Kind::Dropped, "custom views of sheets the file doesn't have");
+        }
+        officina_core::history::Op::apply(officina_grid::ops::GridOp::CustomViews(list), wb);
+    }
+
     fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         hay.windows(needle.len()).position(|w| w == needle)
     }
 }
 
 #[cfg(feature = "read")]
-pub(crate) use read::read;
+pub(crate) use read::{read, views as read_views};

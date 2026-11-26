@@ -353,6 +353,10 @@ pub enum DataCmd {
     /// under the grid).
     Comment,
     NewThread,
+    /// A window command (New Window, Arrange, View Side by Side).
+    Window(crate::app::WindowCmd),
+    /// Every note in the workbook to a comment thread.
+    ConvertNotes,
     /// Take the comments off the selection's cells.
     DeleteComments,
     /// Follow the cursor's link: a place in the workbook, or an address
@@ -629,6 +633,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
             None => "New Comment…",
         }).separated(), Some(DataCmd::Comment)),
         (MenuItem::new("New Comment Thread…").enabled(wb.comment(s, row, col).is_none()), Some(DataCmd::NewThread)),
+        (MenuItem::new("Convert Notes to Comments").enabled((0..wb.sheet_count() as u16).any(|s| wb.comments(s).values().any(|c| c.thread().is_empty()))), Some(DataCmd::ConvertNotes)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Delete Comments" } else { "Delete Comment" }).enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::DeleteComments)),
         (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
         (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }).shortcut("Ctrl+K"), Some(DataCmd::Link)),
@@ -818,6 +823,14 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     use officina_grid::shift::Axis;
     let mut authoring = Vec::new();
     authoring.push((MenuItem::new("Find and Replace…").shortcut("Ctrl+F").separated(), Some(DataCmd::Author(AuthorCmd::FindOpen))));
+    {
+        use crate::app::WindowCmd;
+        for (label, cmd) in [("New Window", WindowCmd::New), ("Arrange Windows Side by Side", WindowCmd::Across), ("Arrange Windows Stacked", WindowCmd::Stacked),
+            ("View Side by Side (Scroll Together)", WindowCmd::Sync), ("Close Window", WindowCmd::Close)] {
+            let item = MenuItem::new(label);
+            authoring.push((if cmd == WindowCmd::New { item.separated() } else { item }, Some(DataCmd::Window(cmd))));
+        }
+    }
     for (label, mode) in [("Split Horizontally", Split::Rows), ("Split Vertically", Split::Columns),
         ("Split Both Ways", Split::Both), ("Remove Split", Split::None)] {
         authoring.push((MenuItem::new(label), Some(DataCmd::Author(AuthorCmd::Split(mode)))));
@@ -3322,6 +3335,8 @@ pub(crate) fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCm
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
+        DataCmd::ConvertNotes => crate::comment::convert_notes(d),
+        DataCmd::Window(_) => Ok(String::new()),
         DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists | DataCmd::FormatPainter | DataCmd::ZoomIn | DataCmd::ZoomOut | DataCmd::Zoom100 | DataCmd::ZoomSelection | DataCmd::TextToColumnsAt | DataCmd::RemoveDuplicatesBy | DataCmd::Iteration | DataCmd::Subtotal | DataCmd::AdvancedFilter | DataCmd::Consolidate | DataCmd::DataTable | DataCmd::Scenarios | DataCmd::Series | DataCmd::ErrorChecking | DataCmd::TraceError | DataCmd::EvaluateFormula | DataCmd::Sparklines | DataCmd::FillAcross => Ok(String::new()),
         DataCmd::Justify => crate::series::justify(d, sel),
         DataCmd::FillDown | DataCmd::FillRight | DataCmd::FillUp | DataCmd::FillLeft => {

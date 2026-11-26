@@ -769,6 +769,10 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
     if let Some(protection) = protection {
         let _ = write!(tc, r#" style:cell-protect="{protection}""#);
     }
+    if st.checkbox {
+        // ODF has no cell checkbox; LibreOffice shows the TRUE/FALSE value.
+        tc.push_str(r#" officina:checkbox="true""#);
+    }
     if !tc.is_empty() {
         let _ = write!(out, "<style:table-cell-properties{tc}/>");
     }
@@ -1695,6 +1699,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     content.push_str(&super::pivot::tables_xml(wb));
     // The theme, custom table styles and Camera pictures, which ODF has no place for.
     content.push_str(&crate::lookxml::write(wb, crate::lookxml::Parts { theme: true, shapes: false }));
+    content.push_str(&crate::lookxml::views(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/>{cf}</office:styles></office:document-styles>"#, cf = super::condfmt::styles_xml(&super::condfmt::dxfs(wb)));
     let macros = super::macros::writable(wb);

@@ -1818,6 +1818,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         rep.note(Kind::Dropped, "a theme or shapes this engine can't use");
     }
     crate::lookxml::read(&wb_xml, &wb, &mut look, &mut rep);
+    crate::lookxml::read_views(&wb_xml, &mut wb, &mut rep);
     if !look.is_default() {
         officina_core::history::Op::apply(officina_grid::ops::GridOp::Look(Box::new(look)), &mut wb);
     }

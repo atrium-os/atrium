@@ -291,3 +291,75 @@ pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
 fn width_of(text: &str, base: &TextStyle, mask: u8) -> f32 {
     pergola::text::measure(&shown(text), &pergola::inline::style(base, mask)).w
 }
+
+/// Convert Notes to Comments, as Excel's Review ▸ Notes ▸ Convert to
+/// Comments: every note in the workbook becomes a comment thread whose first
+/// message is the note's text by the note's author (or the person, for a
+/// note without one). A leading "Author:" line, as Excel writes into notes,
+/// is dropped. Formatting in a note doesn't carry into the thread. One undo
+/// step for the whole workbook.
+pub fn convert_notes(d: &mut crate::doc::Doc) -> Result<String, String> {
+    use officina_grid::comments::ThreadMessage;
+
+    let stamp: Arc<str> = timestamp().into();
+    let me = local_author();
+    let mut people: std::collections::HashMap<String, Arc<ThreadPerson>> = std::collections::HashMap::new();
+    let mut ops = Vec::new();
+    let mut n = 0usize;
+    for s in 0..d.wb.sheet_count() as u16 {
+        let mut set = Vec::new();
+        for (&(r, c), note) in d.wb.comments(s) {
+            if !note.thread().is_empty() {
+                continue;
+            }
+            let author = note.author.trim();
+            let person = if author.is_empty() {
+                me.clone()
+            } else {
+                people.entry(author.to_string()).or_insert_with(|| {
+                    let name = &author[..author.floor_char_boundary(MAX_THREAD_FIELD.min(author.len()))];
+                    Arc::new(ThreadPerson { id: uuid::Uuid::new_v4().as_u128(), name: name.into(), user_id: name.into(), provider_id: "None".into() })
+                }).clone()
+            };
+            let text = note.text.strip_prefix(&format!("{author}:\n")).filter(|_| !author.is_empty()).unwrap_or(&note.text).trim_start_matches('\n');
+            let message = ThreadMessage { id: uuid::Uuid::new_v4().as_u128(), parent: None, author: person, timestamp: stamp.clone(), done: false, text: text.into(), mentions: Arc::default() };
+            if let Some(thread) = Comment::threaded(vec![message]) {
+                set.push((r, c, Some(thread)));
+                n += 1;
+            }
+        }
+        if !set.is_empty() {
+            ops.push(officina_grid::ops::GridOp::Comments { sheet: s, set });
+        }
+    }
+    if n == 0 {
+        return Err("This workbook has no notes to convert.".into());
+    }
+    d.run("Convert Notes to Comments", ops);
+    Ok(if n == 1 { "1 note converted to a comment.".into() } else { format!("{n} notes converted to comments.") })
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+    use officina_grid::comments::Comment;
+
+    #[test]
+    fn notes_become_threads_and_undo() {
+        let mut d = crate::doc::Doc::new("notes");
+        d.wb.add_sheet("Two").unwrap();
+        d.wb.set_comments(0, vec![(1, 1, Some(Comment::new("Ana", "Ana:\nCheck this"))), (2, 2, Some(Comment::new("", "Plain")))]);
+        let thread = Comment::threaded(vec![officina_grid::comments::ThreadMessage { id: 9, parent: None, author: local_author(), timestamp: "".into(), done: false, text: "Already".into(), mentions: Arc::default() }]).unwrap();
+        d.wb.set_comments(1, vec![(0, 0, Some(Comment::new("Lee", "Second sheet"))), (5, 0, Some(thread.clone()))]);
+        assert_eq!(convert_notes(&mut d).unwrap(), "3 notes converted to comments.");
+        let t = d.wb.comment(0, 1, 1).unwrap().thread();
+        assert_eq!((t.len(), &*t[0].text, &*t[0].author.name), (1, "Check this", "Ana"));
+        assert_eq!(&*d.wb.comment(0, 2, 2).unwrap().thread()[0].text, "Plain");
+        assert_eq!(&*d.wb.comment(1, 0, 0).unwrap().thread()[0].author.name, "Lee");
+        assert_eq!(d.wb.comment(1, 5, 0), Some(&thread), "a thread stays as it was");
+        assert!(convert_notes(&mut d).unwrap_err().contains("no notes"));
+        assert!(d.undo());
+        assert!(d.wb.comment(0, 1, 1).unwrap().thread().is_empty());
+        assert!(d.wb.comment(1, 0, 0).unwrap().thread().is_empty());
+    }
+}

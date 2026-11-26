@@ -219,6 +219,8 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
         parent: usize,
         applies_protection: bool,
         protection: Option<(bool, bool)>,
+        /// Excel 365's cell checkbox: a feature property bag complement.
+        checkbox: bool,
     }
     let mut xfs: Vec<Xf> = Vec::new();
     let mut base_protection: Vec<(bool, bool)> = Vec::new();
@@ -434,6 +436,11 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                 base_protection.push((false, false));
                 in_xf = !empty;
             }
+            (In::CellXfs, b"xfComplement") if in_xf => {
+                if let Some(x) = xfs.last_mut() {
+                    x.checkbox = true;
+                }
+            }
             (In::CellXfs | In::CellStyleXfs, b"protection") if in_xf => {
                 let a = attrs(&e);
                 let unlocked = a.get(b"locked".as_slice()).is_some_and(|v| matches!(v.as_str(), "0" | "false"));
@@ -487,7 +494,7 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
     let mut out = Vec::with_capacity(xfs.len());
     for xf in xfs {
         let (nf, fo, fi, bo, al) = (xf.num_format, xf.font, xf.fill, xf.border, xf.alignment);
-        let mut s = Style::default();
+        let mut s = Style { checkbox: xf.checkbox, ..Style::default() };
         (s.unlocked, s.hide_formula) = xf.protection.filter(|_| xf.applies_protection)
             .or_else(|| base_protection.get(xf.parent).copied()).unwrap_or_default();
         let code = fmts.get(&nf).cloned().or_else(|| numfmt::builtin(nf).map(str::to_string));
@@ -577,6 +584,14 @@ fn esc_attr(s: &str) -> String {
     o
 }
 
+/// An xf's extension naming the checkbox cell control (bag 2 of [`FEATURE_BAGS`]).
+const CHECKBOX_XF: &str = r#"<extLst><ext xmlns:xfpb="http://schemas.microsoft.com/office/spreadsheetml/2022/featurepropertybag" uri="{C7286773-470A-42A8-94C5-96B5CB345126}"><xfpb:xfComplement i="0"/></ext></extLst>"#;
+
+/// `xl/featurePropertyBag/featurePropertyBag.xml` as Excel writes it for checkboxes.
+pub(crate) const FEATURE_BAGS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><FeaturePropertyBags xmlns="http://schemas.microsoft.com/office/spreadsheetml/2022/featurepropertybag"><bag type="Checkbox"/><bag type="XFControls"><bagId k="CellControl">0</bagId></bag><bag type="XFComplement"><bagId k="XFControls">1</bagId></bag><bag type="XFComplements" extRef="XFComplementsMapperExtRef"><a k="MappedFeaturePropertyBags"><bagId>2</bagId></a></bag></FeaturePropertyBags>"#;
+pub(crate) const FEATURE_BAGS_REL: &str = "http://schemas.microsoft.com/office/2022/11/relationships/FeaturePropertyBag";
+pub(crate) const FEATURE_BAGS_TYPE: &str = "application/vnd.ms-excel.featurepropertybag+xml";
+
 /// `xl/styles.xml` for the workbook: `cellXfs` entry `i` is style id `i`.
 pub fn write(wb: &Workbook) -> Vec<u8> {
     write_with_dxfs(wb, &super::condfmt::DxfTable::new(wb))
@@ -642,7 +657,7 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs_table: &super::condfmt::DxfTab
         if align {
             xfs.push_str(r#" applyAlignment="1""#);
         }
-        if !align && !protection {
+        if !align && !protection && !s.checkbox {
             xfs.push_str("/>");
             continue;
         }
@@ -689,6 +704,10 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs_table: &super::condfmt::DxfTab
         }
         if protection {
             let _ = write!(xfs, r#"<protection locked="{}" hidden="{}"/>"#, u8::from(!s.unlocked), u8::from(s.hide_formula || s.hide_value));
+        }
+        if s.checkbox {
+            // Excel 365's checkbox: the cell control in the feature property bag.
+            xfs.push_str(CHECKBOX_XF);
         }
         xfs.push_str("</xf>");
     }
