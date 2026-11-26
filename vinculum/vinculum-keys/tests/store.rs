@@ -226,6 +226,20 @@ fn duplicate_bonds_for_one_device_are_both_dropped() {
 }
 
 #[test]
+fn copies_of_one_bond_keep_the_named_one() {
+    // A rename interrupted between storing the new record and deleting the
+    // old: same key, one named. The device stays paired.
+    let mut old = bond(1);
+    old.name = String::new();
+    let named = bond(1);
+    let other = bond(2);
+    let (keep, drop) = vinculum_keys::split_duplicates(vec![([1u8; 16], old), ([2u8; 16], named), ([3u8; 16], other)]);
+    assert_eq!(keep.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![[2u8; 16], [3u8; 16]]);
+    assert_eq!(keep[0].1.name, "Keyboard 1");
+    assert_eq!(drop, vec![[1u8; 16]]);
+}
+
+#[test]
 fn a_long_name_is_cut_on_a_character_boundary_and_reads_back() {
     let mut b = bond(1);
     // 63 ASCII bytes, then a three-byte character that would cross 64.

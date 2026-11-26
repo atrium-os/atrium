@@ -119,6 +119,8 @@ struct Link {
     /// LE: HID over GATT on the ATT channel instead of SDP and channels.
     gatt: Option<Hogp>,
     battery: Option<u8>,
+    /// The last level told to the control clients, and when (ms).
+    battery_told: Option<(u64, u8)>,
 }
 
 struct Tactus {
@@ -133,6 +135,18 @@ pub enum Fd {
     Listener,
     Tactus,
     Device(u16),
+}
+
+/// A level toggling between two values is told at most once a minute;
+/// a step of 5 points, or one to or under the bar's low mark, at once.
+const BATTERY_QUIET_MS: u64 = 60_000;
+
+fn battery_worth_telling(told: Option<(u64, u8)>, p: u8, now: u64) -> bool {
+    match told {
+        None => true,
+        Some((_, q)) if q == p => false,
+        Some((at, q)) => now.saturating_sub(at) >= BATTERY_QUIET_MS || q.abs_diff(p) >= 5 || (p <= 20) != (q <= 20),
+    }
 }
 
 pub struct Hid {
@@ -233,6 +247,7 @@ impl Hid {
             device: None,
             gatt: None,
             battery: None,
+            battery_told: None,
         };
         self.links.insert(handle, link);
     }
@@ -258,6 +273,7 @@ impl Hid {
             device: None,
             gatt: Some(gatt),
             battery: None,
+            battery_told: None,
         };
         self.links.insert(handle, link);
         self.gatt_outs(host, handle, outs, now);
@@ -285,7 +301,10 @@ impl Hid {
                     l.record.version = dev.version;
                     l.battery = dev.battery;
                     if let Some(p) = dev.battery {
-                        self.battery_news.push((l.addr, p));
+                        if battery_worth_telling(l.battery_told, p, now) {
+                            l.battery_told = Some((now, p));
+                            self.battery_news.push((l.addr, p));
+                        }
                     }
                     l.descriptor = Some(dev.report_map);
                     self.attach(handle);
@@ -295,6 +314,9 @@ impl Hid {
                     let Some(l) = self.links.get_mut(&handle) else { return };
                     if l.battery != Some(p) {
                         eprintln!("vinculumd: {}: battery {p}%", l.addr);
+                    }
+                    if battery_worth_telling(l.battery_told, p, now) {
+                        l.battery_told = Some((now, p));
                         self.battery_news.push((l.addr, p));
                     }
                     l.battery = Some(p);
@@ -721,6 +743,16 @@ impl Hid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_news_is_quiet_for_small_toggles() {
+        assert!(battery_worth_telling(None, 50, 0));
+        assert!(!battery_worth_telling(Some((0, 50)), 50, 1), "no change");
+        assert!(!battery_worth_telling(Some((0, 50)), 51, 1_000), "a toggle within the minute");
+        assert!(battery_worth_telling(Some((0, 50)), 51, BATTERY_QUIET_MS), "after the minute");
+        assert!(battery_worth_telling(Some((0, 50)), 45, 1), "a 5-point step");
+        assert!(battery_worth_telling(Some((0, 21)), 20, 1), "reaching the low mark");
+    }
 
     #[test]
     fn report_ids() {

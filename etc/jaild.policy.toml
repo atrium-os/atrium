@@ -991,10 +991,10 @@ ioctls = [
 # out on purpose: USB_DEVICEENUMERATE (reset), USB_SET_POWER_MODE,
 # USB_IFACE_DRIVER_DETACH/ATTACH (dispensatord detaches the base driver),
 # port enable/disable, templates, quirks, streams. Enforced ahead of the
-# policy-wide mode: a jail that tries anything else gets EPERM.
+# policy-wide mode ([sysfil_class_modes] at the end of this file): a jail
+# that tries anything else gets EPERM.
 [sysfil.profiles.usb-driver]
 include = ["base"]
-mode    = 2
 ioctls = [
     "0x8010557f",   # USB_READ_DIR (on /dev/usbctl: the device list)
     "0x4004557e",   # USB_GET_PLUGTIME
@@ -1122,3 +1122,12 @@ ioctls = [
     "0x2000741c",   # TIOCPTMASTER (grantpt, unlockpt)
     "0x80106678",   # FIODGNAME (ptsname)
 ]
+
+# ---------------------------------------------------------------
+# Classes that enforce ahead of [sysfil] mode, once their profile has been
+# learned (jail-sysfil.md §5): never looser than that mode. A top-level
+# table so that a jaild older than it ignores it (and keeps these classes
+# at the policy-wide mode) instead of refusing the policy.
+# ---------------------------------------------------------------
+[sysfil_class_modes]
+usb-driver = 2

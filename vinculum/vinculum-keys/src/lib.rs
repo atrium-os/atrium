@@ -75,16 +75,45 @@ pub trait KeyStore {
     }
 }
 
-/// Splits loaded bonds into the usable ones and the ids of every bond that
-/// shares its address or identity with another: which of two is the live
-/// key cannot be told, so neither is used and that device pairs again.
+/// Splits loaded bonds into the usable ones and the ids to delete, for
+/// records that share an address or identity. Records of one device with
+/// the same key are copies (a rename stores the new record before deleting
+/// the old one): one is kept, a named one first. Records with different
+/// keys can't be told apart, so none is used and that device pairs again.
 pub fn split_duplicates(bonds: Vec<(Id, Bond)>) -> (Vec<(Id, Bond)>, Vec<Id>) {
     let same = |a: &Bond, b: &Bond| a.address == b.address || (a.identity.is_some() && a.identity == b.identity);
-    let dup: Vec<bool> = bonds.iter().enumerate().map(|(i, (_, a))| bonds.iter().enumerate().any(|(j, (_, b))| i != j && same(a, b))).collect();
+    let n = bonds.len();
+    // Group each record with every record it shares a device with.
+    let mut group: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for j in 0..i {
+            if same(&bonds[i].1, &bonds[j].1) {
+                let (gi, gj) = (group[i], group[j]);
+                for g in group.iter_mut() {
+                    if *g == gi {
+                        *g = gj;
+                    }
+                }
+            }
+        }
+    }
+    let mut keep_idx = vec![false; n];
+    for g in 0..n {
+        let members: Vec<usize> = (0..n).filter(|&i| group[i] == g).collect();
+        let Some(&first) = members.first() else { continue };
+        let copies = members.iter().all(|&i| {
+            let (a, b) = (&bonds[i].1, &bonds[first].1);
+            a.ltk == b.ltk && a.classic == b.classic && a.key_size == b.key_size && a.authenticated == b.authenticated && a.secure_connections == b.secure_connections && a.peer_irk == b.peer_irk
+        });
+        if copies {
+            let pick = members.iter().copied().find(|&i| !bonds[i].1.name.trim().is_empty()).unwrap_or(first);
+            keep_idx[pick] = true;
+        }
+    }
     let mut keep = Vec::new();
     let mut drop = Vec::new();
-    for ((id, b), d) in bonds.into_iter().zip(dup) {
-        if d { drop.push(id) } else { keep.push((id, b)) }
+    for ((id, b), k) in bonds.into_iter().zip(keep_idx) {
+        if k { keep.push((id, b)) } else { drop.push(id) }
     }
     (keep, drop)
 }

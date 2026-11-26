@@ -491,7 +491,8 @@ impl Daemon {
                 DeviceInfo {
                     address: a,
                     identity: b.identity.map(from_keys),
-                    name: b.name.clone(),
+                    // Records stored before names were cleaned on arrival.
+                    name: wire::clean_name(&b.name),
                     authenticated: b.authenticated,
                     secure_connections: b.secure_connections,
                     keyboard_allowed: policy::keyboard_allowed(b),
@@ -603,6 +604,7 @@ impl Daemon {
             }
             HostEvent::Advertisement { peer, rssi, name } => {
                 let a = addr(peer);
+                let name = name.map(|n| wire::clean_name(&n)).filter(|n| !n.is_empty());
                 if let Some(n) = &name {
                     self.names.insert(a, n.clone());
                 }
@@ -796,6 +798,7 @@ impl Daemon {
             }
             HostEvent::InquiryResult { peer, rssi, name, class_of_device } => {
                 let a = addr(peer);
+                let name = name.map(|n| wire::clean_name(&n)).filter(|n| !n.is_empty());
                 if let Some(n) = &name {
                     self.names.insert(a, n.clone());
                 }
@@ -812,6 +815,7 @@ impl Daemon {
             }
             HostEvent::RemoteName { peer, name } => {
                 let a = addr(peer);
+                let name = name.map(|n| wire::clean_name(&n)).filter(|n| !n.is_empty());
                 if self.naming == Some(a) {
                     self.naming = None;
                 }

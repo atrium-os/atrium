@@ -106,7 +106,23 @@ impl Conn {
         s.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
         let mut c = Conn { s, r: Reader::default() };
         c.send(&Request::Hello { agent: false })?;
+        // vinculumd answers Hello first: a later request's answer is then
+        // the next Ok or Error.
+        c.answer()?;
         Ok(c)
+    }
+
+    /// Waits for a request's answer, passing over events on their way.
+    fn answer(&mut self) -> Result<(), String> {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.next(end.saturating_duration_since(Instant::now()))? {
+                Some(Event::Ok) => return Ok(()),
+                Some(Event::Error { why }) => return Err(why),
+                Some(_) => {}
+                None => return Err("Bluetooth didn't answer".into()),
+            }
+        }
     }
 
     fn send(&mut self, r: &Request) -> Result<(), String> {
@@ -183,17 +199,7 @@ pub fn act(tx: Sender<BtMsg>, a: BtAction) {
         let r = Conn::open().and_then(|mut c| {
             let BtAction::Disconnect(address) = a.clone();
             c.send(&Request::Disconnect { address })?;
-            // The answer comes after any events already on their way.
-            let end = Instant::now() + Duration::from_secs(5);
-            loop {
-                let left = end.saturating_duration_since(Instant::now());
-                match c.next(left)? {
-                    Some(Event::Ok) => return Ok(()),
-                    Some(Event::Error { why }) => return Err(why),
-                    Some(_) => {}
-                    None => return Err("Bluetooth didn't answer".into()),
-                }
-            }
+            c.answer()
         });
         match &r {
             Ok(()) => eprintln!("forum-bar: bluetooth: {a:?}"),
@@ -244,22 +250,46 @@ mod tests {
         let sock = dir.join("control.sock");
         let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         std::env::set_var("FORUM_BAR_BT_SOCK", &sock);
-        let (rx, _tx) = follow();
+        let wait = Duration::from_secs(5);
+        let mut buf = [0u8; 256];
+        // A Disconnect's own answer is reported, not Hello's Ok.
+        let (tx2, rx2) = channel();
+        act(tx2, BtAction::Disconnect(a(1)));
         let (mut s, _) = l.accept().unwrap();
         let mut r = Reader::default();
-        let mut buf = [0u8; 256];
         let mut got = Vec::new();
         while got.len() < 2 {
             let n = s.read(&mut buf).unwrap();
             r.push(&buf[..n]);
             while let Some(q) = r.next::<Request>().unwrap() {
                 got.push(q);
+                let reply = if got.len() == 1 { Event::Ok } else { Event::Error { why: "not connected".into() } };
+                s.write_all(&encode(&reply)).unwrap();
+            }
+        }
+        assert_eq!(got[1], Request::Disconnect { address: a(1) });
+        assert!(matches!(rx2.recv_timeout(wait).unwrap(), BtMsg::Done(Err(w)) if w == "not connected"));
+        let (rx, _tx) = follow();
+        let (mut s, _) = l.accept().unwrap();
+        let mut r = Reader::default();
+        let mut got = Vec::new();
+        let mut answered = false;
+        while got.len() < 2 {
+            let n = s.read(&mut buf).unwrap();
+            r.push(&buf[..n]);
+            while let Some(q) = r.next::<Request>().unwrap() {
+                got.push(q);
+            }
+            if !answered && !got.is_empty() {
+                // Hello's answer; nothing else is asked until it comes.
+                assert_eq!(got.len(), 1, "a request before Hello was answered");
+                s.write_all(&encode(&Event::Ok)).unwrap();
+                answered = true;
             }
         }
         assert_eq!(got, [Request::Hello { agent: false }, Request::Devices]);
         s.write_all(&encode(&Event::Devices { devices: vec![dev(1, "Mouse", true, None)] })).unwrap();
         s.write_all(&encode(&Event::Battery { address: a(1), percent: 42 })).unwrap();
-        let wait = Duration::from_secs(5);
         assert!(matches!(rx.recv_timeout(wait).unwrap(), BtMsg::Devices(Some(v)) if v.len() == 1));
         assert!(matches!(rx.recv_timeout(wait).unwrap(), BtMsg::Battery { address, percent: 42 } if address == a(1)));
         drop(s);

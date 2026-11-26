@@ -273,7 +273,7 @@ fn main() {
     let (kept, dups) = vinculum_keys::split_duplicates(bonds);
     bonds = kept;
     for id in dups {
-        eprintln!("vinculumd: bond {id:02x?} shares its device with another; removing both, that device must pair again");
+        eprintln!("vinculumd: bond {id:02x?} shares its device with another record; removing it (a copy, or keys that disagree: then that device must pair again)");
         if let Err(e) = store.delete(&id) {
             eprintln!("vinculumd: removing duplicate bond {id:02x?}: {e}");
         }

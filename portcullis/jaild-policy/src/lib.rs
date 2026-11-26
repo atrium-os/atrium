@@ -80,6 +80,15 @@ pub struct Policy {
     /// no profiles, and a request that names one is refused.
     #[serde(default)]
     pub sysfil: SysfilPolicy,
+    /// `[sysfil_class_modes]`: a class's `sysfil.mode` when it is stricter
+    /// than `[sysfil] mode`, so a learned profile enforces while the rest
+    /// still log. Never looser than the policy-wide mode; an included
+    /// profile's mode does not carry over. A top-level table on purpose:
+    /// `[sysfil]` refuses unknown keys, so a jaild built before this field
+    /// would refuse the whole policy, while it ignores an unknown table and
+    /// just keeps every class at the policy-wide mode.
+    #[serde(default)]
+    pub sysfil_class_modes: BTreeMap<String, i32>,
 }
 
 /// `[sysfil]`: the system call filter profiles jaild may put on a jail
@@ -99,13 +108,17 @@ pub struct SysfilPolicy {
     pub mode: i32,
     #[serde(default)]
     pub profiles: BTreeMap<String, SysfilProfile>,
+    /// Per-class modes from the policy's top-level `[sysfil_class_modes]`
+    /// (see `Policy::sysfil_class_modes`), copied here by `Policy::load`.
+    #[serde(skip)]
+    pub class_modes: BTreeMap<String, i32>,
 }
 
 fn default_sysfil_mode() -> i32 { 2 }
 
 impl Default for SysfilPolicy {
     fn default() -> Self {
-        SysfilPolicy { required: false, mode: default_sysfil_mode(), profiles: BTreeMap::new() }
+        SysfilPolicy { required: false, mode: default_sysfil_mode(), profiles: BTreeMap::new(), class_modes: BTreeMap::new() }
     }
 }
 
@@ -117,11 +130,6 @@ pub struct SysfilProfile {
     /// Profiles whose lists this one adds to, e.g. `["base"]`.
     #[serde(default)]
     pub include:  Vec<String>,
-    /// This class's `sysfil.mode` when it is stricter than `[sysfil] mode`:
-    /// a profile already learned enforces while the others still log. It
-    /// never loosens the policy-wide mode, and an included profile's mode
-    /// does not carry over.
-    pub mode:     Option<i32>,
     pub syscalls: Option<Vec<String>>,
     /// ioctl command numbers, as the kernel takes them (`0x4004667f`).
     pub ioctls:   Option<Vec<String>>,
@@ -173,7 +181,7 @@ impl SysfilPolicy {
         }
         let mut acc: [Option<std::collections::BTreeSet<String>>; 4] = Default::default();
         self.fold(name, &mut acc, &mut Vec::new())?;
-        let own = self.profiles.get(name).and_then(|p| p.mode);
+        let own = self.class_modes.get(name).copied();
         if let Some(m) = own.filter(|m| !(1..=3).contains(m)) {
             return Err(format!("sysfil profile {name:?}: mode {m} is not 1, 2 or 3"));
         }
@@ -751,7 +759,8 @@ impl Policy {
         let path = path.as_ref();
         let bytes = fs::read_to_string(path)
             .map_err(|e| PolicyError::Read(path.display().to_string(), e))?;
-        let policy: Policy = toml::from_str(&bytes)?;
+        let mut policy: Policy = toml::from_str(&bytes)?;
+        policy.sysfil.class_modes = policy.sysfil_class_modes.clone();
         if policy.schema_version != SCHEMA_VERSION {
             return Err(PolicyError::SchemaVersion {
                 found: policy.schema_version,
@@ -822,15 +831,15 @@ mod tests {
     fn a_profile_may_enforce_before_the_policy_does_but_never_loosen_it() {
         let mut s = sysfil_sample();
         s.mode = 1;
-        s.profiles.get_mut("net").unwrap().mode = Some(2);
+        s.class_modes.insert("net".into(), 2);
         assert_eq!(s.resolve("net").unwrap().mode, 2, "a learned profile enforces");
         assert_eq!(s.resolve("base").unwrap().mode, 1, "the rest still log");
-        s.profiles.get_mut("base").unwrap().mode = Some(3);
+        s.class_modes.insert("base".into(), 3);
         assert_eq!(s.resolve("net").unwrap().mode, 2, "an included profile's mode does not carry over");
         s.mode = 2;
-        s.profiles.get_mut("net").unwrap().mode = Some(1);
+        s.class_modes.insert("net".into(), 1);
         assert_eq!(s.resolve("net").unwrap().mode, 2, "a profile cannot turn enforcing back to logging");
-        s.profiles.get_mut("net").unwrap().mode = Some(0);
+        s.class_modes.insert("net".into(), 0);
         assert!(s.resolve("net").unwrap_err().contains("mode 0"));
     }
 
