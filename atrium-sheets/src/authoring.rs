@@ -41,6 +41,9 @@ pub enum AuthorCmd {
     Values,
     /// Look in comments and their replies instead of cells.
     Comments,
+    /// Find only cells formatted as the cursor's cell is (Excel's Format…
+    /// ▸ Choose Format From Cell); again, any format.
+    Format,
     Find(bool),
     /// Go to the first match and list every match.
     FindAll,
@@ -82,6 +85,7 @@ pub(super) struct Authoring {
     all_sheets: Mutable<bool>,
     values: Mutable<bool>,
     comments: Mutable<bool>,
+    format: Mutable<Option<officina_grid::style::Style>>,
     split: Mutable<Split>,
     extra_scrolls: [Mutable<ScrollState>; 3],
     active: Mutable<usize>,
@@ -102,6 +106,7 @@ impl Authoring {
             all_sheets: rev.sibling(false),
             values: rev.sibling(false),
             comments: rev.sibling(false),
+            format: rev.sibling(None),
             split: rev.sibling(Split::None),
             extra_scrolls: std::array::from_fn(|_| rev.sibling(ScrollState::default())),
             active: rev.sibling(0),
@@ -176,7 +181,11 @@ impl Authoring {
 
     fn find(&self, s: &Sheets, forward: bool, replace: Option<bool>, list: bool) -> Result<(), String> {
         // Excel's wildcards: * any run, ? any one, ~ before either as itself.
-        let search = Search::excel(self.query.get_cloned().text(), self.case.get(), self.whole.get())?;
+        // With a format and nothing typed, Find finds any cell of that format.
+        let format = self.format.get_cloned();
+        let typed = self.query.get_cloned().text().to_string();
+        let needle = if typed.is_empty() && format.is_some() && replace.is_none() { "*" } else { typed.as_str() };
+        let search = Search::excel(needle, self.case.get(), self.whole.get())?;
         let replacement = self.replacement.get_cloned();
         if replacement.text().len() > 16_384 { return Err("The replacement text is too long.".into()); }
         let mut d = s.doc.borrow_mut();
@@ -190,6 +199,7 @@ impl Authoring {
         if replace.is_some() && self.comments.get() {
             return Err("Replace changes cells: turn Comments off to replace.".into());
         }
+        let fmt_ok = |d: &crate::doc::Doc, at: CellAddr| format.as_ref().is_none_or(|f| d.wb.style(at) == f);
         if let Some(all) = replace {
             let mut ops = Vec::new();
             let mut bytes = 0;
@@ -197,6 +207,7 @@ impl Authoring {
             for sheet in sheets {
                 find::inputs(&d.wb, sheet, &mut |at, input, text| {
                     if !all && at != cursor { return true; }
+                    if !fmt_ok(&d, at) { return true; }
                     let next = match search.replacement(&input, &text, replacement.text()) {
                         Ok(Some(next)) => next,
                         Ok(None) => return true,
@@ -248,14 +259,15 @@ impl Authoring {
         for sheet in sheets {
             if self.comments.get() {
                 for (&(row, col), comment) in d.wb.comments(sheet) {
-                    if search.matches(&comment.text) || comment.thread().iter().any(|m| search.matches(&m.text)) {
-                        hit(CellAddr::new(sheet, row, col));
+                    let at = CellAddr::new(sheet, row, col);
+                    if fmt_ok(&d, at) && (search.matches(&comment.text) || comment.thread().iter().any(|m| search.matches(&m.text))) {
+                        hit(at);
                     }
                 }
             } else if self.values.get() {
-                find::values(&d.wb, sheet, &mut |at, text| { if search.matches(&text) { hit(at); } true });
+                find::values(&d.wb, sheet, &mut |at, text| { if search.matches(&text) && fmt_ok(&d, at) { hit(at); } true });
             } else {
-                find::inputs(&d.wb, sheet, &mut |at, _, text| { if search.matches(&text) { hit(at); } true });
+                find::inputs(&d.wb, sheet, &mut |at, _, text| { if search.matches(&text) && fmt_ok(&d, at) { hit(at); } true });
             }
         }
         let none = if self.comments.get() { "No matching comments." } else { "No matching cell inputs." };
@@ -344,6 +356,21 @@ impl Authoring {
             AuthorCmd::Workbook => { self.all_sheets.set(!self.all_sheets.get()); Ok(()) }
             AuthorCmd::Values => { self.values.set(!self.values.get()); self.comments.set(false); Ok(()) }
             AuthorCmd::Comments => { self.comments.set(!self.comments.get()); self.values.set(false); Ok(()) }
+            AuthorCmd::Format => {
+                if self.format.get_cloned().is_some() {
+                    self.format.set(None);
+                    s.doc.borrow_mut().status = "Find looks at any format again.".into();
+                } else {
+                    let d = s.doc.borrow();
+                    let (row, col) = s.grid.get_cloned().cursor;
+                    let st = d.wb.style(CellAddr::new(d.sheet, row, col)).clone();
+                    let say = format!("Find looks only at cells formatted as {} is.", a1(row, col));
+                    drop(d);
+                    self.format.set(Some(st));
+                    s.doc.borrow_mut().status = say;
+                }
+                Ok(())
+            }
             AuthorCmd::Find(forward) => self.search(s, forward, None),
             AuthorCmd::FindAll => self.find(s, true, None, true),
             AuthorCmd::Replace(all) => self.search(s, true, Some(all)),
@@ -493,7 +520,8 @@ impl Authoring {
                 ("Whole cell", self.whole.get(), AuthorCmd::Whole),
                 ("All sheets", self.all_sheets.get(), AuthorCmd::Workbook),
                 ("Values", self.values.get(), AuthorCmd::Values),
-                ("Comments", self.comments.get(), AuthorCmd::Comments)];
+                ("Comments", self.comments.get(), AuthorCmd::Comments),
+                ("Format", self.format.get_cloned().is_some(), AuthorCmd::Format)];
             let n = options.len() as f32;
             for (i, (label, on, action)) in options.into_iter().enumerate() {
                 let state = Mutable::new(if on { Check::On } else { Check::Off });
@@ -741,6 +769,36 @@ mod tests {
         s.authoring.replacement.set(TextEdit::new("ow"));
         run(&s, AuthorCmd::Replace(true));
         assert_eq!(s.doc.borrow().wb.value(0, 0, 1), officina_grid::Value::str("cow"));
+    }
+
+    #[test]
+    fn find_and_replace_by_the_format_of_a_cell() {
+        let s = sheets(b"pen,pen\npen,ink\n");
+        {
+            let mut d = s.doc.borrow_mut();
+            let bold = officina_grid::style::Style { font: officina_grid::style::Font { bold: true, ..Default::default() }, ..Default::default() };
+            for (r, c) in [(0, 1), (1, 1)] {
+                d.wb.set_style(&officina_grid::Rect::cell(CellAddr::new(0, r, c)), bold.clone());
+            }
+        }
+        run(&s, AuthorCmd::FindOpen);
+        { let mut g = s.grid.get_cloned(); g.cursor = (0, 1); g.anchor = (0, 1); s.grid.set(g); }
+        run(&s, AuthorCmd::Format);
+        assert_eq!(s.doc.borrow().status, "Find looks only at cells formatted as B1 is.");
+        // Nothing typed: every cell of that format.
+        run(&s, AuthorCmd::FindAll);
+        assert_eq!(s.doc.borrow().status, "Found 2 cells: Sheet1!B1, Sheet1!B2.");
+        s.authoring.query.set(TextEdit::new("pen"));
+        run(&s, AuthorCmd::FindAll);
+        assert_eq!(s.doc.borrow().status, "Found 1 cell: Sheet1!B1.");
+        // Replace All touches only the bold pen.
+        s.authoring.replacement.set(TextEdit::new("cap"));
+        run(&s, AuthorCmd::Replace(true));
+        assert_eq!(s.doc.borrow().wb.value(0, 0, 1), officina_grid::Value::str("cap"));
+        assert_eq!(s.doc.borrow().wb.value(0, 0, 0), officina_grid::Value::str("pen"));
+        run(&s, AuthorCmd::Format);
+        run(&s, AuthorCmd::FindAll);
+        assert_eq!(s.doc.borrow().status, "Found 2 cells: Sheet1!A1, Sheet1!A2.");
     }
 
     #[test]

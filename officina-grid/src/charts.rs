@@ -239,6 +239,25 @@ pub struct Chart {
     pub x_title: Option<Arc<str>>,
     pub y_title: Option<Arc<str>>,
     pub anchor: Anchor,
+    /// Alt Text: what the chart shows, for a screen reader (Excel's
+    /// `descr`), at most [`MAX_ALT`] bytes.
+    pub alt: Option<Arc<str>>,
+}
+
+/// The longest alt text, in bytes.
+pub const MAX_ALT: usize = 4096;
+
+/// Alt text as kept: trimmed, control characters other than line breaks
+/// dropped, cut to [`MAX_ALT`] bytes on a character boundary; `None` when
+/// nothing is left.
+pub fn clean_alt(s: &str) -> Option<Arc<str>> {
+    let clean: String = s.trim().chars().filter(|c| !c.is_control() || *c == '\n').collect();
+    let mut end = clean.len().min(MAX_ALT);
+    while !clean.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = clean[..end].trim();
+    (!cut.is_empty()).then(|| Arc::from(cut))
 }
 
 /// A series' values as the chart draws them.
@@ -359,13 +378,15 @@ impl Chart {
             Grouping::Stacked => 1,
             Grouping::Percent => 2,
         });
+        // Bit 7 of the legend byte: alt text follows the series.
+        let alt = self.alt.as_deref().filter(|a| !a.is_empty());
         w.u8(match self.legend {
             None => 0,
             Some(LegendPos::Right) => 1,
             Some(LegendPos::Left) => 2,
             Some(LegendPos::Top) => 3,
             Some(LegendPos::Bottom) => 4,
-        });
+        } | if alt.is_some() { 0x80 } else { 0 });
         text(w, self.title.as_ref());
         w.str(self.x_title.as_deref().unwrap_or(""));
         w.str(self.y_title.as_deref().unwrap_or(""));
@@ -390,6 +411,9 @@ impl Chart {
             rect(w, &s.vals);
             w.u8(s.kind.map_or(0xFF, |k| k.code()));
         }
+        if let Some(alt) = alt {
+            w.str(alt);
+        }
     }
 
     pub fn decode(r: &mut Reader) -> Result<Chart, WireError> {
@@ -400,7 +424,9 @@ impl Chart {
             2 => Grouping::Percent,
             _ => return Err(WireError::Invalid("chart grouping")),
         };
-        let legend = match r.u8()? {
+        let legend_byte = r.u8()?;
+        let has_alt = legend_byte & 0x80 != 0;
+        let legend = match legend_byte & 0x7F {
             0 => None,
             1 => Some(LegendPos::Right),
             2 => Some(LegendPos::Left),
@@ -442,7 +468,16 @@ impl Chart {
             };
             series.push(Series { name, cats, vals, kind });
         }
-        Ok(Chart { kind, grouping, title, series, legend, x_title, y_title, anchor: Anchor { sheet, from: corners[0], to: corners[1] } })
+        let alt = if has_alt {
+            let a = r.str("alt text", MAX_ALT as u64)?;
+            if a.is_empty() || a.chars().any(|c| c.is_control() && c != '\n') {
+                return Err(WireError::Invalid("alt text"));
+            }
+            Some(Arc::from(a))
+        } else {
+            None
+        };
+        Ok(Chart { kind, grouping, title, series, legend, x_title, y_title, anchor: Anchor { sheet, from: corners[0], to: corners[1] }, alt })
     }
 }
 
@@ -572,7 +607,7 @@ mod tests {
             legend: Some(LegendPos::Bottom),
             x_title: None,
             y_title: Some("€".into()),
-            anchor: Anchor { sheet: 0, from: (5, 1, 0.0, 0.0), to: (20, 8, 12.5, 3.0) },
+            anchor: Anchor { sheet: 0, from: (5, 1, 0.0, 0.0), to: (20, 8, 12.5, 3.0) }, alt: None
         }
     }
 
@@ -605,6 +640,14 @@ mod tests {
         for n in 0..b.len() {
             let _ = Chart::decode(&mut Reader::new(&b[..n]));
         }
+        // Alt text rides after the series, flagged in the legend byte.
+        let mut described = c.clone();
+        described.alt = Some("Sales by month, rising".into());
+        let mut w = Writer::new();
+        described.encode(&mut w);
+        let b = w.into_bytes();
+        assert_eq!(Chart::decode(&mut Reader::new(&b)).unwrap(), described);
+        assert_eq!(b.len(), { let mut w = Writer::new(); c.encode(&mut w); w.into_bytes().len() } + 1 + "Sales by month, rising".len());
         let mut bad = c.clone();
         bad.series[0].vals = Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 2 };
         assert!(wb.add_chart(bad).is_err());

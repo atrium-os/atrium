@@ -1112,6 +1112,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             match name {
                                 b"draw:object" => f.href = attrs(e).remove("xlink:href"),
                                 b"draw:image" if f.image.is_none() => f.image = attrs(e).remove("xlink:href"),
+                                b"svg:desc" if !empty => f.in_desc = true,
                                 _ => {}
                             }
                         }
@@ -1336,6 +1337,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             href: None,
                             image: None,
                             transformed: a.contains_key("draw:transform"),
+                            desc: String::new(),
+                            in_desc: false,
                         };
                         if empty {
                             frames.push(f);
@@ -1627,6 +1630,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     }
                 }
             }
+            Event::Text(t) if frame_depth > 0 => {
+                if let Some(f) = frame.as_mut().filter(|f| f.in_desc) {
+                    let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
+                    let room = officina_grid::charts::MAX_ALT.saturating_sub(f.desc.len());
+                    f.desc.push_str(&s[..s.floor_char_boundary(s.len().min(room))]);
+                }
+            }
             Event::Text(t) if in_p && annotation_depth == 0 && frame_depth == 0 => {
                 if let Some(c) = cell.as_mut() {
                     let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
@@ -1640,6 +1650,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                 let name = name.as_ref();
                 if frame_depth > 0 {
                     frame_depth -= 1;
+                    if frame_depth == 1 && name == b"svg:desc" {
+                        if let Some(f) = frame.as_mut() {
+                            f.in_desc = false;
+                        }
+                    }
                     if frame_depth == 0 {
                         frames.extend(frame.take());
                     }

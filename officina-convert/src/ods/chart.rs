@@ -39,6 +39,9 @@ pub(crate) struct FrameIn {
     pub href: Option<String>,
     pub image: Option<String>,
     pub transformed: bool,
+    /// The frame's `svg:desc` (a chart's alt text), at most `MAX_ALT` bytes.
+    pub desc: String,
+    pub in_desc: bool,
 }
 
 const PT_PX: f64 = 72.0 / 96.0;
@@ -141,7 +144,8 @@ pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, 
             continue;
         };
         match chart_doc(wb, &data, anchor, rep) {
-            Some(c) => {
+            Some(mut c) => {
+                c.alt = officina_grid::charts::clean_alt(&f.desc);
                 if wb.add_chart(c).is_err() {
                     rep.note(Kind::Dropped, "charts this engine can't use");
                 }
@@ -304,7 +308,7 @@ fn chart_doc(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> Op
         legend,
         x_title: opt(axis_title.0),
         y_title: opt(axis_title.1),
-        anchor,
+        anchor, alt: None
     })
 }
 
@@ -436,8 +440,9 @@ fn frame_inches(wb: &Workbook, a: Anchor) -> [String; 4] {
 /// The `draw:frame` for chart `i` (shown as `Object {i+1}`), anchored to its sheet.
 pub(crate) fn frame_xml(wb: &Workbook, c: &Chart, i: usize) -> String {
     let [x, y, w, h] = frame_inches(wb, c.anchor);
+    let desc = c.alt.as_deref().map_or(String::new(), |a| format!("<svg:desc>{}</svg:desc>", crate::xml::esc(a)));
     format!(
-        r#"<draw:frame draw:z-index="{i}" draw:name="Chart {}" svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}"><draw:object xlink:href="./Object {}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#,
+        r#"<draw:frame draw:z-index="{i}" draw:name="Chart {}" svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}"><draw:object xlink:href="./Object {}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>{desc}</draw:frame>"#,
         i + 1,
         x, y, w, h,
         i + 1

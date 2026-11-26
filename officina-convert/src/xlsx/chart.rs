@@ -60,6 +60,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
         let mut crop = [0; 4];
         let mut rotation = 0;
         let mut chart: Option<String> = None;
+        let mut descr: Option<String> = None;
         let mut other = false;
         loop {
             match r.read_event_into(&mut buf)? {
@@ -78,6 +79,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         corner = 0;
                         field = None;
                         chart = None;
+                        descr = None;
                         other = false;
                         pos = [[0; 4]; 2];
                     }
@@ -101,6 +103,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         }
                     }
                     b"pic" if !anchor_kind.is_empty() => in_picture = true,
+                    b"cNvPr" if !anchor_kind.is_empty() && !in_picture => descr = attr(&e, b"descr")?,
                     b"srcRect" if in_picture => {
                         for (inset, side) in crop.iter_mut().zip([b"l", b"t", b"r", b"b"]) {
                             if let Some(value) = attr(&e, side)? {
@@ -183,7 +186,8 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         if let Some(p) = chart.take() {
                             if let Some(data) = z.read_name(&p)? {
                                 match chart_part(wb, &data, anchor, rep)? {
-                                    Some(c) => {
+                                    Some(mut c) => {
+                                        c.alt = descr.take().and_then(|d| officina_grid::charts::clean_alt(&d));
                                         if wb.add_chart(c).is_err() {
                                             rep.note(Kind::Dropped, "charts this engine can't use");
                                         }
@@ -391,7 +395,7 @@ fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> R
         title = series[0].name.clone();
     }
     let pick = |cat: bool| axis_titles.iter().find(|(c, t)| *c == cat && !t.is_empty()).map(|(_, t)| Arc::from(t.as_str()));
-    Ok(Some(Chart { kind, grouping, title, series, legend, x_title: pick(true), y_title: pick(false), anchor }))
+    Ok(Some(Chart { kind, grouping, title, series, legend, x_title: pick(true), y_title: pick(false), anchor, alt: None }))
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────
@@ -602,9 +606,11 @@ pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> S
         anchor(&mut o, wb.charts()[i - 1].anchor);
         let _ = write!(
             o,
-            r#"<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{}" name="Chart {}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId{}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#,
+            r#"<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{}" name="Chart {}"{}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId{}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#,
             j + 2,
             j + 1,
+            // An attribute keeps a line break only as a reference.
+            wb.charts()[i - 1].alt.as_deref().map_or(String::new(), |a| format!(r#" descr="{}""#, esc(a).replace('\n', "&#10;"))),
             j + 1
         );
     }

@@ -227,6 +227,12 @@ pub enum DataCmd {
     AutoCorrect,
     /// Custom Views… (a bar).
     CustomViews,
+    /// Alt Text… for the chart at the cursor (a bar).
+    AltText,
+    /// Check Accessibility (a bar stepping through what it finds).
+    CheckAccessibility,
+    /// Insert Checkbox (or take it off, from a checkbox).
+    Checkbox,
     AddWatch,
     WatchWindow,
     CreateNames,
@@ -477,7 +483,7 @@ fn short(s: &str) -> String {
 }
 
 /// The chart under the cursor's cell, else the last one using it.
-fn chart_at(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Option<usize> {
+pub(crate) fn chart_at(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Option<usize> {
     let cs = wb.charts();
     let over = cs.iter().rposition(|c| c.anchor.sheet == sheet && (c.anchor.from.0..=c.anchor.to.0).contains(&row) && (c.anchor.from.1..=c.anchor.to.1).contains(&col));
     over.or_else(|| {
@@ -681,6 +687,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
         (MenuItem::new("Spelling…").shortcut("F7"), Some(DataCmd::Spelling)),
         (MenuItem::new("AutoCorrect Options…"), Some(DataCmd::AutoCorrect)),
+        (MenuItem::new("Check Accessibility"), Some(DataCmd::CheckAccessibility)),
         (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
         (MenuItem::new("Properties…"), Some(DataCmd::Properties)),
         (MenuItem::new("Mark as Final").checked(wb.properties().marked_final), Some(DataCmd::MarkFinal)),
@@ -727,10 +734,12 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         }
         None => v.push((MenuItem::new("Format as Table").shortcut("Ctrl+T").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
     }
-    v.push((MenuItem::new("Insert Column Chart").enabled(some).separated(), Some(DataCmd::Chart(ChartKind::Column))));
+    v.push((MenuItem::new("Insert Checkbox").checked(wb.style(CellAddr::new(s, row, col)).checkbox).separated(), Some(DataCmd::Checkbox)));
+    v.push((MenuItem::new("Insert Column Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Column))));
     v.push((MenuItem::new("Insert Line Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Line))));
     v.push((MenuItem::new("Insert Pie Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Pie))));
     v.push((MenuItem::new("Delete Chart").enabled(chart_at(wb, s, row, col).is_some()), Some(DataCmd::DeleteChart)));
+    v.push((MenuItem::new("Alt Text…").enabled(chart_at(wb, s, row, col).is_some()), Some(DataCmd::AltText)));
     let here = wb.pivot_at(CellAddr::new(s, row, col));
     match here {
         Some((i, _)) => {
@@ -3188,7 +3197,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::CheckAccessibility => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3295,6 +3304,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::ProtectWorkbook => protect_workbook(d),
         DataCmd::ManualCalc => crate::formulas::toggle_manual(d),
         DataCmd::MarkFinal => crate::checks::toggle_final(d),
+        DataCmd::Checkbox => crate::checkbox::insert(d, sel, cursor),
         DataCmd::DateSystem1904 => {
             let on = d.wb.date_system() != officina_grid::eval::dates::DateSystem::Excel1904;
             if !d.run_action("Date System", vec![GridOp::DateSystem1904(on)]) {
@@ -3479,7 +3489,7 @@ pub fn chart_for(wb: &Workbook, t: &Target, kind: ChartKind) -> Option<Chart> {
     let free = |c0: u32| (r0..=r0 + 16).all(|row| (c0..=c0 + 7).all(|c| matches!(wb.get(CellAddr::new(s, row, c)), Value::Empty)));
     let start = (r.c1 + 2).min(officina_grid::addr::MAX_COLS - 9);
     let c0 = (start..start.saturating_add(64).min(officina_grid::addr::MAX_COLS - 9)).find(|&c| free(c)).unwrap_or(start);
-    Some(Chart { kind, grouping: Grouping::Standard, title: None, series, legend, x_title: None, y_title: None, anchor: Anchor { sheet: s, from: (r0, c0, 0.0, 0.0), to: (r0 + 16, c0 + 7, 0.0, 0.0) } })
+    Some(Chart { kind, grouping: Grouping::Standard, title: None, series, legend, x_title: None, y_title: None, anchor: Anchor { sheet: s, from: (r0, c0, 0.0, 0.0), to: (r0 + 16, c0 + 7, 0.0, 0.0) }, alt: None })
 }
 
 #[cfg(test)]

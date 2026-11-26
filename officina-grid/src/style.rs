@@ -234,6 +234,9 @@ pub struct Style {
     pub borders: [Edge; 4],
     /// Diagonals from top left down, then from bottom left up.
     pub diagonals: [Edge; 2],
+    /// The cell shows a checkbox (Excel's Insert ▸ Checkbox): ticked for
+    /// TRUE, clear for FALSE; other values show as they are.
+    pub checkbox: bool,
 }
 
 impl Default for Style {
@@ -251,6 +254,7 @@ impl Default for Style {
             unlocked: false,
             hide_formula: false,
             hide_value: false,
+            checkbox: false,
             indent: 0,
             rotation: 0,
             borders: [Edge::default(); 4],
@@ -274,6 +278,7 @@ impl Style {
             | (self.unlocked as u8) << 5 | (self.hide_formula as u8) << 6 | (self.hide_value as u8) << 7);
         color_out(w, f.color);
         let effects = u8::from(f.double && f.underline) << 2 | match f.script { Script::Normal => 0, Script::Super => 1 << 3, Script::Sub => 1 << 4 } | u8::from(f.accounting && f.underline) << 5;
+        let effects = effects | u8::from(self.checkbox) << 6;
         let extended = self.shrink_to_fit || self.gradient.is_some() || self.diagonals.iter().any(|e| e.line != Line::None) || effects != 0;
         if extended {
             w.u8(3);
@@ -329,8 +334,8 @@ impl Style {
         if tag == 3 {
             let extra = r.u8()?;
             // Bit 2 a double underline, bit 3 superscript, bit 4 subscript,
-            // bit 5 an accounting underline.
-            if extra > 0x3F || extra & 0x18 == 0x18 {
+            // bit 5 an accounting underline, bit 6 a checkbox.
+            if extra > 0x7F || extra & 0x18 == 0x18 {
                 return Err(WireError::Invalid("extra style flags"));
             }
             shrink_to_fit = extra & 1 != 0;
@@ -395,6 +400,7 @@ impl Style {
             unlocked: flags & 32 != 0,
             hide_formula: flags & 64 != 0,
             hide_value: flags & 128 != 0,
+            checkbox: effects & 64 != 0,
             indent,
             rotation: rotation as i16,
             borders,
@@ -649,6 +655,15 @@ mod tests {
         s.encode(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(Style::decode(&mut Reader::new(&bytes)).unwrap(), s);
+        // A checkbox rides in the extra flags.
+        let boxed = Style { checkbox: true, ..s.clone() };
+        let mut w = Writer::new();
+        boxed.encode(&mut w);
+        assert_eq!(Style::decode(&mut Reader::new(&w.into_bytes())).unwrap(), boxed);
+        let plain = Style { checkbox: true, ..Style::default() };
+        let mut w = Writer::new();
+        plain.encode(&mut w);
+        assert_eq!(Style::decode(&mut Reader::new(&w.into_bytes())).unwrap(), plain);
     }
 
     #[test]

@@ -5353,6 +5353,41 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
   The views are saved with the workbook, at most 64, with names up to 64 bytes and unique ignoring case. Adding and deleting are undo steps. Structural edits don't move a view. A view whose sheet is gone is refused when shown. `.xlsx` and `.ods` don't carry views yet; Excel's are `customSheetView` elements.
 - Tests: grid `docprops` (the mark round-trips and a bad byte is refused) and `views` (capture, show, undo, the op and the native file, duplicate names, a bad zoom); convert `fonteffects` (`_MarkAsFinal` in `.xlsx` and `.ods`); Sheets `checks` (edits refused while final, properties still set, the mark through the file and its status, undo), `autocorrect` (the list is sorted; words, symbols, capitals and days; what is left alone; the second step, formulas untouched, options and refusals) and `customviews` (add, show, undo, replace, refusals, delete); `app` (a commit corrected, and a view shown from another sheet at its zoom and cell).
 
+### 16.159 Alt Text, Check Accessibility, checkboxes in cells, Find by format (2026-11-26)
+
+`Chart::alt` and `clean_alt` in `officina-grid/src/charts.rs`, `Style::checkbox` in `officina-grid/src/style.rs`, `atrium-sheets/src/accessibility.rs`, `atrium-sheets/src/checkbox.rs`, the Format option in `atrium-sheets/src/authoring.rs`, `CellView::checkbox`, `checkbox_box` and `GridAction::ToggleChecks` in Pergola's grid view, and the chart `descr` and `svg:desc` handling in `officina-convert` (`xlsx/chart.rs`, `ods/chart.rs`, `ods/read.rs`).
+
+- **Alt Text…** (beside Delete Chart, for the chart under the cursor or using its cell) is a bar that sets what the chart shows, for a screen reader; `none` clears it. It is one undo step. The text is trimmed, keeps line breaks, has control characters dropped, and is at most 4,096 bytes.
+  - `.osheet`: bit 7 of the chart's legend byte says a string follows the series, so older files read as before.
+  - `.xlsx`: Excel's `descr` on the chart frame's `xdr:cNvPr`, with a line break as `&#10;`.
+  - `.ods`: the frame's `svg:desc`.
+- **Check Accessibility** (beside Spelling…), as Excel's Review ▸ Check Accessibility. A bar steps through what it finds with Next, going to each place and saying what is wrong and how to fix it (`… (2 of 5; Sheet1!A4)`). It looks for:
+  - charts without alt text;
+  - tables without a header row;
+  - merged cells;
+  - text whose colour against its fill is under WCAG's 4.5:1 (the font colour, black when automatic, against the solid fill, white when none), checking up to 200,000 cells a sheet;
+  - sheets with content still named SheetN.
+
+  It lists at most 1,000 issues and counts the rest. Not checked yet: pictures' alt text (pictures don't carry it), and contrast against patterns, gradients and conditional formats.
+- **Checkboxes in cells** (Insert Checkbox, a checked menu item), as Excel 365's Insert ▸ Checkbox:
+  - A cell format that shows TRUE as a ticked box and FALSE as a clear one. Other values show as they are. The box is centred unless the cell is aligned left or right.
+  - Inserting fills the selection's empty cells with FALSE, at most 100,000 cells.
+  - From a cell that has a checkbox, the item takes the format off and the values stay.
+  - A click on the box, or Space with the cursor on one, flips the selection's boxes: if any is clear they all tick, otherwise they all clear. Cells whose formula decides them, or that hold other values, are left alone. Each flip is one undo step.
+  - Clear Formats removes the box like any format.
+  - The format is bit 6 of the style's extra flags in `.osheet`.
+  - `.xlsx` and `.ods` keep the TRUE and FALSE values but not the box yet (Excel keeps it in a feature property bag).
+  - Print shows TRUE and FALSE.
+- **Find by format** (a sixth Find option, Format), as Excel's Format… ▸ Choose Format From Cell. Turning it on takes the cursor cell's whole format, and Find, Find All and Replace then match only cells formatted exactly so. With nothing typed, Find and Find All list every cell of that format that has content. Turning it off again matches any format.
+- Tests:
+  - Grid: `charts` (alt text through the wire, one flag bit plus the string) and `style` (the checkbox round-trips).
+  - Convert: `roundtrip` (alt text with quotes, an ampersand and a line break, in `.xlsx` and `.ods`).
+  - Sheets:
+    - `accessibility`: Alt Text set, cleaned, undone and cleared; WCAG contrast; the check finding a default name, merged cells and a pale font, and stepping through them.
+    - `checkbox`: insert, flip, formula and text cells left alone, undo, removal, the native file, the size limit.
+    - `authoring`: find by format with and without text; Replace All only in that format.
+  - Pergola's grid: a click on the box, a click beside it, Space on a checkbox, Space elsewhere.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

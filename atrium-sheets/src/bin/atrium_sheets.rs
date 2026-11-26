@@ -1338,7 +1338,7 @@ mod document_tests {
                 name: Some(ChartText::Lit("Units shipped".into())), cats: None, vals: rect, kind: None,
             }],
             legend: None, x_title: None, y_title: None,
-            anchor: Anchor { sheet: 0, from: (4, 2, 0.0, 0.0), to: (12, 8, 0.0, 0.0) },
+            anchor: Anchor { sheet: 0, from: (4, 2, 0.0, 0.0), to: (12, 8, 0.0, 0.0) }, alt: None
         }).unwrap();
 
         assert!(!saved_status(&doc, Format::Ods).contains("kept live references"));

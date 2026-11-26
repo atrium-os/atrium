@@ -488,7 +488,7 @@ pub fn forecast_sheet(d: &mut Doc, sel: CellRange, cursor: (u32, u32), typed: &s
     if charts.len() < officina_grid::charts::MAX_CHARTS {
         use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, LegendPos, Series};
         let series = (1..=4).map(|c| Series { name: Some(ChartText::Cell(CellAddr::new(count, 0, c))), cats: Some(col(0)), vals: col(c), kind: None }).collect();
-        charts.push(Chart { kind: ChartKind::Line, grouping: Grouping::Standard, title: None, series, legend: Some(LegendPos::Bottom), x_title: None, y_title: None, anchor: Anchor { sheet: count, from: (1, 6, 0.0, 0.0), to: (19, 14, 0.0, 0.0) } });
+        charts.push(Chart { kind: ChartKind::Line, grouping: Grouping::Standard, title: None, series, legend: Some(LegendPos::Bottom), x_title: None, y_title: None, anchor: Anchor { sheet: count, from: (1, 6, 0.0, 0.0), to: (19, 14, 0.0, 0.0) }, alt: None });
         ops.push(GridOp::Charts(charts));
     }
     d.extend(ops);

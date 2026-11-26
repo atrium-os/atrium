@@ -1824,6 +1824,13 @@ impl Sheets {
                         self.split_text.set(TextEdit::new("").secret(true));
                         crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
                     }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::CheckAccessibility) => {
+                        let r = crate::accessibility::step(&mut self.doc.borrow_mut());
+                        match self.accessibility_step(r) {
+                            Some(done) => Ok(done),
+                            None => Err(std::mem::take(&mut self.doc.borrow_mut().status)),
+                        }
+                    }
                     _ if self.splitting.get() == Some(crate::data::DataCmd::CustomViews) => {
                         let r = crate::customviews::run(&mut self.doc.borrow_mut(), g.cursor, &typed);
                         match r {
@@ -2170,6 +2177,34 @@ impl Sheets {
     /// Shows where a spelling check stopped: the word's cell, the bar with
     /// its first suggestion, the word and the rest in the status. The
     /// check's end (or its failure) closes the bar and is returned.
+    /// Goes to the issue and keeps the bar open (`None`), or closes it
+    /// with the summary.
+    fn accessibility_step(&self, r: crate::accessibility::Step) -> Option<String> {
+        match r {
+            crate::accessibility::Step::Show { sheet, at, say } => {
+                self.show_sheet(sheet);
+                self.show_cell(at.0, at.1);
+                let mut g = self.grid.get_cloned();
+                g.anchor = at;
+                g.cursor = at;
+                self.grid.set(g);
+                self.split_text.set(TextEdit::new(""));
+                self.splitting.set(Some(crate::data::DataCmd::CheckAccessibility));
+                self.rev.set(self.rev.get().wrapping_add(1));
+                self.doc.borrow_mut().status = say;
+                None
+            }
+            crate::accessibility::Step::Done(m) => {
+                if self.splitting.get() == Some(crate::data::DataCmd::CheckAccessibility) {
+                    self.splitting.set(None);
+                }
+                self.rev.set(self.rev.get().wrapping_add(1));
+                self.set_status(m.clone());
+                Some(m)
+            }
+        }
+    }
+
     fn spelling_step(&self, r: Result<crate::spelling::Next, String>) -> Option<String> {
         match r {
             Ok(crate::spelling::Next::Word { cursor, text, say }) => {
@@ -2812,6 +2847,11 @@ impl Sheets {
                 if crate::autocorrect::type_corrected(&mut d, cell, &text) {
                     grow = Some(row);
                 }
+            }
+            GridAction::ToggleChecks(r) => {
+                d.status = match crate::checkbox::toggle(&mut d, r) {
+                    Ok(m) | Err(m) => m,
+                };
             }
             GridAction::CommitAll { sel, text } => {
                 let area = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -4178,7 +4218,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.
@@ -4196,6 +4236,13 @@ impl Sheets {
                         self.split_text.set(ed);
                         self.splitting.set(Some(c));
                     }
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::CheckAccessibility) => {
+                    self.close_bars();
+                    let r = crate::accessibility::begin(&mut self.doc.borrow_mut());
+                    self.accessibility_step(r);
                     self.changed();
                     false
                 }
@@ -5517,7 +5564,7 @@ mod tests {
             legend: None, x_title: None, y_title: None,
             series: vec![Series { name: Some(ChartText::Cell(CellAddr::new(data, 0, 0))),
                 cats: Some(region(data, 0, 0, 3)), vals: region(data, 1, 0, 3), kind: None }],
-            anchor: Anchor { sheet, from: (row, 0, 0.0, 0.0), to: (row + 4, 3, 0.0, 0.0) },
+            anchor: Anchor { sheet, from: (row, 0, 0.0, 0.0), to: (row + 4, 3, 0.0, 0.0) }, alt: None
         };
         let kept_chart = chart(0, 1, 8, "Keep chart");
         local.wb.add_chart(chart(0, 1, 2, "Removed")).unwrap();

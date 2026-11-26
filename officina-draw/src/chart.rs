@@ -567,7 +567,7 @@ mod tests {
             legend: Some(LegendPos::Right),
             x_title: Some("x".into()),
             y_title: Some("y".into()),
-            anchor: Anchor { sheet: 0, from: (0, 0, 0.0, 0.0), to: (1, 1, 0.0, 0.0) },
+            anchor: Anchor { sheet: 0, from: (0, 0, 0.0, 0.0), to: (1, 1, 0.0, 0.0) }, alt: None
         }
     }
 

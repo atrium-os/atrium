@@ -52,7 +52,7 @@ fn book() -> Workbook {
             legend: Some(if i % 2 == 0 { LegendPos::Right } else { LegendPos::Bottom }),
             x_title: (!kind.round()).then(|| "Month".into()),
             y_title: (!kind.round()).then(|| "Amount".into()),
-            anchor: Anchor { sheet: 1, from: (r, 1, 0.0, 0.0), to: (r + 18, 8, 0.0, 0.0) },
+            anchor: Anchor { sheet: 1, from: (r, 1, 0.0, 0.0), to: (r + 18, 8, 0.0, 0.0) }, alt: None
         })
         .unwrap();
     }
@@ -65,7 +65,7 @@ fn book() -> Workbook {
         legend: Some(LegendPos::Top),
         x_title: None,
         y_title: None,
-        anchor: Anchor { sheet: 1, from: (200, 1, 0.0, 0.0), to: (218, 8, 0.0, 0.0) },
+        anchor: Anchor { sheet: 1, from: (200, 1, 0.0, 0.0), to: (218, 8, 0.0, 0.0) }, alt: None
     })
     .unwrap();
     wb.recalc();

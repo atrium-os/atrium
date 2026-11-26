@@ -1589,7 +1589,7 @@ mod tests {
             legend: None,
             x_title: None,
             y_title: None,
-            anchor: Anchor { sheet: 0, from: (1, 3, 0.0, 0.0), to: (10, 8, 0.0, 0.0) },
+            anchor: Anchor { sheet: 0, from: (1, 3, 0.0, 0.0), to: (10, 8, 0.0, 0.0) }, alt: None
         };
         let ops = vec![GridOp::Tables(vec![t.clone()]), GridOp::Charts(vec![ch.clone()])];
         for op in &ops {

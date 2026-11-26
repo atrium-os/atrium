@@ -246,7 +246,7 @@ mod tests {
             legend: None,
             x_title: None,
             y_title: None,
-            anchor: crate::charts::Anchor { sheet: 2, from: (5, 1, 0.0, 0.0), to: (15, 6, 0.0, 0.0) },
+            anchor: crate::charts::Anchor { sheet: 2, from: (5, 1, 0.0, 0.0), to: (15, 6, 0.0, 0.0) }, alt: None
         };
         GridOp::Charts(vec![ch]).apply(&mut wb);
         wb.recalc();

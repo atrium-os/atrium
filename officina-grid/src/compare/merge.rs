@@ -420,7 +420,7 @@ mod tests {
                     vals: Rect::cell(CellAddr::new(1, 0, 0)),
                     kind: None,
                 }],
-                anchor: anchor(1),
+                anchor: anchor(1), alt: None
             })
             .unwrap();
             wb.add_picture(Picture {

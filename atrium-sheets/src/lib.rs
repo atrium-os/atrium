@@ -37,3 +37,5 @@ pub mod sheetbars;
 pub mod spelling;
 pub mod autocorrect;
 pub mod customviews;
+pub mod accessibility;
+pub mod checkbox;

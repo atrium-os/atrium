@@ -1067,7 +1067,7 @@ mod tests {
             legend: None,
             x_title: None,
             y_title: None,
-            anchor: crate::charts::Anchor { sheet: 0, from: (5, 5, 0.0, 0.0), to: (15, 9, 0.0, 0.0) },
+            anchor: crate::charts::Anchor { sheet: 0, from: (5, 5, 0.0, 0.0), to: (15, 9, 0.0, 0.0) }, alt: None
         };
         GridOp::Charts(vec![ch]).apply(&mut wb);
         // A copy brings the comment and link, and leaves the rest.

@@ -196,6 +196,9 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
     if !cv.mono {
         cv.family = st.font.name.as_deref().and_then(drawn_family);
     }
+    if let (true, Value::Bool(on)) = (st.checkbox, v) {
+        cv.checkbox = Some(*on);
+    }
     if st.indent > 0 && matches!(st.h_align, officina_grid::style::HAlign::Left | officina_grid::style::HAlign::General) {
         cv.indent = st.indent;
     }

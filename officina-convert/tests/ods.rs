@@ -139,7 +139,7 @@ fn hostile_ods_never_panics() {
             legend: Some(LegendPos::Right),
             x_title: Some("x".into()),
             y_title: None,
-            anchor: Anchor { sheet: 0, from: (1, 3, 1.0, 2.0), to: (12, 9, 0.0, 0.0) },
+            anchor: Anchor { sheet: 0, from: (1, 3, 1.0, 2.0), to: (12, 9, 0.0, 0.0) }, alt: None
         })
         .unwrap();
     }

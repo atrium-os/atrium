@@ -588,6 +588,8 @@ pub struct Doc {
     pub spelling: Option<crate::spelling::Run>,
     /// AutoCorrect's settings for typing into this document.
     pub autocorrect: crate::autocorrect::AutoCorrect,
+    /// Check Accessibility being stepped through.
+    pub accessibility: Option<crate::accessibility::Run>,
     /// The line and colour the plain border commands draw with (Format ▸
     /// Border Line and Border Colour); thick and double ones keep theirs.
     pub border_pen: (officina_grid::style::Line, Option<u32>),
@@ -642,7 +644,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, show_formulas: false, border_pen: (officina_grid::style::Line::Thin, None), clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None, show_comments: false, arrows: Vec::new(), found: Vec::new(), allowances: Vec::new(), spelling: None, autocorrect: Default::default() }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, show_formulas: false, border_pen: (officina_grid::style::Line::Thin, None), clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None, show_comments: false, arrows: Vec::new(), found: Vec::new(), allowances: Vec::new(), spelling: None, autocorrect: Default::default(), accessibility: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.

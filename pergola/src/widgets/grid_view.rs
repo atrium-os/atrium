@@ -159,6 +159,25 @@ pub struct CellView {
     pub dashes: [Dash; 4],
     /// The face the text draws in, when not the grid's own sans (or mono).
     pub family: Option<&'static str>,
+    /// A checkbox in the cell (Excel's cell checkbox), ticked or not; it
+    /// draws instead of the text.
+    pub checkbox: Option<bool>,
+}
+
+/// Where a cell's checkbox sits: the square (x, y, side) in the cell at
+/// (`cx`, `cy`), `cw` by `ch`, placed by `align` (centred unless left or
+/// right). `None` when the cell is too small to hold one.
+pub fn checkbox_box(align: CellAlign, cx: f32, cy: f32, cw: f32, ch: f32) -> Option<(f32, f32, f32)> {
+    let s = (ch - 6.0).clamp(0.0, 14.0);
+    if s < 8.0 || cw < s + 4.0 {
+        return None;
+    }
+    let x = match align {
+        CellAlign::Left => cx + PAD,
+        CellAlign::Right => cx + cw - PAD - s,
+        _ => cx + ((cw - s) / 2.0).floor(),
+    };
+    Some((x, cy + ((ch - s) / 2.0).floor(), s))
 }
 
 /// How a border line is drawn along its edge.
@@ -445,7 +464,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false, dashes: [Dash::Solid; 4], family: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false, dashes: [Dash::Solid; 4], family: None, checkbox: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -826,6 +845,9 @@ pub enum GridAction {
     GoTo,
     /// F7: check the spelling (the app does).
     Spelling,
+    /// Tick or untick the checkboxes in these cells (a click on one, or
+    /// Space with the cursor on one).
+    ToggleChecks(CellRange),
     /// A formatting key on the selection: `b`, `i`, `u` and `5` (bold,
     /// italic, underline, strikethrough) with Ctrl; `~ ! @ # $ % ^` with
     /// Ctrl+Shift (General, number, time, date, currency, percent,
@@ -1480,6 +1502,23 @@ impl GridView {
                         let at = src.merge_at(cell.0, cell.1).map_or(cell, |m| (m.r0, m.c0));
                         g.select(at.0, at.1);
                         let m = crate::input::pointer_modifiers();
+                        // A press on a cell's checkbox ticks or unticks it.
+                        if !(m.ctrl || m.meta || m.shift) && src.fills() {
+                            if let Some(cv) = src.cell(at.0, at.1).filter(|cv| cv.checkbox.is_some()) {
+                                let (x0, y0) = (src.col_left(at.1) as f32, src.row_top(at.0) as f32);
+                                let (w, h) = (src.col_left(at.1 + 1) as f32 - x0, src.row_top(at.0 + 1) as f32 - y0);
+                                if let Some((bx, by, bs)) = checkbox_box(cv.align, x0, y0, w, h) {
+                                    let (px, py) = (cx as f32, cy as f32);
+                                    if px >= bx - 2.0 && px <= bx + bs + 2.0 && py >= by - 2.0 && py <= by + bs + 2.0 {
+                                        gst.set(g);
+                                        if let Some(f) = &act {
+                                            f(GridAction::ToggleChecks(CellRange::of(at, at)));
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                         if m.ctrl || m.meta {
                             gst.set(g);
                             if let Some(f) = &act {
@@ -2648,6 +2687,22 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         let (x1, y0) = (cx + cw - 1.0, cy);
         ctx.add(poly(&[(x1 - 6.0, y0), (x1, y0), (x1, y0 + 6.0)], Color::rgba(0.84, 0.18, 0.15, 1.0), None));
     }
+    if let Some(on) = cv.checkbox {
+        if let Some((x, y, s)) = checkbox_box(cv.align, cx, cy, cw, ch) {
+            if on {
+                ctx.add(Node::Rect { rect: Rect::new(x, y, s, s), fill: t.accent_fill(), radius: 2.0 });
+                // A tick: down to the bottom third, then up to the right.
+                let (u, w) = (s / 14.0, 1.6 * s / 14.0);
+                let pts = [(x + 3.0 * u, y + 7.0 * u), (x + 6.0 * u, y + 10.0 * u), (x + 11.0 * u, y + 4.0 * u)];
+                let c = t.text_on_accent();
+                ctx.add(poly(&[pts[0], pts[1], pts[2], (pts[2].0 + w * 0.7, pts[2].1 + w * 0.7), (pts[1].0, pts[1].1 + w * 1.4), (pts[0].0 - w * 0.7, pts[0].1 + w * 0.7)], c, None));
+            } else {
+                ctx.add(Node::Rect { rect: Rect::new(x, y, s, s), fill: t.border_control(), radius: 2.0 });
+                ctx.add(Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, s - 2.0, s - 2.0), fill: cv.fill.unwrap_or(t.bg_surface()), radius: 1.5 });
+            }
+            return;
+        }
+    }
     if cv.text.is_empty() {
         return;
     }
@@ -3488,6 +3543,10 @@ fn on_key_inner(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut S
             }
             return true;
         }
+        Key::Char if chars == " " && !cmd && !m.alt && !m.shift && src.fills() && src.cell(g.cursor.0, g.cursor.1).is_some_and(|cv| cv.checkbox.is_some()) => {
+            send(GridAction::ToggleChecks(g.selection()));
+            return true;
+        }
         Key::Char if !chars.is_empty() && !chars.chars().any(char::is_control) => {
             // Typing replaces the active cell's content; the selection stays
             // (for Ctrl+Enter).
@@ -3669,6 +3728,10 @@ mod tests {
         }
         fn cell(&self, r: u32, c: u32) -> Option<CellView> {
             if let Some(s) = self.cells.borrow().get(&(r, c)) {
+                // "☐", "☑": a checkbox.
+                if s == "☐" || s == "☑" {
+                    return Some(CellView { align: CellAlign::Center, checkbox: Some(s == "☑"), ..CellView::text(String::new()) });
+                }
                 // "»…": centred across the cells after it.
                 if let Some(t) = s.strip_prefix('»') {
                     return Some(CellView { align: CellAlign::Across, ..CellView::text(t.to_string()) });
@@ -4085,6 +4148,36 @@ mod tests {
         state.set(g);
         key(&mut app, Key::Right, "", none);
         assert_eq!(state.get_cloned().cursor, (0, 4));
+    }
+
+    #[test]
+    fn a_click_on_a_checkbox_or_space_toggles_it() {
+        let (mut app, grid, _, state, log) = host(100, 10);
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        grid.cells.borrow_mut().insert((5, 5), "☐".into());
+        grid.fills.set(true);
+        app.tick();
+        let mid = Point::new(hw + 5.0 * 64.0 + 32.0, HEADER_H + 5.0 * 20.0 + 10.0);
+        app.handle_event(Event::PointerDown { at: mid });
+        app.handle_event(Event::PointerUp { at: mid });
+        app.tick();
+        assert_eq!(log.borrow().last(), Some(&GridAction::ToggleChecks(CellRange::of((5, 5), (5, 5)))));
+        // A press beside the box only selects the cell.
+        log.borrow_mut().clear();
+        let side = Point::new(hw + 5.0 * 64.0 + 4.0, HEADER_H + 5.0 * 20.0 + 10.0);
+        app.handle_event(Event::PointerDown { at: side });
+        app.handle_event(Event::PointerUp { at: side });
+        app.tick();
+        assert!(!log.borrow().iter().any(|a| matches!(a, GridAction::ToggleChecks(_))));
+        assert_eq!(state.get_cloned().cursor, (5, 5));
+        key(&mut app, Key::Char, " ", Modifiers::default());
+        assert_eq!(log.borrow().last(), Some(&GridAction::ToggleChecks(CellRange::of((5, 5), (5, 5)))));
+        // Elsewhere, Space types.
+        let mut g = state.get_cloned();
+        g.select(1, 1);
+        state.set(g);
+        key(&mut app, Key::Char, " ", Modifiers::default());
+        assert!(state.get_cloned().edit.is_some());
     }
 
     #[test]

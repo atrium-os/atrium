@@ -28,7 +28,7 @@ fn main() {
         legend: Some(LegendPos::Bottom),
         x_title: None,
         y_title: None,
-        anchor: Anchor { sheet: 0, from: (from.0, from.1, 0.0, 0.0), to: (to.0, to.1, 0.0, 0.0) },
+        anchor: Anchor { sheet: 0, from: (from.0, from.1, 0.0, 0.0), to: (to.0, to.1, 0.0, 0.0) }, alt: None
     };
     wb.add_chart(mk(ChartKind::Column, vec![ser(1, None), ser(2, Some(ChartKind::Line))], (1, 4), (16, 10), "Sales and costs")).unwrap();
     wb.add_chart(mk(ChartKind::Pie, vec![ser(1, None)], (17, 4), (32, 8), "Sales by month")).unwrap();

@@ -53,7 +53,7 @@ fn main() {
             legend: Some([LegendPos::Right, LegendPos::Bottom, LegendPos::Top][i % 3]),
             x_title: (!kind.round()).then(|| "Month".into()),
             y_title: (!kind.round()).then(|| "Amount".into()),
-            anchor: Anchor { sheet: 0, from: (0, 0, 0.0, 0.0), to: (1, 1, 0.0, 0.0) },
+            anchor: Anchor { sheet: 0, from: (0, 0, 0.0, 0.0), to: (1, 1, 0.0, 0.0) }, alt: None
         };
         let data = c.data(&wb, 100_000);
         let title = c.title.as_ref().map(|t| Chart::text(&wb, t));

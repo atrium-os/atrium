@@ -307,7 +307,7 @@ fn charted(mut wb: Workbook) -> Workbook {
         legend: Some(LegendPos::Bottom),
         x_title: Some("Item".into()),
         y_title: Some("Amount".into()),
-        anchor: anchor(0),
+        anchor: anchor(0), alt: Some("Items & amounts \"by item\"\nsecond line".into())
     })
     .unwrap();
     for (i, (kind, grouping)) in [(ChartKind::Bar, Grouping::Stacked), (ChartKind::Area, Grouping::Percent), (ChartKind::Scatter, Grouping::Standard), (ChartKind::Pie, Grouping::Standard), (ChartKind::Doughnut, Grouping::Standard)].into_iter().enumerate() {
@@ -319,7 +319,7 @@ fn charted(mut wb: Workbook) -> Workbook {
             legend: if kind.round() { Some(LegendPos::Right) } else { None },
             x_title: None,
             y_title: None,
-            anchor: anchor(20 * (i as u32 + 1)),
+            anchor: anchor(20 * (i as u32 + 1)), alt: None
         })
         .unwrap();
     }

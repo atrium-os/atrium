@@ -89,7 +89,7 @@ fn fixture() -> Workbook {
             sheet: 0,
             from: (0, 7, 0.0, 0.0),
             to: (16, 15, 0.0, 0.0),
-        },
+        }, alt: None
     })
     .unwrap();
     book
