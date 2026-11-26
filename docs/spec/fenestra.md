@@ -195,7 +195,7 @@ on those outputs into scanout, each renderer jail emits its window's scene as a 
                                 └─────────────────────┘  │
  ┌─────────────────────────────┐ records                  ▼
  │ frescod broker (no network) │◄────────────────┐ ┌──────────────────┐ QUIC over UDP   ┌────────────────────┐
- │ windows, z, focus, outputs, │  input, acks,   └─┤ fenestrad (jail, ├────────────────►│ fenestra-net (jail,│
+ │ windows, z, focus, outputs, │  input, acks,   └─┤ fenestrad +      ├────────────────►│ fenestra-net (jail,│
  │ input routing, chrome       │  output changes   │ fenestra-session │◄────────────────┤ own uid, connect   │
  └─────────────────────────────┘                   │ (jail/session)   │  input, acks    │ only)              │
                                                    └──────────────────┘                 └─────────┬──────────┘
