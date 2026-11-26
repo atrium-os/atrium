@@ -1219,6 +1219,24 @@ FreeBSD-specific. They would run the renderer in-process without Atrium's jails,
 the validator but not the containment; their spec must say how they confine it (a macOS
 sandbox profile, the browser's process). Not in v1.
 
+Input on such viewers needs no Tactus *daemon*. The contract with the host is the typed event
+set of §9.1 (Tactus's event shapes), so each platform needs an **input adapter** from its own
+APIs to those events:
+
+- **macOS**: keyboard, mouse and trackpad from AppKit events (the OS's own palm rejection,
+  momentum and gestures, which are better used than redone); controllers from the
+  GameController framework; wheels and other HID devices through IOHIDManager raw reports,
+  decoded with the pure `tactus` crate (descriptor parser, decoders), which has no FreeBSD
+  dependency. Force feedback through IOHIDManager output reports built by the same crate.
+- **Windows**: Raw Input for keyboard and mouse, Windows.Gaming.Input for pads and wheels
+  (including force feedback); the `tactus` crate for anything else that exposes HID.
+- **Browser**: Pointer Events with Pointer Lock, keyboard events (no HID usages for every key,
+  so some keys degrade), the Gamepad API (rumble only, no wheel force feedback, coarse
+  polling). A browser viewer is fine for desktop work and limited for games.
+
+The adapter maps into the same events, rate caps and bounds, and the host cannot tell which
+platform the viewer runs. Only the controlling viewer's devices are sent, as on Atrium.
+
 ## 15. CLI: everything the GUI does
 
 Shankar's rule: every GUI action has a command. `fenestra` on both ends:
