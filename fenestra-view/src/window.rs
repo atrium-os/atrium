@@ -463,8 +463,9 @@ pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: St
             })
             .map_err(|e| e.to_string())?;
     }
-    let host_name = title.strip_prefix("Fenestra: ").unwrap_or(&title).to_string();
+    let host_name = crate::strip::clean_name(title.strip_prefix("Fenestra: ").unwrap_or(&title));
     let strip_colour = host_colour(&host_name);
+    let title = format!("Fenestra: {host_name}");
     let mut app = App { views, input, wins: HashMap::new(), screen: (0, 0), modifiers: 0, title, dismissed: Vec::new(), mode: None, strip_colour, host_name };
     el.run_app(&mut app).map_err(|e| e.to_string())
 }
