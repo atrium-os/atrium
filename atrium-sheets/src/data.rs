@@ -221,6 +221,12 @@ pub enum DataCmd {
     /// the Watch Window and Add Watch, names from labels (a bar) and into
     /// formulas, Auto Outline and Workbook Statistics.
     ManualCalc,
+    /// Mark as Final: the workbook is to be read, edits are refused.
+    MarkFinal,
+    /// AutoCorrect Options… (a bar).
+    AutoCorrect,
+    /// Custom Views… (a bar).
+    CustomViews,
     AddWatch,
     WatchWindow,
     CreateNames,
@@ -669,12 +675,15 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Add Watch"), Some(DataCmd::AddWatch)),
         (MenuItem::new("Watch Window…"), Some(DataCmd::WatchWindow)),
         (MenuItem::new("Workbook Statistics…"), Some(DataCmd::WorkbookStats)),
+        (MenuItem::new("Custom Views…"), Some(DataCmd::CustomViews)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
         (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
         (MenuItem::new("Spelling…").shortcut("F7"), Some(DataCmd::Spelling)),
+        (MenuItem::new("AutoCorrect Options…"), Some(DataCmd::AutoCorrect)),
         (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
         (MenuItem::new("Properties…"), Some(DataCmd::Properties)),
+        (MenuItem::new("Mark as Final").checked(wb.properties().marked_final), Some(DataCmd::MarkFinal)),
         (MenuItem::new("Insert Symbol…"), Some(DataCmd::InsertSymbol)),
         if wb.sheet_protected(s) {
             (MenuItem::new("Unprotect Sheet…"), Some(DataCmd::UnprotectSheet))
@@ -3179,7 +3188,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3285,6 +3294,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::ProtectWorkbook => protect_workbook(d),
         DataCmd::ManualCalc => crate::formulas::toggle_manual(d),
+        DataCmd::MarkFinal => crate::checks::toggle_final(d),
         DataCmd::DateSystem1904 => {
             let on = d.wb.date_system() != officina_grid::eval::dates::DateSystem::Excel1904;
             if !d.run_action("Date System", vec![GridOp::DateSystem1904(on)]) {

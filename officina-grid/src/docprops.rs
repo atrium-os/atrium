@@ -22,6 +22,9 @@ pub const MAX_PROP: usize = 4096;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocProps {
     values: [String; 6],
+    /// Marked as final (Excel's Mark as Final): the workbook is to be read,
+    /// and Sheets refuses edits until the mark is taken off.
+    pub marked_final: bool,
 }
 
 impl DocProps {
@@ -50,7 +53,7 @@ impl DocProps {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.iter().all(String::is_empty)
+        self.values.iter().all(String::is_empty) && !self.marked_final
     }
 
     fn valid(&self) -> bool {
@@ -61,12 +64,22 @@ impl DocProps {
         for v in &self.values {
             w.str(v);
         }
+        // Only when set, so files without the mark keep their old layout.
+        if self.marked_final {
+            w.u8(1);
+        }
     }
 
     pub fn decode(r: &mut Reader) -> Result<DocProps, WireError> {
         let mut p = DocProps::default();
         for v in p.values.iter_mut() {
             *v = r.str("document property", MAX_PROP as u64)?.to_string();
+        }
+        if !r.is_empty() {
+            p.marked_final = match r.u8()? {
+                1 => true,
+                _ => return Err(WireError::Invalid("final mark")),
+            };
         }
         if !p.valid() {
             return Err(WireError::Invalid("document property"));
@@ -114,6 +127,18 @@ mod tests {
             w.str(v);
         }
         assert!(DocProps::decode(&mut Reader::new(&w.into_bytes())).is_err());
+        // The final mark: alone it is still a property, and it round-trips.
+        let mut f = DocProps::default();
+        assert!(f.is_empty());
+        f.marked_final = true;
+        assert!(!f.is_empty());
+        let mut w = Writer::new();
+        f.encode(&mut w);
+        let bytes = w.into_bytes();
+        assert_eq!(DocProps::decode(&mut Reader::new(&bytes)).unwrap(), f);
+        let mut bad = bytes.clone();
+        *bad.last_mut().unwrap() = 2;
+        assert!(DocProps::decode(&mut Reader::new(&bad)).is_err());
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub mod strings;
 pub mod style;
 pub mod tables;
 pub mod value;
+pub mod views;
 
 pub use addr::{CellAddr, Rect};
 pub use book::{Input, Workbook};

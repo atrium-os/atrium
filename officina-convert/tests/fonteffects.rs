@@ -71,6 +71,24 @@ fn document_properties_round_trip_in_xlsx_and_ods() {
 }
 
 #[test]
+fn mark_as_final_round_trips_in_xlsx_and_ods() {
+    use officina_grid::docprops::DocProps;
+    let (mut wb, _) = book();
+    let mut p = DocProps::default();
+    p.marked_final = true;
+    wb.set_properties(p.clone());
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    assert_eq!(xlsx::read(&file).unwrap().0.properties(), &p, "xlsx");
+    // Excel's own marks: the custom property and the content status.
+    let zip = officina_convert::zip::Archive::open(&file).unwrap();
+    let custom = zip.entries.iter().find(|e| e.name == "docProps/custom.xml").expect("custom.xml");
+    let text = String::from_utf8(zip.read(custom).unwrap()).unwrap();
+    assert!(text.contains(r#"name="_MarkAsFinal"><vt:bool>true</vt:bool>"#), "{text}");
+    let file = ods::write(&wb, Vec::new()).unwrap();
+    assert_eq!(ods::read(&file).unwrap().0.properties(), &p, "ods");
+}
+
+#[test]
 fn accounting_underlines_round_trip_in_xlsx() {
     let mut wb = Workbook::new();
     wb.add_sheet("S").unwrap();

@@ -1824,6 +1824,23 @@ impl Sheets {
                         self.split_text.set(TextEdit::new("").secret(true));
                         crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
                     }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::CustomViews) => {
+                        let r = crate::customviews::run(&mut self.doc.borrow_mut(), g.cursor, &typed);
+                        match r {
+                            Ok(crate::customviews::Outcome::Said(say)) => Ok(say),
+                            Ok(crate::customviews::Outcome::Show { sheet, cursor, zoom, say }) => {
+                                self.show_sheet(sheet);
+                                self.set_zoom(zoom);
+                                let mut g = self.grid.get_cloned();
+                                g.anchor = cursor;
+                                g.cursor = cursor;
+                                self.grid.set(g);
+                                self.show_cell(cursor.0, cursor.1);
+                                Ok(say)
+                            }
+                            Err(why) => Err(why),
+                        }
+                    }
                     _ if self.splitting.get() == Some(crate::data::DataCmd::Spelling) => {
                         // A word that can't be used keeps the bar open.
                         let r = crate::spelling::answer(&mut self.doc.borrow_mut(), &typed);
@@ -2791,13 +2808,14 @@ impl Sheets {
                 }
             }
             GridAction::Commit { row, col, text } => {
-                if d.type_into(row, col, &text) {
+                let cell = officina_grid::addr::Rect { sheet: d.sheet, r0: row, c0: col, r1: row, c1: col };
+                if crate::autocorrect::type_corrected(&mut d, cell, &text) {
                     grow = Some(row);
                 }
             }
             GridAction::CommitAll { sel, text } => {
                 let area = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
-                if d.type_all(area, &text) && sel.r0 == sel.r1 {
+                if crate::autocorrect::type_corrected(&mut d, area, &text) && sel.r0 == sel.r1 {
                     grow = Some(sel.r0);
                 }
             }
@@ -4160,7 +4178,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.
@@ -7702,6 +7720,37 @@ mod tests {
         assert!(s.splitting.get().is_none());
         assert_eq!(s.doc.borrow().status, "The spelling check is complete.");
         assert_eq!(shown(&s, 1, 1), "recieve");
+    }
+
+    #[test]
+    fn typing_autocorrects_and_custom_views_go_back_to_their_sheet() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"a\n");
+        Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Commit { row: 1, col: 0, text: "teh plan (c)".into() });
+        assert_eq!(shown(&s, 1, 0), "the plan ©");
+        assert!(s.doc.borrow().status.starts_with("AutoCorrect: teh → the, (c) → ©."), "{}", s.doc.borrow().status);
+        // A view saved on the first sheet at 150 %, shown from another sheet.
+        select(&s, (1, 0), (1, 0));
+        s.set_zoom(150);
+        let bar = |text: &str| {
+            s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::CustomViews));
+            s.take_cmds();
+            assert_eq!(s.splitting.get(), Some(DataCmd::CustomViews));
+            s.split_text.set(TextEdit::new(text));
+            s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+            s.take_cmds();
+        };
+        bar("add Plan");
+        assert!(s.doc.borrow().status.starts_with("Saved the view “Plan”"), "{}", s.doc.borrow().status);
+        s.doc.borrow_mut().run("Add Sheet", vec![officina_grid::ops::GridOp::add_sheet("Two".into())]);
+        s.show_sheet(1);
+        s.set_zoom(100);
+        select(&s, (0, 0), (0, 0));
+        bar("show plan");
+        assert_eq!(s.doc.borrow().sheet, 0);
+        assert_eq!(s.zoom_percent(), 150);
+        assert_eq!(s.grid.get_cloned().cursor, (1, 0));
+        assert!(s.splitting.get().is_none());
     }
 
     #[test]

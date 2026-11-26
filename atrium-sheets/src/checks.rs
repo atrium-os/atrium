@@ -385,6 +385,27 @@ mod tests {
         assert!(d.wb.properties().is_empty());
     }
 
+    #[test]
+    fn mark_as_final_refuses_edits_until_turned_off() {
+        use super::*;
+        let mut d = crate::doc::Doc::from_csv("f.csv", b"a\n").unwrap().0;
+        assert!(toggle_final(&mut d).unwrap().starts_with("Marked as final"));
+        assert!(!d.type_into(0, 0, "b"));
+        assert_eq!(d.status, crate::sheet_protection::FINAL_REFUSED);
+        assert_eq!(d.wb.get(officina_grid::CellAddr::new(0, 0, 0)), officina_grid::Value::str("a"));
+        // The properties still change, and the mark survives the file.
+        properties(&mut d, "title: Report").unwrap();
+        let bytes = officina_grid::native::save_to_vec(&d.wb);
+        let back = crate::files::load_with("f.osheet", &bytes, None).unwrap();
+        assert!(back.wb.properties().marked_final);
+        assert!(back.status.contains("Marked as final"), "{}", back.status);
+        // Off again: edits go through; undo puts the mark back.
+        assert!(toggle_final(&mut d).unwrap().starts_with("No longer"));
+        assert!(d.type_into(0, 0, "b"));
+        assert!(d.undo() && d.undo());
+        assert!(d.wb.properties().marked_final);
+    }
+
     use super::*;
 
     fn doc(csv: &[u8]) -> Doc {
@@ -496,6 +517,22 @@ mod tests {
         assert!(d.undo());
         assert_eq!(d.wb.sheet_count(), 2);
     }
+}
+
+/// Mark as Final: on, the workbook refuses edits (Excel also sets the
+/// content status to Final); off, it takes them again. One step either way.
+pub fn toggle_final(d: &mut Doc) -> Result<String, String> {
+    let mut p = d.wb.properties().clone();
+    p.marked_final = !p.marked_final;
+    let on = p.marked_final;
+    d.status.clear();
+    d.run("Mark as Final", vec![GridOp::Properties(p)]);
+    refused(d)?;
+    Ok(if on {
+        "Marked as final: the workbook is read only until Mark as Final is turned off.".into()
+    } else {
+        "No longer marked as final: the workbook can be edited.".into()
+    })
 }
 
 /// The Properties bar's text: each property set, as `title: Budget; author: Ana`.

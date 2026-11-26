@@ -1497,6 +1497,37 @@ fn core_properties(xml: &[u8]) -> officina_grid::docprops::DocProps {
     p
 }
 
+/// Whether `docProps/custom.xml` holds Excel's `_MarkAsFinal` set true.
+fn marked_final(xml: &[u8]) -> bool {
+    let mut r = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut inside = false;
+    let mut in_bool = false;
+    loop {
+        buf.clear();
+        match r.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"property" => inside = e.attributes().flatten().any(|a| a.key.local_name().as_ref() == b"name" && a.value.as_ref() == b"_MarkAsFinal"),
+                b"bool" => in_bool = inside,
+                _ => {}
+            },
+            Ok(Event::Text(t)) if in_bool => {
+                let v = t.unescape().map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+                if v == "true" || v == "1" {
+                    return true;
+                }
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"property" => inside = false,
+                b"bool" => in_bool = false,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
 /// Reads an `.xlsx` (or `.xlsm`) package into a workbook.
 pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     let z = Archive::open(data)?;
@@ -1612,6 +1643,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     if let Some(core) = root.values().find(|(t, _)| t.ends_with("/metadata/core-properties")).map(|(_, p)| p.clone()) {
         if let Some(xml) = z.read_name(&core)? {
             wb.set_properties(core_properties(&xml));
+        }
+    }
+    if let Some(custom) = root.values().find(|(t, _)| t.ends_with("/custom-properties")).map(|(_, p)| p.clone()) {
+        if let Some(xml) = z.read_name(&custom)? {
+            if marked_final(&xml) {
+                let mut p = wb.properties().clone();
+                p.marked_final = true;
+                wb.set_properties(p);
+            }
         }
     }
     if let Some(attrs) = structure {

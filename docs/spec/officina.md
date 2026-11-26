@@ -5331,6 +5331,28 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
 - **Comments** (a Find option, exclusive with Values), as Excel's Look in: Comments: searches each comment's text and every reply in its thread instead of cells. Replace is refused while it is on.
 - Tests: Sheets `spelling` (walks from the cursor and wraps, passes digits and capitals, Ignore All, Change All in one step), `app` (the bar steps through the sheet, refuses a 256-character word, closes at the end), `authoring` (Find All's list and count, comments found only in Comments, the exclusive options, Replace refused) and Pergola's grid key test (F7).
 
+### 16.158 Mark as Final, AutoCorrect, Custom Views (2026-11-26)
+
+`DocProps::marked_final` in `officina-grid/src/docprops.rs`, `officina-grid/src/views.rs` (GridOp tag 39, native chunk 38 CUSTOM_VIEWS), `atrium-sheets/src/autocorrect.rs`, `atrium-sheets/src/customviews.rs`, `toggle_final` in `atrium-sheets/src/checks.rs`, the final refusal in `atrium-sheets/src/sheet_protection.rs`, the `_MarkAsFinal` reading and writing in `officina-convert` (`xlsx/read.rs`, `xlsx/write.rs`, `ods/read.rs`, `ods/write.rs`).
+
+- **Mark as Final** (a checked menu item beside Properties…), as Excel's: the workbook becomes read only. Every edit is refused with "This workbook is marked as final. Turn off Mark as Final to edit it." Only property changes go through, and turning the mark off is one of those. Marking and unmarking are undo steps. Opening a final workbook says so in the status. Files keep the mark: in `.osheet` it is a byte after the six properties, written only when set, so older files read as before. `.xlsx` writes Excel's custom property `_MarkAsFinal` in `docProps/custom.xml` plus `cp:contentStatus` Final, and reads the custom property back. `.ods` keeps it as LibreOffice keeps an `.xlsx`'s custom property, a boolean `meta:user-defined` named `_MarkAsFinal`.
+- **AutoCorrect** on typed text, with Excel's defaults where they apply to cells:
+  - About 50 common misspellings (`teh`, `adn`, `recieve`, `seperate`), with the typed case kept (`Teh` becomes `The`, `TEH` becomes `THE`).
+  - Contractions typed without the apostrophe (`dont`).
+  - `(c)`, `(r)`, `(tm)` and `(e)` become ©, ®, ™ and €. `-->`, `<--`, `==>` and `<==` become arrows.
+  - TWo INitial CApitals keeps one capital. Only words with at least two lowercase letters after the capitals count, so `IDs` stays as typed.
+  - Day names take a capital.
+
+  It leaves formulas, numbers and dates alone, along with words containing digits and anything in an address (`@`, `://`, `www.`). The correction is a second undo step after the typing, so one undo gives back what was typed, as in Excel, and the status names each change. Ctrl+Enter into a selection is corrected the same way.
+- **AutoCorrect Options…** (a bar): `on` or `off`; `add WORD REPLACEMENT` (the word is 1 to 64 bytes with no spaces, the replacement up to 255, at most 1,000 entries of one's own); `remove WORD` takes out one's own entry or a built-in one. As in Excel, these settings belong to the app, not the file: they last while the document is open and are not saved.
+- **Custom Views…** (a bar):
+  - `add NAME` saves the current sheet's view: hidden rows and AutoFilter, column widths and hidden columns, zoom and the selected cell. A name used again replaces that view.
+  - `show NAME`, or the name alone, puts rows, filter and columns back as one undo step, then goes to the view's sheet, zoom and cell.
+  - `delete NAME` removes a view, and `list` names each view with its sheet.
+
+  The views are saved with the workbook, at most 64, with names up to 64 bytes and unique ignoring case. Adding and deleting are undo steps. Structural edits don't move a view. A view whose sheet is gone is refused when shown. `.xlsx` and `.ods` don't carry views yet; Excel's are `customSheetView` elements.
+- Tests: grid `docprops` (the mark round-trips and a bad byte is refused) and `views` (capture, show, undo, the op and the native file, duplicate names, a bad zoom); convert `fonteffects` (`_MarkAsFinal` in `.xlsx` and `.ods`); Sheets `checks` (edits refused while final, properties still set, the mark through the file and its status, undo), `autocorrect` (the list is sorted; words, symbols, capitals and days; what is left alone; the second step, formulas untouched, options and refusals) and `customviews` (add, show, undo, replace, refusals, delete); `app` (a commit corrected, and a view shown from another sheet at its zoom and cell).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -129,6 +129,8 @@ pub enum GridOp {
     /// The 1904 date system on (`true`) or off: the same serial numbers,
     /// read as dates four years and a day later. Everything recalculates.
     DateSystem1904(bool),
+    /// The workbook's Custom Views, the whole list replaced.
+    CustomViews(Vec<crate::views::CustomView>),
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -389,6 +391,11 @@ impl GridOp {
             GridOp::DateSystem1904(on) => {
                 w.u8(38);
                 w.u8(u8::from(*on));
+                return w.into_bytes();
+            }
+            GridOp::CustomViews(list) => {
+                w.u8(39);
+                crate::views::encode(list, &mut w);
                 return w.into_bytes();
             }
             GridOp::Properties(p) => {
@@ -699,6 +706,13 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::DateSystem1904(on));
+        }
+        if kind == 39 {
+            let list = crate::views::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::CustomViews(list));
         }
         if kind == 37 {
             let p = crate::docprops::DocProps::decode(&mut r)?;
@@ -1056,6 +1070,12 @@ impl Op<Workbook> for GridOp {
                 GridOp::Protection { sheet, protection }
             }
             GridOp::Properties(p) => GridOp::Properties(std::mem::replace(&mut wb.props, p)),
+            GridOp::CustomViews(list) => {
+                if !crate::views::valid(&list) {
+                    return GridOp::Batch(Vec::new());
+                }
+                GridOp::CustomViews(std::mem::replace(&mut wb.views, list))
+            }
             GridOp::DateSystem1904(on) => {
                 use crate::eval::dates::DateSystem;
                 let old = wb.date_system == DateSystem::Excel1904;

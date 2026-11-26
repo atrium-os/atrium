@@ -940,13 +940,21 @@ fn meta_properties(xml: &[u8]) -> officina_grid::docprops::DocProps {
     let mut at: Option<usize> = None;
     let mut text = String::new();
     let mut keywords: Vec<String> = Vec::new();
+    // Past the fields: the _MarkAsFinal property.
+    const FINAL: usize = 99;
     loop {
         buf.clear();
         match r.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 at = if name == "meta:user-defined" {
-                    attrs(&e).get("meta:name").filter(|n| n.eq_ignore_ascii_case("category") || n.as_str() == "OOXMLCorePropertyCategory").map(|_| 4)
+                    let a = attrs(&e);
+                    let meta = a.get("meta:name");
+                    if meta.is_some_and(|n| n.as_str() == "_MarkAsFinal") {
+                        Some(FINAL)
+                    } else {
+                        meta.filter(|n| n.eq_ignore_ascii_case("category") || n.as_str() == "OOXMLCorePropertyCategory").map(|_| 4)
+                    }
                 } else {
                     FIELDS.iter().position(|(_, _, odf)| *odf == name && name != "meta:user-defined")
                 };
@@ -965,6 +973,7 @@ fn meta_properties(xml: &[u8]) -> officina_grid::docprops::DocProps {
                         keywords.push(text.trim().to_string());
                     }
                 }
+                Some(FINAL) => p.marked_final = matches!(text.trim(), "true" | "1"),
                 Some(i) => p.set(i, &text),
                 None => {}
             },

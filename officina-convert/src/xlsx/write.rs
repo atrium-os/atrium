@@ -937,18 +937,34 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     if !props.is_empty() {
         ct.push_str(r#"<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>"#);
     }
+    if props.marked_final {
+        ct.push_str(r#"<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/>"#);
+    }
     ct.push_str("</Types>");
     z.add("[Content_Types].xml", ct.as_bytes())?;
     if props.is_empty() {
         z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
     } else {
-        z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>"#)?;
+        // Excel marks a final workbook with the custom property _MarkAsFinal
+        // and the content status Final.
+        let custom = if props.marked_final {
+            r#"<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties" Target="docProps/custom.xml"/>"#
+        } else {
+            ""
+        };
+        z.add("_rels/.rels", format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>{custom}</Relationships>"#).as_bytes())?;
+        if props.marked_final {
+            z.add("docProps/custom.xml", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="_MarkAsFinal"><vt:bool>true</vt:bool></property></Properties>"#)?;
+        }
         let mut core = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#);
         for (i, (_, el, _)) in officina_grid::docprops::FIELDS.iter().enumerate() {
             let v = props.get(i);
             if !v.is_empty() {
                 core.push_str(&format!("<{el}>{}</{el}>", crate::xml::esc(v)));
             }
+        }
+        if props.marked_final {
+            core.push_str("<cp:contentStatus>Final</cp:contentStatus>");
         }
         core.push_str("</cp:coreProperties>");
         z.add("docProps/core.xml", core.as_bytes())?;

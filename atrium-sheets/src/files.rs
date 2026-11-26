@@ -106,6 +106,14 @@ pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
 /// [`load`] with the password of a protected file. `NeedsPassword` and
 /// `WrongPassword` say to ask (again); anything else is in words.
 pub fn load_with(name: &str, data: &[u8], password: Option<&str>) -> Result<Doc, ConvertError> {
+    let mut d = load_any(name, data, password)?;
+    if d.wb.properties().marked_final {
+        d.status = format!("{} Marked as final: read only until Mark as Final is turned off.", d.status).trim_start().to_string();
+    }
+    Ok(d)
+}
+
+fn load_any(name: &str, data: &[u8], password: Option<&str>) -> Result<Doc, ConvertError> {
     let failed = ConvertError::Failed;
     if is_native(name) && sealed::is_sealed(data) {
         let Some(pw) = password else { return Err(ConvertError::NeedsPassword) };

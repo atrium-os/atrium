@@ -5,9 +5,11 @@ pub(crate) const REFUSED: &str = "This sheet is protected. Only unlocked cells c
 
 pub(crate) const STRUCTURE_REFUSED: &str = "The workbook's structure is protected: sheets can't be added, deleted, renamed, moved, hidden or recoloured.";
 
+pub(crate) const FINAL_REFUSED: &str = "This workbook is marked as final. Turn off Mark as Final to edit it.";
+
 /// Whether `status` says an edit was refused for protection.
 pub(crate) fn refused(status: &str) -> bool {
-    status == REFUSED || status == STRUCTURE_REFUSED
+    status == REFUSED || status == STRUCTURE_REFUSED || status == FINAL_REFUSED
 }
 
 /// Check a whole transaction before applying any part of it. Metadata and
@@ -18,6 +20,11 @@ pub(crate) fn allows(wb: &Workbook, ops: &[GridOp]) -> bool {
 
 /// Why the transaction is refused, if it is.
 pub(crate) fn refusal(wb: &Workbook, ops: &[GridOp]) -> Option<&'static str> {
+    // A final workbook takes only a change of its properties (which is how
+    // the mark comes off).
+    if wb.properties().marked_final && !ops.iter().all(|op| matches!(op, GridOp::Properties(_))) {
+        return Some(FINAL_REFUSED);
+    }
     if wb.structure_protected() && ops.iter().any(changes_structure) {
         return Some(STRUCTURE_REFUSED);
     }
@@ -59,6 +66,8 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         GridOp::Iteration(_) | GridOp::Structure(_) | GridOp::Calculation(_) => true,
         // The document's properties, not a sheet's contents.
         GridOp::Properties(_) | GridOp::DateSystem1904(_) => true,
+        // Named views of the workbook, not a sheet's contents.
+        GridOp::CustomViews(_) => true,
         // What the Watch Window shows is no part of the sheet's contents.
         GridOp::Watches { .. } => true,
         // Error Checking's view, not the sheet's contents.

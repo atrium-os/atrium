@@ -78,6 +78,10 @@ fn meta_props(wb: &Workbook) -> String {
             }
         }
     }
+    if p.marked_final {
+        // As LibreOffice keeps an .xlsx's custom property.
+        out.push_str(r#"<meta:user-defined meta:name="_MarkAsFinal" meta:value-type="boolean">true</meta:user-defined>"#);
+    }
     out
 }
 

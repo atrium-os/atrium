@@ -35,3 +35,5 @@ pub mod symbols;
 pub mod lock;
 pub mod sheetbars;
 pub mod spelling;
+pub mod autocorrect;
+pub mod customviews;

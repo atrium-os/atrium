@@ -29,8 +29,9 @@
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, a plain note, styled note or thread |
 //! | 29 | ZOOM | sheets' view zoom other than 100 %: count; per sheet, its index and percent (10–400) |
 //! | 30 | VIEW_HIDDEN | sheets showing no gridlines, headings or zeros: count; per sheet, its index and flags (1 gridlines off, 2 headings off, 4 zero values hidden) |
-//! | 36 | PROPERTIES | document properties: title, subject, author, keywords, category, comments |
+//! | 36 | PROPERTIES | document properties: title, subject, author, keywords, category, comments, then the final mark when set |
 //! | 37 | GRID_COLORS | sheets' gridline colours other than automatic: count; per sheet, its index and 0xRRGGBB |
+//! | 38 | CUSTOM_VIEWS | Custom Views: count; each name, sheet, cursor, zoom, its filter state, column widths and hidden widths ([`crate::views`]) |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -76,6 +77,7 @@ pub const EDIT_RANGES: u16 = 34;
 pub const IGNORED_ERRORS: u16 = 35;
 pub const PROPERTIES: u16 = 36;
 pub const GRID_COLORS: u16 = 37;
+pub const CUSTOM_VIEWS: u16 = 38;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -227,6 +229,12 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         w.u16(sheet as u16);
         crate::sheetareas::encode_ignored(&sh.ignored, &mut w);
         c.add(IGNORED_ERRORS, &w.into_bytes())?;
+    }
+
+    if !wb.views.is_empty() {
+        let mut w = Writer::new();
+        crate::views::encode(&wb.views, &mut w);
+        c.add(CUSTOM_VIEWS, &w.into_bytes())?;
     }
 
     if !wb.props.is_empty() {
@@ -1170,6 +1178,20 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             sh.show_headings = f & 2 == 0;
             sh.show_zeros = f & 4 == 0;
         }
+        done(&r)?;
+    }
+
+    let mut views = of(CUSTOM_VIEWS);
+    if let Some(i) = views.next() {
+        if views.next().is_some() {
+            return Err(LoadError::Bad("repeated custom views"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let list = crate::views::decode(&mut r)?;
+        if list.iter().any(|v| v.sheet as usize >= wb.sheets.len()) {
+            return Err(LoadError::Bad("a custom view of a sheet that does not exist"));
+        }
+        wb.views = list;
         done(&r)?;
     }
 
