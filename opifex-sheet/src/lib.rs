@@ -117,7 +117,18 @@ pub fn words(cap: &str) -> (String, bool) {
         "embeds" => ("show parts of other apps inside its window", false),
         // An Artifex plugin's ask; the person allows it per workspace there.
         "workspace-read" => ("read a workspace's files in Artifex, where you allow it", true),
+        // Background apps (background-apps.md §5): the same words as Settings.
+        "background:sign-in" => ("open when you sign in and keep running in the background (if you allow it)", true),
+        "background:manual" => ("keep running in the background once opened (if you allow it)", true),
         _ => {
+            if let Some(rest) = cap.strip_prefix("listen:") {
+                let (port, from) = rest.split_once(':').unwrap_or((rest, ""));
+                let port: String = port.chars().filter(char::is_ascii_digit).take(5).collect();
+                return match from {
+                    "this-computer" => (format!("let your own programs on this computer connect on port {port} (if you allow it)"), true),
+                    _ => (format!("let devices on your network connect on port {port} (if you allow it, per network)"), true),
+                };
+            }
             if let Some(role) = cap.strip_prefix("embeds:") {
                 return (embed_words(role), false);
             }
@@ -180,5 +191,16 @@ mod tests {
         for a in [Answer::Installed, Answer::Declined, Answer::Failed { why: "x".into() }] {
             assert_eq!(serde_json::from_str::<Answer>(&serde_json::to_string(&a).unwrap()).unwrap(), a);
         }
+    }
+}
+
+#[cfg(test)]
+mod background_words_tests {
+    #[test]
+    fn background_and_listen_lines_say_what_they_do() {
+        assert!(super::words("background:sign-in").0.starts_with("open when you sign in"));
+        assert_eq!(super::words("listen:8080:local-network").0, "let devices on your network connect on port 8080 (if you allow it, per network)");
+        assert!(super::words("listen:9000:this-computer").0.contains("this computer connect on port 9000"));
+        assert!(super::words("listen:9000:this-computer").1);
     }
 }

@@ -234,6 +234,8 @@ pub fn manifest(text: &str) -> (Vec<Finding>, Vec<String>, Option<Reach>) {
         let mut v = d.describe();
         v.extend(m.opens_lines());
         v.extend(m.links_line());
+        // Asked separately: the person turns each on in Settings › Apps.
+        v.extend(m.background_lines());
         v
     };
     let c = &m.capabilities;

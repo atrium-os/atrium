@@ -398,6 +398,33 @@ pub enum Request {
         component_id: String,
         owner_name:   String,
     },
+    /// ★ After sign-in: start `owner`'s background apps that they allowed
+    /// to open at sign-in (background-apps.md §3.3). Only from a
+    /// `session_launch` service, as `LaunchSessionComponent`; portcullisd
+    /// reads the list from the person's own grants, never from the request,
+    /// and starts nothing already known this session. Answer: `Ok`.
+    StartBackground { owner: String },
+    /// ★ The bar's "Running in the background" list (background-apps.md
+    /// §3.2): the background apps running for the caller's person, named
+    /// from their installed manifests. Only from that person's own
+    /// `org.atrium.forum-bar` session component. Answer: `BackgroundApps`.
+    BackgroundApps,
+    /// ★ Quit one of them: it is not started again this session. Same
+    /// caller rule as `BackgroundApps`. Answer: `Ok`.
+    BackgroundQuit {
+        app_id:  String,
+        #[serde(default)]
+        persona: Option<String>,
+    },
+    /// ★ "Don't open at sign-in": turn the person's background switch off
+    /// for that persona (no press: it only takes leave away). It keeps
+    /// running until quit or the session ends, and is not restarted. Same
+    /// caller rule. Answer: `Ok`.
+    BackgroundOff {
+        app_id:  String,
+        #[serde(default)]
+        persona: Option<String>,
+    },
 
     /// `_ostiarius` forwards a credential received from vestibulum for portcullisd
     /// to verify against PAM/shadow — which it can read as root; the hashes never
@@ -881,6 +908,22 @@ pub struct AccessEntry {
     pub background: Option<BackgroundAccess>,
 }
 
+/// One row of the bar's "Running in the background" list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundApp {
+    pub app_id:  String,
+    /// From the installed manifest, never from the app.
+    pub name:    String,
+    /// `None`: Personal.
+    pub persona: Option<String>,
+    /// It crashed too often and restarts are paused for a while.
+    #[serde(default)]
+    pub paused:  bool,
+    /// The person's switch to open it at sign-in is on.
+    #[serde(default)]
+    pub at_sign_in: bool,
+}
+
 /// An app's background switch on Settings' Apps page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundAccess {
@@ -1172,6 +1215,9 @@ pub enum Response {
     WorkspaceExecStarted { pid: i32 },
     /// Access → each installed app, by name.
     Access { apps: Vec<AccessEntry> },
+
+    /// Answer to `BackgroundApps`.
+    BackgroundApps { apps: Vec<BackgroundApp> },
 
     /// Answer to `Workspaces` (and to `WorkspaceNew`/`WorkspaceSet`: the
     /// list after the change).

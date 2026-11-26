@@ -83,6 +83,22 @@ const SERVICE: &[File] = &[
     ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/service/cargo-config.toml.tmpl")),
 ];
 
+const STATUS_ITEM: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/status-item/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/status-item/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/status-item/src/main.rs")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/status-item/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/status-item/cargo-config.toml.tmpl")),
+];
+
+const SERVER: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/server/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/server/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/server/src/main.rs")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/server/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/server/cargo-config.toml.tmpl")),
+];
+
 /// (template, what it is, its files).
 pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("app", "a window and nothing else: start here for an app that opens no files and uses no network", APP),
@@ -92,6 +108,8 @@ pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("client", "fetches through Nuntius (net-fetch) and parses each response in a worker (a JSON Feed reader)", CLIENT),
     ("media", "plays opened audio and video in the system's media player, embedded through Limen (no codecs in the app)", MEDIA),
     ("service", "provides a role to other apps: a share target that keeps the text people share to it", SERVICE),
+    ("status-item", "an item in the bar with a menu and no window, opened at sign-in if the person allows it", STATUS_ITEM),
+    ("server", "a windowless HTTP server on port 8080 that devices on the person's network may reach, if they allow it", SERVER),
 ];
 
 /// Where an SDK crate is in an Atrium checkout.
@@ -204,6 +222,24 @@ mod tests {
         assert!(m.contains("implements = [\"share-target\"]"), "{m}");
         let (findings, _, _) = crate::check::manifest(m);
         assert!(findings.iter().all(|x| x.level != crate::check::Level::Error), "{findings:?}");
+    }
+
+    #[test]
+    fn background_templates() {
+        for (t, line) in [("status-item", "Opens when you sign in"), ("server", "Lets devices on your network connect on port 8080")] {
+            let o = Opts { name: "my-bg", template: t, id: None, sdk_path: None, registry: REGISTRY };
+            let f = render(&o).unwrap();
+            assert!(f.iter().all(|x| !x.1.contains("{{")), "{t}: unfilled placeholder");
+            let m = &f.iter().find(|x| x.0 == "atrium.toml").unwrap().1;
+            let man = portcullis_toml::Manifest::from_str(m).unwrap();
+            assert!(portcullis_toml::validate(&man).errors.is_empty(), "{t}");
+            assert!(man.resident().is_some(), "{t}: runs in the background");
+            assert!(man.background_lines().iter().any(|l| l.starts_with(line)), "{t}: {:?}", man.background_lines());
+            let (findings, _, _) = crate::check::manifest(m);
+            assert!(findings.iter().all(|x| x.level != crate::check::Level::Error), "{t}: {findings:?}");
+        }
+        let f = render(&Opts { name: "my-bg", template: "status-item", id: None, sdk_path: Some(Path::new("/src/atrium")), registry: REGISTRY }).unwrap();
+        assert!(f.iter().any(|x| x.0 == "Cargo.toml" && x.1.contains("forum-ctl = { path = \"/src/atrium/forum-ctl\" }")));
     }
 
     #[test]

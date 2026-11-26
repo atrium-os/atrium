@@ -55,6 +55,21 @@ pub fn caps(manifest: &str) -> Vec<String> {
     if ext.and_then(|e| e.get("workspace-read")).and_then(|w| w.as_bool()) == Some(true) {
         out.push("workspace-read".into());
     }
+    // A background app (background-apps.md §3.1, §4): its start, and each
+    // port it listens on, so an update that starts asking is asked about.
+    let res = v.get("background").and_then(|b| b.get("resident"));
+    if let Some(r) = res {
+        let start = r.get("start").and_then(|s| s.as_str()).unwrap_or("manual");
+        out.push(format!("background:{}", if start == "sign-in" { "sign-in" } else { "manual" }));
+    }
+    let listen = v.get("capabilities").and_then(|c| c.get("network")).and_then(|n| n.get("listen")).and_then(|l| l.as_array());
+    for l in listen.into_iter().flatten() {
+        let port = l.get("port").and_then(|p| p.as_integer()).filter(|p| (1024..=65535).contains(p));
+        let from = l.get("from").and_then(|f| f.as_str()).filter(|f| matches!(*f, "this-computer" | "local-network"));
+        if let (Some(port), Some(from)) = (port, from) {
+            out.push(format!("listen:{port}:{from}"));
+        }
+    }
     out
 }
 
@@ -99,6 +114,17 @@ mod embeds_tests {
         assert!(super::caps(&m("")).is_empty());
         let (_, added) = super::decide(&m(""), &m("workspace-read = true\n"), true, None);
         assert_eq!(added, ["workspace-read"]);
+    }
+
+    #[test]
+    fn a_background_app_and_its_ports_are_asked_about() {
+        let bg = "[app]\nid = \"a.b\"\n[background.resident]\nstart = \"sign-in\"\n[capabilities.network]\nlisten = [{ port = 8080, from = \"local-network\" }, { port = 80, from = \"local-network\" }]\n";
+        let caps = super::caps(bg);
+        assert!(caps.contains(&"background:sign-in".to_string()), "{caps:?}");
+        assert!(caps.contains(&"listen:8080:local-network".to_string()), "{caps:?}");
+        assert!(!caps.iter().any(|c| c.starts_with("listen:80:")), "a low port is not a line: {caps:?}");
+        let (_, added) = super::decide("[app]\nid = \"a.b\"\n", bg, true, None);
+        assert!(added.contains(&"background:sign-in".to_string()), "{added:?}");
     }
 
     #[test]

@@ -1,0 +1,23 @@
+# {{name}}: made by `cargo atrium new` (template: server).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# No window and no outbound network. `listen` asks for devices on the
+# person's network to reach port 8080; the person allows it per network in
+# Settings › Apps, and never on open Wi-Fi.
+[capabilities.network]
+listen = [{ port = 8080, proto = "tcp", from = "local-network" }]
+
+# Asks to start when the person signs in and to be restarted if it crashes.
+[background.resident]
+start = "sign-in"
+restart = "on-failure"
+
+# Required with [background.resident]: the limits it runs under.
+[resources]
+memory = "64M"
+cpu = 25

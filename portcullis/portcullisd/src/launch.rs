@@ -623,6 +623,7 @@ fn launch_inner(
         inspect: inspector.is_some(), uid: app_uid, user: run_as_user.clone(), home: user_home.clone(), args: Vec::new(),
         syscall_class: portcullis_jail::sysfil_class(&manifest.capabilities),
         app_data: None,
+        rctl: background_rctl(&manifest)?,
     };
     let debug_tree = match &debug {
         Some(_) => Some(debug_tree().map_err(|e| LaunchError::Failed("debug", e))?),
@@ -763,7 +764,7 @@ fn launch_inner(
             ensure_mountpoints(&setup_jc)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             let setup_run = AppRun {
-                debug: false, inspect: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), ..app_run.clone()
+                debug: false, inspect: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), rctl: None, ..app_run.clone()
             };
             /* The setup's output goes to the daemon's. */
             let setup_exit = run_one_jail(&setup_jc, &jail_path, None, Vec::new(), &setup_run, None, None)
@@ -1279,6 +1280,30 @@ pub struct AppRun {
     /// A2), passed on as `ATRIUM_APP_DATA`; `None` for a jail with no
     /// persistent app data (a workbook's tmpfs layer).
     pub app_data: Option<portcullisd::home::AppData>,
+    /// The jail's rctl ceilings: a background app's `[resources]`
+    /// (background-apps.md §3.1), which jaild applies before the jail
+    /// exists or refuses to create it.
+    pub rctl: Option<jaild::protocol::RctlLimits>,
+}
+
+/// A background app's `[resources]` as rctl ceilings; `None` for any other
+/// app (its `[resources]` stay declarations). Validation already refused a
+/// resident app without memory and cpu, so a missing one here is refused
+/// again rather than run uncapped.
+pub fn background_rctl(m: &Manifest) -> Result<Option<jaild::protocol::RctlLimits>, LaunchError> {
+    if m.resident().is_none() {
+        return Ok(None);
+    }
+    let res = m.resources.as_ref();
+    let mem = res.and_then(|r| r.memory.as_deref()).and_then(portcullis_overlay::parse_size);
+    let cpu = res.and_then(|r| r.cpu).filter(|c| *c > 0);
+    match (mem, cpu) {
+        (Some(b), Some(c)) => Ok(Some(jaild::protocol::RctlLimits {
+            memoryuse_mb: Some((b / (1024 * 1024)).max(1)),
+            pcpu: Some(c),
+        })),
+        _ => Err(LaunchError::Failed("resources", "a background app must name [resources] memory and cpu".into())),
+    }
 }
 
 /// The entry's whole environment: the account's HOME, SHELL and USER, a
@@ -1376,7 +1401,8 @@ fn run_one_jail(
         grants,
         syscall_profile: Some(run.syscall_class.clone()),
     };
-    let req = portcullisd::jail_request::to_create_request(jc, parts).map_err(fail("jail"))?;
+    let mut req = portcullisd::jail_request::to_create_request(jc, parts).map_err(fail("jail"))?;
+    req.rctl = run.rctl.clone();
     /* jaild mounts this jail's devfs; one left from a run that died would
      * be stacked under it. */
     let _ = umount_silent(&jail_path.join("dev"));

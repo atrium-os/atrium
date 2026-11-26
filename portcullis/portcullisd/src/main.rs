@@ -51,6 +51,7 @@ use portcullis_ipc::{
 };
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
+mod background_run;
 mod calendar;
 mod crypta;
 mod console;
@@ -1215,6 +1216,30 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         /* Session-launcher broker verbs — same peer-uid gating shape as the
          * governor verbs (the caller must be a `session_launch` service, i.e.
          * the jailed, non-root _ostiarius). docs/spec/ostiarius-privsep.md. */
+        /* ★ The bar's background list (background-apps.md §3.2): only the
+         * person's own forum-bar session component, by the PEER UID. */
+        if matches!(req, Request::BackgroundApps | Request::BackgroundQuit { .. } | Request::BackgroundOff { .. }) {
+            let resp = handle_background_bar(uid, req, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if let Request::StartBackground { owner } = &req {
+            let resp = match session_launcher(uid) {
+                Err(r) => r,
+                Ok(()) => match background_run::start(&shared, owner) {
+                    Ok(n) => {
+                        eprintln!("portcullisd: background: {n} app(s) started at {owner}'s sign-in");
+                        Response::Ok
+                    }
+                    Err(why) => {
+                        eprintln!("portcullisd: StartBackground for {owner} REFUSED: {why}");
+                        Response::Error { message: why }
+                    }
+                },
+            };
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         if matches!(req,
             Request::LaunchSessionComponent { .. }
             | Request::VerifyCredential { .. }
@@ -1839,8 +1864,13 @@ fn handle_launch(
     let stdio = [iter.next().unwrap(), iter.next().unwrap(), iter.next().unwrap()];
 
     /* 4. launch for the connecting user (the entry runs as that
-     *    person's uid for the app). */
-    let resp = match launch::launch_instance(&app_id, persona, user, Some(stdio)) {
+     *    person's uid for the app). A background app they allowed here, in
+     *    a live session, is supervised from this thread (§3.3). */
+    let run = match background_run::supervise_opened(shared, user, &app_id, persona) {
+        Some((k, run)) => background_run::supervise(shared, user, &k, run, Some(stdio)),
+        None => launch::launch_instance(&app_id, persona, user, Some(stdio)),
+    };
+    let resp = match run {
         Ok(o) => Response::LaunchExit { code: o.exit_code },
         Err(e) => Response::LaunchFailed {
             stage: e.stage().into(),
@@ -4299,21 +4329,73 @@ fn prepare_state_dir(owner: &str, app_id: &str, uid: u32) -> std::io::Result<Str
     Ok(dir.to_string_lossy().into_owned())
 }
 
-fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
-    use portcullisd::system_services;
+/// BackgroundApps, BackgroundQuit and BackgroundOff, for the person whose
+/// forum-bar `uid` is.
+fn handle_background_bar(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
+    let refuse = |why: String| {
+        eprintln!("portcullisd: background list REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let owner = match reg.resolve(uid) {
+        Some((o, "org.atrium.forum-bar")) if reg.is_session(uid) => o.to_string(),
+        _ => return refuse("cap.background.denied: only the person's bar may list or quit background apps".into()),
+    };
+    let key = |app_id: String, persona: Option<String>| portcullisd::background::Key { app_id, persona };
+    match req {
+        Request::BackgroundApps => Response::BackgroundApps { apps: background_run::list(shared, &owner) },
+        Request::BackgroundQuit { app_id, persona } => match background_run::quit(&owner, &key(app_id.clone(), persona)) {
+            Ok(()) => {
+                eprintln!("portcullisd: background: {owner} quit {app_id}");
+                Response::Ok
+            }
+            Err(why) => refuse(why),
+        },
+        Request::BackgroundOff { app_id, persona } => {
+            let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let tp = match s.get_or_load(&owner) {
+                Ok(tp) => tp,
+                Err(e) => return refuse(format!("policy for {owner}: {e}")),
+            };
+            let p = persona.unwrap_or_else(|| portcullis_policy::PERSONAL.into());
+            match tp.policy.set_background(&app_id, &p, "", false) {
+                Ok(false) => Response::Ok,
+                Ok(true) => match tp.policy.save(&tp.policy_path.clone()) {
+                    Ok(()) => {
+                        eprintln!("portcullisd: background: {owner} won't open {app_id} at sign-in in {p} (from the bar)");
+                        Response::Ok
+                    }
+                    Err(e) => refuse(format!("save: {e}")),
+                },
+                Err(why) => refuse(why),
+            }
+        }
+        _ => refuse("not a background-list request".into()),
+    }
+}
 
+/// `uid` is a `session_launch` service (the jailed, non-root _ostiarius).
+fn session_launcher(uid: u32) -> Result<(), Response> {
+    use portcullisd::system_services;
     let authorized = match system_services::load_dir(std::path::Path::new(SERVICES_DIR)) {
         Ok(outcome) => outcome.manifests.iter().any(|m| {
             m.capabilities.session_launch
                 && m.exec.as_ref().map_or(false, |e| e.uid == uid)
         }),
-        Err(e) => return Response::Error { message: format!("services.d load: {e}") },
+        Err(e) => return Err(Response::Error { message: format!("services.d load: {e}") }),
     };
     if !authorized {
-        return Response::Error {
+        return Err(Response::Error {
             message: format!(
                 "cap.session_launch.denied: uid {uid} is not a session-launch service"),
-        };
+        });
+    }
+    Ok(())
+}
+
+fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
+    if let Err(r) = session_launcher(uid) {
+        return r;
     }
 
     match req {
@@ -4358,6 +4440,8 @@ fn session_ended(user: &str) -> Response {
     if !portcullis_overlay::plain_segment(user) || portcullis_overlay::home_of(user).is_none() {
         return Response::Ok;
     }
+    // Nothing of theirs restarts from here: the kills below are not failures.
+    background_run::stopping(user);
     launch::stop_files_for_logout(user);
     portcullisd::home::app_data_session_ended(user);
     // Stoa writes the person's sessions out and lets them go before the
@@ -4384,6 +4468,7 @@ fn session_ended(user: &str) -> Response {
         }
         thread::sleep(std::time::Duration::from_millis(250));
     }
+    background_run::ended(user);
     // Something outside the person's uids still holds an overlay (a root
     // shell's cwd, a stuck reader). Arca locks next whatever this answers,
     // and a mounted overlay's writes are dropped once its key goes, so force
@@ -4661,7 +4746,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LaunchSessionComponent { .. }
         | Request::VerifyCredential { .. }
         | Request::TeardownSessionComponent { .. }
-        | Request::SessionEnded { .. } => Response::Error {
+        | Request::SessionEnded { .. }
+        | Request::StartBackground { .. }
+        | Request::BackgroundApps | Request::BackgroundQuit { .. } | Request::BackgroundOff { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },

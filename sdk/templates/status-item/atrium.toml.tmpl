@@ -1,0 +1,24 @@
+# {{name}}: made by `cargo atrium new` (template: status-item).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# An item in the bar and no window: the bar draws its icon and menu
+# (forum-status-items.md), so the app needs no graphics of its own.
+[capabilities]
+status-item = true
+network = "none"
+
+# Asks to open when the person signs in and to be kept running. The person
+# turns that on in Settings › Apps; until then it runs only when opened.
+[background.resident]
+start = "sign-in"
+restart = "on-failure"
+
+# Required with [background.resident]: the limits it runs under.
+[resources]
+memory = "64M"
+cpu = 10

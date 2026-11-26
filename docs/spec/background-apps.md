@@ -266,7 +266,7 @@ read only the manifest and the person's grant.
    StartBackground doesn't undo a Quit; a kill during sign-out doesn't
    come back, and the app is gone before unmount; a person who didn't
    allow it gets nothing.
-3. **B3 the bar list.** forum-wm's list with Quit and "Don't open at
+3. **B3 the bar list.** forum-bar's list with Quit and "Don't open at
    sign-in"; added to the same VM check.
 4. **B4 listen.** jaild rdr rendering with refusals; atrium-netd's
    network identity; Curia's per-network switch; Navigator's loopback
@@ -363,3 +363,48 @@ portcullisd.
   person to Settings › Apps), so the switch lives there. The background
   line is in the asks the dock shows.
 
+
+**B2 (2026-11-26).**
+- Supervision is not portcullisd's kqueue supervisor: each background
+  instance has a thread of its own around the ordinary launch path
+  (`portcullisd/src/background_run.rs`), and the state machine is
+  `portcullisd::background::Registry` (unit-tested). Every run has an id,
+  so a thread left from an earlier session never restarts a later one.
+- A crash is restarted; a third crash within 60 s pauses restarts for 60 s
+  ("crashed too often"). Before each restart portcullisd checks again that
+  the installed manifest is still resident, its signature verifies, the
+  person's switch holds for that manifest, and its capabilities need no
+  new press; otherwise it stops ("no longer allowed"). `restart = "never"`
+  stops after the first exit.
+- `StartBackground { owner }` comes from ostiarius after the session
+  components, once per new session, and only from the `session_launch`
+  service uid; portcullisd also wants `owner` to hold the active seat. It
+  reads the list from the person's grants, never from the request, and
+  starts nothing already known this session (so a Quit sticks).
+- A resident app's `[resources]` become jaild's rctl (`memoryuse:sigkill`,
+  `pcpu:deny`). Laminar's low weight is not applied yet.
+- An app the person opens from the dock that is allowed in the background
+  in that persona is supervised the same way.
+- Sign-out marks the person stopping first, so the kills are not crashes.
+- `scripts/vm-background-check.sh` (amd64 cloud VM): sign-in start with no
+  press, rctl limits, refusals, crash restarts and the pause, revocation
+  during the pause, a manual app opened and supervised, sign-out and the
+  next session, and the bar's verbs below.
+
+**B3 (2026-11-26).** The list lives in `forum-bar` (the bar draws the
+system menus, not forum-wm): `forum-bar/src/background.rs`, polled every
+3 s, hidden while nothing runs, amber while an app is paused. Each app has
+Quit and, when it opens at sign-in, "Don't open … at sign-in". portcullisd
+answers `BackgroundApps`, `BackgroundQuit` and `BackgroundOff` only to the
+person's own `org.atrium.forum-bar` session component, by peer uid; names
+come from the installed manifest. Off takes no press, since it only takes
+leave away.
+
+**B5 (2026-11-26).** `cargo atrium new` has `status-item` (a bar menu,
+sign-in, 64M, 10% CPU) and `server` (a std-only HTTP server on 8080 with
+an 8 KiB head limit, 5 s timeouts and 16 connections; `listen`
+local-network; 64M, 25%). Artifex's New project lists them from `cargo
+atrium new --list`. `cargo atrium check`'s consent lines and the install
+sheet carry the background and listen words; opifex counts
+`background:<start>` and `listen:<port>:<from>` as capabilities, so an
+update that starts asking for either is asked about.

@@ -62,6 +62,12 @@ pub trait Launcher {
     fn session_ended(&mut self, _user: &str) -> Result<(), String> {
         Ok(())
     }
+    /// `user`'s session components are up: start the background apps they
+    /// allowed to open at sign-in (background-apps.md §3.3). The default
+    /// (demo launchers) has none.
+    fn start_background(&mut self, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Verify a credential, returning the canonical username. The default is the
     /// dev stub (any non-empty credential); the production [`JaildLauncher`]
     /// forwards it to the portcullisd broker, which runs PAM as root — the jailed
@@ -275,6 +281,10 @@ impl<L: Launcher> Ostiarius<L> {
                 }
             }
             self.sessions.insert(human.to_string(), ids);
+            // After the session's own components, so a bar app finds the bar.
+            if let Err(e) = self.launcher.start_background(human) {
+                eprintln!("ostiarius: background apps for {human}: {e}");
+            }
         }
         Ok(())
     }
@@ -609,6 +619,14 @@ impl Launcher for JaildLauncher {
         }
     }
 
+    fn start_background(&mut self, user: &str) -> Result<(), String> {
+        match self.broker(Request::StartBackground { owner: user.to_string() })? {
+            Response::Ok => Ok(()),
+            Response::Error { message } => Err(format!("broker start background: {message}")),
+            other => Err(format!("broker start background: {other:?}")),
+        }
+    }
+
     fn verify_credential(&self, user: &str, password: &str) -> Result<String, String> {
         // Forward to the broker: portcullisd (root) runs PAM and reads shadow;
         // this jailed ostiarius never can. Empty-check first to avoid a round-trip.
@@ -671,6 +689,9 @@ mod tests {
         /// Users whose session end was told, and how many teardowns came
         /// before it.
         ended: Vec<(String, usize)>,
+        /// Users whose background apps were asked for, and how many
+        /// launches came before it.
+        background: Vec<(String, usize)>,
     }
     impl Launcher for MockLauncher {
         fn launch(&mut self, s: &LaunchSpec) -> Result<i32, String> {
@@ -683,6 +704,10 @@ mod tests {
         }
         fn session_ended(&mut self, user: &str) -> Result<(), String> {
             self.ended.push((user.to_string(), self.torn_down.len()));
+            Ok(())
+        }
+        fn start_background(&mut self, user: &str) -> Result<(), String> {
+            self.background.push((user.to_string(), self.launched.len()));
             Ok(())
         }
     }
@@ -769,6 +794,20 @@ mod tests {
         assert_eq!(live, vec!["alice", "bob"], "BOTH sessions alive — alice not torn down");
         assert!(o.launcher.torn_down.is_empty(), "FUS tears nothing down");
         assert!(o.launcher.launched.len() > after_alice, "bob's layer was launched");
+    }
+
+    #[test]
+    fn background_apps_start_once_per_session_after_its_components() {
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("bg"));
+        o.login("alice", Frontend::Gui).unwrap();
+        let n = o.launcher.launched.len();
+        assert_eq!(o.launcher.background, vec![("alice".to_string(), n)], "after the bar is up");
+        o.login("bob", Frontend::Gui).unwrap();
+        o.login("alice", Frontend::Gui).unwrap();
+        assert_eq!(o.launcher.background.iter().filter(|(u, _)| u == "alice").count(), 1, "a switch back asks nothing again");
+        o.logout().unwrap();
+        o.login("alice", Frontend::Gui).unwrap();
+        assert_eq!(o.launcher.background.iter().filter(|(u, _)| u == "alice").count(), 2, "a new session asks again");
     }
 
     #[test]

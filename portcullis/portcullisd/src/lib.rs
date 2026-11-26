@@ -20,6 +20,7 @@ pub mod jail_request;
 pub mod jaild_jail;
 /// Settings' Apps page (curia.md §13).
 pub mod access;
+pub mod background;
 pub mod crossing;
 /// Opening files in apps (opening-files.md §6.2).
 pub mod links;

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod background;
 mod network;
 mod vpn;
 mod status_panel;
@@ -129,6 +130,11 @@ struct BarView {
     vpn: Mutable<vpn::VpnShown>,
     vpn_open: Mutable<MenuState>,
     want_vpn: Mutable<Option<vpn::VpnAction>>,
+    /// Running in the background (background-apps.md §3.2): shown while
+    /// something does.
+    bg: Mutable<background::BgShown>,
+    bg_open: Mutable<MenuState>,
+    want_bg: Mutable<Option<background::BgAction>>,
     /// The overflow menu: what the row had no room for (§ "Fitting").
     more_open: Mutable<MenuState>,
 }
@@ -722,6 +728,24 @@ impl View for BarView {
                 ctx.place(button);
             }
         }
+        // Running in the background (background-apps.md §3.2): each app
+        // with Quit, and "Don't open at sign-in". Not there while nothing is.
+        {
+            let n = self.bg.get_cloned();
+            if n.shown() {
+                let (items, acts) = background::menu(&n);
+                let want = self.want_bg.clone();
+                let colour = if n.apps.iter().any(|a| a.paused) { t.warning_fg() } else { t.text_secondary() };
+                let button = MenuButton::new("Running in the background", self.bg_open.clone(), items, move |i| {
+                    if let Some(Some(a)) = acts.get(i) {
+                        want.set(Some(a.clone()));
+                    }
+                })
+                .icon(phosphor::STACK_SIMPLE, 15.0, Some(colour))
+                .attached();
+                ctx.place(button);
+            }
+        }
         // The system volume (lyra-v1.md §7): an attached drop-down from the
         // speaker, drawn by the bar (fresco-popups.md §2): mute, the master
         // level, and the output in use. Dimmed while choragusd is away.
@@ -1241,6 +1265,11 @@ fn main() -> std::io::Result<()> {
     let want_vpn = Mutable::with_dirty(None, dirty.clone());
     let (vpn_events, vpn_tx) = vpn::follow();
     let mut vpn_was_open = false;
+    let bg_shown = Mutable::with_dirty(background::BgShown::default(), dirty.clone());
+    let bg_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
+    let want_bg = Mutable::with_dirty(None, dirty.clone());
+    let (bg_events, bg_tx) = background::follow();
+    let mut bg_was_open = false;
     // The grants handed to apps for their own panels: token, app.
     let mut drawn: Vec<([u8; 16], String)> = Vec::new();
     let dirty_flag = dirty.clone();
@@ -1279,6 +1308,9 @@ fn main() -> std::io::Result<()> {
         vpn: vpn_shown.clone(),
         vpn_open: vpn_open.clone(),
         want_vpn: want_vpn.clone(),
+        bg: bg_shown.clone(),
+        bg_open: bg_open.clone(),
+        want_bg: want_bg.clone(),
         more_open: Mutable::new(MenuState::default()),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
@@ -1494,6 +1526,28 @@ fn main() -> std::io::Result<()> {
                 vpn_shown.set(n);
             }
         }
+        // Running in the background: the list, and picks from its menu.
+        {
+            let mut n = bg_shown.get_cloned();
+            while let Ok(m) = bg_events.try_recv() {
+                match m {
+                    background::BgMsg::Apps(v) => n.apps = v,
+                    background::BgMsg::Done(r) => n.note = r.err(),
+                }
+            }
+            let open = bg_open.get().open;
+            if open && !bg_was_open {
+                n.note = None;
+            }
+            bg_was_open = open;
+            if let Some(a) = want_bg.get_cloned() {
+                want_bg.set(None);
+                background::act(bg_tx.clone(), a);
+            }
+            if n != bg_shown.get_cloned() {
+                bg_shown.set(n);
+            }
+        }
         // The Lock button: ostiarius's lock-only socket, on a thread.
         if want_lock.get() {
             want_lock.set(false);
@@ -1582,6 +1636,9 @@ mod tests {
             vpn: Mutable::new(vpn::VpnShown::default()),
             vpn_open: Mutable::new(MenuState::default()),
             want_vpn: Mutable::new(None),
+            bg: Mutable::new(background::BgShown::default()),
+            bg_open: Mutable::new(MenuState::default()),
+            want_bg: Mutable::new(None),
             more_open: Mutable::new(MenuState::default()),
         }
     }
