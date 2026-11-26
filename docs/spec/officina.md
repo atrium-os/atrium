@@ -5289,6 +5289,17 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
 - **Justify Vertically** and **Distribute Vertically** (the cell menu, after Align Bottom): wrapped lines spread from the top of the cell to the bottom, the first line at the top edge and the last at the bottom; a single line sits in the middle. Files already kept `justify` and `distributed`; they are now drawn (`CellView::vspread`).
 - Tests: `officina-grid` `ops` (the op's encoding, refusals of bad bytes, recalculation and undo), Pergola (vertical spread, top to bottom and one line centred), Sheets `sheetbars` (font sizes and refusals, moves and copies to each place, structure protection, standard sizes keeping sized columns, undo) and `source` (the vertical commands set the style and draw spread; the 1904 switch recalculates and undoes).
 
+### 16.154 The Borders bar, side, inside and diagonal borders, dashed lines drawn (2026-11-26)
+
+`border_ops` and `borders_typed` in `atrium-sheets/src/format.rs`, `Dash` and `dashed_edge` in `pergola/src/widgets/grid_view.rs`.
+
+- **More border commands** in the Format menu: **Top Border**, **Left Border**, **Right Border**, **Inside Borders** (the lines between the selection's cells, not round it), **Diagonal Down Border** and **Diagonal Up Border**, each in the border pen's line and colour. Inside sets each cell's inner sides, so either neighbour shows the line, as Excel's files do. **No Borders** now takes diagonals off too. Every command builds disjoint parts of the selection against the same styles, so one undo step takes it all back.
+- **Borders…** (a bar, from the Format menu), Excel's Format Cells > Border as words: the edges (`all`, `outside`, `inside`, `inside horizontal`, `inside vertical`, `top`, `bottom`, `left`, `right`, `top and bottom`, `diagonal down`, `diagonal up`, `none`), then a line (`thin`, `medium`, `thick`, `double`, `hair`, `dashed`, `dotted`, `medium dashed`, `dash dot`, `medium dash dot`, `dash dot dot`, `medium dash dot dot`, `slanted dash dot`) and a colour (a tab colour's name, six hex digits, or `automatic`). A part left out comes from the pen. Clauses are separated by `;` (`outside thick red; inside horizontal dashed 1F4E79`) and make one step together. At most 512 bytes; an unknown word is refused with what it should be.
+- The Format menu's **Border Line** pen also offers Thick, Double, Medium Dashed and Dash Dot (nine lines in all).
+- **Dashed, dotted, double and hair lines are drawn** as they are saved (`CellView::dashes`): dashed three widths on and one off, dotted (and hair) one on and one off, the dash-dot styles as a dash, gap, dot, gap, and double as two one-pixel lines the width apart. An edge needing more than 512 pieces is drawn solid.
+- LibreOffice check (`officina-convert/examples/fonteffects_lo.rs`, LibreOffice 24.2): all 13 line styles, their colour and both diagonals survive our `.xlsx` to LibreOffice's `.ods` and our `.ods` to LibreOffice's `.xlsx`, except slanted dash dot, which LibreOffice does not have (it comes back as medium dashed or medium dash dot).
+- Tests: Pergola (dashed, dotted, dash-dot and double pieces), `officina-convert` `tests/fonteffects.rs` (every line style and both diagonals through `.xlsx` and `.ods`), Sheets `format` (inside, side and diagonal borders, No Borders, the double pen, the bar's clauses, colours, one undo, refusals, dashes reaching the drawn cell).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

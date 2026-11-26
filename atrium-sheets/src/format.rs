@@ -44,6 +44,9 @@ pub enum FormatCmd {
     Rotate(i16),
     /// Opens the bar for a rotation angle of one's own; the window runs it.
     Angle,
+    /// Opens the Borders bar (edges, line and colour typed); the window
+    /// runs it: [`borders_typed`].
+    BordersBar,
     /// The line the plain border commands draw (one of [`PEN_LINES`]).
     PenLine(usize),
     /// Their colour: one of the tab colours, or automatic.
@@ -68,6 +71,17 @@ pub enum BorderKind {
     DoubleBottom,
     /// Thin lines over the first row and under the last.
     TopAndBottom,
+    /// One side of the selection.
+    Top,
+    Left,
+    Right,
+    /// Lines between the selection's cells, not round it.
+    Inside,
+    InsideHorizontal,
+    InsideVertical,
+    /// A line across each cell, from the top left (down) or bottom left (up).
+    DiagonalDown,
+    DiagonalUp,
 }
 
 /// The number formats the menu offers: name and format code.
@@ -209,7 +223,14 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
     v.push((MenuItem::new("All Borders").separated(), Some(FormatCmd::Borders(BorderKind::All))));
     v.push((MenuItem::new("Outside Borders").shortcut("Ctrl+Shift+&"), Some(FormatCmd::Borders(BorderKind::Outside))));
     v.push((MenuItem::new("Bottom Border"), Some(FormatCmd::Borders(BorderKind::Bottom))));
+    v.push((MenuItem::new("Top Border"), Some(FormatCmd::Borders(BorderKind::Top))));
+    v.push((MenuItem::new("Left Border"), Some(FormatCmd::Borders(BorderKind::Left))));
+    v.push((MenuItem::new("Right Border"), Some(FormatCmd::Borders(BorderKind::Right))));
     v.push((MenuItem::new("Top and Bottom Border"), Some(FormatCmd::Borders(BorderKind::TopAndBottom))));
+    v.push((MenuItem::new("Inside Borders"), Some(FormatCmd::Borders(BorderKind::Inside))));
+    v.push((MenuItem::new("Diagonal Down Border"), Some(FormatCmd::Borders(BorderKind::DiagonalDown))));
+    v.push((MenuItem::new("Diagonal Up Border"), Some(FormatCmd::Borders(BorderKind::DiagonalUp))));
+    v.push((MenuItem::new("Borders…"), Some(FormatCmd::BordersBar)));
     v.push((MenuItem::new("Thick Outside Borders"), Some(FormatCmd::Borders(BorderKind::ThickOutside))));
     v.push((MenuItem::new("Thick Bottom Border"), Some(FormatCmd::Borders(BorderKind::ThickBottom))));
     v.push((MenuItem::new("Double Bottom Border"), Some(FormatCmd::Borders(BorderKind::DoubleBottom))));
@@ -413,75 +434,205 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
             }.into())
         }
         FormatCmd::Borders(kind) => {
-            const L: usize = 0;
-            const R: usize = 1;
-            const T: usize = 2;
-            const B: usize = 3;
             let (pen, color) = d.border_pen;
             let line = match kind {
                 BorderKind::ThickOutside | BorderKind::ThickBottom => Line::Thick,
                 BorderKind::DoubleBottom => Line::Double,
                 _ => pen,
             };
-            let thin = Edge { line, color };
-            let set = |edges: &'static [usize]| move |st: &Style| {
-                let mut st = st.clone();
-                for &e in edges {
-                    st.borders[e] = thin;
-                }
-                st
-            };
-            let ops = match kind {
-                BorderKind::All => vec![GridOp::restyle(&d.wb, r, set(&[L, R, T, B]))],
-                BorderKind::None => vec![GridOp::restyle(&d.wb, r, |st| Style { borders: [Edge::default(); 4], ..st.clone() })],
-                BorderKind::Bottom | BorderKind::ThickBottom | BorderKind::DoubleBottom => vec![GridOp::restyle(&d.wb, Rect { r0: r.r1, ..r }, set(&[B]))],
-                BorderKind::TopAndBottom if r.r0 == r.r1 => vec![GridOp::restyle(&d.wb, r, set(&[T, B]))],
-                BorderKind::TopAndBottom => vec![GridOp::restyle(&d.wb, Rect { r1: r.r0, ..r }, set(&[T])), GridOp::restyle(&d.wb, Rect { r0: r.r1, ..r }, set(&[B]))],
-                BorderKind::Outside | BorderKind::ThickOutside => {
-                    // Disjoint parts, each built against the same styles:
-                    // corners, edge strips (the inside keeps its own).
-                    let mut ops = Vec::new();
-                    let rows: Vec<(u32, u32, &'static [usize])> = if r.r0 == r.r1 { vec![(r.r0, r.r0, &[T, B])] } else {
-                        let mut v: Vec<(u32, u32, &'static [usize])> = vec![(r.r0, r.r0, &[T]), (r.r1, r.r1, &[B])];
-                        if r.r1 > r.r0 + 1 { v.push((r.r0 + 1, r.r1 - 1, &[])); }
-                        v
-                    };
-                    let cols: Vec<(u32, u32, &'static [usize])> = if r.c0 == r.c1 { vec![(r.c0, r.c0, &[L, R])] } else {
-                        let mut v: Vec<(u32, u32, &'static [usize])> = vec![(r.c0, r.c0, &[L]), (r.c1, r.c1, &[R])];
-                        if r.c1 > r.c0 + 1 { v.push((r.c0 + 1, r.c1 - 1, &[])); }
-                        v
-                    };
-                    for &(r0, r1, re) in &rows {
-                        for &(c0, c1, ce) in &cols {
-                            if re.is_empty() && ce.is_empty() {
-                                continue;
-                            }
-                            let edges: Vec<usize> = re.iter().chain(ce).copied().collect();
-                            ops.push(GridOp::restyle(&d.wb, Rect { sheet: s, r0, c0, r1, c1 }, move |st| {
-                                let mut st = st.clone();
-                                for &e in &edges {
-                                    st.borders[e] = thin;
-                                }
-                                st
-                            }));
-                        }
-                    }
-                    ops
-                }
-            };
+            let ops = border_ops(&d.wb, r, kind, Edge { line, color });
             d.run("Borders", ops);
-            Ok(match kind {
-                BorderKind::All => "Borders on every cell.",
-                BorderKind::Outside => "Border around the selection.",
-                BorderKind::Bottom => "Bottom border.",
-                BorderKind::None => "Borders taken off.",
-                BorderKind::ThickOutside => "Thick border around the selection.",
-                BorderKind::ThickBottom => "Thick bottom border.",
-                BorderKind::DoubleBottom => "Double bottom border.",
-                BorderKind::TopAndBottom => "Top and bottom borders.",
-            }.into())
+            Ok(border_done(kind).into())
+        }
+        FormatCmd::BordersBar => Ok(String::new()),
+    }
+}
+
+const L: usize = 0;
+const R: usize = 1;
+const T: usize = 2;
+const B: usize = 3;
+
+/// What the status says once `kind` is drawn.
+fn border_done(kind: BorderKind) -> &'static str {
+    match kind {
+        BorderKind::All => "Borders on every cell.",
+        BorderKind::Outside => "Border around the selection.",
+        BorderKind::Bottom => "Bottom border.",
+        BorderKind::None => "Borders taken off.",
+        BorderKind::ThickOutside => "Thick border around the selection.",
+        BorderKind::ThickBottom => "Thick bottom border.",
+        BorderKind::DoubleBottom => "Double bottom border.",
+        BorderKind::TopAndBottom => "Top and bottom borders.",
+        BorderKind::Top => "Top border.",
+        BorderKind::Left => "Left border.",
+        BorderKind::Right => "Right border.",
+        BorderKind::Inside => "Borders between the cells.",
+        BorderKind::InsideHorizontal => "Borders between the rows.",
+        BorderKind::InsideVertical => "Borders between the columns.",
+        BorderKind::DiagonalDown => "Diagonal down border.",
+        BorderKind::DiagonalUp => "Diagonal up border.",
+    }
+}
+
+/// The ops drawing `kind` on `r` with `edge`. Each op covers a part of
+/// `r` no other one does, so all are built against the same styles.
+pub fn border_ops(wb: &officina_grid::Workbook, r: Rect, kind: BorderKind, edge: Edge) -> Vec<GridOp> {
+    type Span = (u32, u32, &'static [usize]);
+    // Rows (columns) split into the first, the middle and the last, each
+    // with the edges it takes.
+    let split = |lo: u32, hi: u32, first: &'static [usize], last: &'static [usize], both: &'static [usize], mid: &'static [usize]| -> Vec<Span> {
+        if lo == hi {
+            return vec![(lo, lo, both)];
+        }
+        let mut v = vec![(lo, lo, first), (hi, hi, last)];
+        if hi > lo + 1 {
+            v.push((lo + 1, hi - 1, mid));
+        }
+        v
+    };
+    let grid = |rows: Vec<Span>, cols: Vec<Span>| -> Vec<GridOp> {
+        let mut ops = Vec::new();
+        for &(r0, r1, re) in &rows {
+            for &(c0, c1, ce) in &cols {
+                if re.is_empty() && ce.is_empty() {
+                    continue;
+                }
+                let edges: Vec<usize> = re.iter().chain(ce).copied().collect();
+                ops.push(GridOp::restyle(wb, Rect { sheet: r.sheet, r0, c0, r1, c1 }, move |st| {
+                    let mut st = st.clone();
+                    for &e in &edges {
+                        st.borders[e] = edge;
+                    }
+                    st
+                }));
+            }
+        }
+        ops
+    };
+    let all_rows: Vec<Span> = vec![(r.r0, r.r1, &[])];
+    let all_cols: Vec<Span> = vec![(r.c0, r.c1, &[])];
+    let set = |edges: &'static [usize]| move |st: &Style| {
+        let mut st = st.clone();
+        for &e in edges {
+            st.borders[e] = edge;
+        }
+        st
+    };
+    match kind {
+        BorderKind::All => vec![GridOp::restyle(wb, r, set(&[L, R, T, B]))],
+        BorderKind::None => vec![GridOp::restyle(wb, r, |st| Style { borders: [Edge::default(); 4], diagonals: [Edge::default(); 2], ..st.clone() })],
+        BorderKind::Bottom | BorderKind::ThickBottom | BorderKind::DoubleBottom => vec![GridOp::restyle(wb, Rect { r0: r.r1, ..r }, set(&[B]))],
+        BorderKind::Top => vec![GridOp::restyle(wb, Rect { r1: r.r0, ..r }, set(&[T]))],
+        BorderKind::Left => vec![GridOp::restyle(wb, Rect { c1: r.c0, ..r }, set(&[L]))],
+        BorderKind::Right => vec![GridOp::restyle(wb, Rect { c0: r.c1, ..r }, set(&[R]))],
+        BorderKind::TopAndBottom if r.r0 == r.r1 => vec![GridOp::restyle(wb, r, set(&[T, B]))],
+        BorderKind::TopAndBottom => vec![GridOp::restyle(wb, Rect { r1: r.r0, ..r }, set(&[T])), GridOp::restyle(wb, Rect { r0: r.r1, ..r }, set(&[B]))],
+        BorderKind::Outside | BorderKind::ThickOutside => grid(split(r.r0, r.r1, &[T], &[B], &[T, B], &[]), split(r.c0, r.c1, &[L], &[R], &[L, R], &[])),
+        // Between cells: each cell's inner sides, so either neighbour shows it.
+        BorderKind::Inside => grid(split(r.r0, r.r1, &[B], &[T], &[], &[T, B]), split(r.c0, r.c1, &[R], &[L], &[], &[L, R])),
+        BorderKind::InsideHorizontal => grid(split(r.r0, r.r1, &[B], &[T], &[], &[T, B]), all_cols),
+        BorderKind::InsideVertical => grid(all_rows, split(r.c0, r.c1, &[R], &[L], &[], &[L, R])),
+        BorderKind::DiagonalDown | BorderKind::DiagonalUp => {
+            let k = usize::from(kind == BorderKind::DiagonalUp);
+            vec![GridOp::restyle(wb, r, move |st: &Style| {
+                let mut st = st.clone();
+                st.diagonals[k] = edge;
+                st
+            })]
         }
     }
+}
+
+/// The longest text the Borders bar reads.
+const MAX_BORDERS_TYPED: usize = 512;
+
+/// The Borders bar's words for line styles, as Excel's Format Cells names
+/// them (longest first, so `medium dashed` is not read as `medium`).
+const LINE_WORDS: [(&str, Line); 13] = [
+    ("medium dash dot dot", Line::MediumDashDotDot),
+    ("medium dash dot", Line::MediumDashDot),
+    ("slanted dash dot", Line::SlantDashDot),
+    ("medium dashed", Line::MediumDashed),
+    ("dash dot dot", Line::DashDotDot),
+    ("dash dot", Line::DashDot),
+    ("dashed", Line::Dashed),
+    ("dotted", Line::Dotted),
+    ("double", Line::Double),
+    ("medium", Line::Medium),
+    ("thick", Line::Thick),
+    ("thin", Line::Thin),
+    ("hair", Line::Hair),
+];
+
+const EDGE_WORDS: [(&str, BorderKind); 14] = [
+    ("inside horizontal", BorderKind::InsideHorizontal),
+    ("inside vertical", BorderKind::InsideVertical),
+    ("diagonal down", BorderKind::DiagonalDown),
+    ("diagonal up", BorderKind::DiagonalUp),
+    ("top and bottom", BorderKind::TopAndBottom),
+    ("outside", BorderKind::Outside),
+    ("inside", BorderKind::Inside),
+    ("bottom", BorderKind::Bottom),
+    ("right", BorderKind::Right),
+    ("left", BorderKind::Left),
+    ("none", BorderKind::None),
+    ("top", BorderKind::Top),
+    ("all", BorderKind::All),
+    ("box", BorderKind::Outside),
+];
+
+/// One clause of the Borders bar: `outside dashed red`, `inside thin
+/// 1F4E79`, `diagonal up`, `none`.
+fn border_clause(t: &str, pen: (Line, Option<u32>)) -> Result<(BorderKind, Edge), String> {
+    let mut rest = t.trim().to_ascii_lowercase();
+    let take = |rest: &mut String, word: &str| -> bool {
+        if rest == word || rest.starts_with(&format!("{word} ")) {
+            *rest = rest[word.len()..].trim_start().to_string();
+            true
+        } else {
+            false
+        }
+    };
+    let kind = EDGE_WORDS.iter().find(|(w, _)| take(&mut rest, w)).map(|e| e.1).ok_or_else(|| format!("Name the edges first: all, outside, inside, top, bottom, left, right, inside horizontal, inside vertical, diagonal down, diagonal up or none (not \"{}\").", t.trim()))?;
+    let _ = take(&mut rest, "border") || take(&mut rest, "borders");
+    let line = LINE_WORDS.iter().find(|(w, _)| take(&mut rest, w)).map_or(pen.0, |e| e.1);
+    let color = match rest.trim() {
+        "" => pen.1,
+        "automatic" | "auto" | "black" => None,
+        c => Some(crate::tabs::COLORS.iter().find(|(_, n)| n.eq_ignore_ascii_case(c)).map(|e| e.0).or_else(|| hex_color(c)).ok_or_else(|| format!("\"{c}\" isn't a colour: use a name such as red or blue, or six hex digits."))?),
+    };
+    Ok((kind, Edge { line, color }))
+}
+
+fn hex_color(c: &str) -> Option<u32> {
+    let h = c.strip_prefix('#').unwrap_or(c);
+    (h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u32::from_str_radix(h, 16).ok()).flatten()
+}
+
+/// Borders…: clauses separated by `;`, each the edges, then a line
+/// style and a colour if not the pen's (`outside thick; inside dotted
+/// 808080`). All are one step, in the order typed.
+pub fn borders_typed(d: &mut Doc, sel: CellRange, typed: &str) -> Result<String, String> {
+    if typed.len() > MAX_BORDERS_TYPED {
+        return Err("That's too long.".into());
+    }
+    let clauses: Vec<(BorderKind, Edge)> = typed.split(';').filter(|c| !c.trim().is_empty()).map(|c| border_clause(c, d.border_pen)).collect::<Result<_, _>>()?;
+    if clauses.is_empty() {
+        return Err("Type the edges, for example outside thick; inside dotted.".into());
+    }
+    let r = Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    for (i, &(kind, edge)) in clauses.iter().enumerate() {
+        let ops = border_ops(&d.wb, r, kind, edge);
+        if i == 0 {
+            if !d.run_action("Borders", ops) {
+                return Err(std::mem::take(&mut d.status));
+            }
+        } else {
+            d.extend(ops);
+        }
+    }
+    Ok(clauses.iter().map(|c| border_done(c.0).trim_end_matches('.')).collect::<Vec<_>>().join("; ") + ".")
 }
 
 /// `code` with one more (or one fewer) decimal place in each section.
@@ -534,6 +685,64 @@ pub fn decimals(code: &str, more: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::decimals;
+
+    #[test]
+    fn side_inside_and_diagonal_borders_and_the_borders_bar() {
+        use super::{borders_typed, run, BorderKind, FormatCmd};
+        use officina_grid::style::Line;
+        use officina_grid::CellAddr;
+        use pergola::widgets::{CellRange, Dash, GridSource};
+        let d = std::rc::Rc::new(std::cell::RefCell::new(crate::doc::Doc::from_csv("b.csv", b"1,2,3\n4,5,6\n7,8,9\n").unwrap().0));
+        let src = crate::source::SheetSource::new(d.clone());
+        let sel = CellRange { r0: 0, c0: 0, r1: 2, c1: 2 };
+        let edges = |r: u32, c: u32| d.borrow().wb.style(CellAddr::new(0, r, c)).borders.map(|e| e.line != Line::None);
+        // Inside: each cell's inner sides only (left, right, top, bottom).
+        run(&mut d.borrow_mut(), sel, FormatCmd::Borders(BorderKind::Inside));
+        assert_eq!(edges(0, 0), [false, true, false, true]);
+        assert_eq!(edges(1, 1), [true, true, true, true]);
+        assert_eq!(edges(2, 2), [true, false, true, false]);
+        assert_eq!(edges(0, 2), [true, false, false, true]);
+        run(&mut d.borrow_mut(), sel, FormatCmd::Borders(BorderKind::None));
+        assert_eq!(edges(1, 1), [false; 4]);
+        for (kind, cell, want) in [(BorderKind::Top, (0, 1), [false, false, true, false]), (BorderKind::Left, (1, 0), [true, false, false, false]), (BorderKind::Right, (2, 2), [false, true, false, false])] {
+            run(&mut d.borrow_mut(), sel, FormatCmd::Borders(kind));
+            assert_eq!(edges(cell.0, cell.1), want, "{kind:?}");
+            assert_eq!(edges(1, 1), [false; 4], "{kind:?} leaves the middle");
+        }
+        run(&mut d.borrow_mut(), sel, FormatCmd::Borders(BorderKind::DiagonalUp));
+        let st = d.borrow().wb.style(CellAddr::new(0, 1, 1)).clone();
+        assert!(st.diagonals[1].line == Line::Thin && st.diagonals[0].line == Line::None);
+        run(&mut d.borrow_mut(), sel, FormatCmd::Borders(BorderKind::None));
+        assert_eq!(d.borrow().wb.style(CellAddr::new(0, 1, 1)).diagonals[1].line, Line::None, "No Borders takes diagonals off too");
+        // The bar: several clauses, one step, each with its line and colour.
+        let msg = borders_typed(&mut d.borrow_mut(), sel, "outside thick red; inside horizontal dashed #1F4E79").unwrap();
+        assert_eq!(msg, "Border around the selection; Borders between the rows.");
+        let st = |r: u32, c: u32| d.borrow().wb.style(CellAddr::new(0, r, c)).clone();
+        assert_eq!((st(0, 0).borders[2].line, st(0, 0).borders[2].color), (Line::Thick, Some(0xC62828)));
+        assert_eq!((st(1, 1).borders[3].line, st(1, 1).borders[3].color), (Line::Dashed, Some(0x1F4E79)));
+        assert_eq!(st(1, 1).borders[0].line, Line::None);
+        // Drawn dashed.
+        let cv = src.cell(1, 1).unwrap();
+        assert_eq!((cv.dashes[3], cv.dashes[2]), (Dash::Dashed, Dash::Dashed));
+        assert_eq!(src.cell(0, 0).unwrap().dashes[2], Dash::Solid);
+        d.borrow_mut().undo();
+        assert_eq!(st(1, 1).borders[3].line, Line::None, "one undo takes both clauses");
+        assert_eq!(st(0, 0).borders[2].line, Line::None);
+        // Medium dashed is not read as medium; the pen gives what is not typed.
+        borders_typed(&mut d.borrow_mut(), sel, "all medium dashed").unwrap();
+        assert_eq!(st(2, 2).borders[0].line, Line::MediumDashed);
+        borders_typed(&mut d.borrow_mut(), sel, "diagonal down hair").unwrap();
+        assert_eq!(st(0, 0).diagonals[0].line, Line::Hair);
+        // The pen offers the thick, double and dash-dot lines too.
+        run(&mut d.borrow_mut(), sel, FormatCmd::PenLine(6));
+        assert_eq!(d.borrow().status, "Borders now draw double lines.");
+        run(&mut d.borrow_mut(), sel, FormatCmd::Borders(BorderKind::Bottom));
+        assert_eq!(st(2, 1).borders[3].line, Line::Double);
+        assert_eq!(src.cell(2, 1).unwrap().dashes[3], Dash::Double);
+        for bad in ["", "sideways", "all wavy", "top thin 12345G", &"all ".repeat(200)] {
+            assert!(borders_typed(&mut d.borrow_mut(), sel, bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn font_effects_and_spread_alignments_toggle_and_reach_the_grid() {
@@ -620,12 +829,16 @@ pub const ROTATIONS: [(&str, i16); 6] = [
 ];
 
 /// The lines the plain border commands can draw with.
-pub const PEN_LINES: [(&str, Line); 5] = [
+pub const PEN_LINES: [(&str, Line); 9] = [
     ("Thin", Line::Thin),
     ("Medium", Line::Medium),
     ("Dashed", Line::Dashed),
     ("Dotted", Line::Dotted),
     ("Hair", Line::Hair),
+    ("Thick", Line::Thick),
+    ("Double", Line::Double),
+    ("Medium Dashed", Line::MediumDashed),
+    ("Dash Dot", Line::DashDot),
 ];
 
 /// The most indent steps a cell takes (Excel's indent buttons stop at 15).

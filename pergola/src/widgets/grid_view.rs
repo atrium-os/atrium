@@ -155,7 +155,27 @@ pub struct CellView {
     /// Several lines spaced evenly from the top edge to the bottom (a
     /// spreadsheet's vertical Justify and Distributed); one line centred.
     pub vspread: bool,
+    /// How each of `borders` (left, right, top, bottom) is drawn.
+    pub dashes: [Dash; 4],
 }
+
+/// How a border line is drawn along its edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dash {
+    #[default]
+    Solid,
+    /// Three widths on, one off.
+    Dashed,
+    /// One width on, one off.
+    Dotted,
+    /// A dash, a gap, a dot, a gap.
+    DashDot,
+    /// Two one-pixel lines, the width apart.
+    Double,
+}
+
+/// The most pieces one dashed edge is drawn in; a longer edge is solid.
+const MAX_DASHES: usize = 512;
 
 /// A spreadsheet's other horizontal alignments, drawn from the left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -423,7 +443,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false, dashes: [Dash::Solid; 4] }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -2605,7 +2625,7 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
             2 => Rect::new(cx - 1.0, cy - 1.0, cw + 1.0, w),
             _ => Rect::new(cx - 1.0, cy + ch - w, cw + 1.0, w),
         };
-        ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
+        dashed_edge(ctx, r, k >= 2, cv.dashes[k], w, c);
     }
     // The icon at the left; text keeps clear of it.
     let mut lead = cv.indent as f32 * INDENT_STEP;
@@ -2816,6 +2836,55 @@ fn split_fill(text: &str, at: usize) -> Option<(&str, &str, &str)> {
     let rest = text.get(at..)?;
     let n = rest.chars().next()?.len_utf8();
     Some((&text[..at], &rest[..n], &rest[n..]))
+}
+
+/// One border edge `r` (`across`: a top or bottom edge, else a side), `w`
+/// thick, drawn as `dash`.
+fn dashed_edge(ctx: &mut Ctx, r: Rect, across: bool, dash: Dash, w: f32, c: Color) {
+    let (x, y, len) = (r.x(), r.y(), if across { r.w() } else { r.h() });
+    let piece = |ctx: &mut Ctx, at: f32, n: f32| {
+        let rect = if across { Rect::new(x + at, y, n, r.h()) } else { Rect::new(x, y + at, r.w(), n) };
+        ctx.add(Node::Rect { rect, fill: c, radius: 0.0 });
+    };
+    let unit = w.max(1.0);
+    let pattern: &[(f32, bool)] = match dash {
+        Dash::Solid => &[],
+        Dash::Dashed => &[(3.0, true), (1.0, false)],
+        Dash::Dotted => &[(1.0, true), (1.0, false)],
+        Dash::DashDot => &[(3.0, true), (1.0, false), (1.0, true), (1.0, false)],
+        Dash::Double => {
+            // Two hairlines on the edge's outer and inner sides.
+            if w >= 3.0 {
+                let line = |ctx: &mut Ctx, off: f32| {
+                    let rect = if across { Rect::new(x, y + off, r.w(), 1.0) } else { Rect::new(x + off, y, 1.0, r.h()) };
+                    ctx.add(Node::Rect { rect, fill: c, radius: 0.0 });
+                };
+                line(ctx, 0.0);
+                line(ctx, w - 1.0);
+            } else {
+                piece(ctx, 0.0, len);
+            }
+            return;
+        }
+    };
+    let period: f32 = pattern.iter().map(|p| p.0).sum::<f32>() * unit;
+    if pattern.is_empty() || len / period * pattern.len() as f32 > MAX_DASHES as f32 {
+        piece(ctx, 0.0, len);
+        return;
+    }
+    let mut at = 0.0;
+    'out: loop {
+        for &(n, on) in pattern {
+            let n = n * unit;
+            if at >= len {
+                break 'out;
+            }
+            if on {
+                piece(ctx, at, n.min(len - at));
+            }
+            at += n;
+        }
+    }
 }
 
 /// The formatting a Ctrl (Ctrl+Shift) key asks for: see [`GridAction::Format`].
@@ -3796,6 +3865,37 @@ mod tests {
         assert!(spread[0] < 10.0 && *spread.last().unwrap() > 150.0 && *plain.last().unwrap() < 150.0, "{plain:?} {spread:?}");
         let one = ys(CellView { wrap: true, vspread: true, ..CellView::text("x") });
         assert!(one.len() == 1 && (one[0] - 90.0).abs() < 15.0, "{one:?}");
+    }
+
+    #[test]
+    fn dashed_dotted_and_double_borders_draw_in_pieces() {
+        struct One(CellView);
+        impl View for One {
+            #[cfg_attr(debug_assertions, track_caller)]
+            fn render(&self, ctx: &mut Ctx) {
+                ctx.widget_site();
+                draw_cell(ctx, &crate::theme::Semantic::LIGHT, &self.0, 0.0, 0.0, 41.0, 20.0);
+            }
+        }
+        // The bottom edge's pieces, as (x, y, w, h).
+        let bottom = |dash: Dash, w: f32| {
+            let mut cv = CellView::text("");
+            cv.borders[3] = Some((w, Color::rgba(0.0, 0.0, 0.0, 1.0)));
+            cv.dashes[3] = dash;
+            let mut app = App::new(One(cv));
+            app.tick();
+            app.tree().iter().filter_map(|(_, n)| match n { Node::Rect { rect, .. } => Some((rect.x(), rect.y(), rect.w(), rect.h())), _ => None }).collect::<Vec<_>>()
+        };
+        assert_eq!(bottom(Dash::Solid, 1.0).len(), 1);
+        let d = bottom(Dash::Dashed, 1.0);
+        assert_eq!(d.len(), 11, "{d:?}");
+        assert!(d.iter().all(|p| p.2 <= 3.0) && d[1].0 - d[0].0 == 4.0, "{d:?}");
+        let d = bottom(Dash::Dotted, 1.0);
+        assert!(d.len() == 21 && d.iter().all(|p| p.2 == 1.0), "{d:?}");
+        let d = bottom(Dash::DashDot, 2.0);
+        assert_eq!(d.iter().map(|p| p.2).take(4).collect::<Vec<_>>(), [6.0, 2.0, 6.0, 2.0], "{d:?}");
+        let d = bottom(Dash::Double, 3.0);
+        assert!(d.len() == 2 && d.iter().all(|p| p.3 == 1.0 && p.2 == 42.0) && d[1].1 - d[0].1 == 2.0, "{d:?}");
     }
 
     #[test]

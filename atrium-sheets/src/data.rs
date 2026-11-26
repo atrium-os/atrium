@@ -277,6 +277,8 @@ pub enum DataCmd {
     MoveOrCopy,
     StandardWidth,
     StandardHeight,
+    /// The Borders bar; [`crate::format::borders_typed`].
+    BordersBar,
     /// The workbook's dates counted from 1904 (as old Mac Excel), or 1900.
     DateSystem1904,
     /// Zero values shown or left blank on this sheet (a view setting).
@@ -3158,7 +3160,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);

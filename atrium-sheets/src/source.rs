@@ -97,6 +97,18 @@ pub fn view_of(v: &Value) -> Option<CellView> {
     view_of_centred(v).map(|cv| CellView { valign: CellVAlign::Bottom, ..cv })
 }
 
+/// How a border's line is drawn: Excel's dash styles, hair as dots.
+fn dash(l: Line) -> pergola::widgets::Dash {
+    use pergola::widgets::Dash;
+    match l {
+        Line::Dashed | Line::MediumDashed => Dash::Dashed,
+        Line::Dotted | Line::Hair => Dash::Dotted,
+        Line::DashDot | Line::DashDotDot | Line::MediumDashDot | Line::MediumDashDotDot | Line::SlantDashDot => Dash::DashDot,
+        Line::Double => Dash::Double,
+        Line::None | Line::Thin | Line::Medium | Line::Thick => Dash::Solid,
+    }
+}
+
 fn view_of_centred(v: &Value) -> Option<CellView> {
     Some(match v {
         Value::Empty => return None,
@@ -193,6 +205,7 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
     for (k, e) in st.borders.iter().enumerate() {
         if e.line != Line::None {
             cv.borders[k] = Some((e.line.width(), rgb(e.color.unwrap_or(0))));
+            cv.dashes[k] = dash(e.line);
         }
     }
     cv.align = match st.h_align {

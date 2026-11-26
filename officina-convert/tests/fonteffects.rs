@@ -89,3 +89,39 @@ fn accounting_underlines_round_trip_in_xlsx() {
         assert!(f.underline && f.accounting && f.double == double, "row {r}: {f:?}");
     }
 }
+
+/// Each border line style on a cell's bottom, with a coloured diagonal
+/// each way, as the Borders bar draws them.
+fn borders_book() -> Workbook {
+    use officina_grid::style::{Edge, Line};
+    let mut wb = Workbook::new();
+    wb.add_sheet("S").unwrap();
+    let lines = [Line::Thin, Line::Medium, Line::Thick, Line::Double, Line::Dashed, Line::Dotted, Line::Hair, Line::MediumDashed, Line::DashDot, Line::MediumDashDot, Line::DashDotDot, Line::MediumDashDotDot, Line::SlantDashDot];
+    for (i, line) in lines.into_iter().enumerate() {
+        let mut st = Style::default();
+        st.borders[3] = Edge { line, color: Some(0x1F4E79) };
+        st.diagonals[i % 2] = Edge { line: Line::Thin, color: Some(0xC62828) };
+        let r = i as u32;
+        wb.set_value(CellAddr::new(0, r, 0), Value::Num(r as f64));
+        wb.set_style(&Rect { sheet: 0, r0: r, c0: 0, r1: r, c1: 0 }, st);
+    }
+    wb
+}
+
+#[test]
+fn border_line_styles_and_diagonals_round_trip() {
+    let wb = borders_book();
+    let xlsx_back = xlsx::read(&xlsx::write(&wb, Vec::new()).unwrap()).unwrap().0;
+    let ods_back = ods::read(&ods::write(&wb, Vec::new()).unwrap()).unwrap().0;
+    for r in 0..13u32 {
+        let want = wb.style(CellAddr::new(0, r, 0));
+        let got = xlsx_back.style(CellAddr::new(0, r, 0));
+        assert_eq!((got.borders[3], got.diagonals), (want.borders[3], want.diagonals), "xlsx row {r}");
+        // .ods keeps solid, double, dashed and dotted lines (no dash-dot),
+        // and widths as lengths.
+        let got = ods_back.style(CellAddr::new(0, r, 0));
+        assert_ne!(got.borders[3].line, officina_grid::style::Line::None, "ods row {r}");
+        assert_eq!(got.borders[3].color, Some(0x1F4E79), "ods row {r}");
+        assert_eq!(got.diagonals.map(|e| e.line != officina_grid::style::Line::None), want.diagonals.map(|e| e.line != officina_grid::style::Line::None), "ods row {r}");
+    }
+}
