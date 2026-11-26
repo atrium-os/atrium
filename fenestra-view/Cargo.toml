@@ -18,8 +18,9 @@ png = "0.17"
 log = "0.4"
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
+ab_glyph = { version = "0.2", optional = true }
 
 [features]
 default = ["window"]
 # The windowed viewer; headless mode needs neither.
-window = ["dep:winit", "dep:softbuffer"]
+window = ["dep:winit", "dep:softbuffer", "dep:ab_glyph"]

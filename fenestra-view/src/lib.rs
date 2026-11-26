@@ -25,6 +25,8 @@ use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 /// Where the viewer's input comes from (a window's events, or a script).
 #[cfg(feature = "window")]
 pub mod window;
+#[cfg(feature = "window")]
+mod strip;
 
 pub type Inputs = Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<scene::Input>>>;
 

@@ -1549,7 +1549,7 @@ VM runs only with the coordinator's go.
 | R1 | **Done 2026-11-26** (§5.6): portable crate, stream writer and reader, fuzzer, recorder; gate 8/8. Wiring the writer into fresco-renderer moves to R2. The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
 | R2 | **In progress** (§19b: QUIC, the session, fenestrad, frescod's stream link, the viewer (windowed and headless), input and reconnect are built; loopback 18/18, cloud VM desktop 12/12, bad networks 15/15). `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
-| R4 | Rootless mode, the rest: local move and resize (§6.4), dialogs kept with their parent (pop-ups and slots moved into R2), the host strip with the host's name, dock badge. (Each window as its own local window, chosen by the host's mode, moved into R2: decision 17.) | `fenestra-rootless-vm.sh` |
+| R4 | Rootless mode, the rest: local move and resize (§6.4), dialogs kept with their parent (pop-ups, slots and the host's name in the strip moved into R2), the person's own colour for a host, dock badge. (Each window as its own local window, chosen by the host's mode, moved into R2: decision 17.) | `fenestra-rootless-vm.sh` |
 | R5 | Viewer-scrollable SCROLL groups in frescod (local and remote), Pergola ScrollView and Navigator documents set the flag. | `scroll_bench` locally; scroll latency at 150 ms RTT in the R2 rig |
 | R6 | Fallbacks: pixel-mode regions (lossless and video switching), video layers (re-encode, then compressed passthrough), external surfaces; `fenestra-enc` jail; audio. | encoded-region quality (final lossless refresh asserted), AV sync, bitrate follows `netem` rate changes |
 | R7 | Typing prediction for Pergola plain-text fields. | typing corpus: share of keystrokes shown before the host frame, misprediction rate |
@@ -1678,8 +1678,12 @@ from the kernel) and gone after its grace: the
 window management is connected (`wm_running`: set on the grant, cleared when the last such
 client goes), and every `Layout` carries it (link `Rec::Layout` flag, control tag 3's mode
 byte). `fenestra-view` follows it: with a WM, the one desktop window as before; without, one
-local window per placed host window, the window's size plus a 6 pt host strip in a colour from
-the host's name (its name in the strip, and a colour the person picks, are still to come), and
+local window per placed host window, the window's size plus an 18 pt host strip (§11.5): the
+host's name as the person gave it to the viewer (the SSH destination, or the session
+directory), never a name the host sends, in light IBM Plex Sans on a colour from that name (a
+colour the person picks is still to come; `fenestra-view/src/strip.rs`). A pop-up has no strip
+but an edge in that colour, sits within 16 px of its parent and is at most twice its size per
+side, and
 no desktop composed (headless: `mode apps`, `window-ID.png` each, no `desktop.png`). The
 pointer in such a window is `Input::MotionIn { window, x, y }` (control tag 10, link input 5);
 fenestra-session keeps it inside a window the layout has and drops it for one it does not;

@@ -30,8 +30,7 @@ use winit::window::{Window, WindowId};
 
 use crate::{desktop, Views};
 
-/// The host strip over each per-app window, points.
-const HOST_STRIP_PT: f64 = 6.0;
+use crate::strip::STRIP_PT as HOST_STRIP_PT;
 
 struct Win {
     w: Rc<Window>,
@@ -86,6 +85,8 @@ struct App {
     /// The mode the windows are in now.
     mode: Option<bool>,
     strip_colour: u32,
+    /// The host's name as the person gave it, for the strip.
+    host_name: String,
 }
 
 impl App {
@@ -237,6 +238,7 @@ impl App {
     fn draw(&mut self, id: WindowId) {
         let views = self.views.clone();
         let strip_colour = self.strip_colour;
+        let host_name = self.host_name.clone();
         let Some(win) = self.wins.get_mut(&id) else { return };
         let size = win.w.inner_size();
         let (Some(ww), Some(wh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
@@ -270,9 +272,7 @@ impl App {
             }
             Some(host) => {
                 // The host strip, then the window 1:1 under it.
-                for p in buf.iter_mut().take((strip.min(size.height) * size.width) as usize) {
-                    *p = strip_colour;
-                }
+                crate::strip::draw(&mut buf, size.width, strip.min(size.height), strip_colour, &host_name, win.w.scale_factor());
                 // The window, then its slots over it where the host has
                 // them, each source over.
                 let placed: Vec<fenestra_wire::scene::Placed> = views.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|l| l.1.clone()).unwrap_or_default();
@@ -463,8 +463,9 @@ pub fn run(views: Arc<Views>, input: tokio::sync::mpsc::Sender<Input>, title: St
             })
             .map_err(|e| e.to_string())?;
     }
-    let strip_colour = host_colour(&title);
-    let mut app = App { views, input, wins: HashMap::new(), screen: (0, 0), modifiers: 0, title, dismissed: Vec::new(), mode: None, strip_colour };
+    let host_name = title.strip_prefix("Fenestra: ").unwrap_or(&title).to_string();
+    let strip_colour = host_colour(&host_name);
+    let mut app = App { views, input, wins: HashMap::new(), screen: (0, 0), modifiers: 0, title, dismissed: Vec::new(), mode: None, strip_colour, host_name };
     el.run_app(&mut app).map_err(|e| e.to_string())
 }
 

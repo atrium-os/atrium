@@ -743,6 +743,7 @@ version = "0.1.0"
 name = "fenestra-view"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "bytes",
  "fenestra-wire",
  "fresco-compute",
