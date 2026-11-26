@@ -228,8 +228,10 @@ on those outputs into scanout, each renderer jail emits its window's scene as a 
   validated structures, never by copying the client's bytes, so only canonical records leave
   the jail.
 - **fenestrad** is a new jailed daemon, its own uid (`_fenestra`), no filesystem but its socket
-  directory, a `listen` grant on one UDP port (background-apps.md: local network by default,
-  wider only by the person's choice). It terminates QUIC, authenticates the session (§11.2),
+  directory, a `listen` grant on a small UDP port range (background-apps.md: local network by
+  default, wider only by the person's choice). There is **no standing listener**: a port is
+  opened only by a successful SSH mint, for that one session (Stoa's per-session port model,
+  stoa.md §2), and closed when the session ends (§11.9). It terminates QUIC, authenticates the session (§11.2),
   schedules what to send (§8), runs the fallback encoders in a child jail (§7.4), and carries
   input and acks back to frescod as fixed-size records. It parses nothing but its own transport
   framing and the viewer's fixed-size input and ack records.
@@ -745,6 +747,36 @@ Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet
 
 ## 11. Security
 
+This section is the whole security design of Fenestra in one place. Other sections point here.
+Shankar asked for it to be reviewed on its own (2026-11-26); the review log is §21.
+
+### 11.0 What is protected, and the rules that protect it
+
+Assets, in order of harm if lost:
+
+1. **The host session's authority**: the person's apps, files, secrets in Arca, and the power
+   to grant permissions. A remote viewer may *use* the session; it must not be able to *widen*
+   it (new grants, unlock, pairing) without a local press or a security-key touch.
+2. **The viewer machine**: its kernel, its GPU driver, its own sessions and secrets. A host the
+   person connects to is untrusted; it must not reach anything on the viewer beyond pixels in
+   the remote area and data the person deliberately pastes or drops.
+3. **What is on screen**: documents, messages, passwords being typed. Only the authenticated
+   viewer of that session may see them; the host's own desk must not see them either unless the
+   person chose that (decision 3).
+4. **Availability**: a hostile viewer or network must not degrade the host's local session or
+   other viewers; a hostile host must not hang the viewer's desktop.
+
+Rules (each one is checked in §11.18):
+
+- Every byte from the other machine is parsed in a jail with nothing to lose (H8.1's "parse
+  where the capability set is empty"), and the processes with capabilities read only
+  fixed-size records.
+- No new long-lived secrets: authentication rides SSH; per-session keys live in memory only.
+- No standing network listener on the host.
+- The other side's claims never grant anything: roles, sizes, offsets, hashes, versions are
+  checked by the receiver against what it itself decided.
+- A remote person is the person for *use*, never for *authority*.
+
 ### 11.1 Threat model
 
 | Party | Can do | Contained by |
@@ -803,7 +835,7 @@ Targets are to be met in the R2 and R6 `netem` profiles (§19), not measured yet
 |---|---|---|---|---|---|
 | frescod broker | host | `_frescod` | none (unchanged) | none | fixed records from `fenestrad` |
 | fresco-renderer | both | `_fresco-render` | none | none | client wire (host); scene stream (viewer) |
-| `fenestrad` | host | `_fenestra` | `listen`, one UDP port, local network unless widened | its socket dir | QUIC framing; fixed input and ack records |
+| `fenestrad` | host | `_fenestra` | `listen` on a port range, one port per minted session, local network unless widened | its socket dir | QUIC framing; fixed input and ack records |
 | `fenestra-enc` | host | `_fenestra-enc` | none | none | its memfd ring (pixels, no structure) |
 | `fenestra-net` | viewer | per viewing persona | outbound UDP to one host address | none | QUIC framing; stream demux |
 | decoder workers | viewer | player's decoder uid | none | none | compressed video (hostile) |
@@ -861,6 +893,166 @@ H7 applies across the network:
   is no wider than the local one.
 - A viewer's cache is a second copy of the person's on-screen data; it is encrypted in their
   key group and can be turned off (decision 10).
+- The viewer's GPU runs the compositor's own raster of remote scenes (fresco-compute kernels,
+  Atrium-shipped and attested, aqueduct-gpu.md §11.5), never host-supplied shaders. Remoted
+  Vulkan (§7.2a) would change that and is therefore an opt-in with its own review.
+
+### 11.8 Attack surface, parser by parser
+
+Every place one machine parses bytes the other wrote, where it runs, and how it is tested.
+
+| Parser | Runs on | In | Input from | Bounded by | Test |
+|---|---|---|---|---|---|
+| QUIC + TLS handshake (quinn, rustls) | host | `fenestrad` | anyone who can reach an open per-session port | rustls/quinn limits; port open only after a mint; handshake rate limit per source (§11.10) | upstream fuzzing; R3 handshake flood |
+| QUIC + TLS handshake | viewer | `fenestra-net` | the host address the mint named | same | same |
+| `SESSION_HANDSHAKE` proof | host | `fenestrad` | authenticated peer | fixed size | unit tests, wrong-proof gate |
+| Input, ack and stats records | host | `fenestrad`, then frescod | the viewer | fixed size, every field ranged, rate caps (§9) | `fenestra-split-fuzz` style fuzzer on fenestrad's records |
+| Scene stream records | viewer | fresco-renderer (full validator, H1 to H6, F4h budgets) | the host | per-client budgets, cost limits | stream fuzzer (R1), R3 hostile-host gate |
+| Blobs (images, atlases, fills) | viewer | fresco-renderer | the host | size caps per class, hash checked (H2) | same |
+| Image decoding (if the host sends encoded images) | viewer | the existing jailed image decoder (`org.atrium.image-decode`) | the host | its own caps | its own fuzzers |
+| Compressed video | viewer | decoder worker jail (atrium-player.md) | the host | 150 MB feed cap, decoder limits | player's decoder fuzzing |
+| Encoded regions (video codec, zstd tiles) | viewer | decoder worker jail; zstd in the renderer with an output cap | the host | frame size fixed by the region | same |
+| Clipboard data | both | the receiving side's Tabula, as for any app | the other machine | Tabula's caps, formats it already parses | Tabula tests |
+| Window placements, roles, titles | viewer | viewer's frescod via the renderer's fixed records (`fresco-split`) | the host | roles mapped (§11.5), titles 64 bytes | split fuzzer |
+| Remote output descriptions | host | frescod via `fenestrad` records | the viewer | sizes and scales ranged as for EDID-derived outputs | fuzzer |
+
+What is never parsed: the host never parses viewer-supplied scenes, pixels or files; the viewer
+never interprets a path, a command line or a URL from the host (a link click in a remote app
+opens on the host, never on the viewer).
+
+### 11.9 Network exposure on the host
+
+- `fenestrad` has no open port while no session exists. A successful SSH mint opens one UDP
+  port from its range for that session, bound to the address family the mint came in on, and
+  `fenestrad` accepts on it only a QUIC handshake presenting the viewer key pinned in that mint.
+  The port closes when the session ends, is revoked, or its token expires with no connection.
+- A minted port with no successful handshake within 30 s is closed and the mint is void.
+- QUIC address validation (Retry tokens) is on, so a spoofed source cannot make `fenestrad`
+  send large responses (no amplification); stateless reset tokens are per session.
+- The grant is local network by default. Widening it to "any network" is a Curia setting with
+  a warning, and `fenestra host status` says which it is.
+- The pre-authentication surface is therefore: the SSH server (already exposed, already the
+  platform's remote entry point) and, only for a just-minted session, quinn and rustls up to the
+  key check.
+
+### 11.10 Denial of service and resource limits
+
+Host:
+- Sessions, viewers and backlog bounds as in §11.2. Handshake attempts: 10 a minute per source
+  address per port, then the port closes.
+- Diffing for a viewer runs in that client's renderer jail and counts against the renderer's
+  CPU limit, so a viewer that forces full resyncs slows only the app's own remote view, never
+  the local seat's compose or other apps.
+- Encoder jails: at most 4 encoded regions per session, each its own jail with memory and CPU
+  limits; past that, further regions are sent as lossless tiles at a lower rate.
+- Blob sends are capped per session per second by congestion control; the viewer cannot ask
+  for blobs (there is no fetch-by-hash from the viewer), so it cannot make the host read
+  arbitrary content.
+
+Viewer:
+- Each remote client's renderer has the local budgets (F4h: nodes, params, textures, atlas
+  pages) and cost limits (H6, F4j), and it rasters under the same no-wait compose rule, so a
+  hostile host's huge scene is refused and reported, and the viewer's own windows keep their
+  frame rate (the noisy-neighbour gate covers it).
+- The viewer's cache has its size cap; a host cannot fill the viewer's disk.
+- Decoder jails have their own limits; a decoder that hangs is killed and that region shows its
+  last frame.
+
+### 11.11 Behaviour that runs on the viewer
+
+Viewer-scrollable groups (§6.3), predicted window drags (§8.6), local camera control for
+retained 3D (§7.2a) and, later, typing prediction (§6.5) put a little of the app's behaviour on
+the viewer. Invariants for all of them:
+
+- They change only **what the viewer draws**, inside the remote area. They never create input
+  to the host beyond the person's own actions (a viewer scroll is forwarded as the scroll the
+  person made; a predicted glyph is never sent as a key, the key itself is).
+- They are bounded by values the viewer checks: a scroll offset stays inside the declared range
+  and the group's clip; a predicted drag stays inside the session area; a predicted glyph uses
+  an atlas the viewer already holds and is drawn only inside the hinted field's group.
+- They can never apply to trusted chrome, the host strip or any viewer-local window.
+- A host that lies in a hint can at most make the viewer draw a wrong tentative picture inside
+  the remote area for one round trip, which it could do anyway by drawing it.
+
+### 11.12 Outages, reconnects and migration
+
+- Input during an outage is discarded (decision 14), so a reconnect never delivers old input.
+- Connection migration uses QUIC path validation, so an attacker who spoofs the viewer's source
+  address cannot redirect the host's stream to itself; it would also lack the keys to read it.
+- A reconnect re-runs the handshake with the pinned keys and a fresh `K_sess` proof; a stolen
+  session id alone is useless. After a `fenestrad` restart all session keys are gone and only an
+  SSH re-mint works.
+- The viewer refuses a reconnect answered by a different host key than the one pinned (a host
+  that was reinstalled or replaced must be re-trusted through SSH's own host-key check).
+
+### 11.13 Personas and multi-user hosts
+
+- A session belongs to one host user and one persona; its windows, its clipboard (Tabula's
+  persona scope) and its audio are that persona's only. Another persona's windows on the same
+  seat are never emitted to that viewer.
+- On the viewer, each viewing persona has its own `fenestra-net` instance, cache and paired
+  hosts; a remote session cannot see or paste into another viewer persona's data.
+- Two host users may each be viewed at once; their sessions share no renderer, port, cache or
+  key.
+
+### 11.14 Privacy
+
+- The host's indicator (§11.4) and local blanking (decision 3) mean nobody is watched without
+  knowing it, and nobody at the host's desk watches the remote person's work by default.
+- Fenestra sends no telemetry. Statistics stay on the two machines.
+- mDNS discovery (R9) is off by default; when on, it announces only that a Fenestra host
+  exists, with a random per-boot instance name, never the user's name or persona; paired viewers
+  recognise the host by its key, not its announced name.
+- Logs (§11.15) record who connected and when, never what was shown or typed.
+
+### 11.15 Audit
+
+`fenestrad` logs to the system log (no content): mints and their caps, handshakes accepted and
+refused (with reason), sessions ended and why, viewers dropped for exceeding bounds, revocations,
+and authority sheets refused for lack of a local press. The same events go to vigil's validator
+channel (atrium-scenegraph-hardening.md §4) so repeated refusals from one viewer show up as one
+correlated alert. `fenestra sessions --history` shows the last 100 on the host.
+
+### 11.16 Updates and version skew
+
+- Wire version and feature set are negotiated only inside the authenticated connection, so a
+  network attacker cannot force a downgrade.
+- A feature the viewer lacks makes the host send that window as pixels (§4.3): a quality
+  downgrade, never a security one, since the pixel path is parsed in the same kind of jail.
+- The viewer runs the renderer bundle its own Opifex installed and signed; the host cannot ship
+  code to the viewer.
+
+### 11.17 Security tests that must pass before each step lands
+
+- R1: the stream fuzzer (random, truncated and mutated records, hash mismatches, budget
+  overruns) against the viewer-side renderer, with ASan where the renderer links C.
+- R2 and R3: a hostile host (fuzzed streams, wrong roles, oversized titles, huge scenes), a
+  hostile viewer (fuzzed input and ack records, floods, view-only sending input, scoped input
+  aimed outside scope, authority sheets pressed remotely), handshake floods and wrong keys, a
+  port that closes on time, jails and uids checked from the kernel (`jls`, `procstat`), the host
+  indicator and the host strip present (screen capture), clipboard released only after a paste
+  gesture.
+- R6: decoder and encoder jails killed on a hang, with the region recovering.
+- Every gate sources `scripts/lib/gate.sh` and fails if fewer checks ran than declared.
+
+### 11.18 Invariants, for reviewers
+
+1. frescod has no network and never reads network bytes.
+2. Every parser of the other machine's bytes runs in a jail with no network it does not need,
+   no files and no secrets (§11.8).
+3. The host has no listening port without a live mint.
+4. The QUIC peer key is pinned through SSH; no certificate, no trust on first use, no 0-RTT.
+5. `K_sess` is never stored or sent; only `H(K_sess)` and in-memory session keys exist.
+6. Remote presses never satisfy authority purposes; scoped input never leaves its scope.
+7. Viewer clipboard bytes leave only right after a forwarded paste gesture.
+8. Remote content can never take a viewer trusted role and always carries the host strip.
+9. The host always shows that it is being viewed, drawn by frescod.
+10. Personal data at rest on the viewer lives only in the viewing persona's key group.
+11. Every count, size and rate from the other side is bounded before it is buffered.
+12. Viewer-local behaviour (§11.11) changes only drawing inside the remote area.
+13. Input made during an outage is never delivered.
+14. The viewer's GPU runs only Atrium-shipped kernels for remote content unless the person
+    opted into remoted Vulkan for that host and app.
 
 ## 12. Persistence, roaming and reconnect
 
