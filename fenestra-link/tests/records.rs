@@ -26,8 +26,12 @@ fn samples() -> Vec<Rec> {
         Rec::Input(Input::Focus { window: 3 }),
         Rec::Input(Input::Resize { window: 3, width: 900, height: 600 }),
         Rec::Disconnect,
-        Rec::Viewer { label: "shankar@mac".into() },
-        Rec::Viewer { label: "x".repeat(64) },
+        Rec::Viewer { viewers: 1, addr: "192.0.2.4".into(), key: "shankar@mac".into() },
+        Rec::Viewer { viewers: 255, addr: "2001:db8::1".into(), key: "x".repeat(64) },
+        Rec::Viewer { viewers: 2, addr: "10.0.2.2".into(), key: String::new() },
+        Rec::Peer { addr: "10.0.2.2".into() },
+        Rec::Viewer { viewers: 0, addr: String::new(), key: String::new() },
+        Rec::Peer { addr: "2001:db8::1".into() },
     ]
 }
 
@@ -103,16 +107,27 @@ fn hostile_records_are_refused() {
         Rec::Output { width: 63, height: 900, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 9000, scale_milli: 1000 }.encode(),
         Rec::Output { width: 1600, height: 900, scale_milli: 4001 }.encode(),
-        Rec::Viewer { label: String::new() }.encode(),
-        Rec::Viewer { label: "a\u{202e}b".into() }.encode(),
-        Rec::Viewer { label: "a\nb".into() }.encode(),
+        Rec::Viewer { viewers: 0, addr: "10.0.2.2".into(), key: String::new() }.encode(),
+        Rec::Viewer { viewers: 0, addr: String::new(), key: "k".into() }.encode(),
+        Rec::Viewer { viewers: 1, addr: String::new(), key: "k".into() }.encode(),
+        Rec::Viewer { viewers: 1, addr: "not-an-address".into(), key: String::new() }.encode(),
+        Rec::Viewer { viewers: 1, addr: "10.0.2.2".into(), key: "a\u{202e}b".into() }.encode(),
+        Rec::Viewer { viewers: 1, addr: "10.0.2.2".into(), key: "a\nb".into() }.encode(),
         {
-            // A label past its bound is refused before it is read.
-            let mut b = Rec::Viewer { label: "x".repeat(64) }.encode();
-            b[32..36].copy_from_slice(&65u32.to_le_bytes());
-            b.push(b'x');
+            // An address split past the payload.
+            let mut b = Rec::Viewer { viewers: 1, addr: "10.0.2.2".into(), key: String::new() }.encode();
+            b[24..32].copy_from_slice(&9u64.to_le_bytes());
             b
         },
+        {
+            // A key name past its bound is refused before it is read.
+            let mut b = Rec::Viewer { viewers: 1, addr: "2001:db8::1".into(), key: "x".repeat(64) }.encode();
+            b[32..36].copy_from_slice(&((45 + 64 + 1) as u32).to_le_bytes());
+            b.extend(std::iter::repeat_n(b'x', 110 - (b.len() - 36)));
+            b
+        },
+        Rec::Peer { addr: "10.0.2.2:5000".into() }.encode(),
+        Rec::Peer { addr: "fe80::1%vtnet0".into() }.encode(),
         {
             // A Disconnect that carries anything.
             let mut b = Rec::Disconnect.encode();

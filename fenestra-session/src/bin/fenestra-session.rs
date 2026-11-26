@@ -156,6 +156,9 @@ async fn run(link: std::os::unix::net::UnixStream, mut how: MintBy, bind: String
             a = conns.recv() => match a {
                 Some(Ok(hc)) => {
                     n += 1;
+                    if src.peer(hc.conn.remote_address().ip()).await.is_err() {
+                        break;
+                    }
                     let (src, wake, conn, live_tx) = (src.clone(), wake.clone(), n, live_tx.clone());
                     live_tx.send_modify(|v| *v += 1);
                     tokio::spawn(async move {

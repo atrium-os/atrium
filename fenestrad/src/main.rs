@@ -109,9 +109,12 @@ struct Session {
     on: bool,
     /// How many of its wants are outstanding.
     wants: usize,
-    /// Who minted it, as the host's records name them (fenestra-shell's
-    /// `label=`), for frescod's viewed screen.
+    /// The comment on the SSH key that minted it (fenestra-shell's
+    /// `label=`): the key holder's word, shown as such.
     label: Option<String>,
+    /// Where its latest viewer connected from (its `Peer`), and when, in
+    /// [`Table::peers`]' count: the seat names the latest.
+    peer: Option<(String, u64)>,
 }
 
 #[derive(Default)]
@@ -126,6 +129,10 @@ struct Table {
     /// them from here.
     layout: Option<Rec>,
     chrome: Option<Rec>,
+    /// `Peer` records taken, to order them.
+    peers: u64,
+    /// The `Viewer` frescod was last sent.
+    viewer: Option<Rec>,
 }
 
 struct Relay {
@@ -149,6 +156,24 @@ impl Relay {
             if let Err(e) = self.to_frescod(&Rec::Session { on }) {
                 die(format!("frescod: {e}"));
             }
+        }
+    }
+
+    /// Tell frescod who is viewing, when that changed: how many sessions
+    /// that are on have a viewer, and the latest's address and key name.
+    fn sync_viewer(&self, t: &mut Table) {
+        let with: Vec<&Session> = t.sessions.values().filter(|s| s.on && s.peer.is_some()).collect();
+        let latest = with.iter().max_by_key(|s| s.peer.as_ref().map(|p| p.1));
+        let rec = Rec::Viewer {
+            viewers: u8::try_from(with.len()).unwrap_or(u8::MAX),
+            addr: latest.and_then(|s| s.peer.as_ref()).map(|p| p.0.clone()).unwrap_or_default(),
+            key: latest.and_then(|s| s.label.clone()).unwrap_or_default(),
+        };
+        if t.viewer.as_ref() != Some(&rec) {
+            if let Err(e) = self.to_frescod(&rec) {
+                die(format!("frescod: {e}"));
+            }
+            t.viewer = Some(rec);
         }
     }
 
@@ -218,7 +243,7 @@ impl Relay {
                     }
                     t.tickets.clear();
                 }
-                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } | Rec::Viewer { .. } => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } | Rec::Viewer { .. } | Rec::Peer { .. } => unreachable!("from_broker() refused it"),
             }
             // A session ended for not reading may have been the one on.
             self.sync_on(&mut t);
@@ -240,17 +265,9 @@ impl Relay {
             match rec {
                 Rec::Session { on } => {
                     let joins = on && !s.on && was_on;
-                    // Who is viewing, before frescod hears the session is on.
-                    if on && !s.on {
-                        if let Some(label) = s.label.clone() {
-                            if let Err(e) = self.to_frescod(&Rec::Viewer { label }) {
-                                die(format!("frescod: {e}"));
-                            }
-                        }
-                    }
-                    let Some(s) = t.sessions.get_mut(&id) else { return "ended".into() };
                     s.on = on;
                     self.sync_on(&mut t);
+                    self.sync_viewer(&mut t);
                     if joins {
                         for rec in [t.layout.clone(), t.chrome.clone()].into_iter().flatten() {
                             Relay::to_session(&mut t, id, rec);
@@ -288,6 +305,15 @@ impl Relay {
                         die(format!("frescod: {e}"));
                     }
                 }
+                Rec::Peer { addr } => {
+                    s.peer = Some((addr, 0));
+                    t.peers += 1;
+                    let n = t.peers;
+                    if let Some((_, at)) = t.sessions.get_mut(&id).and_then(|s| s.peer.as_mut()) {
+                        *at = n;
+                    }
+                    self.sync_viewer(&mut t);
+                }
                 // fenestrad's own word to frescod, never a session's.
                 Rec::Viewer { .. } => return "sent a Viewer record (fenestrad's own)".into(),
                 _ => unreachable!("from_broker() refused it"),
@@ -302,6 +328,7 @@ impl Relay {
         }
         t.tickets.retain(|_, (s, _)| *s != id);
         self.sync_on(&mut t);
+        self.sync_viewer(&mut t);
     }
 }
 
@@ -413,7 +440,7 @@ fn start_session(relay: &Arc<Relay>, cfg: &Config, id: u32, by: MintBy) -> Resul
         ),
     };
     let (tx, rx) = mpsc::sync_channel::<Rec>(SESSION_QUEUE);
-    relay.table.lock().unwrap_or_else(|e| e.into_inner()).sessions.insert(id, Session { tx, child, on: false, wants: 0, label: None });
+    relay.table.lock().unwrap_or_else(|e| e.into_inner()).sessions.insert(id, Session { tx, child, on: false, wants: 0, label: None, peer: None });
     let mut w = ours.try_clone().map_err(|e| e.to_string())?;
     std::thread::spawn(move || {
         for rec in rx.iter() {

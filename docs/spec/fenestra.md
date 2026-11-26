@@ -1092,9 +1092,12 @@ portcullisd for Fenestra: the jails use existing manifest grants (AGENTS.md revi
 ### 11.4 The host always shows that it is being viewed
 
 When a viewer is attached to a session, the host's frescod draws a trusted indicator in the
-chrome lane (F4d) on every local monitor of that session: who (the SSH key's comment or the paired device name, both from the host's own records, never
-from the viewer at connect time, cut to 32 characters, printable characters only, shown as
-plain text), view-only or full control, and a one-press Disconnect. The bar shows it too, but the
+chrome lane (F4d) on every local monitor of that session: who (first the address the viewer's
+connection came from, as the host saw it, and how many viewers are connected; then the SSH key's
+comment or the paired device name from the host's own records, never from the viewer at connect
+time, printable characters only, shown as plain text and worded as the key holder's claim, since a
+key holder with a shell can mint with any name unless the key is restricted to the forced
+command), view-only or full control, and a one-press Disconnect. The bar shows it too, but the
 indicator is frescod's, so an app cannot cover or fake its absence (H7). A host with the screen
 locked (decision 3) shows the indicator on the lock screen.
 
@@ -1819,14 +1822,22 @@ with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture save
 1600x900@1.5 and a stub lock socket. On the display path each monitor scans out the viewed screen
 (the button and pointer on the first) and a spanning window's direct scanout stops; that path
 still keeps the desktop at the monitors' size while viewed, and has not run on a real display yet.
-"By whom" is the viewer as the host knows them, never words the viewer chose: `fenestra-shell`
-takes the comment on the `authorized_keys` line of the key sshd accepted (sshd's `ExposeAuthInfo
-yes` gives that key in `$SSH_USER_AUTH`), else the address the connection came from, cleaned to
-printable ASCII of at most 64 bytes, and sends it with the mint (`MINT KEY [take-over]
-[label=HEX]`). fenestrad keeps it on the session and, when the session first turns on, sends it to
-frescod in a `Viewer` record (kind 5, fenestrad to frescod only; fenestra-link refuses an empty,
-oversized or non-printable label, and a session sending one is dropped). frescod draws it in its
-chrome's glyphs (lowercased; `@` and `+` added to them) and forgets it when the session ends.
+"By whom" says first what the host itself saw: the address the viewer's connection came from
+(the session's QUIC or TCP peer, sent to fenestrad as a `Peer` record, kind 6, session to fenestrad
+only, an IP address in its canonical spelling), and how many viewers are connected when there are
+more than one ("by 2 viewers, the latest from ..."), so a second viewer is never hidden behind
+the first's name. Then, as the viewer's own word, "their key says:" the comment on the
+`authorized_keys` line of the key sshd accepted (`fenestra-shell` reads it through sshd's
+`ExposeAuthInfo yes` and `$SSH_USER_AUTH`, and mints with `MINT KEY [take-over] [label=HEX]`).
+That comment is not the host's authority: whoever holds the key and has a shell of their own can
+mint with any name, which is why it is worded as a claim and shown under the address. A host that
+wants the name to mean something restricts the key to the forced command (`command="fenestra-shell
+..."` in `authorized_keys`), which fenestrad cannot check (§11.4). fenestrad sends frescod a
+`Viewer` record (kind 5: the count, the latest viewer's address and its key's comment; count 0
+carries neither) whenever that changes, as sessions get viewers and end; fenestra-link refuses a
+non-canonical address and an empty, oversized or non-printable name, and a session that sends a
+`Viewer` is dropped. frescod draws it in its chrome's glyphs (lowercased; `@` and `+` added to
+them) and forgets it when the session ends.
 
 **UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
 connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram

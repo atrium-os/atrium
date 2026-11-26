@@ -26,10 +26,12 @@ const MAX_LABEL: usize = 64;
 /// The most of `authorized_keys` and of sshd's auth-info file read.
 const MAX_KEYS_FILE: u64 = 1 << 20;
 
-/// Who the host's screen says is viewing: the comment on the
-/// `authorized_keys` line of the key sshd took (`ExposeAuthInfo yes`
-/// gives it in `$SSH_USER_AUTH`), else the address the connection came
-/// from. Words the host's owner wrote, or the kernel's: never the viewer's.
+/// The name the host's screen shows beside the viewer's address: the
+/// comment on the `authorized_keys` line of the key sshd took
+/// (`ExposeAuthInfo yes` gives it in `$SSH_USER_AUTH`), else none. A key
+/// holder with a shell of their own can mint with any name, so the seat
+/// shows it as their word ("their key says"), next to the address
+/// fenestrad's session saw.
 fn viewer_label() -> Option<String> {
     let comment = || -> Option<String> {
         let read = |p: &std::path::Path| -> Option<String> {
@@ -41,8 +43,7 @@ fn viewer_label() -> Option<String> {
         let keys = read(&std::path::Path::new(&std::env::var_os("HOME")?).join(".ssh/authorized_keys"))?;
         key_comment(&auth, &keys)
     };
-    let addr = || std::env::var("SSH_CONNECTION").ok()?.split(' ').next().map(str::to_string);
-    comment().or_else(addr).and_then(|l| clean_label(&l))
+    comment().and_then(|l| clean_label(&l))
 }
 
 /// The comment of the `authorized_keys` line holding the key sshd says it
@@ -112,7 +113,7 @@ mod tests {
         let auth = "publickey ssh-ed25519 AAAAB\n";
         let keys = "# old\nssh-ed25519 AAAAZ other@box\nfrom=\"10.0.0.0/8\" ssh-ed25519 AAAAB shankar@mac  work\n";
         assert_eq!(key_comment(auth, keys).as_deref(), Some("shankar@mac work"));
-        assert_eq!(key_comment(auth, "ssh-ed25519 AAAAB\n"), None, "no comment: the address instead");
+        assert_eq!(key_comment(auth, "ssh-ed25519 AAAAB\n"), None, "no comment: no name");
         assert_eq!(key_comment("password\n", keys), None);
     }
 

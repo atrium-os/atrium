@@ -5,8 +5,9 @@
 # what they show is saved as screen-seat.png. forum-wm runs (a whole
 # desktop); the viewer asks for a 1600x900 output at 1.5.
 #
-# Checks: the seat's screen names the viewer by the comment on their key
-# in authorized_keys (sshd's ExposeAuthInfo, turned on here); while viewed, the desktop takes the viewer's output and the
+# Checks: the seat's screen names the viewer by the address their session
+# saw and, as their word, the comment on their key in authorized_keys
+# (sshd's ExposeAuthInfo, turned on here); while viewed, the desktop takes the viewer's output and the
 # viewer's desktop equals it after typing sent from the viewer; the seat's
 # monitors show frescod's viewed screen (who, and a Disconnect), nothing
 # of the session; typing at the seat reaches nothing; a click on
@@ -114,7 +115,7 @@ button = sum(1 for p in d if p == (38, 140, 255))
 print("yes" if field > 0.9 and text > 300 and button > 500 else f"no (field {field:.3f}, text {text}, button {button})")
 EOF
 )"
-check "the seat's screen names the viewer by their key" yes "$(grep -q 'viewed: the viewer is fenestra-gate@viewer' "$W/frescod.log" && grep -qF 'Fenestra-Gate@viewer' "$W/fenestrad.log" && echo yes || echo no)"
+check "the seat names the viewer: where from, and what their key says" yes "$(grep -qF 'viewed: viewers 1, latest from 10.0.2.2, key "fenestra-gate@viewer"' "$W/frescod.log" && grep -qF 'Fenestra-Gate@viewer' "$W/fenestrad.log" && echo yes || echo no)"
 check "the seat switched to it when the session began" yes "$(grep -q "viewed: the seat's monitors show the viewed screen" "$W/frescod.log" && echo yes || echo no)"
 check "typing at the seat reached nothing on the desktop" "yes yes" "$(cmp -s "$W/after-seat-keys.png" "$W/viewed.png" && echo yes || echo no) $(grep -q 'inject KEY 38 1 -> the viewed screen' "$W/frescod.log" && echo yes || echo no)"
 check "Disconnect at the seat ended the session" "yes gone" "$([ -n "$B" ] && grep -q 'disconnected at the host' "$W/fenestrad.log" && echo yes || echo "no (button at '$B')") $(g "pgrep -x fenestra-session >/dev/null" && echo running || echo gone)"

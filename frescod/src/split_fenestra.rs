@@ -139,8 +139,9 @@ impl Broker {
             };
             match rec {
                 Rec::Session { on } => self.set_remote(on),
-                // fenestra-link checked it: printable ASCII, 1 to 64 bytes.
-                Rec::Viewer { label } => crate::viewed::set_viewer(&label),
+                // fenestra-link checked it: an IP address, a printable name.
+                Rec::Viewer { viewers, addr, key } => crate::viewed::set_viewer(viewers, &addr, &key),
+                Rec::Peer { .. } => return "refused a Peer (a session's record)".into(),
                 Rec::Want { window, ticket, base } => self.want(window, ticket, base),
                 Rec::Output { width, height, scale_milli } => {
                     let mut f = self.fen.lock().unwrap();

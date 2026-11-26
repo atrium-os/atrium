@@ -48,9 +48,10 @@ struct State {
     /// The account the session runs as: the seat's user, as the chrome's
     /// font shows it.
     who: String,
-    /// Who is viewing, as fenestrad named them (their SSH key's comment,
-    /// else their address); empty until it does.
-    viewer: String,
+    /// Who is viewing, as fenestrad saw them: where from, how many, and
+    /// what their key's comment says (their word, not the host's); the
+    /// screen's lines for it, none until a viewer connects.
+    viewer: Vec<String>,
     /// The seat's pointer on this screen; shown once it moves.
     cursor: (f32, f32),
     cursor_shown: bool,
@@ -73,7 +74,7 @@ const FRESH: State = State {
     seat: (0, 0),
     scale_milli: 1000,
     who: String::new(),
-    viewer: String::new(),
+    viewer: Vec::new(),
     cursor: (0.0, 0.0),
     cursor_shown: false,
     button: None,
@@ -134,14 +135,25 @@ pub fn gen() -> u64 {
     state().gen
 }
 
-/// Who is viewing: `label` is fenestrad's (a checked [`fenestra_link::Rec::Viewer`]),
-/// shown from now until the session ends.
-pub fn set_viewer(label: &str) {
-    let name = chrome::viewer_name(label);
+/// Who is viewing (fenestrad's checked [`fenestra_link::Rec::Viewer`]):
+/// `viewers` connected, the latest from `addr`, whose key's comment is
+/// `key` (may be empty). Shown from now until the session ends.
+pub fn set_viewer(viewers: u8, addr: &str, key: &str) {
+    let addr = chrome::viewer_name(addr);
+    let key = chrome::viewer_name(key);
+    let mut lines = Vec::new();
+    match viewers {
+        0 => {}
+        1 => lines.push(format!("from {addr}")),
+        n => lines.push(format!("by {n} viewers, the latest from {addr}")),
+    }
+    if viewers > 0 && !key.is_empty() {
+        lines.push(format!("their key says: {key}"));
+    }
     let mut s = state();
-    if s.viewer != name {
-        eprintln!("frescod: viewed: the viewer is {name}");
-        s.viewer = name;
+    if s.viewer != lines {
+        eprintln!("frescod: viewed: viewers {viewers}, latest from {addr}, key {key:?}");
+        s.viewer = lines;
         changed(&mut s);
     }
 }
@@ -346,11 +358,12 @@ pub fn picture_for(output: u32, w: u32, h: u32) -> Option<std::sync::Arc<Vec<u8>
 /// The screen's words: who views it and as whom, or that it is locking.
 fn draw_lines(s: &State) -> Vec<String> {
     let lines = match s.phase {
-        Phase::Viewed => vec![
-            "this screen is being viewed remotely".to_string(),
-            if s.viewer.is_empty() { String::new() } else { format!("by {}", s.viewer) },
-            if s.who.is_empty() { "full control".to_string() } else { format!("full control as {}", s.who) },
-        ],
+        Phase::Viewed => [
+            vec!["this screen is being viewed remotely".to_string()],
+            s.viewer.clone(),
+            vec![if s.who.is_empty() { "full control".to_string() } else { format!("full control as {}", s.who) }],
+        ]
+        .concat(),
         _ => vec!["the remote session ended".to_string(), "locking".to_string()],
     };
     lines.into_iter().filter(|l| !l.is_empty()).collect()
@@ -387,11 +400,19 @@ mod tests {
     fn the_screen_names_the_viewer_not_only_the_account() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        set_viewer("Shankar@MacBook (work)\u{202e}");
         begin(640, 360, 1000);
-        assert_eq!(state().viewer, "shankar@macbook work");
-        let lines = |s: &State| draw_lines(s);
-        assert!(lines(&state()).iter().any(|l| l == "by shankar@macbook work"), "{:?}", lines(&state()));
+        set_viewer(1, "192.0.2.4", "Shankar@MacBook (work)\u{202e}");
+        let lines = || draw_lines(&state());
+        assert_eq!(lines()[1..3], ["from 192.0.2.4", "their key says: shankar@macbook work"], "{:?}", lines());
+        // A second viewer: counted, never hidden behind the first's name.
+        set_viewer(2, "2001:db8::1", "");
+        // (The last line names the seat's user, whoever it is here.)
+        assert_eq!(lines().len(), 3, "{:?}", lines());
+        assert_eq!(lines()[1], "by 2 viewers, the latest from 2001:db8::1");
+        assert!(lines()[2].starts_with("full control"), "{:?}", lines());
+        set_viewer(0, "", "");
+        assert_eq!(lines().len(), 2, "{:?}", lines());
+        set_viewer(1, "192.0.2.4", "k");
         end();
         assert!(state().viewer.is_empty(), "the next session starts unnamed");
         reset();

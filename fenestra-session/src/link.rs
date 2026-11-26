@@ -108,6 +108,11 @@ impl LinkSource {
         self.out.send(Rec::Session { on }).await.map_err(|_| WireError::Protocol("the link ended"))
     }
 
+    /// Tell fenestrad a viewer connected from `ip`, for the host's seat.
+    pub async fn peer(&self, ip: std::net::IpAddr) -> Result<(), WireError> {
+        self.out.send(Rec::Peer { addr: ip.to_canonical().to_string() }).await.map_err(|_| WireError::Protocol("the link ended"))
+    }
+
     async fn read_loop<R: AsyncRead + Unpin>(&self, mut read: R, wake: &watch::Sender<u64>) -> String {
         loop {
             let mut h = [0u8; HEADER];
@@ -168,7 +173,7 @@ impl LinkSource {
                 }
                 // fenestrad acts on it (ends this session); it is never relayed.
                 Rec::Disconnect => return "fenestrad relayed a Disconnect".into(),
-                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } | Rec::Viewer { .. } => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } | Rec::Viewer { .. } | Rec::Peer { .. } => unreachable!("from_broker() refused it"),
             }
         }
     }

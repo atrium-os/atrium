@@ -29,13 +29,21 @@ pub const MAX_SCREEN: u32 = 65536;
 /// in thousandths (fenestra.md §4.1).
 pub const OUTPUT_SIDE: std::ops::RangeInclusive<u32> = 64..=8192;
 pub const OUTPUT_SCALE: std::ops::RangeInclusive<u32> = 500..=4000;
-/// The longest `Viewer` label.
+/// The longest `Viewer` key name.
 pub const MAX_VIEWER: usize = 64;
+/// The longest address text (`Viewer`, `Peer`): an IP address.
+pub const MAX_ADDR: usize = 45;
 
-/// Whether `s` may be a `Viewer` label: printable ASCII, not empty, at
+/// Whether `s` may be a viewer's key name: printable ASCII, not empty, at
 /// most [`MAX_VIEWER`] bytes.
 pub fn viewer_label_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_VIEWER && s.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
+fn addr_from(b: &[u8]) -> Option<String> {
+    let a = std::str::from_utf8(b).ok().filter(|a| a.len() <= MAX_ADDR)?;
+    // In its one canonical spelling, so a record decodes to itself.
+    a.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string()).filter(|c| c == a)
 }
 
 pub type Version = (u64, u64);
@@ -89,11 +97,17 @@ pub enum Rec {
     /// fenestrad → frescod: the viewer's input, in the host screen's
     /// pixels, routed as frescod routes its own input devices'.
     Input(Input),
-    /// fenestrad → frescod: who is viewing, as the host's own records name
-    /// them (the SSH key's comment in the person's authorized_keys, else
-    /// the address they came from), for the seat's viewed screen (§11.4).
-    /// Printable ASCII, 1 to [`MAX_VIEWER`] bytes.
-    Viewer { label: String },
+    /// fenestrad → frescod: who is viewing, for the seat's viewed screen
+    /// (§11.4): how many viewers are connected (0 to 255; at 0 there is
+    /// no address or name), the address the
+    /// latest came from (what its session's connection saw), and the
+    /// comment on the SSH key that minted that session (empty for none;
+    /// else printable ASCII, at most [`MAX_VIEWER`] bytes). The comment is
+    /// the key holder's word, shown as such.
+    Viewer { viewers: u8, addr: String, key: String },
+    /// session → fenestrad: a viewer connected, from this IP address (the
+    /// QUIC connection's peer, or the TCP tunnel's).
+    Peer { addr: String },
     /// frescod → fenestrad: the person at the host's seat pressed
     /// Disconnect on the screen it shows while viewed (§11.4): end every
     /// session now.
@@ -140,6 +154,7 @@ mod kind {
     pub const CHROME: u32 = 0x14;
     pub const DISCONNECT: u32 = 0x15;
     pub const VIEWER: u32 = 5;
+    pub const PEER: u32 = 6;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,9 +267,14 @@ impl Rec {
                 Head { kind: CHROME, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
             }
             Rec::Disconnect => Head { kind: DISCONNECT, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: 0 },
-            Rec::Viewer { label } => {
-                payload.extend_from_slice(label.as_bytes());
-                Head { kind: VIEWER, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
+            Rec::Viewer { viewers, addr, key } => {
+                payload.extend_from_slice(addr.as_bytes());
+                payload.extend_from_slice(key.as_bytes());
+                Head { kind: VIEWER, window: 0, ticket: 0, flag: 0, a: u64::from(*viewers), b: addr.len() as u64, len: payload.len() as u32 }
+            }
+            Rec::Peer { addr } => {
+                payload.extend_from_slice(addr.as_bytes());
+                Head { kind: PEER, window: 0, ticket: 0, flag: 0, a: 0, b: 0, len: payload.len() as u32 }
             }
         };
         let mut out = h.bytes().to_vec();
@@ -271,7 +291,8 @@ impl Rec {
             kind::DATA => MAX_DATA,
             kind::LAYOUT => MAX_LAYOUT * PLACED,
             kind::CHROME => chrome::MAX_BODY,
-            kind::VIEWER => MAX_VIEWER,
+            kind::VIEWER => MAX_ADDR + MAX_VIEWER,
+            kind::PEER => MAX_ADDR,
             kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT | kind::OUTPUT | kind::DISCONNECT => 0,
             _ => return Err(Refused("unknown kind")),
         };
@@ -433,9 +454,22 @@ impl Rec {
                 Rec::Chrome(chrome::Chrome::decode(payload).map_err(|e| Refused(e.0))?)
             }
             VIEWER => {
+                unused(h.window == 0 && h.ticket == 0 && h.flag == 0)?;
+                let viewers = u8::try_from(h.a).map_err(|_| Refused("viewer count"))?;
+                if viewers == 0 {
+                    // Nobody connected now: no address, no name.
+                    unused(h.b == 0 && payload.is_empty())?;
+                    return Ok(Rec::Viewer { viewers, addr: String::new(), key: String::new() });
+                }
+                let split = usize::try_from(h.b).ok().filter(|n| *n <= payload.len()).ok_or(Refused("viewer address"))?;
+                let (a, k) = payload.split_at(split);
+                let addr = addr_from(a).ok_or(Refused("viewer address"))?;
+                let key = std::str::from_utf8(k).ok().filter(|k| k.is_empty() || viewer_label_ok(k)).ok_or(Refused("viewer key name"))?;
+                Rec::Viewer { viewers, addr, key: key.to_string() }
+            }
+            PEER => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
-                let label = std::str::from_utf8(payload).ok().filter(|l| viewer_label_ok(l)).ok_or(Refused("viewer label"))?;
-                Rec::Viewer { label: label.to_string() }
+                Rec::Peer { addr: addr_from(payload).ok_or(Refused("peer address"))? }
             }
             DISCONNECT => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;
