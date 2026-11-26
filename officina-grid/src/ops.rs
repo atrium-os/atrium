@@ -1585,7 +1585,7 @@ mod tests {
             kind: ChartKind::Column,
             grouping: Grouping::Standard,
             title: None,
-            series: vec![Series { name: None, cats: None, vals: Rect { sheet: 0, r0: 1, c0: 0, r1: 4, c1: 0 }, kind: None }],
+            series: vec![Series { name: None, cats: None, vals: Rect { sheet: 0, r0: 1, c0: 0, r1: 4, c1: 0 }, kind: None, look: Default::default() }],
             legend: None,
             x_title: None,
             y_title: None,

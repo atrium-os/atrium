@@ -19,7 +19,7 @@ fn main() {
     }
     wb.recalc();
     let col = |c: u32| Rect { sheet: 0, r0: 1, c0: c, r1: 12, c1: c };
-    let ser = |c: u32, kind| Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, c))), cats: Some(col(0)), vals: col(c), kind };
+    let ser = |c: u32, kind| Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, c))), cats: Some(col(0)), vals: col(c), kind, look: Default::default() };
     let mk = |kind, series, from: (u32, u32), to: (u32, u32), title: &str| Chart {
         kind,
         grouping: Grouping::Standard,

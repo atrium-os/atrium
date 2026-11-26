@@ -1063,7 +1063,7 @@ mod tests {
             kind: crate::charts::ChartKind::Column,
             grouping: crate::charts::Grouping::Standard,
             title: None,
-            series: vec![crate::charts::Series { name: None, cats: None, vals: rect(0, 0, 1, 0), kind: None }],
+            series: vec![crate::charts::Series { name: None, cats: None, vals: rect(0, 0, 1, 0), kind: None, look: Default::default() }],
             legend: None,
             x_title: None,
             y_title: None,

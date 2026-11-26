@@ -1335,7 +1335,7 @@ mod document_tests {
         doc.wb.add_chart(Chart {
             kind: ChartKind::Column, grouping: Grouping::Standard, title: None,
             series: vec![Series {
-                name: Some(ChartText::Lit("Units shipped".into())), cats: None, vals: rect, kind: None,
+                name: Some(ChartText::Lit("Units shipped".into())), cats: None, vals: rect, kind: None, look: Default::default(),
             }],
             legend: None, x_title: None, y_title: None,
             anchor: Anchor { sheet: 0, from: (4, 2, 0.0, 0.0), to: (12, 8, 0.0, 0.0) }, alt: None

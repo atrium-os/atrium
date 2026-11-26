@@ -301,8 +301,8 @@ fn charted(mut wb: Workbook) -> Workbook {
         grouping: Grouping::Standard,
         title: Some(ChartText::Lit("Items & <values>".into())),
         series: vec![
-            Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 3))), cats: Some(col(1, 0, 9)), vals: col(0, 0, 9), kind: None },
-            Series { name: Some(ChartText::Lit("Doubled".into())), cats: Some(col(1, 0, 9)), vals: col(2, 0, 9), kind: Some(ChartKind::Line) },
+            Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 3))), cats: Some(col(1, 0, 9)), vals: col(0, 0, 9), kind: None, look: Default::default() },
+            Series { name: Some(ChartText::Lit("Doubled".into())), cats: Some(col(1, 0, 9)), vals: col(2, 0, 9), kind: Some(ChartKind::Line), look: Default::default() },
         ],
         legend: Some(LegendPos::Bottom),
         x_title: Some("Item".into()),
@@ -315,7 +315,7 @@ fn charted(mut wb: Workbook) -> Workbook {
             kind,
             grouping,
             title: Some(ChartText::Lit(format!("{kind:?}").into())),
-            series: vec![Series { name: None, cats: Some(col(0, 0, 4)), vals: col(2, 0, 4), kind: None }],
+            series: vec![Series { name: None, cats: Some(col(0, 0, 4)), vals: col(2, 0, 4), kind: None, look: Default::default() }],
             legend: if kind.round() { Some(LegendPos::Right) } else { None },
             x_title: None,
             y_title: None,
@@ -518,4 +518,76 @@ fn picture_alt_text_round_trips_in_xlsx_and_ods() {
     assert_eq!(back.pictures()[0].alt.as_deref(), Some(alt), "xlsx");
     let (back, _) = officina_convert::ods::read(&officina_convert::ods::write(&wb, Vec::new()).unwrap()).unwrap();
     assert_eq!(back.pictures()[0].alt.as_deref(), Some(alt), "ods");
+}
+
+/// Every kind and every per-series extra the chart model has, for both formats.
+fn charted_extras(mut wb: Workbook) -> Workbook {
+    use officina_grid::addr::Rect;
+    use officina_grid::charts::*;
+    let col = |c: u32| Rect { sheet: 0, r0: 0, c0: c, r1: 9, c1: c };
+    let anchor = |r: u32| Anchor { sheet: 1, from: (r, 2, 0.0, 0.0), to: (r + 15, 9, 6.0, 2.5) };
+    let ser = |name: u32, cats: Option<Rect>, vals: Rect, look: SeriesLook| Series { name: Some(ChartText::Cell(CellAddr::new(0, name, 3))), cats, vals, kind: None, look };
+    let trend = |kind, equation, r_squared, forward| Some(Trendline { kind, equation, r_squared, forward, backward: 0.0 });
+    let charts = [
+        (ChartKind::Column, vec![
+            ser(0, Some(col(1)), col(0), SeriesLook { labels: true, trend: trend(TrendKind::Polynomial(3), true, true, 2.0), errors: Some(ErrorBars::Percent(5.0)), ..Default::default() }),
+            Series { kind: Some(ChartKind::Line), ..ser(1, Some(col(1)), col(2), SeriesLook { secondary: true, trend: trend(TrendKind::MovingAverage(3), false, false, 0.0), errors: Some(ErrorBars::StdDev(1.5)), ..Default::default() }) },
+        ]),
+        (ChartKind::Scatter, vec![ser(0, Some(col(0)), col(2), SeriesLook { trend: trend(TrendKind::Exponential, false, true, 0.0), errors: Some(ErrorBars::StdErr), ..Default::default() })]),
+        (ChartKind::Radar, vec![ser(0, Some(col(1)), col(0), SeriesLook::default()), ser(1, Some(col(1)), col(2), SeriesLook { labels: true, ..Default::default() })]),
+        (ChartKind::Bubble, vec![ser(0, Some(col(0)), col(2), SeriesLook { sizes: Some(col(0)), errors: Some(ErrorBars::Fixed(2.5)), ..Default::default() })]),
+        (ChartKind::Stock, vec![ser(0, Some(col(1)), col(2), SeriesLook::default()), ser(1, Some(col(1)), col(0), SeriesLook::default()), ser(2, Some(col(1)), col(0), SeriesLook::default())]),
+        (ChartKind::Waterfall, vec![ser(0, Some(col(1)), col(0), SeriesLook { labels: true, totals: vec![0, 4, 9], ..Default::default() })]),
+        (ChartKind::Histogram, vec![ser(0, None, col(0), SeriesLook { bins: Some(Bins::Count(7)), ..Default::default() })]),
+        (ChartKind::Histogram, vec![ser(0, None, col(2), SeriesLook { bins: Some(Bins::Width(2.5)), ..Default::default() })]),
+        (ChartKind::BoxWhisker, vec![ser(0, None, col(0), SeriesLook::default()), ser(1, None, col(2), SeriesLook { labels: true, ..Default::default() })]),
+    ];
+    for (i, (kind, series)) in charts.into_iter().enumerate() {
+        wb.add_chart(Chart {
+            kind,
+            grouping: Grouping::Standard,
+            title: Some(ChartText::Lit(format!("{kind:?}").into())),
+            series,
+            legend: Some(LegendPos::Right),
+            x_title: Some("X".into()),
+            y_title: Some("Y".into()),
+            anchor: anchor(20 * i as u32),
+            alt: None,
+        })
+        .unwrap();
+    }
+    wb
+}
+
+#[test]
+fn chart_kinds_and_extras_round_trip() {
+    let wb = charted_extras(book());
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.charts().len(), wb.charts().len());
+    for (a, b) in wb.charts().iter().zip(back.charts()) {
+        assert_eq!(b, a);
+        assert_eq!(b.data(&back, 100), a.data(&wb, 100));
+    }
+    // The extension kinds are chartEx parts that a reader without them sees as a shape.
+    let z = officina_convert::zip::Archive::open(&file).unwrap();
+    assert!(z.find("xl/charts/chartEx6.xml").is_some() && z.find("xl/charts/chart1.xml").is_some());
+    let ct = String::from_utf8(z.read_name("[Content_Types].xml").unwrap().unwrap()).unwrap();
+    assert!(ct.contains(r#"PartName="/xl/charts/chartEx6.xml" ContentType="application/vnd.ms-office.chartex+xml""#), "{ct}");
+}
+
+#[test]
+fn ods_chart_kinds_and_extras_round_trip() {
+    let wb = charted_extras(book());
+    let file = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = officina_convert::ods::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.charts().len(), wb.charts().len());
+    for (a, b) in wb.charts().iter().zip(back.charts()) {
+        let mut b2 = b.clone();
+        b2.anchor = a.anchor;
+        assert_eq!(b2, *a);
+        assert_eq!(b.data(&back, 100), a.data(&wb, 100));
+    }
 }

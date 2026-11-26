@@ -42,3 +42,4 @@ pub mod checkbox;
 pub mod analysis;
 pub mod hypothesis;
 pub mod solver;
+pub mod chartformat;

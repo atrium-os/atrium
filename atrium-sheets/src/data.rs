@@ -229,6 +229,8 @@ pub enum DataCmd {
     CustomViews,
     /// Alt Text… for the chart at the cursor (a bar).
     AltText,
+    /// Format Chart… (type and per-series extras, typed).
+    FormatChart,
     /// Check Accessibility (a bar stepping through what it finds).
     CheckAccessibility,
     /// Insert Checkbox (or take it off, from a checkbox).
@@ -745,6 +747,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Insert Line Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Line))));
     v.push((MenuItem::new("Insert Pie Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Pie))));
     v.push((MenuItem::new("Delete Chart").enabled(chart_at(wb, s, row, col).is_some()), Some(DataCmd::DeleteChart)));
+    v.push((MenuItem::new("Format Chart…").enabled(crate::chartformat::can_format(d, (row, col))), Some(DataCmd::FormatChart)));
     v.push((MenuItem::new("Alt Text…").enabled(crate::accessibility::can_describe(d, (row, col))), Some(DataCmd::AltText)));
     let here = wb.pivot_at(CellAddr::new(s, row, col));
     match here {
@@ -3203,7 +3206,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::CheckAccessibility => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling | DataCmd::AutoCorrect | DataCmd::CustomViews | DataCmd::AltText | DataCmd::FormatChart | DataCmd::CheckAccessibility => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3481,6 +3484,7 @@ pub fn chart_for(wb: &Workbook, t: &Target, kind: ChartKind) -> Option<Chart> {
             cats: cats_col.map(|cc| Rect { sheet: s, r0: d0, c0: cc, r1: r.r1, c1: cc }),
             vals: Rect { sheet: s, r0: d0, c0: c, r1: r.r1, c1: c },
             kind: None,
+            look: Default::default(),
         })
         .collect();
     if series.is_empty() {

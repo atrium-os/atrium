@@ -5522,6 +5522,68 @@ Tests:
   - a nonlinear minimum, with and without non-negative cells;
   - the simplex on its own, including the infeasible and unbounded cases.
 
+### 16.163 Charts: trendlines, labels, secondary axis, error bars and six new kinds (2026-11-26)
+
+Round 2 of the six that finish Sheets. The model is in `officina-grid/src/charts.rs`, the drawing in `officina-draw/src/chart.rs`, the files in `officina-convert/src/xlsx/chart.rs` and `officina-convert/src/ods/chart.rs`, and the command in `atrium-sheets/src/chartformat.rs`.
+
+**Model.** Each series gains a `SeriesLook`:
+
+- `trend`: a trendline, linear, exponential, logarithmic, polynomial (order 2 to 6), power or moving average (period 2 to 255). It can show its equation and R², and extend 0 to 10⁶ periods forward and backward.
+- `labels`: each point's value as a data label.
+- `secondary`: plotted against a second value axis on the right.
+- `errors`: Y error bars, fixed, percent of each value, N standard deviations of the series (around its mean, as Excel draws them) or standard error.
+- `sizes`: a bubble chart's sizes, one row or column.
+- `totals`: the waterfall points that are totals, ascending, at most 4,096.
+- `bins`: a histogram's bin count (1 to 10,000) or width. Without it, Scott's rule, as Excel's automatic bins.
+
+`ChartKind` gains Radar, Bubble, Stock (three series high, low, close, or four with open first), Waterfall, Histogram and BoxWhisker. `whole()` names the kinds that can't be in a combo: pie, doughnut, radar, stock, waterfall, histogram and box. `SeriesLook::valid()` states the ranges above. `add_chart` refuses a look outside them, and the wire decoder refuses the same, so nothing the model holds fails to load. On the wire, bit 0x80 of the grouping byte says a section of looks follows the alt text; a chart without looks is byte for byte what it was.
+
+**Drawing.**
+
+- The secondary axis has its own scale and labels on the right.
+- Trendlines are drawn across the x range plus the extensions. The equation and R² are written at the top right in Excel's form (`y = 0.011x² - 0.3736x + 8 R² = 0.0684`). Exponential, logarithmic and power fits leave out points they can't take (zero or negative), and a fit that isn't possible is not drawn.
+- Data labels go above each point or bar, for up to 500 points a chart.
+- Error bars have caps at both ends.
+- Radar: a spoke per category, rings at the value ticks, a polygon with markers per series.
+- Bubble: area proportional to size, the largest radius an eighth of the plot's shorter side.
+- Stock: a high-low line per category and a close tick; with four series, an up-down bar from open to close, hollow when it rose and filled when it fell.
+- Waterfall: bars float from the running total, increases and decreases in two colours, totals stand on the axis in a third, with an Increase / Decrease / Total legend.
+- Histogram: Excel's bins, the first closed (`[1, 3]`), the rest open on the left (`(3, 5]`).
+- Box and whisker: Excel's exclusive quartiles, whiskers to the last value within 1.5 IQR, the mean as ×, outliers as dots.
+
+**Files.**
+
+- `.xlsx` read and write:
+  - radar, bubble (`bubbleSize`) and stock groups (`hiLowLines`, up-down bars with four series);
+  - combos on the secondary axes (a second category and value axis pair, values on the right, `crosses max`); a group whose axis ids differ from the first group's is read as secondary;
+  - `dLbls` with `showVal`, `trendline` (type, order, period, forward, backward, `dispEq`, `dispRSqr`) and `errBars` (Y only; X bars and custom amounts are reported);
+  - waterfall, histogram and box and whisker as Excel 2016's chart extension: `xl/charts/chartExN.xml` (`cx:` markup, its own content type and relationship type), in an `mc:AlternateContent` whose fallback is the shape Excel 2013 shows. Waterfall totals are `subtotals`, bins are `binCount` or `binSize`, box plots use exclusive quartiles. The reader skips `mc:Fallback` and reads `cx:` parts back; Pareto lines and other extension layouts are reported.
+- `.ods` read and write:
+  - `chart:radar` (also `filled-radar`), `chart:bubble` (the series' values are its sizes, its first domain the y values and the second the x values, as ODF has it) and `chart:stock`;
+  - per series: `chart:data-label-number="value"`, `chart:attached-axis="secondary-y"` with a `secondary-y` axis, `chart:regression-curve` with ODF 1.3's regression properties (LibreOffice's `loext:` ones are read too) and `chart:equation`, and `chart:error-indicator` with `constant`, `percentage`, `standard-deviation` or `standard-error`.
+  - ODF has no waterfall, histogram or box plot. They are written as bar charts with `officina:kind` on the chart and `officina:totals` and `officina:bins` on the series. Officina reads them back; LibreOffice shows plain columns and drops the attributes when it saves.
+- Checked through LibreOffice 24.2 (`cargo run --example charts_lo`): in `.xlsx`, the combo with a trendline, labels, error bars and a secondary axis, radar, bubble with sizes and stock all come back unchanged; LibreOffice drops the three chart-extension kinds, as it has no `cx:` support. In `.ods`, everything comes back but those three, which LibreOffice saves as columns.
+
+**Format Chart…** (Data menu, beside Alt Text…) works on the chart at the cursor, or the chart drawn from the cursor's cell, as Excel's Change Chart Type and Format Data Series. One line, one undo step, and the bar starts with the chart's settings so typing them back changes nothing:
+
+`type waterfall; series 1: labels, totals 1, 12`
+`series 2: line, secondary, trend poly 3 equation r2 forward 2; errors percent 5`
+
+- `type KIND` sets the chart's kind (column, bar, line, area, scatter, pie, doughnut, radar, bubble, stock, waterfall, histogram, box). A series' own kind that can't stay is cleared, and the whole kinds group side by side.
+- Parts split on `;`. A part led by `series N:` is for that series; otherwise for every series. Settings split on `,`; after `totals`, bare numbers are more points (1 is the first).
+- Settings: `labels`, `secondary` / `primary`, a series kind for a combo (`line`, `column`, `area`, …), `trend linear | exponential | log | poly N | power | moving N` with `equation`, `r2`, `forward N`, `backward N`, `errors fixed N | percent N | stddev N | stderr`, `sizes RANGE`, `totals POINTS`, `bins N`, `bin width W`, and `no labels`, `no trend`, `no errors`, `no sizes`, `no totals`, `bins auto`.
+- Refused, with the reason, changing nothing: a stock chart without three or four series, a secondary axis on a pie, trendlines on kinds without them, a polynomial order or period out of range, a radar or other whole kind in a combo, a series that isn't there.
+
+The chart bar's type menu lists all thirteen kinds, and its stacking menu shows only for column, bar, line and area.
+
+**Not built yet**: X error bars, custom error amounts from cells, several trendlines on a series, the trendline's intercept and label formatting, data label positions and number formats, Pareto lines on histograms, overflow and underflow bins, and the inclusive quartile method for box plots.
+
+Tests:
+- grid: a chart with every look rides the wire and every truncation of it fails cleanly; each out-of-range look is refused by `valid()`, `add_chart` and the decoder.
+- draw: linear, quadratic, exponential and power fits recover the coefficients they were made from, with R² of 1; moving averages; box statistics on 1…10 and 100 (Q1 3, median 6, Q3 9, 100 an outlier, whisker at 10); waterfall bars and totals; histogram counts by count and width; percent and standard-deviation error bars. Every kind still lays out inside its box.
+- convert: nine charts covering every new kind and every extra round-trip unchanged through `.xlsx` (with the `chartExN.xml` parts and their content type checked) and through `.ods`.
+- Sheets: Format Chart sets each extra, its bar text reads back and retyping it changes nothing, one undo takes it back; type changes to waterfall, histogram, bubble and stock with their settings; eight refusals leave the chart as it was.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

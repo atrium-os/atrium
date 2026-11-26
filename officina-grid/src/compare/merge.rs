@@ -418,7 +418,7 @@ mod tests {
                     name: None,
                     cats: None,
                     vals: Rect::cell(CellAddr::new(1, 0, 0)),
-                    kind: None,
+                    kind: None, look: Default::default(),
                 }],
                 anchor: anchor(1), alt: None
             })

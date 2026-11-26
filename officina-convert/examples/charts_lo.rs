@@ -24,7 +24,7 @@ fn book() -> Workbook {
         wb.set_value(CellAddr::new(0, r, 2), Value::Num((r * 5 % 7) as f64 + 0.5));
     }
     let col = |c: u32| Rect { sheet: 0, r0: 1, c0: c, r1: 12, c1: c };
-    let ser = |c: u32, kind| Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, c))), cats: Some(col(0)), vals: col(c), kind };
+    let ser = |c: u32, kind| Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, c))), cats: Some(col(0)), vals: col(c), kind, look: Default::default() };
     let kinds = [
         (ChartKind::Column, Grouping::Standard),
         (ChartKind::Column, Grouping::Stacked),
@@ -39,7 +39,7 @@ fn book() -> Workbook {
         let series = if kind.round() {
             vec![ser(1, None)]
         } else if kind == ChartKind::Scatter {
-            vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 2))), cats: Some(col(1)), vals: col(2), kind: None }]
+            vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 2))), cats: Some(col(1)), vals: col(2), kind: None, look: Default::default() }]
         } else {
             vec![ser(1, None), ser(2, None)]
         };
@@ -68,6 +68,34 @@ fn book() -> Workbook {
         anchor: Anchor { sheet: 1, from: (200, 1, 0.0, 0.0), to: (218, 8, 0.0, 0.0) }, alt: None
     })
     .unwrap();
+    // The kinds and per-series extras of the chart round (§16.163).
+    let trend = Some(Trendline { kind: TrendKind::Linear, equation: true, r_squared: true, forward: 1.0, backward: 0.0 });
+    let extras = [
+        (ChartKind::Column, vec![
+            Series { look: SeriesLook { labels: true, trend, errors: Some(ErrorBars::Percent(10.0)), ..Default::default() }, ..ser(1, None) },
+            Series { look: SeriesLook { secondary: true, ..Default::default() }, ..ser(2, Some(ChartKind::Line)) },
+        ]),
+        (ChartKind::Radar, vec![ser(1, None), ser(2, None)]),
+        (ChartKind::Bubble, vec![Series { cats: Some(col(1)), look: SeriesLook { sizes: Some(col(1)), ..Default::default() }, ..ser(2, None) }]),
+        (ChartKind::Stock, vec![ser(1, None), ser(2, None), ser(2, None)]),
+        (ChartKind::Waterfall, vec![Series { look: SeriesLook { totals: vec![11], ..Default::default() }, ..ser(1, None) }]),
+        (ChartKind::Histogram, vec![Series { cats: None, look: SeriesLook { bins: Some(Bins::Count(5)), ..Default::default() }, ..ser(1, None) }]),
+        (ChartKind::BoxWhisker, vec![Series { cats: None, ..ser(1, None) }]),
+    ];
+    for (i, (kind, series)) in extras.into_iter().enumerate() {
+        let r = 220 + 20 * i as u32;
+        wb.add_chart(Chart {
+            kind,
+            grouping: Grouping::Standard,
+            title: Some(ChartText::Lit(format!("{kind:?}").into())),
+            series,
+            legend: Some(LegendPos::Right),
+            x_title: None,
+            y_title: None,
+            anchor: Anchor { sheet: 1, from: (r, 1, 0.0, 0.0), to: (r + 18, 8, 0.0, 0.0) }, alt: None
+        })
+        .unwrap();
+    }
     wb.recalc();
     wb
 }

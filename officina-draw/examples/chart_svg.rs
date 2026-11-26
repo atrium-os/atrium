@@ -23,7 +23,7 @@ fn main() {
         wb.set_value(CellAddr::new(0, r, 3), Value::Num((r * 3 % 5) as f64 + 0.5));
     }
     let col = |c: u32| Rect { sheet: 0, r0: 1, c0: c, r1: 12, c1: c };
-    let ser = |c: u32, kind| Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, c))), cats: Some(col(0)), vals: col(c), kind };
+    let ser = |c: u32, kind| Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, c))), cats: Some(col(0)), vals: col(c), kind, look: Default::default() };
     let (w, h) = (360.0f32, 230.0f32);
     let mut svg = String::new();
     let kinds = [
@@ -36,14 +36,34 @@ fn main() {
         (ChartKind::Pie, Grouping::Standard, None),
         (ChartKind::Doughnut, Grouping::Standard, None),
         (ChartKind::Column, Grouping::Standard, Some(ChartKind::Line)),
+        (ChartKind::Radar, Grouping::Standard, None),
+        (ChartKind::Bubble, Grouping::Standard, None),
+        (ChartKind::Stock, Grouping::Standard, None),
+        (ChartKind::Waterfall, Grouping::Standard, None),
+        (ChartKind::Histogram, Grouping::Standard, None),
+        (ChartKind::BoxWhisker, Grouping::Standard, None),
     ];
     for (i, (kind, g, combo)) in kinds.iter().enumerate() {
-        let series = if kind.round() {
-            vec![ser(1, None)]
+        let series = if kind.round() || matches!(kind, ChartKind::Waterfall | ChartKind::Histogram) {
+            let mut s = ser(1, None);
+            s.look.labels = *kind == ChartKind::Waterfall;
+            s.look.totals = if *kind == ChartKind::Waterfall { vec![11] } else { Vec::new() };
+            vec![s]
+        } else if *kind == ChartKind::Bubble {
+            vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 3))), cats: Some(col(1)), vals: col(3), kind: None, look: SeriesLook { sizes: Some(col(1)), ..Default::default() } }]
+        } else if *kind == ChartKind::Stock {
+            vec![ser(1, None), ser(3, None), ser(2, None)]
         } else if *kind == ChartKind::Scatter {
-            vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 3))), cats: Some(col(1)), vals: col(3), kind: None }]
+            vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 3))), cats: Some(col(1)), vals: col(3), kind: None, look: Default::default() }]
         } else {
-            vec![ser(1, None), ser(2, *combo), ser(3, None)]
+            let mut v = vec![ser(1, None), ser(2, *combo), ser(3, None)];
+            if combo.is_some() {
+                v[1].look.secondary = true;
+                v[0].look.trend = Some(Trendline { kind: TrendKind::Polynomial(2), equation: true, r_squared: true, forward: 0.0, backward: 0.0 });
+                v[0].look.errors = Some(ErrorBars::Percent(10.0));
+                v[2].look.labels = true;
+            }
+            v
         };
         let c = Chart {
             kind: *kind,
@@ -88,5 +108,5 @@ fn main() {
         }
         svg.push_str("</g>");
     }
-    println!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" style="background:#eee">{svg}</svg>"#, 3.0 * (w + 10.0), 3.0 * (h + 10.0));
+    println!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" style="background:#eee">{svg}</svg>"#, 3.0 * (w + 10.0), 5.0 * (h + 10.0));
 }

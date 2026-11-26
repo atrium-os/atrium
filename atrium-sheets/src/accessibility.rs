@@ -223,7 +223,7 @@ mod tests {
         let mut d = Doc::from_csv("c.csv", b"1\n2\n3\n").unwrap().0;
         d.wb.add_chart(Chart {
             kind: ChartKind::Column, grouping: Grouping::Standard, title: None,
-            series: vec![Series { name: None, cats: None, vals: Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 0 }, kind: None }],
+            series: vec![Series { name: None, cats: None, vals: Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 0 }, kind: None, look: Default::default() }],
             legend: None, x_title: None, y_title: None,
             anchor: Anchor { sheet: 0, from: (5, 2, 0.0, 0.0), to: (15, 8, 0.0, 0.0) }, alt: None,
         }).unwrap();

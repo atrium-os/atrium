@@ -80,7 +80,7 @@ fn fixture() -> Workbook {
             name: Some(ChartText::Lit("Units shipped".into())),
             cats: Some(rect(1, 4, 2, 4)),
             vals: rect(1, 5, 2, 5),
-            kind: None,
+            kind: None, look: Default::default(),
         }],
         legend: Some(LegendPos::Bottom),
         x_title: None,

@@ -135,7 +135,7 @@ fn hostile_ods_never_panics() {
             kind,
             grouping: Grouping::Stacked,
             title: Some(ChartText::Lit("t".into())),
-            series: vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 1))), cats: Some(col(1)), vals: col(0), kind: None }],
+            series: vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 1))), cats: Some(col(1)), vals: col(0), kind: None, look: Default::default() }],
             legend: Some(LegendPos::Right),
             x_title: Some("x".into()),
             y_title: None,

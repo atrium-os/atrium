@@ -920,8 +920,12 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
             ct.push_str(&format!(r#"<Override PartName="/xl/threadedComments/threadedComment{}.xml" ContentType="{}"/>"#, s + 1, super::threaded::THREAD_TYPE));
         }
     }
-    for i in 0..wb.charts().len() {
-        ct.push_str(&format!(r#"<Override PartName="/xl/charts/chart{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#, i + 1));
+    for (i, c) in wb.charts().iter().enumerate() {
+        if super::chart::is_ex(c) {
+            ct.push_str(&format!(r#"<Override PartName="/xl/charts/chartEx{}.xml" ContentType="application/vnd.ms-office.chartex+xml"/>"#, i + 1));
+        } else {
+            ct.push_str(&format!(r#"<Override PartName="/xl/charts/chart{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#, i + 1));
+        }
     }
     for i in 0..wb.tables().len() {
         ct.push_str(&format!(r#"<Override PartName="/xl/tables/table{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>"#, i + 1));
@@ -1117,7 +1121,11 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
                 z.add(&format!("xl/drawings/drawing{}.xml", s + 1), super::chart::drawing_xml(wb, &charts, &pictures).as_bytes())?;
                 let mut dr = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
                 for (j, i) in charts.iter().enumerate() {
-                    dr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{i}.xml"/>"#, j + 1));
+                    if super::chart::is_ex(&wb.charts()[i - 1]) {
+                        dr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx{i}.xml"/>"#, j + 1));
+                    } else {
+                        dr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{i}.xml"/>"#, j + 1));
+                    }
                 }
                 for (j, &i) in pictures.iter().enumerate() {
                     let picture = &wb.pictures()[i];
@@ -1158,7 +1166,8 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         z.add(&format!("xl/tables/table{}.xml", i + 1), &table_xml(t, i + 1, wb.date_system(), &dxfs))?;
     }
     for (i, c) in wb.charts().iter().enumerate() {
-        z.add(&format!("xl/charts/chart{}.xml", i + 1), super::chart::chart_xml(wb, c).as_bytes())?;
+        let part = if super::chart::is_ex(c) { format!("xl/charts/chartEx{}.xml", i + 1) } else { format!("xl/charts/chart{}.xml", i + 1) };
+        z.add(&part, super::chart::chart_xml(wb, c).as_bytes())?;
     }
     for (i, p) in pivots {
         let n = i + 1;
