@@ -219,7 +219,7 @@ listen = [{ port = 8080, proto = "tcp", from = "local-network" }]
 - Inbound flows are counted. The bar list shows "3 connections" next to
   the app, and the rate limit keeps a noisy LAN from flooding the jail.
 
-### 4.4 Opening your own server in Navigator (proposed, B6)
+### 4.4 Opening your own server in Navigator (B6, accepted 2026-11-26)
 
 Today a typed `http://localhost:8080` opens nothing. Navigator's fetcher,
 `navigator-fetchd`, runs in a jail with its own network stack, under
@@ -355,7 +355,7 @@ read only the manifest and the person's grant.
 5. **B5 templates and Artifex.** Both templates, Artifex's New project
    and Package card, the sheet's words; vm-templates-check and
    vm-artifex-check gain one section each.
-6. **B6 your own server in Navigator** (§4.4, proposed). portcullisd
+6. **B6 your own server in Navigator** (§4.4, accepted). portcullisd
    `OpenLocalPort`, jaild's connect and fd pass, navigatord's typed-address
    path, fetchd's socket-only `Net`, the address bar chip; the checks in
    §4.4.
@@ -387,7 +387,7 @@ read only the manifest and the person's grant.
 | G6 | Should ports be 1024+ only, with no internet reach? | Yes for v1 (§8) |
 | G7 | Templates: Rust first, C after? | Yes |
 
-Proposed 2026-11-26, open:
+Accepted 2026-11-26 (Shankar: "yes to all"):
 
 | # | Question | Recommendation |
 |---|---|---|
