@@ -155,6 +155,16 @@ impl Daemon {
         self.t0.elapsed().as_millis() as u64
     }
 
+    /// Exits for the supervisor to restart us (the controller went), first
+    /// trying once more a pending key-store clean-up.
+    fn exit_clean(&mut self) -> ! {
+        if self.store_dirty_at.is_some() {
+            let now = self.now();
+            self.reconcile_store(now);
+        }
+        std::process::exit(1)
+    }
+
     /// Deletes stored bonds we do not hold (after a store whose reply was
     /// lost); on failure tries again in 30 s.
     fn reconcile_store(&mut self, now: u64) {
@@ -860,7 +870,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
             }
             if let Err(e) = link.write_all(&f.to_bytes()) {
                 eprintln!("vinculumd: transport write: {e}");
-                std::process::exit(1);
+                d.exit_clean();
             }
         }
         if d.host.poll_event_pending() {
@@ -884,7 +894,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
             let n = link.read(&mut buf).unwrap_or(0);
             if n == 0 {
                 eprintln!("vinculumd: transport closed");
-                std::process::exit(1);
+                d.exit_clean();
             }
             let mut frames = Vec::new();
             if let Err(e) = dec.push(&buf[..n], |f| frames.push(f)) {
