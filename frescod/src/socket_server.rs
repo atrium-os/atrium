@@ -840,7 +840,9 @@ pub fn reader_loop(
         if msg.op == fresco_protocol::control::OP_SLOT_SET {
             if let Ok(p) = fresco_protocol::decode::<fresco_protocol::SlotSetPayload>(&msg.payload) {
                 if let Some(bytes) = conn.cache_get(&p.hash) {
-                    frontend.lock().unwrap().ingest_blob(&bytes);
+                    let fe = frontend.lock().unwrap();
+                    crate::fenrec::blob(&bytes);
+                    fe.ingest_blob(&bytes);
                 } else {
                     log::warn!("client {client_id}: slot_set hash not in \
                                 connection cache; upload dropped");
@@ -957,7 +959,12 @@ pub fn reader_loop(
             continue;
         }
 
-        let outs = match frontend.lock().unwrap().dispatch(&msg, client_id) {
+        let dispatched = {
+            let mut fe = frontend.lock().unwrap();
+            crate::fenrec::msg(client_id, &msg);
+            fe.dispatch(&msg, client_id)
+        };
+        let outs = match dispatched {
             Ok(v)  => v,
             Err(e) => {
                 eprintln!("frescod: client {client_id} op={:#x}: {e:?}", msg.op);

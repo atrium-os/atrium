@@ -9,4 +9,5 @@
 
 pub mod pack;
 pub mod sprites;
+pub mod record;
 pub mod stream;

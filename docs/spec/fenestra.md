@@ -459,10 +459,17 @@ independent streams, so a large image upload in one window never delays typing i
     bit flips, truncation, and random bytes. 200 000 iterations ran with no panic, and the
     reader stayed within its budgets and bounds. A blob changed in flight is never drawn, and
     an endless frame is cut off at `MAX_FRAME_BYTES`.
+- **Recordings.** A frescod built with the `fenestra-record` feature and run with
+  `FRESCO_RECORD=<new file>` records what its frontend takes, in the order it took it, under
+  the frontend's lock (`frescod/src/fenrec.rs`, format in `fresco-render-core/src/record.rs`):
+  client ops, blobs, animation ticks and draws. No other build can record.
+
+  `fenestra-stream-replay` plays a recording through the stream to two viewers per window.
+  `scripts/fenestra-record-vm.sh` records the three sessions in a VM, and
+  `scripts/fenestra-stream-check.sh` is the R1 gate (the tests above plus the three
+  replays).
 - **Not yet:**
   - The writer is not wired into `fresco-renderer`.
-  - No recorder and no `fenestra-stream-check.sh` yet (recorded Pergola, Navigator and Officina
-    sessions).
   - Window 0 (the shared screen) is not streamed.
   - A slot bound on the host whose blob missed the CAS is not sent, so a run's colour mark can
     differ there.

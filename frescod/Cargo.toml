@@ -56,6 +56,9 @@ cranelift = ["fresco-compute/cranelift"]
 # Another one (rdna3, xe2, ...) is another feature here.
 default = ["cranelift", "rdna4"]
 rdna4 = ["fresco-compute/rdna4"]
+# Record every client's scene to FRESCO_RECORD for the Fenestra stream gate
+# (src/fenrec.rs). Development builds only.
+fenestra-record = []
 
 [dependencies]
 # Supervisor-bound sockets (docs/spec/fast-boot.md §5).

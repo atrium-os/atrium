@@ -65,6 +65,8 @@ mod activation;
 mod lock;
 #[path = "../socket_server.rs"]
 mod socket_server;
+#[path = "../fenrec.rs"]
+mod fenrec;
 /// Renderers hold no capabilities (fresco-capabilities.md §2): the front
 /// end decides them. The shared socket code's calls are no-ops here.
 mod caps {

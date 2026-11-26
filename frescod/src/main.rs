@@ -44,6 +44,7 @@ mod redraw;
 mod render_backend;
 use fresco_render_core::sprites;
 mod socket_server;
+mod fenrec;
 mod split;
 mod gpu_app;
 mod chrome;
@@ -1572,7 +1573,9 @@ fn render_one_frame(
         let mut fe = frontend.lock().unwrap();
         /* Declarative animations (pergola.md §4.2) to this frame's time:
          * while any runs, the loop draws again at the next frame. */
-        let live = fe.tick_animations(video::monotonic_ns());
+        let now = video::monotonic_ns();
+        fenrec::tick(now);
+        let live = fe.tick_animations(now);
         ANIMATING.store(live, std::sync::atomic::Ordering::Relaxed);
         let fe = &*fe;
         for (win_id, pos, size) in &layers {
@@ -1610,6 +1613,7 @@ fn render_one_frame(
     }
     let (uploads, clears) = {
         let mut fe = frontend.lock().unwrap();
+        fenrec::draw();
         fe.take_pending_uploads()
     };
     if held >= Duration::from_millis(20) {

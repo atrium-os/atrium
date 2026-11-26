@@ -44,6 +44,8 @@ use fresco_render_core::pack;
 mod chrome;
 #[path = "../socket_server.rs"]
 mod socket_server;
+#[path = "../fenrec.rs"]
+mod fenrec;
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();

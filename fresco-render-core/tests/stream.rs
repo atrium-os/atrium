@@ -175,3 +175,63 @@ fn skipped_states_are_not_queued() {
     assert!(!stats.whole);
     assert_eq!(stats.nodes, 1);
 }
+
+/// A recorded session (the format frescod writes with `fenestra-record`)
+/// reads back as it was written and replays equal, with several windows.
+#[test]
+fn recorded_sessions_replay_equal() {
+    use fresco_render_core::record::{self, Event, Recorder};
+    let mut r = Rng(99);
+    let mut host = frontend();
+    let mut buf = Vec::new();
+    let mut rec = Recorder::new(&mut buf).unwrap();
+    let mut events = Vec::new();
+    let mut put = |rec: &mut Recorder<&mut Vec<u8>>, e: Event| {
+        match &e {
+            Event::Msg { client, msg } => rec.msg(*client, msg).unwrap(),
+            Event::Blob(b) => rec.blob(b).unwrap(),
+            Event::Tick(t) => rec.tick(*t).unwrap(),
+            Event::Draw => rec.draw().unwrap(),
+        }
+        events.push(e);
+    };
+    // Two clients, three windows.
+    let p = WindowCreatePayload { width: W, height: H, title: "t".into(), hints: Default::default(), parent_window_id: 0 };
+    let mut wins = Vec::new();
+    for client in [1u8, 2, 1] {
+        let m = msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap());
+        let out = host.dispatch(&m, client).unwrap();
+        wins.push((client, decode::<WindowCreateReply>(&out[0].payload).unwrap().window_id as u16));
+        put(&mut rec, Event::Msg { client, msg: m });
+    }
+    let mut now = 1_000_000_000u64;
+    for _ in 0..120 {
+        let (client, win) = wins[r.below(3) as usize];
+        for (op, payload) in random_op(&mut r, &host, win) {
+            if op == 0xFFFF {
+                host.ingest_blob(&payload);
+                put(&mut rec, Event::Blob(payload));
+                continue;
+            }
+            let m = msg(op, win, payload);
+            let _ = host.dispatch(&m, client);
+            put(&mut rec, Event::Msg { client, msg: m });
+        }
+        now += 16_000_000;
+        host.tick_animations(now);
+        put(&mut rec, Event::Tick(now));
+        let _ = host.take_pending_uploads();
+        put(&mut rec, Event::Draw);
+    }
+    rec.flush().unwrap();
+    drop(rec);
+    let back = record::read(&buf[..]).unwrap();
+    assert_eq!(back.len(), events.len());
+    let rep = record::replay(&back, 2, 0.3, 5);
+    assert!(rep.passed(), "{rep:?}");
+    assert_eq!(rep.windows, 3);
+    assert!(rep.compared > 200, "{rep:?}");
+    // A torn last record is dropped, not an error.
+    let torn = record::read(&buf[..buf.len() - 3]).unwrap();
+    assert_eq!(torn.len(), events.len() - 1);
+}
