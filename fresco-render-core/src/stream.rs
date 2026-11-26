@@ -724,6 +724,9 @@ impl Reader {
                     }
                     tag::OPS_LZ4 => {
                         let run = self.unpack(&body)?;
+                        if run.is_empty() {
+                            return Err(StreamError::Framing("an empty packed run"));
+                        }
                         let mut at = 0;
                         while at < run.len() {
                             let Some(head) = run.get(at..at + 4) else {

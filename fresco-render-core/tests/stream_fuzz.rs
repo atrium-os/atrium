@@ -444,6 +444,7 @@ fn large_region_updates_go_compressed() {
         ("a packed END", forge(&packed(rec(tag::END, &held.1.to_le_bytes()))), stream::StreamError::Framing("a packed record that is not an OP")),
         ("a packed record cut short", forge(&packed(short)), stream::StreamError::Framing("a packed record cut short")),
         ("a packed empty record", forge(&packed(vec![0u8; 4])), stream::StreamError::Framing("a packed record cut short")),
+        ("an empty run", forge(&packed(Vec::new())), stream::StreamError::Framing("an empty packed run")),
     ];
     for (why, b, want) in cases {
         let (mut fe, mut vs, mut reader) = fresh();
