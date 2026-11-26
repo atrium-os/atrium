@@ -44,6 +44,7 @@ const NS: &str = concat!(
     r#"xmlns:calcext="urn:org:documentfoundation:names:experimental:calc:xmlns:calcext:1.0" "#,
     r#"xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" "#,
     r#"xmlns:tableooo="http://openoffice.org/2009/table" "#,
+    r#"xmlns:css3t="http://www.w3.org/TR/css3-text/" "#,
     r#"office:version="1.3""#
 );
 
@@ -83,6 +84,23 @@ fn odf_href(t: &str) -> String {
 
 /// The cell's text as paragraphs, inside a `text:a` when the cell has a link.
 fn cell_paras(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, text: &str) {
+    // A raised or lowered cell's text in a span too, as LibreOffice keeps it.
+    let span = match wb.style(officina_grid::addr::CellAddr::new(s, r, c)).font.script {
+        officina_grid::style::Script::Super => Some("Tsuper"),
+        officina_grid::style::Script::Sub => Some("Tsub"),
+        officina_grid::style::Script::Normal => None,
+    };
+    if let Some(name) = span {
+        let mut inner = String::new();
+        cell_paras_plain(&mut inner, wb, s, r, c, text);
+        let open = format!(r#"<text:p><text:span text:style-name="{name}">"#);
+        out.push_str(&inner.replace("<text:p>", &open).replace("</text:p>", "</text:span></text:p>"));
+        return;
+    }
+    cell_paras_plain(out, wb, s, r, c, text);
+}
+
+fn cell_paras_plain(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, text: &str) {
     match wb.link(s, r, c) {
         Some(l) => {
             let mut inner = String::new();
@@ -686,6 +704,10 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
     if st.shrink_to_fit {
         tc.push_str(r#" style:shrink-to-fit="true""#);
     }
+    if st.h_align == HAlign::Fill {
+        // LibreOffice's Repeat alignment: fo:text-align start with it.
+        tc.push_str(r#" style:repeat-content="true""#);
+    }
     if st.rotation == 255 {
         tc.push_str(r#" style:direction="ttb""#);
     } else if st.rotation != 0 {
@@ -718,13 +740,17 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
         // its own cell, as it does for .xlsx's centerContinuous.
         HAlign::Center | HAlign::CenterAcross => Some("center"),
         HAlign::Right => Some("end"),
-        HAlign::Justify => Some("justify"),
+        HAlign::Justify | HAlign::Distributed => Some("justify"),
+        HAlign::Fill => Some("start"),
         _ => None,
     };
     if align.is_some() || st.indent > 0 {
         out.push_str("<style:paragraph-properties");
         if let Some(a) = align {
             let _ = write!(out, r#" fo:text-align="{a}""#);
+        }
+        if st.h_align == HAlign::Distributed {
+            out.push_str(r#" css3t:text-justify="distribute""#);
         }
         if st.indent > 0 {
             // Excel's indent step is about three characters.
@@ -742,6 +768,14 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
     }
     if f.underline {
         tp.push_str(r#" style:text-underline-style="solid" style:text-underline-width="auto" style:text-underline-color="font-color""#);
+        if f.double {
+            tp.push_str(r#" style:text-underline-type="double""#);
+        }
+    }
+    match f.script {
+        officina_grid::style::Script::Super => tp.push_str(r#" style:text-position="super 58%""#),
+        officina_grid::style::Script::Sub => tp.push_str(r#" style:text-position="sub 58%""#),
+        officina_grid::style::Script::Normal => {}
     }
     if f.strike {
         tp.push_str(r#" style:text-line-through-style="solid""#);
@@ -1537,6 +1571,8 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     auto.push_str(&cells);
+    auto.push_str(r#"<style:style style:name="Tsuper" style:family="text"><style:text-properties style:text-position="super 58%"/></style:style>"#);
+    auto.push_str(r#"<style:style style:name="Tsub" style:family="text"><style:text-properties style:text-position="sub 58%"/></style:style>"#);
     let comment_styles: BTreeSet<u8> = (0..wb.sheet_count() as u16)
         .flat_map(|sheet| wb.comments(sheet).values())
         .flat_map(|comment| comment.runs().iter().map(|run| run.style.mask()))

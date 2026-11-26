@@ -232,6 +232,11 @@ struct CellStyle {
     bold: Option<bool>,
     italic: Option<bool>,
     underline: Option<bool>,
+    double: Option<bool>,
+    script: Option<officina_grid::style::Script>,
+    /// `style:repeat-content` (Fill) and `css3t:text-justify="distribute"`.
+    repeat: Option<bool>,
+    distribute: Option<bool>,
     strike: Option<bool>,
     color: Option<u32>,
     size: Option<u16>,
@@ -261,6 +266,8 @@ struct Styles {
     /// Font face name → family.
     faces: HashMap<String, String>,
     comment_text: HashMap<String, CommentStyle>,
+    /// Text styles that raise or lower their text (`style:text-position`).
+    text_script: HashMap<String, officina_grid::style::Script>,
     /// Cell styles with `style:map` conditions.
     cond_maps: bool,
 }
@@ -335,6 +342,9 @@ impl Styles {
                         }
                         "style:text-properties" => {
                             if cur_family == "text" {
+                                if let Some(p) = a.get("style:text-position").map(|p| script_of(p)).filter(|p| *p != officina_grid::style::Script::Normal) {
+                                    self.text_script.insert(cur_name.clone(), p);
+                                }
                                 let enabled = |key: &str| a.get(key).is_some_and(|value| value != "none");
                                 self.comment_text.insert(cur_name.clone(), CommentStyle {
                                     bold: a.get("fo:font-weight").is_some_and(|v| v == "bold" || v.parse::<u32>().is_ok_and(|n| n >= 600)),
@@ -352,6 +362,12 @@ impl Styles {
                                 }
                                 if let Some(u) = a.get("style:text-underline-style") {
                                     c.underline = Some(u != "none");
+                                }
+                                if let Some(u) = a.get("style:text-underline-type") {
+                                    c.double = Some(u == "double");
+                                }
+                                if let Some(p) = a.get("style:text-position") {
+                                    c.script = Some(script_of(p));
                                 }
                                 if let Some(u) = a.get("style:text-line-through-style") {
                                     c.strike = Some(u != "none");
@@ -416,6 +432,9 @@ impl Styles {
                                 if let Some(w) = a.get("fo:wrap-option") {
                                     c.wrap = Some(w == "wrap");
                                 }
+                                if let Some(value) = a.get("style:repeat-content") {
+                                    c.repeat = Some(matches!(value.as_str(), "true" | "1"));
+                                }
                                 if let Some(value) = a.get("style:shrink-to-fit") {
                                     c.shrink_to_fit = Some(matches!(value.as_str(), "true" | "1"));
                                 }
@@ -449,6 +468,9 @@ impl Styles {
                                         "justify" => HAlign::Justify,
                                         _ => HAlign::General,
                                     });
+                                }
+                                if let Some(t) = a.get("css3t:text-justify") {
+                                    c.distribute = Some(t == "distribute");
                                 }
                             }
                         }
@@ -736,6 +758,13 @@ impl Styles {
             if let Some(b) = c.underline {
                 s.font.underline = b;
             }
+            if let Some(b) = c.double {
+                s.font.double = b;
+            }
+            s.font.double &= s.font.underline;
+            if let Some(v) = c.script {
+                s.font.script = v;
+            }
             if let Some(b) = c.strike {
                 s.font.strike = b;
             }
@@ -759,6 +788,11 @@ impl Styles {
             }
             if let Some(h) = c.h {
                 s.h_align = h;
+            }
+            if c.repeat == Some(true) {
+                s.h_align = HAlign::Fill;
+            } else if c.distribute == Some(true) && s.h_align == HAlign::Justify {
+                s.h_align = HAlign::Distributed;
             }
             if let Some(v) = c.v {
                 s.v_align = v;
@@ -812,6 +846,9 @@ struct CellIn {
     matrix: Option<(u32, u32)>,
     /// The data validation rule it names.
     validation: Option<String>,
+    /// A raised or lowered span its text starts with, and where it ended:
+    /// LibreOffice writes a whole cell's superscript or subscript so.
+    script_span: Option<(officina_grid::style::Script, Option<usize>)>,
 }
 
 struct StoredFormula {
@@ -1162,12 +1199,19 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         };
                         let formula = a.get("table:formula").cloned();
                         let live_formula = super::formula::live_formula(&a, formula.as_deref());
-                        let c = CellIn { link: None, vtype, value, formula, live_formula, style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix, validation: a.get("table:content-validation-name").cloned() };
+                        let c = CellIn { link: None, vtype, value, formula, live_formula, style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix, validation: a.get("table:content-validation-name").cloned(), script_span: None };
                         if empty {
                             row_cells.push((col, repeat, c));
                             col += repeat as u64;
                         } else {
                             cell = Some(c);
+                        }
+                    }
+                    b"text:span" if !empty => {
+                        if let (true, Some(c)) = (in_p, cell.as_mut()) {
+                            if c.text.is_empty() && c.paras == 1 && c.script_span.is_none() {
+                                c.script_span = attrs(e).get("text:style-name").and_then(|n| styles.text_script.get(n)).map(|&p| (p, None));
+                            }
                         }
                     }
                     b"text:a" => {
@@ -1601,6 +1645,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                     }
                     b"text:p" | b"text:h" => in_p = false,
+                    b"text:span" => {
+                        if let Some(c) = cell.as_mut() {
+                            if let Some((_, end @ None)) = c.script_span.as_mut() {
+                                *end = Some(c.text.len());
+                            }
+                        }
+                    }
                     b"table:table-cell" | b"table:covered-table-cell" => {
                         if let Some(mut c) = cell.take() {
                             if let (Some(href), true) = (c.link.take(), row < MAX_ROWS as u64 && col < MAX_COLS as u64) {
@@ -1703,6 +1754,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 let id = match date_format.filter(|_| wb.styles.format(base).is_general()) {
                                     Some(format) => wb.styles.intern(wb.styles.get(base).clone().with_num_fmt(format)),
                                     None => base,
+                                };
+                                // A span over all of the cell's text raises or lowers the cell.
+                                let id = match c.script_span {
+                                    Some((p, Some(end))) if end == c.text.len() && !c.text.is_empty() && wb.styles.get(id).font.script != p => {
+                                        let mut st = wb.styles.get(id).clone();
+                                        st.font.script = p;
+                                        wb.styles.intern(st)
+                                    }
+                                    _ => id,
                                 };
                                 if runs.len() <= cc as usize {
                                     if id == 0 {
@@ -2033,4 +2093,19 @@ pub(super) fn target_rect(wb: &Workbook, target: &str) -> Option<(u16, u32, u32,
     let sh = sh.trim_matches('\'').replace("''", "'");
     let (r0, c0, r1, c1) = crate::xlsx::read::parse_ref(rf)?;
     Some((wb.sheet_id(&sh)?, r0, c0, r1, c1))
+}
+
+/// ODF's `style:text-position` (`super 58%`, `sub`, `33% 58%`, `0% 100%`):
+/// raised is superscript, lowered subscript.
+fn script_of(v: &str) -> officina_grid::style::Script {
+    use officina_grid::style::Script;
+    match v.split_whitespace().next().unwrap_or("") {
+        "super" => Script::Super,
+        "sub" => Script::Sub,
+        p => match p.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
+            Some(n) if n > 0.0 => Script::Super,
+            Some(n) if n < 0.0 => Script::Sub,
+            _ => Script::Normal,
+        },
+    }
 }

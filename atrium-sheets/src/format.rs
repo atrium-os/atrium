@@ -4,7 +4,7 @@
 
 use officina_grid::addr::{CellAddr, Rect};
 use officina_grid::ops::GridOp;
-use officina_grid::style::{Edge, HAlign, Line, Style};
+use officina_grid::style::{Edge, HAlign, Line, Script, Style};
 use pergola::widgets::{CellRange, MenuItem};
 
 use crate::doc::Doc;
@@ -15,6 +15,10 @@ pub enum FormatCmd {
     Italic,
     Underline,
     Strike,
+    /// A double underline on (an underline doubled) or back to single.
+    DoubleUnderline,
+    /// Superscript or subscript on the whole cell, or back to normal.
+    Script(officina_grid::style::Script),
     /// Left, centre, right, or as the value says (General).
     Align(HAlign),
     /// One of [`NUMBER_FORMATS`].
@@ -164,6 +168,9 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Italic").checked(st.font.italic).shortcut("Ctrl+I"), Some(FormatCmd::Italic)),
         (MenuItem::new("Underline").checked(st.font.underline).shortcut("Ctrl+U"), Some(FormatCmd::Underline)),
         (MenuItem::new("Strikethrough").checked(st.font.strike).shortcut("Ctrl+5"), Some(FormatCmd::Strike)),
+        (MenuItem::new("Double Underline").checked(st.font.underline && st.font.double), Some(FormatCmd::DoubleUnderline)),
+        (MenuItem::new("Superscript").checked(st.font.script == Script::Super), Some(FormatCmd::Script(Script::Super))),
+        (MenuItem::new("Subscript").checked(st.font.script == Script::Sub), Some(FormatCmd::Script(Script::Sub))),
         (MenuItem::new(format!("Larger Text ({pt} pt)")).separated(), Some(FormatCmd::Larger)),
         (MenuItem::new("Smaller Text"), Some(FormatCmd::Smaller)),
         (MenuItem::new("Font: Sans").radio(!mono), Some(FormatCmd::Mono(false))),
@@ -174,6 +181,9 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Align Centre").checked(st.h_align == HAlign::Center), Some(FormatCmd::Align(HAlign::Center))),
         (MenuItem::new("Align Right").checked(st.h_align == HAlign::Right), Some(FormatCmd::Align(HAlign::Right))),
         (MenuItem::new("Align by Value").checked(st.h_align == HAlign::General), Some(FormatCmd::Align(HAlign::General))),
+        (MenuItem::new("Fill the Cell").checked(st.h_align == HAlign::Fill), Some(FormatCmd::Align(HAlign::Fill))),
+        (MenuItem::new("Justify").checked(st.h_align == HAlign::Justify), Some(FormatCmd::Align(HAlign::Justify))),
+        (MenuItem::new("Distributed").checked(st.h_align == HAlign::Distributed), Some(FormatCmd::Align(HAlign::Distributed))),
         (MenuItem::new("Increase Indent").enabled(st.indent < MAX_INDENT), Some(FormatCmd::Indent(true))),
         (MenuItem::new("Decrease Indent").enabled(st.indent > 0), Some(FormatCmd::Indent(false))),
     ];
@@ -313,14 +323,35 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
         }
         FormatCmd::Bold => toggle!("Bold", bold),
         FormatCmd::Italic => toggle!("Italic", italic),
-        FormatCmd::Underline => toggle!("Underline", underline),
+        FormatCmd::Underline => {
+            let on = !first.font.underline;
+            one(d, "Underline", &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = false; st });
+            Ok(format!("Underline {}.", if on { "on" } else { "off" }))
+        }
         FormatCmd::Strike => toggle!("Strikethrough", strike),
+        FormatCmd::DoubleUnderline => {
+            let on = !(first.font.underline && first.font.double);
+            one(d, "Double Underline", &|st| { let mut st = st.clone(); st.font.underline = on; st.font.double = on; st });
+            Ok(if on { "Double underline on.".into() } else { "Double underline off.".into() })
+        }
+        FormatCmd::Script(want) => {
+            let to = if first.font.script == want { Script::Normal } else { want };
+            one(d, if want == Script::Sub { "Subscript" } else { "Superscript" }, &|st| { let mut st = st.clone(); st.font.script = to; st });
+            Ok(match to {
+                Script::Super => "Superscript on.",
+                Script::Sub => "Subscript on.",
+                Script::Normal => "Back to normal text.",
+            }.into())
+        }
         FormatCmd::Align(a) => {
             one(d, "Align", &|st| Style { h_align: a, ..st.clone() });
             Ok(match a {
                 HAlign::Left => "Aligned left.",
                 HAlign::Center => "Centred.",
                 HAlign::Right => "Aligned right.",
+                HAlign::Fill => "The text is repeated to fill each cell.",
+                HAlign::Justify => "Justified: lines wrap and stretch to both edges.",
+                HAlign::Distributed => "Distributed: words spread evenly over each cell.",
                 _ => "Aligned by value: text left, numbers right.",
             }.into())
         }
@@ -488,6 +519,56 @@ pub fn decimals(code: &str, more: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::decimals;
+
+    #[test]
+    fn font_effects_and_spread_alignments_toggle_and_reach_the_grid() {
+        use super::{run, FormatCmd};
+        use officina_grid::style::{HAlign, Script};
+        use officina_grid::CellAddr;
+        use pergola::inline::Emphasis;
+        use pergola::widgets::{grid_view::Spread, CellRange, GridSource};
+        let d = std::rc::Rc::new(std::cell::RefCell::new(crate::doc::Doc::from_csv("f.csv", b"H2O,x\n").unwrap().0));
+        let src = crate::source::SheetSource::new(d.clone());
+        let sel = CellRange { r0: 0, c0: 0, r1: 0, c1: 0 };
+        let st = |d: &std::rc::Rc<std::cell::RefCell<crate::doc::Doc>>| d.borrow().wb.style(CellAddr::new(0, 0, 0)).clone();
+        run(&mut d.borrow_mut(), sel, FormatCmd::Script(Script::Super));
+        assert_eq!(st(&d).font.script, Script::Super);
+        assert!(src.cell(0, 0).unwrap().marks & Emphasis::Super as u8 != 0);
+        // Subscript replaces it; asked again, back to normal.
+        run(&mut d.borrow_mut(), sel, FormatCmd::Script(Script::Sub));
+        assert_eq!(st(&d).font.script, Script::Sub);
+        run(&mut d.borrow_mut(), sel, FormatCmd::Script(Script::Sub));
+        assert_eq!(st(&d).font.script, Script::Normal);
+        run(&mut d.borrow_mut(), sel, FormatCmd::DoubleUnderline);
+        assert!(st(&d).font.underline && st(&d).font.double);
+        let m = src.cell(0, 0).unwrap().marks;
+        assert!(m & Emphasis::Underline as u8 != 0 && m & Emphasis::Double as u8 != 0);
+        // Plain Underline off takes the double away too.
+        run(&mut d.borrow_mut(), sel, FormatCmd::Underline);
+        assert!(!st(&d).font.underline && !st(&d).font.double);
+        for (a, spread) in [(HAlign::Fill, Spread::Fill), (HAlign::Justify, Spread::Justify), (HAlign::Distributed, Spread::Distributed), (HAlign::Left, Spread::None)] {
+            run(&mut d.borrow_mut(), sel, FormatCmd::Align(a));
+            assert_eq!(src.cell(0, 0).unwrap().spread, spread);
+        }
+        assert!(d.borrow_mut().undo());
+        assert_eq!(st(&d).h_align, HAlign::Distributed);
+    }
+
+    #[test]
+    fn next_comment_steps_in_reading_order_and_wraps() {
+        use officina_grid::comments::Comment;
+        let mut wb = officina_grid::Workbook::new();
+        wb.add_sheet("S").unwrap();
+        assert_eq!(crate::data::next_comment(&wb, 0, (0, 0), false), None);
+        wb.set_comments(0, vec![(2, 1, Some(Comment::new("a", "x"))), (0, 3, Some(Comment::new("a", "y"))), (2, 0, Some(Comment::new("", "z")))]);
+        let n = |at, back| crate::data::next_comment(&wb, 0, at, back);
+        assert_eq!(n((0, 0), false), Some((0, 3)));
+        assert_eq!(n((0, 3), false), Some((2, 0)));
+        assert_eq!(n((2, 0), false), Some((2, 1)));
+        assert_eq!(n((2, 1), false), Some((0, 3)), "wraps");
+        assert_eq!(n((0, 3), true), Some((2, 1)), "back wraps");
+        assert_eq!(n((2, 1), true), Some((2, 0)));
+    }
 
     #[test]
     fn decimals_are_added_and_taken_in_every_section() {

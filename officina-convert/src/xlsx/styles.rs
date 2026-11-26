@@ -187,6 +187,8 @@ struct FontIn {
     underline: bool,
     strike: bool,
     color: Option<u32>,
+    double: bool,
+    script: officina_grid::style::Script,
 }
 
 #[cfg(feature = "read")]
@@ -327,7 +329,17 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                     b"b" => font.bold = val.is_none_or(|v| v != "0" && v != "false"),
                     b"i" => font.italic = val.is_none_or(|v| v != "0" && v != "false"),
                     b"strike" => font.strike = val.is_none_or(|v| v != "0" && v != "false"),
-                    b"u" => font.underline = val.is_none_or(|v| v != "none"),
+                    b"u" => {
+                        font.underline = val.is_none_or(|v| v != "none");
+                        font.double = val.is_some_and(|v| v == "double" || v == "doubleAccounting");
+                    }
+                    b"vertAlign" => {
+                        font.script = match val.map(String::as_str) {
+                            Some("superscript") => officina_grid::style::Script::Super,
+                            Some("subscript") => officina_grid::style::Script::Sub,
+                            _ => officina_grid::style::Script::Normal,
+                        }
+                    }
                     b"color" => fcol = Some(a),
                     _ => {}
                 }
@@ -496,6 +508,8 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                 strike: f.strike,
                 color: f.color.filter(|c| Some(*c) != base.color
                     || (fo != 0 && font_colors.get(fo) != font_colors.first())),
+                double: f.underline && f.double,
+                script: f.script,
             };
         }
         (s.fill, s.pattern, s.gradient) = fills.get(fi).cloned().unwrap_or_default();
@@ -708,7 +722,12 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
             o.push_str("<strike/>");
         }
         if f.underline {
-            o.push_str("<u/>");
+            o.push_str(if f.double { r#"<u val="double"/>"# } else { "<u/>" });
+        }
+        match f.script {
+            officina_grid::style::Script::Super => o.push_str(r#"<vertAlign val="superscript"/>"#),
+            officina_grid::style::Script::Sub => o.push_str(r#"<vertAlign val="subscript"/>"#),
+            officina_grid::style::Script::Normal => {}
         }
         let sz = f.size.map_or(11.0, |z| z as f64 / 20.0);
         let _ = write!(o, r#"<sz val="{sz}"/>"#);

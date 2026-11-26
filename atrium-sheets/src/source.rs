@@ -124,7 +124,10 @@ fn rotation_face() -> pergola::glyphs::Face {
 /// The grid's italic, underline and strikethrough bits for `f`.
 pub fn font_marks(f: &officina_grid::style::Font) -> u8 {
     use pergola::inline::Emphasis;
+    use officina_grid::style::Script;
     (if f.italic { Emphasis::Italic as u8 } else { 0 }) | (if f.underline { Emphasis::Underline as u8 } else { 0 }) | (if f.strike { Emphasis::Strike as u8 } else { 0 })
+        | (if f.underline && f.double { Emphasis::Double as u8 } else { 0 })
+        | match f.script { Script::Normal => 0, Script::Super => Emphasis::Super as u8, Script::Sub => Emphasis::Sub as u8 }
 }
 
 /// Whether a font named `name` is a monospace one, drawn in the monospace
@@ -197,6 +200,12 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
         HAlign::Center => CellAlign::Center,
         HAlign::CenterAcross => CellAlign::Across,
         HAlign::Right => CellAlign::Right,
+    };
+    cv.spread = match st.h_align {
+        HAlign::Fill => pergola::widgets::grid_view::Spread::Fill,
+        HAlign::Justify => pergola::widgets::grid_view::Spread::Justify,
+        HAlign::Distributed => pergola::widgets::grid_view::Spread::Distributed,
+        _ => pergola::widgets::grid_view::Spread::None,
     };
     cv.wrap = st.wrap;
     cv.valign = match st.v_align {

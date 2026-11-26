@@ -84,6 +84,8 @@ struct FontRec {
     color: u16,
     bold: bool,
     underline: bool,
+    double: bool,
+    script: officina_grid::style::Script,
     name: String,
 }
 
@@ -167,11 +169,11 @@ fn globals(recs: &[Record], rep: &mut Report) -> Result<Globals, XlsError> {
                 let grbit = c.u16()?;
                 let color = c.u16()?;
                 let bls = c.u16()?;
-                let _sss = c.u16()?;
+                let script = match c.u16()? { 1 => officina_grid::style::Script::Super, 2 => officina_grid::style::Script::Sub, _ => officina_grid::style::Script::Normal };
                 let uls = c.u8()?;
                 c.skip(3)?;
                 let name = c.short_string()?;
-                g.fonts.push(FontRec { twips, italic: grbit & 2 != 0, strike: grbit & 8 != 0, color, bold: bls >= 600, underline: uls != 0, name });
+                g.fonts.push(FontRec { twips, italic: grbit & 2 != 0, strike: grbit & 8 != 0, color, bold: bls >= 600, underline: uls != 0, double: matches!(uls, 2 | 0x22), script, name });
             }
             0x041E => {
                 let id = c.u16()?;
@@ -295,6 +297,8 @@ fn styles(g: &Globals, rep: &mut Report) -> Vec<Style> {
                 underline: f.underline,
                 strike: f.strike,
                 color: col.filter(|c| Some(*c) != base_col),
+                double: f.double,
+                script: f.script,
             };
         }
         let al = x[6];

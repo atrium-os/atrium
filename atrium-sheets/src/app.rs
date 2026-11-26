@@ -4276,6 +4276,35 @@ impl Sheets {
                     self.audit(c == crate::data::DataCmd::TraceError);
                     false
                 }
+                Cmd::Data(c @ (crate::data::DataCmd::NextComment | crate::data::DataCmd::PrevComment)) => {
+                    let at = self.grid.get_cloned().cursor;
+                    let found = {
+                        let d = self.doc.borrow();
+                        crate::data::next_comment(&d.wb, d.sheet, at, c == crate::data::DataCmd::PrevComment).map(|to| {
+                            let all = d.wb.comments(d.sheet);
+                            let place = all.range(..to).count() + 1;
+                            let say = all.get(&to).map(|k| {
+                                let first: String = k.text.lines().next().unwrap_or("").chars().take(80).collect();
+                                let who = if k.author.is_empty() { String::new() } else { format!("{}: ", k.author) };
+                                format!("{} ({place} of {}): {who}{first}", range_name(CellRange { r0: to.0, c0: to.1, r1: to.0, c1: to.1 }), all.len())
+                            }).unwrap_or_default();
+                            (to, say)
+                        })
+                    };
+                    match found {
+                        Some((to, say)) => {
+                            self.show_cell(to.0, to.1);
+                            let mut g = self.grid.get_cloned();
+                            g.anchor = to;
+                            g.cursor = to;
+                            self.grid.set(g);
+                            self.set_status(say);
+                        }
+                        None => self.set_status("This sheet has no comments."),
+                    }
+                    self.changed();
+                    false
+                }
                 Cmd::Data(c @ (crate::data::DataCmd::Precedents | crate::data::DataCmd::Dependents)) => {
                     self.trace(c == crate::data::DataCmd::Precedents);
                     self.changed();
@@ -7953,6 +7982,24 @@ mod tests {
             press(&mut app, at(r));
             assert_eq!(s.doc.borrow().sheet, 1, "a press on Sheet2's {what}");
         }
+    }
+
+    #[test]
+    fn next_comment_moves_the_cursor_and_says_what_it_reads() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"a,1\nb,2\n");
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        run(Cmd::Data(DataCmd::NextComment));
+        assert!(s.doc.borrow().status.contains("no comments"), "{}", s.doc.borrow().status);
+        s.doc.borrow_mut().wb.set_comments(0, vec![(1, 1, Some(officina_grid::comments::Comment::new("Ana", "check this\nsecond line")))]);
+        run(Cmd::Data(DataCmd::NextComment));
+        assert_eq!(s.grid.get_cloned().cursor, (1, 1));
+        assert_eq!(s.doc.borrow().status, "B2 (1 of 1): Ana: check this");
+        run(Cmd::Data(DataCmd::PrevComment));
+        assert_eq!(s.grid.get_cloned().cursor, (1, 1), "the only one");
     }
 
     #[test]

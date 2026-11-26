@@ -150,6 +150,22 @@ pub struct CellView {
     /// repeated to the cell's width. What comes before it sits at the left
     /// edge, what comes after at the right (Accounting's sign and number).
     pub fill_at: Option<usize>,
+    /// How the text spreads over the cell's width beyond `align`.
+    pub spread: Spread,
+}
+
+/// A spreadsheet's other horizontal alignments, drawn from the left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Spread {
+    #[default]
+    None,
+    /// The text repeated as many whole times as fit; it never runs over.
+    Fill,
+    /// Wrapped, every line but the last stretched to both edges.
+    Justify,
+    /// Wrapped, every line's words spaced evenly over the width (one word
+    /// centred).
+    Distributed,
 }
 
 /// How a sparkline draws its points.
@@ -404,7 +420,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -2196,12 +2212,19 @@ pub fn needed_width(cv: &CellView) -> f64 {
 
 fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
     let st = TextStyle { family: if cv.mono { font::MONO } else { font::SANS }.into(), size: cv.size.unwrap_or(TEXT_SIZE), weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
-    crate::inline::style(&st, cv.marks & crate::inline::Emphasis::Italic as u8)
+    let mut st = crate::inline::style(&st, cv.marks & crate::inline::Emphasis::Italic as u8);
+    if cv.marks & (crate::inline::Emphasis::Super as u8 | crate::inline::Emphasis::Sub as u8) != 0 {
+        st.size *= crate::inline::SCRIPT_SCALE;
+    }
+    st
 }
 
 /// A cell's text node, with its underline and strikethrough under and
 /// through what is shown.
 fn cell_text(ctx: &mut Ctx, rect: Rect, content: String, style: TextStyle, marks: u8) {
+    use crate::inline::{Emphasis, SCRIPT_SCALE, SCRIPT_SHIFT};
+    let shift = style.size / SCRIPT_SCALE * SCRIPT_SHIFT;
+    let rect = if marks & Emphasis::Super as u8 != 0 { Rect::new(rect.x(), rect.y() - shift, rect.w(), rect.h()) } else if marks & Emphasis::Sub as u8 != 0 { Rect::new(rect.x(), rect.y() + shift, rect.w(), rect.h()) } else { rect };
     let rules: Vec<Node> = crate::inline::rules(rect, &style, marks).collect();
     ctx.add(Node::Text { rect, content, style });
     for r in rules {
@@ -2282,7 +2305,7 @@ fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
 /// alignment points (both, centred), up to [`SPILL_COLS`]. None when it fits,
 /// is a number, or has no empty neighbour.
 fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u32)> {
-    if cv.text.is_empty() || cv.text.contains('\n') || cv.wrap || cv.shrink_to_fit || cv.rotation != 0 {
+    if cv.text.is_empty() || cv.text.contains('\n') || cv.wrap || cv.shrink_to_fit || cv.rotation != 0 || cv.spread != Spread::None {
         return None;
     }
     let cols = src.cols();
@@ -2609,15 +2632,39 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
     if cv.rotation != 0 && draw_rotated(ctx, cv, &style, Rect::new(cx+PAD+lead, cy, avail, ch)) {
         return;
     }
-    if !cv.numeric && (cv.wrap || cv.text.contains('\n')) {
+    if cv.spread == Spread::Fill && !cv.text.contains('\n') {
+        let avail = cw - 2.0 * PAD - lead;
+        let w = crate::text::measure_chars(&cv.text, &style);
+        let n = if w > 0.0 { ((avail / w).floor() as usize).clamp(1, MAX_FILL_REPEAT) } else { 1 };
+        let (shown, w) = fit_text(&CellView { text: cv.text.repeat(n), spread: Spread::None, ..cv.clone() }, avail, &style);
+        cell_text(ctx, Rect::new(cx + PAD + lead, cy + line_top(cv.valign, ch, lh), w, lh), shown, style, cv.marks);
+        return;
+    }
+    let spread = matches!(cv.spread, Spread::Justify | Spread::Distributed);
+    if !cv.numeric && (cv.wrap || spread || cv.text.contains('\n')) {
         // Several lines: centred down the cell when they fit, else from
         // the top, as many as fit whole (at least one).
         let avail = cw - 2.0 * PAD - lead;
-        let lines = text_lines(cv, avail, &style);
+        // Each line, and whether it ends its paragraph (Justify leaves those as they are).
+        let lines: Vec<(String, bool)> = if spread {
+            let width = avail.max(1.0);
+            let wrap = crate::wrap::Wrap { hyphens: false, max_lines: MAX_LINES as u16 };
+            cv.text.replace("\r\n", "\n").split('\n').flat_map(|para| {
+                let ls = crate::text::lines_with(para, &style, width, &wrap);
+                let n = ls.len();
+                ls.into_iter().enumerate().map(move |(i, l)| (l, i + 1 == n))
+            }).take(MAX_LINES).collect()
+        } else {
+            text_lines(cv, avail, &style).into_iter().map(|l| (l, false)).collect()
+        };
         let room = (((ch - 2.0 * LINE_PAD) / lh).floor() as usize).max(1);
         let n = lines.len().min(room);
         let top = if lines.len() <= room { cy + line_top(cv.valign, ch, n as f32 * lh) } else { cy + LINE_PAD };
-        for (i, line) in lines.iter().take(n).enumerate() {
+        for (i, (line, last)) in lines.iter().take(n).enumerate() {
+            let y = top + i as f32 * lh;
+            if spread && spread_line(ctx, line, cx + PAD + lead, y, avail, lh, &style, cv, *last) {
+                continue;
+            }
             let (shown, w) = fit_text(&CellView { text: line.clone(), ..cv.clone() }, avail, &style);
             let tx0 = match cv.align {
                 CellAlign::Left => cx + PAD + lead,
@@ -2656,6 +2703,33 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         CellAlign::Right => cx + q((cw - PAD - w) as f64),
     };
     cell_text(ctx, Rect::new(tx0, cy + line_top(cv.valign, ch, lh), w, lh), shown, style, cv.marks);
+}
+
+/// Draws `line` with its words spread over `avail` (Justify: not the last
+/// line; Distributed: every line, a lone word centred). False, nothing
+/// drawn, when it is drawn as it is.
+#[allow(clippy::too_many_arguments)]
+fn spread_line(ctx: &mut Ctx, line: &str, x: f32, y: f32, avail: f32, lh: f32, style: &TextStyle, cv: &CellView, last: bool) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.is_empty() || (cv.spread == Spread::Justify && (last || words.len() < 2)) {
+        return false;
+    }
+    let widths: Vec<f32> = words.iter().map(|w| crate::text::measure_chars(w, style)).collect();
+    let total: f32 = widths.iter().sum();
+    if total > avail {
+        return false;
+    }
+    if words.len() == 1 {
+        cell_text(ctx, Rect::new(x + q(((avail - total) / 2.0) as f64), y, total, lh), words[0].to_string(), style.clone(), cv.marks);
+        return true;
+    }
+    let gap = (avail - total) / (words.len() - 1) as f32;
+    let mut at = x;
+    for (word, w) in words.iter().zip(&widths) {
+        cell_text(ctx, Rect::new(q(at as f64), y, *w, lh), word.to_string(), style.clone(), cv.marks);
+        at += w + gap;
+    }
+    true
 }
 
 /// F4 in a formula: `text` with the cell reference touching byte `caret`
@@ -3621,6 +3695,60 @@ mod tests {
         // An offset off a character boundary is ignored.
         let v = nodes(CellView { fill_at: Some(2), ..CellView::number("€5") }, 200.0);
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn fill_justify_distributed_and_script_cells_draw_as_spreadsheets_do() {
+        struct One(CellView, f32, f32);
+        impl View for One {
+            #[cfg_attr(debug_assertions, track_caller)]
+            fn render(&self, ctx: &mut Ctx) {
+                ctx.widget_site();
+                draw_cell(ctx, &crate::theme::Semantic::LIGHT, &self.0, 0.0, 0.0, self.1, self.2);
+            }
+        }
+        // Texts as (content, x, y, size), and the rules (underlines) as y.
+        let draw = |cv: CellView, w: f32, h: f32| {
+            let mut app = App::new(One(cv, w, h));
+            app.tick();
+            let mut texts = Vec::new();
+            let mut rules = Vec::new();
+            for (_, n) in app.tree().iter() {
+                match n {
+                    Node::Text { content, rect, style } => texts.push((content.to_string(), rect.x(), rect.y(), style.size)),
+                    Node::Rect { rect, .. } if rect.h() <= 2.0 => rules.push(rect.y()),
+                    _ => {}
+                }
+            }
+            texts.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.1.total_cmp(&b.1)));
+            (texts, rules)
+        };
+        // Fill: the whole text repeated as many times as fit, never cut.
+        let (t, _) = draw(CellView { spread: Spread::Fill, ..CellView::text("ab") }, 120.0, 20.0);
+        assert_eq!(t.len(), 1);
+        let n = t[0].0.len() / 2;
+        assert!(n > 3 && t[0].0 == "ab".repeat(n), "{t:?}");
+        // Distributed: one line's words reach both edges.
+        let (t, _) = draw(CellView { spread: Spread::Distributed, ..CellView::text("a b c") }, 200.0, 20.0);
+        assert_eq!(t.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert!(t[0].1 < 10.0 && t[2].1 > 180.0 && (t[1].1 - 100.0).abs() < 10.0, "{t:?}");
+        // Justify: wrapped, a paragraph's last line left as it is.
+        let (t, _) = draw(CellView { spread: Spread::Justify, ..CellView::text("one two three four five six seven") }, 90.0, 120.0);
+        let lines: Vec<f32> = t.iter().map(|x| x.2).fold(Vec::new(), |mut v, y| { if v.last() != Some(&y) { v.push(y); } v });
+        assert!(lines.len() >= 2, "{t:?}");
+        let first: Vec<_> = t.iter().filter(|x| x.2 == lines[0]).collect();
+        assert!(first.len() >= 2 && first.last().unwrap().1 > 40.0, "{t:?}");
+        let last: Vec<_> = t.iter().filter(|x| x.2 == *lines.last().unwrap()).collect();
+        assert_eq!(last.len(), 1, "the last line is one node: {t:?}");
+        // Superscript smaller and higher, subscript lower; a double underline two rules.
+        let base = draw(CellView::text("x"), 100.0, 20.0).0[0].clone();
+        let sup = draw(CellView { marks: crate::inline::Emphasis::Super as u8, ..CellView::text("x") }, 100.0, 20.0).0[0].clone();
+        let sub = draw(CellView { marks: crate::inline::Emphasis::Sub as u8, ..CellView::text("x") }, 100.0, 20.0).0[0].clone();
+        assert!(sup.3 < base.3 && sup.2 < base.2 && sub.2 > base.2, "{base:?} {sup:?} {sub:?}");
+        let u = crate::inline::Emphasis::Underline as u8;
+        assert_eq!(draw(CellView { marks: u, ..CellView::text("x") }, 100.0, 20.0).1.len(), 1);
+        assert_eq!(draw(CellView { marks: u | crate::inline::Emphasis::Double as u8, ..CellView::text("x") }, 100.0, 20.0).1.len(), 2);
+        assert_eq!(draw(CellView { marks: crate::inline::Emphasis::Double as u8, ..CellView::text("x") }, 100.0, 20.0).1.len(), 0, "double alone draws nothing");
     }
 
     #[test]

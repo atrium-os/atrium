@@ -257,6 +257,10 @@ pub enum DataCmd {
     UnlockRange,
     /// Sort Left to Right: columns by rows' values (a bar).
     SortLeftToRight,
+    /// The cursor to the sheet's next (previous) comment, wrapping round;
+    /// the window runs them.
+    NextComment,
+    PrevComment,
     /// Zero values shown or left blank on this sheet (a view setting).
     ZeroValues,
     /// Shrink to Fit on the selection.
@@ -447,6 +451,14 @@ fn comments_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u
     wb.comments(s).range((sel.r0, 0)..=(sel.r1, u32::MAX)).map(|(&k, _)| k).filter(move |&(_, c)| (sel.c0..=sel.c1).contains(&c))
 }
 
+/// The comment after (before, with `back`) cell `at` in reading order on
+/// sheet `s`, wrapping round; `at` itself only when it is the only one.
+pub fn next_comment(wb: &Workbook, s: u16, at: (u32, u32), back: bool) -> Option<(u32, u32)> {
+    let all = wb.comments(s);
+    let found = if back { all.range(..at).next_back() } else { all.range((std::ops::Bound::Excluded(at), std::ops::Bound::Unbounded)).next() };
+    found.or_else(|| if back { all.iter().next_back() } else { all.iter().next() }).map(|(&k, _)| k)
+}
+
 fn links_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u32, u32)> + '_ {
     wb.links(s).range((sel.r0, 0)..=(sel.r1, u32::MAX)).map(|(&k, _)| k).filter(move |&(_, c)| (sel.c0..=sel.c1).contains(&c))
 }
@@ -582,6 +594,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Clear Formats").separated(), Some(DataCmd::ClearFormats)),
         (MenuItem::new("Clear All"), Some(DataCmd::ClearAll)),
         (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
+        (MenuItem::new("Next Comment").enabled(!wb.comments(s).is_empty()), Some(DataCmd::NextComment)),
+        (MenuItem::new("Previous Comment").enabled(!wb.comments(s).is_empty()), Some(DataCmd::PrevComment)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
         (MenuItem::new("Go To Special…"), Some(DataCmd::GoToSpecial)),
         (MenuItem::new("Show Formulas").checked(d.show_formulas).shortcut("Ctrl+`"), Some(DataCmd::ShowFormulas)),
@@ -3101,7 +3115,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);

@@ -114,11 +114,23 @@ pub struct Font {
     pub strike: bool,
     /// 0xRRGGBB; `None` is automatic.
     pub color: Option<u32>,
+    /// The underline is doubled (only with `underline`).
+    pub double: bool,
+    pub script: Script,
+}
+
+/// Superscript or subscript, for the whole cell (Excel's `vertAlign`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Script {
+    #[default]
+    Normal,
+    Super,
+    Sub,
 }
 
 impl Default for Font {
     fn default() -> Self {
-        Font { name: None, size: None, bold: false, italic: false, underline: false, strike: false, color: None }
+        Font { name: None, size: None, bold: false, italic: false, underline: false, strike: false, color: None, double: false, script: Script::Normal }
     }
 }
 
@@ -258,7 +270,8 @@ impl Style {
         w.u8(f.bold as u8 | (f.italic as u8) << 1 | (f.underline as u8) << 2 | (f.strike as u8) << 3 | (self.wrap as u8) << 4
             | (self.unlocked as u8) << 5 | (self.hide_formula as u8) << 6 | (self.hide_value as u8) << 7);
         color_out(w, f.color);
-        let extended = self.shrink_to_fit || self.gradient.is_some() || self.diagonals.iter().any(|e| e.line != Line::None);
+        let effects = u8::from(f.double && f.underline) << 2 | match f.script { Script::Normal => 0, Script::Super => 1 << 3, Script::Sub => 1 << 4 };
+        let extended = self.shrink_to_fit || self.gradient.is_some() || self.diagonals.iter().any(|e| e.line != Line::None) || effects != 0;
         if extended {
             w.u8(3);
         }
@@ -268,7 +281,7 @@ impl Style {
         }
         color_out(w, self.fill);
         if extended {
-            w.u8(u8::from(self.shrink_to_fit) | (u8::from(self.gradient.is_some()) << 1));
+            w.u8(u8::from(self.shrink_to_fit) | (u8::from(self.gradient.is_some()) << 1) | effects);
             for edge in self.diagonals {
                 w.u8(edge.line as u8);
                 color_out(w, edge.color);
@@ -309,12 +322,15 @@ impl Style {
         let mut diagonals = [Edge::default(); 2];
         let mut gradient = None;
         let mut shrink_to_fit = false;
+        let mut effects = 0;
         if tag == 3 {
             let extra = r.u8()?;
-            if extra > 3 {
+            // Bit 2 a double underline, bit 3 superscript, bit 4 subscript.
+            if extra > 0x1F || extra & 0x18 == 0x18 {
                 return Err(WireError::Invalid("extra style flags"));
             }
             shrink_to_fit = extra & 1 != 0;
+            effects = extra;
             for edge in &mut diagonals {
                 edge.line = *Line::ALL.get(r.u8()? as usize).ok_or(WireError::Invalid("diagonal border"))?;
                 edge.color = color_in(r)?;
@@ -361,6 +377,8 @@ impl Style {
                 underline: flags & 4 != 0,
                 strike: flags & 8 != 0,
                 color,
+                double: flags & 4 != 0 && effects & 4 != 0,
+                script: if effects & 8 != 0 { Script::Super } else if effects & 16 != 0 { Script::Sub } else { Script::Normal },
             },
             fill,
             pattern,
@@ -626,5 +644,33 @@ mod tests {
         s.encode(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(Style::decode(&mut Reader::new(&bytes)).unwrap(), s);
+    }
+
+    #[test]
+    fn font_effects_encode_and_bad_ones_are_refused() {
+        for (double, script) in [(true, Script::Normal), (false, Script::Super), (true, Script::Sub)] {
+            let mut s = Style::default();
+            s.font.underline = double;
+            s.font.double = double;
+            s.font.script = script;
+            let mut w = Writer::new();
+            s.encode(&mut w);
+            let bytes = w.into_bytes();
+            assert_eq!(Style::decode(&mut Reader::new(&bytes)).unwrap(), s);
+        }
+        // Super and sub at once: refused. The two encodings differ only in that flag byte.
+        let enc = |script| {
+            let mut s = Style::default();
+            s.font.script = script;
+            let mut w = Writer::new();
+            s.encode(&mut w);
+            w.into_bytes()
+        };
+        let (sup, sub) = (enc(Script::Super), enc(Script::Sub));
+        let at: Vec<usize> = (0..sup.len()).filter(|&i| sup[i] != sub[i]).collect();
+        assert_eq!((at.len(), sup[at[0]], sub[at[0]]), (1, 8, 16));
+        let mut bytes = sup.clone();
+        bytes[at[0]] = 0x18;
+        assert!(Style::decode(&mut Reader::new(&bytes)).is_err());
     }
 }
