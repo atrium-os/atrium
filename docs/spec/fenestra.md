@@ -865,8 +865,21 @@ Rules (each one is checked in §11.18):
   with no such session gets a refusal. A headless session needs its persona's key group
   unlocked (the same gap as background-apps.md G11: a session that cannot reach its key group
   is not offered for viewing until it can).
-- **Bounds.** At most 4 viewers per session and 16 sessions per host (Curia settings, refused
-  past that). Per viewer, the renderer keeps at most one acked version per window and a diff
+- **Bounds.** How many viewers, by kind (Curia settings; refused past them, with the reason):
+  - **Whole desktop** (`scope = "session"`): at most **one viewer with control** at a time, plus
+    up to **3 view-only** viewers (4 in all). Two people driving one desktop needs input
+    arbitration (whose pointer, whose focus), which is out of scope (§18); a second full mint
+    while one is attached is refused unless the person asks to take over, which disconnects the
+    first.
+  - **One app or one window** (`app:<id>`, `window:<id>`): each scoped session is separate and
+    may have up to 4 viewers (one with control if `input = "full"`). Different apps can be
+    shared to different people at once.
+  - **Per host**: at most **16 sessions** and **32 viewers** in all, across every user and kind.
+  - Why these numbers: in scene mode a viewer costs the host little (an acked version per window
+    and the bytes it is sent), but each encoded region (video, GPU surfaces) is encoded once per
+    viewer at that viewer's bitrate, and those encoders are the expensive part (at most 4 per
+    session, §11.10). The defaults are guesses to be checked in R2 and R6; the host can lower
+    them, and raise the per-host ones. Per viewer, the renderer keeps at most one acked version per window and a diff
   backlog bounded by the window's own scene budget (F4h); a viewer whose unacked data passes
   64 MiB, or that has not acked for 30 s while data waits, is dropped and must reconnect
   (from version 0).
