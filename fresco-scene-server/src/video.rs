@@ -51,9 +51,18 @@ pub struct Layer {
     pub protected: bool,
 }
 
+/// Video layers need sealed shared memory (memfd), which the hosts that
+/// serve them have; elsewhere (fenestra-view on macOS, which never serves
+/// video) asking for buffers is refused.
+#[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "android")))]
+pub fn buffers(_n: u32, _len: u64) -> std::io::Result<(Vec<OwnedFd>, Vec<memmap2::Mmap>)> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "video buffers need memfd sealing"))
+}
+
 /// `n` anonymous shared-memory buffers of `len` bytes, sealed against
 /// resizing (so a client can't shrink one under our mapping), each with a
 /// read-only mapping for us.
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "android"))]
 pub fn buffers(n: u32, len: u64) -> std::io::Result<(Vec<OwnedFd>, Vec<memmap2::Mmap>)> {
     let mut fds = Vec::new();
     let mut maps = Vec::new();
