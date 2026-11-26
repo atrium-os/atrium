@@ -72,6 +72,9 @@ pub struct Sheet {
     /// keeps them; not undo steps.
     pub show_grid: bool,
     pub show_headings: bool,
+    /// Whether zero values show (Excel's "Show a zero in cells that have
+    /// zero value"); a view setting, as gridlines are.
+    pub show_zeros: bool,
     pub(crate) outlines: [crate::outline::Outline; 2],
     pub(crate) axis_ids: [crate::axis_ids::AxisIds; 2],
     pub(crate) scenarios: Vec<crate::scenario::Scenario>,
@@ -90,7 +93,7 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new(), watches: Vec::new(), edit_ranges: Vec::new(), ignored: Vec::new() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), zoom: 100, show_grid: true, show_headings: true, show_zeros: true, outlines: Default::default(), axis_ids: Default::default(), scenarios: Vec::new(), sparklines: Vec::new(), watches: Vec::new(), edit_ranges: Vec::new(), ignored: Vec::new() }
     }
     /// Allow Edit Ranges on this sheet.
     pub fn edit_ranges(&self) -> &[crate::sheetareas::EditRange] {

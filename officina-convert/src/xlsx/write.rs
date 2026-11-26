@@ -313,6 +313,9 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
     if !sh.show_headings {
         view.push_str(r#" showRowColHeaders="0""#);
     }
+    if !sh.show_zeros {
+        view.push_str(r#" showZeros="0""#);
+    }
     if zoom != 100 {
         view.push_str(&format!(r#" zoomScale="{zoom}""#));
     }

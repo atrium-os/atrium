@@ -122,6 +122,8 @@ pub enum GridOp {
     EditRanges { sheet: u16, list: Vec<crate::sheetareas::EditRange> },
     /// A sheet's ignored errors, the whole list replaced.
     IgnoredErrors { sheet: u16, list: Vec<crate::sheetareas::Ignored> },
+    /// Protect Sheet on (with its verifier and allowances) or off.
+    Protection { sheet: u16, protection: Option<crate::protection::SheetProtection> },
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -365,6 +367,18 @@ impl GridOp {
                 w.u8(34);
                 w.u16(*sheet);
                 crate::sheetareas::encode_ranges(list, &mut w);
+                return w.into_bytes();
+            }
+            GridOp::Protection { sheet, protection } => {
+                w.u8(36);
+                w.u16(*sheet);
+                match protection {
+                    Some(p) => {
+                        w.u8(1);
+                        p.encode(&mut w);
+                    }
+                    None => w.u8(0),
+                }
                 return w.into_bytes();
             }
             GridOp::IgnoredErrors { sheet, list } => {
@@ -647,6 +661,18 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::EditRanges { sheet, list });
+        }
+        if kind == 36 {
+            let sheet = r.u16()?;
+            let protection = match r.u8()? {
+                0 => None,
+                1 => Some(crate::protection::SheetProtection::decode(&mut r)?),
+                _ => return Err(WireError::Invalid("sheet protection")),
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Protection { sheet, protection });
         }
         if kind == 35 {
             let sheet = r.u16()?;
@@ -984,6 +1010,17 @@ impl Op<Workbook> for GridOp {
                     _ => return GridOp::Batch(Vec::new()),
                 }
                 GridOp::EditRanges { sheet, list }
+            }
+            GridOp::Protection { sheet, mut protection } => {
+                // A sheet's protection is Excel's or ODF's, never the workbook's.
+                if protection.as_ref().is_some_and(|p| p.format() == crate::protection::ProtectionFormat::ExcelWorkbook) {
+                    return GridOp::Batch(Vec::new());
+                }
+                match wb.sheets.get_mut(sheet as usize) {
+                    Some(sh) => std::mem::swap(&mut sh.protection, &mut protection),
+                    None => return GridOp::Batch(Vec::new()),
+                }
+                GridOp::Protection { sheet, protection }
             }
             GridOp::IgnoredErrors { sheet, mut list } => {
                 match wb.sheets.get_mut(sheet as usize) {

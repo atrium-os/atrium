@@ -243,6 +243,15 @@ pub enum DataCmd {
     HideDetail,
     ClearOutline,
     ForecastSheet,
+    /// Protect Sheet and Unprotect Sheet (bars for the password when one is
+    /// needed) and Protection Options (a bar); [`crate::lock`].
+    ProtectSheet,
+    UnprotectSheet,
+    ProtectionOptions,
+    /// Zero values shown or left blank on this sheet (a view setting).
+    ZeroValues,
+    /// Shrink to Fit on the selection.
+    ShrinkToFit,
     /// Formulas at the cursor reading the cells last copied, one for each.
     PasteLink,
     /// The selection's text centred across its columns without merging
@@ -476,6 +485,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Zoom to Selection"), Some(DataCmd::ZoomSelection)),
         (MenuItem::new("Gridlines").checked(wb.sheet(s).show_grid), Some(DataCmd::Gridlines)),
         (MenuItem::new("Headings").checked(wb.sheet(s).show_headings), Some(DataCmd::Headings)),
+        (MenuItem::new("Zero Values").checked(wb.sheet(s).show_zeros), Some(DataCmd::ZeroValues)),
         (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()).separated(), Some(DataCmd::FillCopy)),
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Series…").enabled(nr > 1 || nc > 1), Some(DataCmd::Series)),
@@ -539,6 +549,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Merge Across").enabled(nc > 1), Some(DataCmd::MergeAcross)),
         (MenuItem::new("Center Across Selection").checked(across_at(wb, s, sel)).enabled(nc > 1 || across_at(wb, s, sel)), Some(DataCmd::CenterAcross)),
         (MenuItem::new("Wrap Text").checked(wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).wrap), Some(DataCmd::WrapText)),
+        (MenuItem::new("Shrink to Fit").checked(wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).shrink_to_fit), Some(DataCmd::ShrinkToFit)),
         (MenuItem::new("Locked").checked(!wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).unlocked).enabled(!wb.sheet_protected(s)), Some(DataCmd::LockCells)),
         (MenuItem::new("Hide Formulas When Protected").checked(wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).hide_formula).enabled(!wb.sheet_protected(s)), Some(DataCmd::HideFormula)),
         (MenuItem::new("Align Top").checked(v_at(wb, s, sel) == VAlign::Top), Some(DataCmd::AlignTop)),
@@ -589,6 +600,12 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
         (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
         (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
+        if wb.sheet_protected(s) {
+            (MenuItem::new("Unprotect Sheet…"), Some(DataCmd::UnprotectSheet))
+        } else {
+            (MenuItem::new("Protect Sheet…"), Some(DataCmd::ProtectSheet))
+        },
+        (MenuItem::new("Protection Options…").enabled(!wb.sheet_protected(s)), Some(DataCmd::ProtectionOptions)),
         (MenuItem::new("Protect Workbook Structure").checked(wb.structure_protected()), Some(DataCmd::ProtectWorkbook)),
         (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
         (MenuItem::new("Data Form…"), Some(DataCmd::DataForm)),
@@ -2998,6 +3015,26 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if cmd == DataCmd::CalculateNow { "Calculated every sheet.".into() } else { "Calculated this sheet.".into() })
         }
         DataCmd::InsertFunction | DataCmd::PasteName | DataCmd::Precedents | DataCmd::Dependents => Ok(String::new()),
+        DataCmd::ZeroValues => {
+            let sheet = d.sheet;
+            let sh = d.wb.sheet_mut(sheet);
+            sh.show_zeros = !sh.show_zeros;
+            let on = sh.show_zeros;
+            // A view setting, as gridlines are.
+            d.dirty = true;
+            Ok(if on { "Zero values shown.".into() } else { "Zero values left blank on this sheet.".into() })
+        }
+        DataCmd::ShrinkToFit => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            let on = !d.wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).shrink_to_fit;
+            d.run("Shrink to Fit", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { shrink_to_fit: on, ..st.clone() })]);
+            if crate::sheet_protection::refused(&d.status) {
+                return Err(d.status.clone());
+            }
+            Ok(if on { "Text shrinks to fit its cells.".into() } else { "Text keeps its size.".into() })
+        }
+        DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);

@@ -1168,6 +1168,14 @@ impl GridSource for SheetSource {
         if z != 1.0 {
             cv.size = Some(cv.size.unwrap_or(pergola::theme::type_size::SM) * z);
         }
+        // Zero values left blank (the sheet's view setting); formulas show in Show Formulas.
+        let zero_hidden = {
+            let d = self.doc.borrow();
+            !d.wb.sheet(d.sheet).show_zeros && !d.show_formulas && d.wb.get(CellAddr::new(d.sheet, r, c)) == Value::Num(0.0)
+        };
+        if zero_hidden {
+            cv.text.clear();
+        }
         Some(cv)
     }
     fn edit_text(&self, r: u32, c: u32) -> String {

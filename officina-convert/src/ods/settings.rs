@@ -1,6 +1,6 @@
 //! `settings.xml`: the view settings LibreOffice keeps per sheet. Frozen panes
-//! (a split position with mode 2), the zoom, and whether gridlines and
-//! headings show are read and written. LibreOffice keeps the last two for the
+//! (a split position with mode 2), the zoom, and whether gridlines,
+//! headings and zero values show are read and written. LibreOffice keeps the last three for the
 //! whole view as well; a `false` there turns them off on every sheet.
 //! LibreOffice ignores the file's view settings unless the root declares the
 //! `xlink` and `ooo` namespaces as its own do.
@@ -13,7 +13,7 @@ use officina_grid::Workbook;
 /// `settings.xml` for `wb`'s frozen panes and zooms; None when no sheet has
 /// either.
 pub fn settings_xml(wb: &Workbook) -> Option<String> {
-    let frozen: Vec<(u16, (u32, u32), (u32, u32))> = (0..wb.sheet_count() as u16).map(|s| (s, wb.sheet(s).freeze, wb.sheet(s).freeze_from)).filter(|x| x.1 != (0, 0) || wb.sheet(x.0).zoom != 100 || !wb.sheet(x.0).show_grid || !wb.sheet(x.0).show_headings).collect();
+    let frozen: Vec<(u16, (u32, u32), (u32, u32))> = (0..wb.sheet_count() as u16).map(|s| (s, wb.sheet(s).freeze, wb.sheet(s).freeze_from)).filter(|x| x.1 != (0, 0) || wb.sheet(x.0).zoom != 100 || !wb.sheet(x.0).show_grid || !wb.sheet(x.0).show_headings || !wb.sheet(x.0).show_zeros).collect();
     if frozen.is_empty() {
         return None;
     }
@@ -32,6 +32,9 @@ pub fn settings_xml(wb: &Workbook) -> Option<String> {
     if sheets().all(|sh| !sh.show_headings) {
         flag(&mut o, "HasColumnRowHeaders", false);
     }
+    if sheets().all(|sh| !sh.show_zeros) {
+        flag(&mut o, "ShowZeroValues", false);
+    }
     o.push_str(r#"<config:config-item-map-named config:name="Tables">"#);
     for (s, (rows, cols), (top, left)) in frozen {
         let _ = write!(o, r#"<config:config-item-map-entry config:name="{}">"#, crate::xml::esc(&wb.sheet(s).name));
@@ -45,6 +48,9 @@ pub fn settings_xml(wb: &Workbook) -> Option<String> {
         }
         if !wb.sheet(s).show_headings {
             flag(&mut o, "HasColumnRowHeaders", false);
+        }
+        if !wb.sheet(s).show_zeros {
+            flag(&mut o, "ShowZeroValues", false);
         }
         if (rows, cols) == (0, 0) {
             o.push_str("</config:config-item-map-entry>");
@@ -78,13 +84,13 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
     // entry is open; the item open, and its text.
     let mut tables: Option<usize> = None;
     let mut depth = 0usize;
-    let mut sheet: Option<(String, [Option<u32>; 9])> = None;
-    // ShowGrid and HasColumnRowHeaders outside the sheets' entries.
+    let mut sheet: Option<(String, [Option<u32>; 10])> = None;
+    // ShowGrid, HasColumnRowHeaders and ShowZeroValues outside the sheets' entries.
     let mut whole: Option<(usize, String)> = None;
-    let mut whole_off = [false; 2];
+    let mut whole_off = [false; 3];
     let mut item: Option<(usize, String)> = None;
     let name = |e: &quick_xml::events::BytesStart| e.attributes().with_checks(false).flatten().find(|a| a.key.local_name().as_ref() == b"name").and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()));
-    let keys = ["HorizontalSplitMode", "VerticalSplitMode", "HorizontalSplitPosition", "VerticalSplitPosition", "PositionLeft", "PositionTop", "ZoomValue", "ShowGrid", "HasColumnRowHeaders"];
+    let keys = ["HorizontalSplitMode", "VerticalSplitMode", "HorizontalSplitPosition", "VerticalSplitPosition", "PositionLeft", "PositionTop", "ZoomValue", "ShowGrid", "HasColumnRowHeaders", "ShowZeroValues"];
     // A number, or a boolean as 0 or 1.
     let value = |v: &str| v.trim().parse().ok().or(match v.trim() {
         "true" => Some(1),
@@ -99,7 +105,7 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
                 depth += 1;
                 match e.local_name().as_ref() {
                     b"config-item-map-named" if tables.is_none() && name(&e).as_deref() == Some("Tables") => tables = Some(depth),
-                    b"config-item-map-entry" if tables == Some(depth - 1) => sheet = name(&e).map(|n| (n, [None; 9])),
+                    b"config-item-map-entry" if tables == Some(depth - 1) => sheet = name(&e).map(|n| (n, [None; 10])),
                     b"config-item" if sheet.is_some() => item = name(&e).and_then(|n| keys.iter().position(|k| *k == n)).map(|i| (i, String::new())),
                     b"config-item" if tables.is_none() => whole = name(&e).and_then(|n| keys[7..].iter().position(|k| *k == n)).map(|i| (i, String::new())),
                     _ => {}
@@ -123,11 +129,12 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
                         }
                     }
                     b"config-item-map-entry" if tables == Some(depth - 1) => {
-                        if let Some((n, [hm, vm, hp, vp, pl, pt, zoom, grid, headings])) = sheet.take() {
+                        if let Some((n, [hm, vm, hp, vp, pl, pt, zoom, grid, headings, zeros])) = sheet.take() {
                             if let Some(s) = wb.sheet_id(&n) {
                                 let sh = wb.sheet_mut(s);
                                 sh.show_grid &= grid != Some(0);
                                 sh.show_headings &= headings != Some(0);
+                                sh.show_zeros &= zeros != Some(0);
                             }
                             let zoom = zoom.and_then(|z| u16::try_from(z).ok()).filter(|z| (officina_grid::book::ZOOM_MIN..=officina_grid::book::ZOOM_MAX).contains(z));
                             if let (Some(s), Some(z)) = (wb.sheet_id(&n), zoom) {
@@ -158,5 +165,6 @@ pub fn read(wb: &mut Workbook, data: &[u8]) {
         let sh = wb.sheet_mut(s);
         sh.show_grid &= !whole_off[0];
         sh.show_headings &= !whole_off[1];
+        sh.show_zeros &= !whole_off[2];
     }
 }

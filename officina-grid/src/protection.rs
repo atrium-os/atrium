@@ -91,6 +91,19 @@ impl SheetProtection {
         self.settings.keys().any(|k| k.contains("assword") || k.contains("HashValue") || k == "table:protection-key")
     }
 
+    /// Whether Excel's allowance `what` (`formatCells`, `formatRows`,
+    /// `formatColumns`, `insertHyperlinks`, `autoFilter`, `objects`,
+    /// `scenarios`, …) is granted: Excel writes `0` for a granted one.
+    /// ODF protection grants none of them here.
+    pub fn allows(&self, what: &str) -> bool {
+        self.format == ProtectionFormat::Excel && self.settings.get(what).is_some_and(|v| v == "0" || v == "false")
+    }
+
+    /// Takes a setting away (an allowance taken back, a verifier replaced).
+    pub fn forget(&mut self, key: &str) {
+        self.settings.remove(key);
+    }
+
     pub fn format(&self) -> ProtectionFormat {
         self.format
     }

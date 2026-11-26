@@ -421,6 +421,7 @@ struct Seg {
     /// `<sheetView showGridLines="0">` and `showRowColHeaders="0"`.
     no_grid: bool,
     no_headings: bool,
+    no_zeros: bool,
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
@@ -811,6 +812,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                 let off = |v: Option<String>| v.is_some_and(|v| v == "0" || v == "false");
                 seg.no_grid = off(attr(&e, b"showGridLines")?);
                 seg.no_headings = off(attr(&e, b"showRowColHeaders")?);
+                seg.no_zeros = off(attr(&e, b"showZeros")?);
             }
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from
@@ -973,6 +975,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 }
                 if seg.no_headings {
                     wb.sheet_mut(s).show_headings = false;
+                }
+                if seg.no_zeros {
+                    wb.sheet_mut(s).show_zeros = false;
                 }
                 if let Some(z) = seg.zoom {
                     wb.sheet_mut(s).zoom = z;

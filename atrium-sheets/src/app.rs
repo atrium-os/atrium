@@ -1812,6 +1812,12 @@ impl Sheets {
                         self.split_text.set(TextEdit::new(&step));
                         Err(say)
                     }
+                    _ if matches!(self.splitting.get(), Some(crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet)) => {
+                        let kind = self.splitting.get().unwrap_or(crate::data::DataCmd::ProtectSheet);
+                        // The password goes as soon as it is used, right or wrong.
+                        self.split_text.set(TextEdit::new("").secret(true));
+                        crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
+                    }
                     _ if self.splitting.get() == Some(crate::data::DataCmd::GoToSpecial) => {
                         // The bar stays open so next can step through what was found.
                         let r = crate::special::go_to_special(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed);
@@ -4100,13 +4106,23 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet)) => {
-                    self.close_bars();
-                    let g = self.grid.get_cloned();
-                    let mut ed = TextEdit::new(&crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c));
-                    ed.select_all();
-                    self.split_text.set(ed);
-                    self.splitting.set(Some(c));
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions)) => {
+                    if c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow()) {
+                        // No password to ask for.
+                        let r = crate::lock::unprotect(&mut self.doc.borrow_mut(), "");
+                        self.rev.set(self.rev.get().wrapping_add(1));
+                        self.set_status(r.unwrap_or_else(|e| e));
+                    } else {
+                        self.close_bars();
+                        let g = self.grid.get_cloned();
+                        let text = crate::whatif::start(&self.doc.borrow(), g.selection(), g.cursor, c);
+                        // A password is typed unseen.
+                        let secret = matches!(c, crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet);
+                        let mut ed = TextEdit::new(&text).secret(secret);
+                        ed.select_all();
+                        self.split_text.set(ed);
+                        self.splitting.set(Some(c));
+                    }
                     self.changed();
                     false
                 }

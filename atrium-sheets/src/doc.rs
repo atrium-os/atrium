@@ -582,6 +582,8 @@ pub struct Doc {
     pub arrows: Vec<crate::arrows::Arrow>,
     /// The areas Go To Special marked ([`crate::special`]); any edit clears them.
     pub found: Vec<officina_grid::Rect>,
+    /// What the next Protect Sheet allows, as Excel's settings ([`crate::lock`]).
+    pub allowances: Vec<&'static str>,
     /// The line and colour the plain border commands draw with (Format ▸
     /// Border Line and Border Colour); thick and double ones keep theirs.
     pub border_pen: (officina_grid::style::Line, Option<u32>),
@@ -636,7 +638,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, show_formulas: false, border_pen: (officina_grid::style::Line::Thin, None), clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None, show_comments: false, arrows: Vec::new(), found: Vec::new() }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, show_formulas: false, border_pen: (officina_grid::style::Line::Thin, None), clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None, show_comments: false, arrows: Vec::new(), found: Vec::new(), allowances: Vec::new() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.

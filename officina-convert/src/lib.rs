@@ -11,6 +11,7 @@
 
 pub mod cfb;
 pub mod crypt;
+pub mod protect;
 #[cfg(feature = "read")]
 pub mod doc;
 #[cfg(feature = "read")]

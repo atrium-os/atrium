@@ -112,6 +112,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if !wb.sheet(s).ignored_errors().is_empty() {
         ops.push(GridOp::IgnoredErrors { sheet: s, list: Vec::new() });
     }
+    if wb.sheet(s).protection.is_some() {
+        ops.push(GridOp::Protection { sheet: s, protection: None });
+    }
     if !wb.sheet(s).watches().is_empty() {
         ops.push(GridOp::Watches { sheet: s, list: Vec::new() });
     }
