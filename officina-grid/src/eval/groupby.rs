@@ -67,6 +67,7 @@ struct Slot {
     label: Vec<Value>,
     from: usize,
     to: usize,
+    depth: usize,
 }
 
 /// An axis (rows or columns): the distinct keys in output order, each
@@ -132,7 +133,7 @@ fn axis(keys: &Array, start: usize, kept: &[usize], depth: i64, order: &dyn Fn(u
     fn walk(leaves: &[Vec<Value>], from: usize, to: usize, n: usize, levels: usize, before: bool, slots: &mut Vec<Slot>, blank: &dyn Fn(usize, &[Value]) -> Vec<Value>) {
         if n + 1 >= levels || n + 1 >= leaves.first().map_or(0, Vec::len) {
             for l in from..to {
-                slots.push(Slot { label: leaves[l].clone(), from: l, to: l + 1 });
+                slots.push(Slot { label: leaves[l].clone(), from: l, to: l + 1, depth: leaves[l].len() });
             }
             return;
         }
@@ -142,7 +143,7 @@ fn axis(keys: &Array, start: usize, kept: &[usize], depth: i64, order: &dyn Fn(u
             while j < to && cmp_keys(&leaves[j][..=n], &leaves[i][..=n]).is_eq() {
                 j += 1;
             }
-            let total = Slot { label: blank(n + 1, &leaves[i]), from: i, to: j };
+            let total = Slot { label: blank(n + 1, &leaves[i]), from: i, to: j, depth: n + 1 };
             if before {
                 slots.push(total);
                 walk(leaves, i, j, n + 1, levels, before, slots, blank);
@@ -153,7 +154,7 @@ fn axis(keys: &Array, start: usize, kept: &[usize], depth: i64, order: &dyn Fn(u
             i = j;
         }
     }
-    let grand = |label| Slot { label, from: 0, to: leaves.len() };
+    let grand = |label| Slot { label, from: 0, to: leaves.len(), depth: 0 };
     let mut total_label = vec![Value::str("Total")];
     total_label.resize(k, Value::Empty);
     if levels >= 1 && before {
@@ -164,6 +165,27 @@ fn axis(keys: &Array, start: usize, kept: &[usize], depth: i64, order: &dyn Fn(u
         slots.push(grand(total_label));
     }
     Ok(Axis { leaves, leaf_of, slots })
+}
+
+impl Axis {
+    /// The leaves of the slot's parent: those sharing its first
+    /// `depth - 1` key fields (all leaves for a top-level line or the total).
+    fn parent(&self, s: &Slot) -> (usize, usize) {
+        let n = s.depth.saturating_sub(1);
+        if n == 0 || s.from >= self.leaves.len() {
+            return (0, self.leaves.len());
+        }
+        let key = &self.leaves[s.from][..n];
+        let same = |l: usize| cmp_keys(&self.leaves[l][..n], key).is_eq();
+        let (mut from, mut to) = (s.from, s.to);
+        while from > 0 && same(from - 1) {
+            from -= 1;
+        }
+        while to < self.leaves.len() && same(to) {
+            to += 1;
+        }
+        (from, to)
+    }
 }
 
 /// The records kept by filter_array (TRUE rows), after any header row.
@@ -417,6 +439,8 @@ fn pivotby_(c: &Ctx, a: &[Expr]) -> R<Ev> {
         rrecs[rax.leaf_of[r]].push(r);
     }
     let body = header_rows + usize::from(show);
+    let two = f.params.len() >= 2;
+    let mut work: u64 = 0;
     for (ri, rslot) in rax.slots.iter().enumerate() {
         let line = body + ri;
         for (j, label) in rslot.label.iter().enumerate() {
@@ -424,13 +448,35 @@ fn pivotby_(c: &Ctx, a: &[Expr]) -> R<Ev> {
         }
         let records: Vec<usize> = (rslot.from..rslot.to).flat_map(|l| rrecs[l].iter().copied()).collect();
         for (ci, cslot) in cax.slots.iter().enumerate() {
+            // What a two-argument function's second argument covers: the
+            // records in row leaves `rr` and column leaves `cr`.
+            let (rr, cr) = match relative {
+                0 => ((0, rax.leaves.len()), (cslot.from, cslot.to)),
+                1 => ((rslot.from, rslot.to), (0, cax.leaves.len())),
+                3 => (rax.parent(rslot), (cslot.from, cslot.to)),
+                4 => ((rslot.from, rslot.to), cax.parent(cslot)),
+                _ => ((0, rax.leaves.len()), (0, cax.leaves.len())),
+            };
+            let whole = (rr, cr) == ((0, rax.leaves.len()), (0, cax.leaves.len()));
+            let total_recs: Option<Vec<usize>> = (two && !whole).then(|| {
+                let recs: Vec<usize> = (rr.0..rr.1).flat_map(|l| rrecs[l].iter().copied()).filter(|&r| (cr.0..cr.1).contains(&cax.leaf_of[r])).collect();
+                work += recs.len() as u64 + (rr.1 - rr.0) as u64;
+                recs
+            });
+            if work > MAX_WORK as u64 {
+                return Err(ErrorKind::Limit);
+            }
             for j in 0..v {
                 let vals: Vec<Value> = records
                     .iter()
                     .filter(|&&r| (cslot.from..cslot.to).contains(&cax.leaf_of[r]))
                     .map(|&r| vcol(r, j))
                     .collect();
-                out[line * width + rk + ci * v + j] = apply(c, &f, vals, &all[j]);
+                let total = match &total_recs {
+                    Some(recs) => Arc::new(Array { rows: recs.len().max(1), cols: 1, vals: if recs.is_empty() { vec![Value::Empty] } else { recs.iter().map(|&r| vcol(r, j)).collect() } }),
+                    None => all[j].clone(),
+                };
+                out[line * width + rk + ci * v + j] = apply(c, &f, vals, &total);
             }
         }
     }

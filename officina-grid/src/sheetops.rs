@@ -98,6 +98,17 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if charts.len() != wb.charts().len() {
         ops.push(GridOp::Charts(charts));
     }
+    // Sparklines elsewhere that read it go (as charts do); its own go with it.
+    for other in 0..n as u16 {
+        let list = wb.sheet(other).sparklines();
+        let kept: Vec<_> = list.iter().filter(|sp| other != s && sp.data.sheet != s).cloned().collect();
+        if kept.len() != list.len() {
+            ops.push(GridOp::Sparklines { sheet: other, list: kept });
+        }
+    }
+    if !wb.sheet(s).scenarios().is_empty() {
+        ops.push(GridOp::Scenarios { sheet: s, list: Vec::new() });
+    }
     let pictures: Vec<_> = wb.pictures().iter().filter(|p| p.anchor.sheet != s).cloned().collect();
     if pictures.len() != wb.pictures().len() {
         ops.push(GridOp::Pictures(pictures));

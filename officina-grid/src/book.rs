@@ -1104,8 +1104,8 @@ pub(crate) fn remap_sheets(e: &Expr, m: &dyn Fn(u16) -> u16) -> Expr {
 
 impl Workbook {
     /// Moves sheet `from` to place `to`, the sheets between closing up; every
-    /// formula, name, table, chart, pivot table, conditional format and spill
-    /// follows its sheet. Cells don't move or recalculate: the cost is in the
+    /// formula, name, table, chart, sparkline, pivot table, conditional format
+    /// and spill follows its sheet. Cells don't move or recalculate: the cost is in the
     /// workbook's formula groups and objects, not its cells. False (nothing
     /// done) if either place isn't a sheet.
     pub fn move_sheet(&mut self, from: u16, to: u16) -> bool {
@@ -1149,6 +1149,8 @@ impl Workbook {
         for (index, sheet) in self.sheets.iter_mut().enumerate() {
             for merge in &mut sheet.merges { merge.sheet = index as u16; }
             if let Some(filter) = &mut sheet.filter { filter.rect.sheet = index as u16; }
+            // A sparkline reads the sheet it named, wherever that sheet goes.
+            for sp in &mut sheet.sparklines { sp.data.sheet = m(sp.data.sheet); }
         }
         let ts: Vec<_> = std::mem::take(&mut self.tables).into_iter().map(|mut t| {
             t.rect = rect(t.rect);
