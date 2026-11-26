@@ -684,17 +684,17 @@ fn instance() -> String {
 }
 
 fn upstream(cfg: &Config, inst: &str) -> Result<Upstream, String> {
-    upstream_for(cfg, inst, None)
+    upstream_for(cfg, inst, None, None)
 }
 
 /// [`upstream`]; for `page`, a local address, the person's own server's.
-fn upstream_for(cfg: &Config, inst: &str, page: Option<&str>) -> Result<Upstream, String> {
+fn upstream_for(cfg: &Config, inst: &str, page: Option<&str>, jar: Option<u64>) -> Result<Upstream, String> {
     if let Some(url) = page.filter(|u| ctl::local::parse(u).is_some()) {
         if cfg.portal.is_some() || cfg.vpn.is_some() {
             return Err("a sign-in window doesn't open your own servers".into());
         }
         let spec = cfg.fetchd.as_ref().ok_or("no fetcher")?;
-        return local_server::LocalUp::start(url, spec, &format!("f{inst}")).map(|l| Upstream::Local(Box::new(l)));
+        return local_server::LocalUp::start(url, jar, spec, &format!("f{inst}")).map(|l| Upstream::Local(Box::new(l)));
     }
     if let Some(p) = &cfg.portal {
         return Ok(Upstream::Portal(p.clone(), None));
@@ -752,7 +752,7 @@ fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64
         if cfg.vpn.is_some() {
             return Err("the VPN sign-in needs its courier jar".into());
         }
-        let mut up = upstream_for(cfg, &inst, Some(url))?;
+        let mut up = upstream_for(cfg, &inst, Some(url), jar_id(ctx.jar))?;
         if let Upstream::Portal(_, body) = &mut up {
             if form.as_ref().is_some_and(|f| f.2.is_some()) {
                 return Err("a password from Arca's field goes only through Arca's couriers".into());
@@ -1420,6 +1420,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 st.set(&p.and_then(|p| origin(&p.url)).unwrap_or_default());
             }
             Request::Forget { jar, url } => {
+                // Your own servers' cookies in that jar (or that origin's).
+                local_server::forget(jar_id(jar), url.as_deref());
                 let site = url.as_deref().and_then(site_of);
                 if url.is_some() && site.is_none() {
                     continue;

@@ -584,13 +584,21 @@ differences:
   portcullisd hands out at most 32 sockets in any 10 s, a rate rather
   than a count of open sockets, since portcullisd can't see when
   navigatord closes one without holding a copy that would keep it open.
-- **No state kept.** Local pages open with no cookies at all (each request
-  is anonymous), are never written to the page store and never served
-  from the cache, so another app taking the port later starts with
-  nothing, and :8080 and :9090 share nothing. A per-(app, port) cookie jar
-  is not built. Live pages run only for HTTPS pages (D12), so a local page
-  shows in the document lane: its scripts run in the converter, not live,
-  and there is no storage for it to keep.
+- **Cookies, per app and port.** The fetcher passes on each well-formed
+  `Set-Cookie` (`cookie <path> <max-age or -> <name>=<value>`, at most 32,
+  `Expires` read as a max-age, `Secure` ones dropped, `Domain` ignored),
+  and takes a `C <header>` line with the request, checked as name=value
+  pairs before anything is sent. navigatord keeps them in memory per
+  (trail jar, app id portcullisd named for that socket, origin with its
+  port): another app on the port starts with none, :8080 and :9090 share
+  none, an Unrecorded trail's go when it closes, and "Forget this site"
+  takes an origin's. At most 50 a jar, 64 jars, 400 days. Not at rest:
+  navigatord has no persona key group directory for them, so they end with
+  navigatord. The converter's `document.cookie` sees none.
+- **Not stored.** Local pages are never written to the page store and
+  never served from the cache. Live pages run only for HTTPS pages (D12),
+  so a local page shows in the document lane: its scripts run in the
+  converter, not live, and there is no web storage for it to keep.
 - **The chip.** `Event::LocalServer { id, app }` before `Opened`; the
   address bar shows "Your computer · Photo Server" where an http page
   says "Not private", and the popover says the page doesn't cross a
@@ -599,6 +607,7 @@ differences:
   exchange, redirects and refusals (`navigator-fetch`), navigatord's
   grants and origin check (`local_server.rs`), the address bar and chip
   (`navigator-ui`), portcullisd's rate, jaild's `ListenTarget`. VM check
-  `scripts/vm-local-server-check.sh`: the server side end to end, with a
-  stand-in for navigatord (`examples/local_port_ask`).
+  `scripts/vm-local-server-check.sh` (30 checks): the server side end to
+  end, cookies through the real fetcher, with a stand-in for navigatord
+  (`examples/local_port_ask`).
 

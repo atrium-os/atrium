@@ -146,6 +146,57 @@ pub fn join_same_origin(base: &Local, href: &str) -> Option<Local> {
     Some(l)
 }
 
+// ── cookies of your own server ─────────────────────────────────────────
+// The fetcher passes on the cookies a local server sets in this shape, and
+// navigatord keeps them per (jar, app, origin), in memory.
+
+/// The longest cookie name and value passed on.
+pub const SET_COOKIE_MAX: usize = 4096;
+/// `Set-Cookie`s passed on from one response.
+pub const SET_COOKIES_MAX: usize = 32;
+
+/// A cookie the server set, as navigatord's jar keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCookie {
+    pub name: String,
+    pub value: String,
+    pub path: String,
+    /// Seconds it lives; `None` for the session; 0 removes it.
+    pub max_age: Option<u64>,
+}
+
+impl SetCookie {
+    /// Its answer line (without the newline).
+    pub fn line(&self) -> String {
+        let age = self.max_age.map_or("-".to_string(), |a| a.to_string());
+        format!("cookie {} {age} {}={}", self.path, self.name, self.value)
+    }
+
+    /// A line navigatord read back: refused unless it is in shape.
+    pub fn from_line(line: &str) -> Option<SetCookie> {
+        let mut f = line.strip_prefix("cookie ")?.splitn(3, ' ');
+        let (path, age, pair) = (f.next()?, f.next()?, f.next()?);
+        let (name, value) = pair.split_once('=')?;
+        let max_age = if age == "-" { None } else { Some(age.parse().ok()?) };
+        (path_ok(path) && token(name) && value.bytes().all(cookie_octet) && name.len() + value.len() <= SET_COOKIE_MAX)
+            .then(|| SetCookie { name: name.into(), value: value.into(), path: path.into(), max_age })
+    }
+}
+
+/// RFC 6265 §4.1.1 `token` (a cookie's name).
+pub fn token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// RFC 6265 §4.1.1 `cookie-octet`.
+pub fn cookie_octet(b: u8) -> bool {
+    matches!(b, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
+}
+
+pub fn path_ok(p: &str) -> bool {
+    p.starts_with('/') && p.len() <= 256 && p.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

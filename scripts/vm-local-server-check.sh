@@ -15,7 +15,8 @@
 #
 #   1. lcsrv (9000 from this computer) runs with no grant: refused;
 #   2. allowed: a socket to its own jail address, and a page through the
-#      fetcher with no cookie carried; a redirect home is followed by the
+#      fetcher with no cookie carried, the cookie it sets passed on and a
+#      Cookie line from the jar carried; a redirect home is followed by the
 #      caller, one away is refused; every address the parser refuses is
 #      refused by the fetcher before it sends a byte;
 #   3. the port it serves but doesn't declare, another app, another
@@ -30,7 +31,7 @@ set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin local-server 27
+gate_begin local-server 30
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 V() { "$ROOT/scripts/vssh" "$@"; }
 TGT=${CARGO_TARGET_DIR:-$ROOT/portcullis/target}
@@ -130,6 +131,9 @@ case "$R" in
 esac
 has "the page comes through the fetcher" "$R" "|ok 200 text/plain"
 has "…from the server, with no cookie carried" "$R" "|served 9000 /hello cookie=-"
+has "…and the cookie it set is passed on for navigatord's jar" "$R" "|cookie / - s=9000|ok 200"
+has "a Cookie line from the jar reaches the server" "$(ask _lcnav 9000 $B/navigator-fetchd http://localhost:9000/hello '"s=9000; t=2"')" "|served 9000 /hello cookie=s=9000; t=2"
+has "…one out of shape is refused before anything is sent" "$(ask _lcnav 9000 $B/navigator-fetchd http://localhost:9000/hello '"a b"')" "|err a cookie header out of shape"
 check "…and the fetcher said so in its log" 1 "$(V "su -m _lcnav -c '$B/local_port_ask 9000 $B/navigator-fetchd http://localhost:9000/' 2>&1" | grep -c 'no network of its own')"
 has "a redirect home is handed back to follow" "$(ask _lcnav 9000 $B/navigator-fetchd http://localhost:9000/redirect)" "|redirect 302 http://localhost:9000/hello"
 has "a redirect off the computer is refused" "$(ask _lcnav 9000 $B/navigator-fetchd http://localhost:9000/away)" "|err your server redirected away from itself"

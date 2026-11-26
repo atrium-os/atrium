@@ -2,12 +2,14 @@
 //! scripts/vm-local-server-check.sh (background-apps.md §4.4).
 //!
 //!   local_port_ask <port>                      ask portcullisd for a socket
-//!   local_port_ask <port> <fetchd> <url>       and fetch <url> on it through
+//!   local_port_ask <port> <fetchd> <url> [<cookie header>]
+//!                                              and fetch <url> on it through
 //!                                              navigator-fetchd started on a
 //!                                              Unix socket, as navigatord does
 //!
 //! Prints one line: `refused: <why>`, or `ok <app name> <addr>`; with a
-//! fetcher, then the fetcher's answer (its head line, and the body).
+//! fetcher, then the fetcher's answer (its cookie lines, head line, and the
+//! body).
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpStream};
@@ -57,12 +59,24 @@ fn main() {
     let (ours, theirs) = UnixStream::pair().expect("socketpair");
     let mut child = Command::new(fetchd).stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stdout(Stdio::null()).spawn().expect("start fetchd");
-    portcullis_ipc::send_fds_with(&ours, &[sock.as_raw_fd()], format!("G {url}\n").as_bytes()).expect("send");
+    let mut msg = format!("G {url}\n");
+    if let Some(c) = a.get(4) {
+        msg.push_str(&format!("C {c}\n"));
+    }
+    portcullis_ipc::send_fds_with(&ours, &[sock.as_raw_fd()], msg.as_bytes()).expect("send");
     drop(sock);
     let mut r = BufReader::new(&ours);
     let mut head = String::new();
-    let _ = r.read_line(&mut head);
-    print!("{head}");
+    loop {
+        head.clear();
+        if r.read_line(&mut head).unwrap_or(0) == 0 {
+            break;
+        }
+        print!("{head}");
+        if !head.starts_with("cookie ") {
+            break;
+        }
+    }
     if let Some(len) = head.strip_prefix("ok ").and_then(|h| h.split(' ').nth(2)).and_then(|l| l.parse::<usize>().ok()) {
         let mut body = vec![0u8; len.min(1 << 20)];
         if r.read_exact(&mut body).is_ok() {
