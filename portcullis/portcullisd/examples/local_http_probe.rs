@@ -1,7 +1,9 @@
 //! A stand-in web server for scripts/vm-local-server-check.sh
 //! (background-apps.md §4.4): on 9000 and 9090 (all addresses) it answers
 //! each request with `served <port> <path> cookie=<Cookie or ->`, setting a
-//! cookie; `/redirect` redirects to `/hello`, `/away` off this computer.
+//! cookie; `/redirect` redirects to `/hello`, `/away` off this computer,
+//! and `/page` answers HTML whose title is that line (so navigatord's
+//! `Opened` shows it).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -12,6 +14,11 @@ fn answer(port: u16, req: &str) -> String {
     match path {
         "/redirect" => "HTTP/1.1 302 Found\r\nLocation: /hello\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
         "/away" => "HTTP/1.1 302 Found\r\nLocation: http://example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "/page" | "/go" => {
+            let line = format!("served {port} {path} cookie={}", cookie.trim());
+            let body = format!("<!doctype html><html><head><title>{line}</title></head><body><p>{line}</p></body></html>");
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nSet-Cookie: s={port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        }
         _ => {
             let body = format!("served {port} {path} cookie={}", cookie.trim());
             format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: s={port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())

@@ -72,6 +72,7 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secr
         outbound,
         peers: vec![],
         inbound: vec![],
+        listen: vec![],
         no_resolver: true,
         tag: Some(TAG.into()),
     };

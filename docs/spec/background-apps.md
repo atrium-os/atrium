@@ -607,7 +607,12 @@ differences:
   exchange, redirects and refusals (`navigator-fetch`), navigatord's
   grants and origin check (`local_server.rs`), the address bar and chip
   (`navigator-ui`), portcullisd's rate, jaild's `ListenTarget`. VM check
-  `scripts/vm-local-server-check.sh` (30 checks): the server side end to
-  end, cookies through the real fetcher, with a stand-in for navigatord
-  (`examples/local_port_ask`).
+  `scripts/vm-local-server-check.sh` (37 checks): the server side end to
+  end with a stand-in for navigatord (`examples/local_port_ask`), then the
+  real navigatord as Navigator's broker with the real fetcher and
+  prerender, driven by `navigatord/examples/nav_ask` in the UI's place: an
+  untyped Open is refused, a typed one opens and is named as the app's, the
+  next open carries the cookie navigatord's jar kept, and nothing of the
+  page reaches navigatord's store. The chip itself is covered by the UI's
+  host tests.
 

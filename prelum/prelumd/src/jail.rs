@@ -152,6 +152,7 @@ impl Launcher for Jailed {
             outbound: vec![NetDest { cidr: format!("{}/32", v4.ip()), port: Some(v4.port()), udp: false }],
             peers: vec![],
             inbound: vec![],
+            listen: vec![],
             no_resolver: true,
             tag: None,
         };

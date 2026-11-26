@@ -6,12 +6,12 @@
 #   ARCH=amd64 sh scripts/cloud-vm.sh up      # or the Mac VM, with its OK
 #   ARCH=amd64 sh scripts/vm-local-server-check.sh
 #
-# What navigatord does is played by examples/local_port_ask: it asks
-# portcullisd `OpenLocalPort` as a uid the launch registry binds to an app
-# holding `navigator-broker`, and fetches through navigator-fetchd started
-# on a Unix socket, as navigatord starts it. The typed-address grant, the
-# per-page origin check and the chip are navigatord's and the UI's, covered
-# by their host tests (local_server.rs, where_field.rs).
+# examples/local_port_ask plays navigatord's part: it asks portcullisd
+# `OpenLocalPort` as a uid the launch registry binds to an app holding
+# `navigator-broker`, and fetches through navigator-fetchd started on a Unix
+# socket, as navigatord starts it. Then the real navigatord runs as that
+# uid, and examples/nav_ask plays the UI's part (Typed, then Open). The
+# chip is the UI's, covered by its host tests (shell.rs, where_field.rs).
 #
 #   1. lcsrv (9000 from this computer) runs with no grant: refused;
 #   2. allowed: a socket to its own jail address, and a page through the
@@ -19,6 +19,10 @@
 #      Cookie line from the jar carried; a redirect home is followed by the
 #      caller, one away is refused; every address the parser refuses is
 #      refused by the fetcher before it sends a byte;
+#   2b. navigatord: an Open not typed is refused; typed, the page opens,
+#      named as Photo Server's, and the next open carries the cookie its
+#      jar kept; the undeclared port and 127.0.0.2 fail; nothing of the
+#      page is in its store;
 #   3. the port it serves but doesn't declare, another app, another
 #      persona, another person and a plain process are refused, and a
 #      persona gets at most 32 sockets in 10 s;
@@ -31,11 +35,13 @@ set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin local-server 30
+gate_begin local-server 37
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 V() { "$ROOT/scripts/vssh" "$@"; }
 TGT=${CARGO_TARGET_DIR:-$ROOT/portcullis/target}
 FTGT=${CARGO_TARGET_DIR:-$ROOT/navigator-fetch/target}
+NTGT=${CARGO_TARGET_DIR:-$ROOT/navigatord/target}
+PRTGT=${CARGO_TARGET_DIR:-$ROOT/navigator-prerender/target}
 
 B=/var/tmp/localsrv
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
@@ -55,6 +61,19 @@ echo "=== cross-build"
     || gate_abort "cross-build failed"
 (cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin navigator-fetchd) \
     || gate_abort "cross-build of the fetcher failed"
+# ring (linked by prerender and navigatord) compiles C: a FreeBSD-targeting
+# clang with the sysroot's headers.
+T=$(echo "$TARGET" | tr - _)
+if ! env | grep -q "^CC_$T="; then
+    llvm=/opt/homebrew/opt/llvm/bin
+    if [ -x "$llvm/clang" ] && [ -x "$llvm/llvm-ar" ]; then cc="$llvm/clang"; archiver="$llvm/llvm-ar"
+    else cc=$(command -v clang); archiver=$(command -v llvm-ar || command -v ar); fi
+    export "CC_$T=$cc" "CFLAGS_$T=--target=$TARGET --sysroot=${SYSROOT:-$HOME/atrium-vm/sysroot}" "AR_$T=$archiver"
+fi
+(cd "$ROOT/navigatord" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin navigatord --example nav_ask) \
+    || gate_abort "cross-build of navigatord failed"
+(cd "$ROOT/navigator-prerender" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin prerender) \
+    || gate_abort "cross-build of prerender failed"
 
 echo "=== install"
 V "mkdir -p $B"
@@ -62,6 +81,9 @@ for b in release/portcullisd release/portcullis release/opifex release/atrium-ja
     scp -q $K -P "$VM_SSH_PORT" "$TGT/$TARGET/$b" root@localhost:$B/ || gate_abort "copy $b"
 done
 scp -q $K -P "$VM_SSH_PORT" "$FTGT/$TARGET/release/navigator-fetchd" root@localhost:$B/ || gate_abort "copy navigator-fetchd"
+for b in "$NTGT/$TARGET/release/navigatord" "$NTGT/$TARGET/release/examples/nav_ask" "$PRTGT/$TARGET/release/prerender"; do
+    scp -q $K -P "$VM_SSH_PORT" "$b" root@localhost:$B/ || gate_abort "copy $b"
+done
 scp -q $K -P "$VM_SSH_PORT" "$ROOT/etc/atrium.pf" root@localhost:$B/ || gate_abort "copy atrium.pf"
 
 V 'sh -s' <<EOS
@@ -74,7 +96,7 @@ install -m 0755 $B/atrium-jaild /usr/local/bin/atrium-jaild
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
 install -m 0755 $B/portcullis /usr/local/bin/portcullis
 install -m 0755 $B/opifex /usr/local/bin/opifex
-chmod 0755 $B/navigator-fetchd $B/local_port_ask
+chmod 0755 $B $B/navigator-fetchd $B/local_port_ask $B/navigatord $B/nav_ask $B/prerender
 cp $B/atrium.pf /usr/local/etc/atrium/pf.conf
 pfctl -f /usr/local/etc/atrium/pf.conf
 service atrium-jaild onestart >/dev/null
@@ -140,6 +162,26 @@ has "a redirect off the computer is refused" "$(ask _lcnav 9000 $B/navigator-fet
 for u in 'http://127.0.0.2:9000/' 'http://0.0.0.0:9000/' 'http://[::ffff:127.0.0.1]:9000/' 'http://localhost.:9000/' 'http://a.localhost:9000/'; do
     has "the fetcher refuses $u" "$(ask _lcnav 9000 $B/navigator-fetchd "$u")" "|err not one of your own server's addresses"
 done
+
+echo "=== 2b. through navigatord"
+# navigatord as _lcnav (Navigator's broker), unconfined, its fetcher the
+# real navigator-fetchd; nav_ask is the UI.
+ND=$B/nd
+V "pkill -U 62990 navigatord; rm -rf $ND; mkdir -p $ND/downloads; chown -R _lcnav $ND; \
+   daemon -f -o $B/navigatord.log su -m _lcnav -c 'cd $ND && env NAVIGATORD_SOCKET=$ND/nav.sock NAVIGATORD_PAGE_SOCKET=$ND/page.sock \
+   NAVIGATORD_STORE=$ND/store NAVIGATORD_PRERENDER=$B/prerender NAVIGATORD_FETCHD=$B/navigator-fetchd NAVIGATORD_DOWNLOADS=$ND/downloads \
+   NAVIGATORD_MONSTRATOR=$ND/mon.sock PORTCULLIS_SOCKET=$PSOCK $B/navigatord --unconfined-for-testing' </dev/null" >/dev/null 2>&1
+i=0; while [ $i -lt 60 ] && ! V "test -S $ND/nav.sock"; do sleep 1; i=$((i+1)); done
+V "test -S $ND/nav.sock" && ok "navigatord runs as Navigator's broker" || gate_abort "navigatord: $(V "tail -5 $B/navigatord.log")"
+nav() { V "su -m _lcnav -c '$B/nav_ask $ND/nav.sock $*'" 2>/dev/null | tr -d '\r' | paste -sd '|' -; }
+has "an Open of your server that wasn't typed is refused" "$(nav http://localhost:9000/page)" "failed Your own server opens only from an address you type"
+R=$(nav +http://localhost:9000/page)
+has "typed, it opens, named as Photo Server's page" "$R" "local Photo Server|opened http://localhost:9000/page | served 9000 /page cookie=-"
+has "…and the next open carries the cookie navigatord's jar kept" "$(nav +http://localhost:9000/page)" "opened http://localhost:9000/page | served 9000 /page cookie=s=9000"
+has "typed, the port it doesn't declare fails" "$(nav +http://localhost:9090/page)" "Nothing of yours is serving port 9090"
+case "$(nav +http://127.0.0.2:9000/page)" in failed*) ok "typed, 127.0.0.2 is not your server and fails" ;; *) bad "127.0.0.2: [$(nav +http://127.0.0.2:9000/page)]" ;; esac
+check "nothing of your server's page is in navigatord's store" 0 "$(V "grep -rl 'served 9000' $ND/store 2>/dev/null | wc -l" | tr -d '\r ')"
+V "pkill -U 62990 navigatord" >/dev/null 2>&1
 
 echo "=== 3. who and which port"
 has "a port lcsrv serves but didn't declare (9090) is refused" "$(ask _lcnav 9090)" "refused: Nothing of yours is serving port 9090"
