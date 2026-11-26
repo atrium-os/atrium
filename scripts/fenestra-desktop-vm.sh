@@ -174,10 +174,12 @@ if [ "${FEN_SERVICE:-0}" = 1 ]; then
     # The root side killed outright: its other side goes with it (no
     # orphan holding the mint socket and frescod's link) and daemon(8)
     # starts the pair again, which takes frescod's link again.
-    g "kill -9 $R0"
+    # Within a second, before daemon(8) starts the next one (2 s), whose
+    # start would clear a jail left over: the old side ended by itself.
+    OLD=$(g "kill -9 $R0; sleep 1; kill -0 $U0 2>/dev/null && echo \"orphan $U0\" || echo gone")
     P1=$(whole "$R0" "$U0")
     case "$P1" in no:*) bad "killed outright, fenestrad came back whole: $P1";;
-        *) check "killed outright, fenestrad came back whole, the old side gone" "gone" "$(g "kill -0 $U0 2>/dev/null" && echo "orphan $U0" || echo gone)";; esac
+        *) check "killed outright, the old side ended at once and fenestrad came back whole" "gone" "$OLD";; esac
     # The unprivileged side killed: the root side ends with it, and the
     # pair comes back.
     set -- $P1

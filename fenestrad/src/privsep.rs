@@ -344,6 +344,9 @@ pub mod jailer {
     /// `OK <uid> <name>` for the seat session's user, read here as root.
     fn seat_user(seat: &str) -> String {
         let Some(name) = portcullis_peer::seat::active_at(seat) else { return "ERR no one at the seat".into() };
+        if name.len() + 16 >= MSG || name.contains(' ') {
+            return "ERR a name that does not fit".into();
+        }
         // Whoever is at the seat, root too, as the unjailed check takes it.
         let Ok(c) = std::ffi::CString::new(name.as_str()) else { return "ERR not a user name".into() };
         // SAFETY: getpwnam with a NUL-terminated name, from this thread
@@ -354,9 +357,6 @@ pub mod jailer {
         }
         // SAFETY: pw is non-null and points at a passwd record from libc.
         let uid = unsafe { (*pw).pw_uid };
-        if name.len() + 16 >= MSG || name.contains(' ') {
-            return "ERR a name that does not fit".into();
-        }
         format!("OK {uid} {name}")
     }
 

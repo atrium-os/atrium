@@ -213,7 +213,8 @@ pub const DAEMON_NAME: &str = "system-fenestrad";
 pub const DAEMON_EXEC: &str = "/usr/local/bin/atrium-fenestrad";
 
 /// fenestrad's unprivileged side in its own jail (fenestra.md §19b):
-/// `DAEMON_EXEC` as `uid`/`gid` with `sock` as its stdin and stdout and
+/// `DAEMON_EXEC` as `uid`/`gid` with `sock` as its stdin (stdout to
+/// /dev/null) and
 /// `extra` from fd 3 on, `argv` after the binary. No network at all
 /// (`Isolated`), the base libraries and installed binaries read-only and
 /// nothing else. A jail left by an earlier root side goes first. Returns
@@ -258,7 +259,10 @@ pub fn start_daemon(jaild: &str, uid: u32, gid: u32, sock: BorrowedFd<'_>, extra
         fuse: None,
     });
     let err = io::stderr();
-    let mut fds = vec![sock, sock, err.as_fd()];
+    // Its stdout is nowhere: a stray print must never reach the root side
+    // as a request.
+    let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+    let mut fds = vec![sock, null.as_fd(), err.as_fd()];
     fds.extend_from_slice(extra);
     let mut c = jaild::client::Client::connect(jaild).map_err(|e| io::Error::other(format!("connect {jaild}: {e}")))?;
     let (resp, got) = c.send_with_fds(&req, &fds, 1).map_err(|e| io::Error::other(format!("jaild: {e}")))?;

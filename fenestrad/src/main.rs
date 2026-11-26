@@ -473,6 +473,16 @@ fn worker(args: &[String]) -> ! {
     if uid == 0 || euid == 0 {
         die("--worker runs as its own user, never root");
     }
+    // The root side going (even killed outright, its procdesc's copy in
+    // jaild or not) ends this side at once: a hang-up on its socket.
+    std::thread::spawn(|| loop {
+        let mut p = libc::pollfd { fd: 0, events: 0, revents: 0 };
+        // SAFETY: one pollfd we own; fd 0 stays open for the process's life.
+        let n = unsafe { libc::poll(&mut p, 1, -1) };
+        if n > 0 && p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            die("the root side is gone");
+        }
+    });
     let jailer = Arc::new(privsep::jailer::Jailer::from_stdin());
     let cfg = Config {
         bin: String::new(),
