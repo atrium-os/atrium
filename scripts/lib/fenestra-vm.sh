@@ -106,7 +106,10 @@ fen_fenestrad() {
         # $PORT, so the forward still lands.
         g "install -m 0755 $D/fenestra-session /usr/local/bin/atrium-fenestra-session && service atrium-jaild status >/dev/null" \
             || gate_abort "no jaild in the guest (sh scripts/deploy-portcullis.sh)"
-        HOW="--jaild /var/run/atrium/jaild.sock --lan vtnet0 10.0.2.0/24 --public-ip 10.0.2.15 --grace 15"
+        # fenestrad itself as _fenestra, its root side keeping only jaild.
+        g "id _fenestra >/dev/null 2>&1 || pw useradd _fenestra -u 65057 -d /nonexistent -s /usr/sbin/nologin -c 'Fenestra session daemon'" \
+            || gate_abort "no _fenestra user"
+        HOW="--jaild /var/run/atrium/jaild.sock --lan vtnet0 10.0.2.0/24 --public-ip 10.0.2.15 --grace 15 --user _fenestra"
     else
         HOW="--bind 0.0.0.0:$PORT"
     fi
@@ -120,7 +123,7 @@ fen_fenestrad() {
 
 # Each placed window's interior equal on both screens. Left out: 4 px at its
 # edges (frescod's focus ring) and the top STRIP px of the screen (frescod's
-# strip): trusted chrome frescod draws over every window, not streamed yet.
+# strip), which compare_all covers.
 STRIP=$(sed -n 's/^pub const STRIP_PT: *[a-z0-9]* *= *\([0-9]*\).*/\1/p' "$ROOT/frescod/src/chrome.rs")
 [ -n "$STRIP" ] || gate_abort "no STRIP_PT in frescod/src/chrome.rs"
 compare_all() { python3 -I - "$1" "$W/view/desktop.png" <<'EOF'

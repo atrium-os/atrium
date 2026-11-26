@@ -1620,12 +1620,12 @@ takes the viewer's own trusted lane (the viewer's host strip, R4, stays outside 
 - `scripts/fenestra-desktop-vm.sh` (cloud VM, `NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300`):
   frescod in split mode with atrium-sheets, fenestrad and its session in the guest, the
   viewer in the container, minting over real ssh into the guest and driven only from the viewer
-(frescod has no injector). 14/14, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 17/17
+(frescod has no injector). 14/14, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 18/18
 confined as on Atrium: frescod as `_frescod`, every renderer an `org.atrium.fresco.renderer` jail
 from portcullisd as `_fresco-render`, the session in its jail (its own vnet, uid 60500, checked
 from the kernel) and gone after its grace: the
   viewer's desktop equals frescod's own screen over every window, and the whole screen
-  pixel for pixel with the strip, focus ring and background (14/14, 17/17 confined); typing before and after a reconnect reaches the host and comes back; every input
+  pixel for pixel with the strip, focus ring and background (14/14, 18/18 confined, fenestrad as `_fenestra`); typing before and after a reconnect reaches the host and comes back; every input
   event passed on, none dropped; 0 scene bytes while idle; the second connection resumed
   without resending (8.8 KB for its typing).
 
@@ -1674,9 +1674,19 @@ UDP `listen` port from the pool (24300 to 24315) from that local network: nothin
 peers, no resolver. jaild's `[fenestra_sessions]` and `is_fenestra_session` accept exactly that
 shape and nothing wider (another port, TCP, two ports, listen from this computer, an outbound
 grant, a resolver, children, locked memory are refused). When the session exits, its jail and
-network are taken apart and the uid and port go back to the pool. fenestrad itself still runs as
-root (jaild takes only root callers), not yet as `_fenestra` in its own jail; no code went into
-portcullisd. Without `--jaild` a session is a plain child (other systems, hosts without jaild).
+network are taken apart and the uid and port go back to the pool. No code went into portcullisd.
+
+**fenestrad as `_fenestra` (uid 65057).** With `--user _fenestra` fenestrad opens frescod's
+link (frescod checks the uid at connect) and binds the mint socket as root, then drops to
+`_fenestra` and checks the drop from the kernel (uid, gid, groups, and that `setuid(0)` fails).
+Everything that reads a peer's bytes (mint requests, frescod's records, sessions' records) runs
+there. jaild still takes only root callers, so with `--jaild` fenestrad forks first
+(`fenestrad/src/privsep.rs`): the root side holds jaild and one `SOCK_SEQPACKET` socket to the
+unprivileged side, and answers only two fixed 32-byte requests, `START` with the session's link
+and mint sockets attached and `STOP PORT`. The session's arguments, uid, port and network are the
+root side's own; the unprivileged side can ask for a jail but not say what is in it, and may hold
+at most two (one more during a take-over). The root side ends with the other side. fenestrad is not
+yet in a jail of its own (it would need jaild to pass it the frescod link and mint socket). Without `--jaild` a session is a plain child (other systems, hosts without jaild).
 
 **UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
 connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram
@@ -1705,8 +1715,7 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** fenestrad as `_fenestra` in its own jail;
-remote outputs at the viewer's size and scale; compressing
+**Next in R2.** fenestrad in a jail of its own; remote outputs at the viewer's size and scale; compressing
 region updates as blobs are.
 
 ## 20. Sources

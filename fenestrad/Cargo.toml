@@ -16,6 +16,7 @@ libc            = "0.2"
 jaild               = { path = "../portcullis/jaild" }
 portcullis-identity = { path = "../portcullis/portcullis-identity" }
 portcullis-mounts   = { path = "../portcullis/portcullis-mounts" }
+atrium-fdpass       = { path = "../atrium-fdpass" }
 
 [[bin]]
 name = "fenestrad"

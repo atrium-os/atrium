@@ -1,6 +1,6 @@
 //! `fenestrad --frescod SOCK --session BIN (--mint-sock PATH | --mint-dir DIR)
 //! [--bind ADDR] [--public-ip IP] [--seat PATH] [--grace S]
-//! [--jaild SOCK --lan IFACE SUBNET]`
+//! [--jaild SOCK --lan IFACE SUBNET] [--user NAME]`
 //!
 //! Fenestra's daemon on the host (fenestra.md §3.2). It has no network:
 //! it holds the link to frescod's broker (`FRESCOD_FENESTRA_SOCK`) and
@@ -34,6 +34,10 @@
 //! local network `--lan` names. Without it a session is a plain child
 //! (other systems, and gates on a host without jaild).
 //!
+//! With `--user` (on Atrium, `_fenestra`) fenestrad opens frescod's link
+//! and binds the mint socket as root, then runs as that user; with
+//! `--jaild` too, a root side forked first keeps jaild (`privsep.rs`).
+//!
 //! `--mint-dir` is the development form: one session through files, and
 //! fenestrad exits when it ends.
 
@@ -50,6 +54,7 @@ use fenestra_link::Rec;
 
 #[cfg(target_os = "freebsd")]
 mod jail;
+mod privsep;
 use fenestra_wire::mint::{self, DevMint};
 
 /// Records queued for one session before it counts as stuck.
@@ -77,6 +82,9 @@ enum Proc {
     Child(Child),
     #[cfg(target_os = "freebsd")]
     Jail(jail::Running),
+    /// In a jail the root side made (`--user` with `--jaild`): its port.
+    #[cfg(target_os = "freebsd")]
+    Remote(u16, Arc<privsep::jailer::Jailer>),
 }
 
 impl Proc {
@@ -89,6 +97,8 @@ impl Proc {
             // Its jail goes when the process does (jail.rs watches it).
             #[cfg(target_os = "freebsd")]
             Proc::Jail(r) => r.kill(),
+            #[cfg(target_os = "freebsd")]
+            Proc::Remote(port, j) => j.stop(*port),
         }
     }
 }
@@ -269,7 +279,16 @@ struct Config {
     grace: Option<u64>,
     /// Sessions in jails through jaild (`--jaild SOCK --lan IFACE SUBNET`).
     #[cfg(target_os = "freebsd")]
-    jails: Option<jail::Jails>,
+    jails: Option<Jailing>,
+}
+
+/// Who asks jaild for a session's jail.
+#[cfg(target_os = "freebsd")]
+enum Jailing {
+    /// fenestrad itself, as root.
+    Here(jail::Jails),
+    /// The root side, for fenestrad running as `--user`.
+    Root(Arc<privsep::jailer::Jailer>),
 }
 
 enum MintBy {
@@ -280,7 +299,7 @@ enum MintBy {
 }
 
 #[cfg(target_os = "freebsd")]
-fn jailed(cfg: &Config) -> Option<&jail::Jails> {
+fn jailed(cfg: &Config) -> Option<&Jailing> {
     cfg.jails.as_ref()
 }
 
@@ -330,13 +349,18 @@ fn start_session(relay: &Arc<Relay>, cfg: &Config, id: u32, by: MintBy) -> Resul
         #[cfg(target_os = "freebsd")]
         (Some(j), Some((_, b))) => {
             use std::os::fd::AsFd;
-            let mut args = vec!["--mint-fd".to_string(), "3".to_string()];
-            if let Some(g) = cfg.grace {
-                args.extend(["--grace".to_string(), g.to_string()]);
+            match j {
+                Jailing::Here(j) => {
+                    let r = j.start(theirs.as_fd(), b.as_fd(), &jail_args(cfg.grace)).map_err(|e| e.to_string())?;
+                    eprintln!("fenestrad: session {id} in jail {}", r.port);
+                    Proc::Jail(r)
+                }
+                Jailing::Root(j) => {
+                    let port = j.start(theirs.as_fd(), b.as_fd()).map_err(|e| e.to_string())?;
+                    eprintln!("fenestrad: session {id} in jail {port}");
+                    Proc::Remote(port, j.clone())
+                }
             }
-            let r = j.start(theirs.as_fd(), b.as_fd(), &args).map_err(|e| e.to_string())?;
-            eprintln!("fenestrad: session {id} in jail {}", r.port);
-            Proc::Jail(r)
         }
         _ => Proc::Child(
             cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
@@ -382,6 +406,16 @@ fn start_session(relay: &Arc<Relay>, cfg: &Config, id: u32, by: MintBy) -> Resul
         relay.end_session(id);
     }
     answer.map(Some)
+}
+
+/// A jailed session's arguments after its binary.
+#[cfg(target_os = "freebsd")]
+fn jail_args(grace: Option<u64>) -> Vec<String> {
+    let mut args = vec!["--mint-fd".to_string(), "3".to_string()];
+    if let Some(g) = grace {
+        args.extend(["--grace".to_string(), g.to_string()]);
+    }
+    args
 }
 
 /// One mint request on the mint socket: the answer line for the caller.
@@ -437,25 +471,52 @@ fn mint_request(relay: &Arc<Relay>, cfg: &Config, next: &mut u32, mut c: UnixStr
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let sock = arg(&args, "--frescod").unwrap_or_else(|| die("--frescod SOCK is needed"));
+    // Before any thread: getpwnam, and the fork for the root side.
+    let user = arg(&args, "--user").map(|n| privsep::lookup(&n).unwrap_or_else(|e| die(e)));
+    // SAFETY: a getter of this process's uid.
+    if user.is_some() && unsafe { libc::geteuid() } != 0 {
+        die("--user needs fenestrad started as root");
+    }
+    let grace: Option<u64> = arg(&args, "--grace").map(|s| s.parse().unwrap_or_else(|_| die("--grace SECONDS")));
+    #[cfg(target_os = "freebsd")]
+    let jaild_at = arg(&args, "--jaild").map(|sock| {
+        let lan = args.iter().position(|a| a == "--lan").and_then(|i| Some((args.get(i + 1)?.clone(), args.get(i + 2)?.clone())));
+        let (iface, subnet) = lan.unwrap_or_else(|| die("--jaild needs --lan IFACE SUBNET (where viewers come from)"));
+        (sock, iface, subnet)
+    });
+    // What needs root, as root: frescod checks our uid when we connect,
+    // and the mint socket's directory is root's.
+    let f = UnixStream::connect(&sock).unwrap_or_else(|e| die(format!("{sock}: {e}")));
+    let mint_listener = arg(&args, "--mint-sock").map(|path| {
+        // A fresh socket in fenestrad's own directory; any local user
+        // may connect, and the uid check in mint_request decides.
+        let l = UnixListener::bind(&path).unwrap_or_else(|e| die(format!("{path}: {e}")));
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap_or_else(|e| die(format!("{path}: {e}")));
+        (path, l)
+    });
+    #[cfg(target_os = "freebsd")]
+    let jails = jaild_at.map(|(sock, iface, subnet)| match &user {
+        Some(_) => Jailing::Root(Arc::new(privsep::jailer::split(move || jail::Jails::new(&sock, &iface, &subnet), jail_args(grace)))),
+        None => Jailing::Here(jail::Jails::new(&sock, &iface, &subnet)),
+    });
+    if let Some(u) = &user {
+        privsep::drop_to(u).unwrap_or_else(|e| die(format!("dropping to {}: {e}", u.name)));
+        eprintln!("fenestrad: running as {} (uid {})", u.name, u.uid);
+    }
     let cfg = Config {
         bin: arg(&args, "--session").unwrap_or_else(|| die("--session BIN is needed")),
         bind: arg(&args, "--bind"),
         public_ip: arg(&args, "--public-ip").map(|s| s.parse().unwrap_or_else(|_| die("--public-ip IP"))),
         seat: arg(&args, "--seat").unwrap_or_else(|| portcullis_peer::seat::ACTIVE_SESSION.into()),
-        grace: arg(&args, "--grace").map(|s| s.parse().unwrap_or_else(|_| die("--grace SECONDS"))),
+        grace,
         #[cfg(target_os = "freebsd")]
-        jails: arg(&args, "--jaild").map(|sock| {
-            let lan = args.iter().position(|a| a == "--lan").and_then(|i| Some((args.get(i + 1)?.clone(), args.get(i + 2)?.clone())));
-            let (iface, subnet) = lan.unwrap_or_else(|| die("--jaild needs --lan IFACE SUBNET (where viewers come from)"));
-            jail::Jails::new(&sock, &iface, &subnet)
-        }),
+        jails,
     };
     #[cfg(not(target_os = "freebsd"))]
     if arg(&args, "--jaild").is_some() {
         die("--jaild is for Atrium only");
     }
 
-    let f = UnixStream::connect(&sock).unwrap_or_else(|e| die(format!("{sock}: {e}")));
     let fr = f.try_clone().unwrap_or_else(|e| die(e));
     let relay = Arc::new(Relay { table: Mutex::new(Table::default()), frescod: Mutex::new(f) });
     {
@@ -466,12 +527,8 @@ fn main() {
         });
     }
 
-    match (arg(&args, "--mint-sock"), arg(&args, "--mint-dir")) {
-        (Some(path), None) => {
-            // A fresh socket in fenestrad's own directory; any local user
-            // may connect, and the uid check above decides.
-            let l = UnixListener::bind(&path).unwrap_or_else(|e| die(format!("{path}: {e}")));
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap_or_else(|e| die(format!("{path}: {e}")));
+    match (mint_listener, arg(&args, "--mint-dir")) {
+        (Some((path, l)), None) => {
             eprintln!("fenestrad: taking mints on {path}");
             let mut next = 0u32;
             // One request at a time, each bounded by MINT_TIMEOUT.

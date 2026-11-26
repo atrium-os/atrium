@@ -328,10 +328,11 @@ fn session_listen(l: &[crate::protocol::NetListen], ports: std::ops::RangeInclus
 /// fenestra.md §3.2, §11.3), named and rooted like a courier's, taking its
 /// caller's stdio (fenestrad's link, and the mint socket as fd 3): a routed
 /// vnet whose only grant is one UDP `listen` port in the policy's range,
-/// from a local network, and that port over TCP too ([`session_listen`]). Nothing outbound, no peers, no resolver, nothing
+/// from a local network, and that port over TCP too ([`session_listen`]).
+/// Nothing outbound, no peers, no resolver, nothing
 /// `inbound`. No devices, no FUSE, no child jails, no locked memory.
 pub fn is_fenestra_session(req: &CreateJailRequest, policy: &Policy) -> bool {
-    use crate::protocol::{ListenFrom, NetworkConfig};
+    use crate::protocol::NetworkConfig;
     let Some(c) = policy.fenestra_sessions.as_ref() else { return false };
     let Some((_, exec)) = service_instance(req, policy, &c.name_prefix, c.uid_first..=c.uid_last) else {
         return false;

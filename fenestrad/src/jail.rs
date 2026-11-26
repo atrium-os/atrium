@@ -62,9 +62,15 @@ pub struct Jails {
 pub struct Running {
     pub port: u16,
     pd: Arc<OwnedFd>,
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Running {
+    /// Whether its process is still running.
+    pub fn alive(&self) -> bool {
+        !self.exited.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn kill(&self) {
         // SAFETY: a procdesc we own; SIGKILL to the process it names.
         unsafe { libc::pdkill(self.pd.as_raw_fd(), libc::SIGKILL) };
@@ -113,13 +119,15 @@ impl Jails {
         match self.create(uid, port, link, mint, args) {
             Ok(pd) => {
                 let pd = Arc::new(pd);
-                let (w, jaild, pool) = (pd.clone(), self.jaild.clone(), self.pool.clone());
+                let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (w, jaild, pool, ex) = (pd.clone(), self.jaild.clone(), self.pool.clone(), exited.clone());
                 std::thread::spawn(move || {
                     let _ = wait(&w);
+                    ex.store(true, std::sync::atomic::Ordering::Relaxed);
                     release(&jaild, uid);
                     pool.lock().unwrap_or_else(|e| e.into_inner()).dying.push((uid, port));
                 });
-                Ok(Running { port, pd })
+                Ok(Running { port, pd, exited })
             }
             Err(e) => {
                 release(&self.jaild, uid);
