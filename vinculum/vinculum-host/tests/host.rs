@@ -234,3 +234,30 @@ fn public_address_controller_keeps_public_own_address() {
     let c = hci::Command::decode_full(&h.poll_frame().unwrap().packet).unwrap();
     assert_eq!(hci::LeSetScanParameters::try_from(c).unwrap().own_address_type, hci::OwnAddressType::PublicDeviceAddress);
 }
+
+#[test]
+fn bredr_secure_connections_comes_from_features_page_2() {
+    // The canned controller lists page 2 bit 8.
+    assert!(ready_host(4).info().bredr_secure_connections());
+    // One with no page 2 (the command fails) still comes up, without it.
+    let mut h = Host::new();
+    h.start(0);
+    for _ in 0..32 {
+        let Some(cmd) = h.poll_frame() else { break };
+        let c = hci::Command::decode_full(&cmd.packet).unwrap();
+        let a = if c.op_code == OpCode::ReadLocalExtendedFeatures {
+            complete(hci::ReadLocalExtendedFeaturesComplete {
+                status: ErrorCode::UnknownHciCommand,
+                page_number: 0,
+                maximum_page_number: 0,
+                extended_lmp_features: 0,
+                num_hci_command_packets: 1,
+            })
+        } else {
+            vinculum_host::testing::answer(&cmd, 4).expect("canned answer")
+        };
+        h.on_frame(a, 0);
+    }
+    assert!(h.is_ready());
+    assert!(!h.info().bredr_secure_connections());
+}

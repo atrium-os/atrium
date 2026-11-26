@@ -64,6 +64,13 @@ pub fn answer(cmd: &Frame, le_buffers: u8) -> Option<Frame> {
         OpCode::ReadLocalSupportedFeatures => {
             complete(hci::ReadLocalSupportedFeaturesComplete { status: ok, lmp_features: 0, num_hci_command_packets: 1 })
         }
+        OpCode::ReadLocalExtendedFeatures => complete(hci::ReadLocalExtendedFeaturesComplete {
+            status: ok,
+            page_number: 2,
+            maximum_page_number: 2,
+            extended_lmp_features: 1 << 8,
+            num_hci_command_packets: 1,
+        }),
         OpCode::ReadBdAddr => complete(hci::ReadBdAddrComplete {
             status: ok,
             bd_addr: hci::Address::try_from(0x0000_1122_3344_5566u64).unwrap(),

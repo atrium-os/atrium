@@ -96,6 +96,9 @@ pub struct ControllerInfo {
     pub hci_version: u8,
     pub manufacturer: u16,
     pub lmp_features: u64,
+    /// LMP features page 2 (0 when not read: LE-only, or the controller
+    /// has no page 2).
+    pub lmp_features_page2: u64,
     pub supported_commands: Vec<u8>,
     pub acl_mtu: u16,
     pub acl_buffers: u16,
@@ -110,6 +113,12 @@ impl ControllerInfo {
     /// such a controller refuses every BR/EDR command.
     pub fn le_only(&self) -> bool {
         self.lmp_features & (1 << 37) != 0
+    }
+
+    /// Page 2 bit 8, "Secure Connections (Controller Support)": without it
+    /// BR/EDR pairing can only make P-192 keys (Core Vol 2 Part C §3.3).
+    pub fn bredr_secure_connections(&self) -> bool {
+        self.lmp_features_page2 & (1 << 8) != 0
     }
 
     /// Whether the controller lists a command (Core Vol 4 Part E §6.27).
@@ -172,6 +181,7 @@ enum Step {
     ReadVersion,
     ReadCommands,
     ReadFeatures,
+    ReadFeaturesPage2,
     ReadBdAddr,
     ZephyrStaticAddress,
     LeSetRandomAddress,
@@ -851,6 +861,12 @@ impl Host {
         if matches!(step, WriteSimplePairingMode | WriteScHostSupport) && status != hci::ErrorCode::Success {
             return self.finish_bring_up();
         }
+        // A controller with no page 2 (pre-4.1) has no BR/EDR Secure
+        // Connections either: page 2 stays 0.
+        if step == ReadFeaturesPage2 && status != hci::ErrorCode::Success {
+            self.issue(to_cmd(hci::ReadBdAddr {}), Tag::Init(ReadBdAddr));
+            return;
+        }
         if status != hci::ErrorCode::Success {
             self.fatal(format!("bring-up {step:?}: {status:?}"));
             return;
@@ -880,9 +896,22 @@ impl Host {
             ReadFeatures => match hci::ReadLocalSupportedFeaturesComplete::try_from(cc) {
                 Ok(r) => {
                     self.info.lmp_features = r.lmp_features;
-                    Some((to_cmd(hci::ReadBdAddr {}), ReadBdAddr))
+                    if self.le_only() {
+                        Some((to_cmd(hci::ReadBdAddr {}), ReadBdAddr))
+                    } else {
+                        Some((to_cmd(hci::ReadLocalExtendedFeatures { page_number: 2 }), ReadFeaturesPage2))
+                    }
                 }
                 Err(_) => return self.fatal(bad("features")),
+            },
+            ReadFeaturesPage2 => match hci::ReadLocalExtendedFeaturesComplete::try_from(cc) {
+                Ok(r) => {
+                    if r.page_number == 2 {
+                        self.info.lmp_features_page2 = r.extended_lmp_features;
+                    }
+                    Some((to_cmd(hci::ReadBdAddr {}), ReadBdAddr))
+                }
+                Err(_) => return self.fatal(bad("features page 2")),
             },
             ReadBdAddr => match hci::ReadBdAddrComplete::try_from(cc) {
                 Ok(r) => {

@@ -528,6 +528,9 @@ impl Daemon {
         match ev {
             HostEvent::Ready(info) => {
                 eprintln!("vinculumd: controller ready, HCI version {}, {} bonds", info.hci_version, self.bonds.len());
+                if !info.le_only() && !info.bredr_secure_connections() {
+                    eprintln!("vinculumd: this controller has no BR/EDR Secure Connections: Classic pairing makes P-192 keys only, which the no-downgrade rule refuses (bluetooth.md §7); LE is unaffected");
+                }
                 self.update_page_scan();
                 self.update_scan();
             }
