@@ -22,7 +22,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop $([ "${FEN_JAIL:-0}" = 1 ] && echo 15 || echo 13)
+gate_begin fenestra-desktop $([ "${FEN_JAIL:-0}" = 1 ] && echo 16 || echo 13)
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -61,6 +61,7 @@ VP=$!
 sleep 15
 g "cp $G/screen.png $G/before.png"
 # While the viewer is attached: the jail as the kernel has it.
+[ "${FEN_JAIL:-0}" = 1 ] && RJ=$(g "ps -ax -o user= -o jid= -o comm= | awk '\$3 == \"fresco-renderer\"'")
 [ "${FEN_JAIL:-0}" = 1 ] && JL=$(g "jls -j system-fenestra-60500 vnet 2>/dev/null; ps -J system-fenestra-60500 -o uid= -o comm= 2>/dev/null" | tr -s ' \n' ' ')
 sleep 50
 g "cp $G/screen.png $G/middle.png"
@@ -104,6 +105,8 @@ if [ "${FEN_JAIL:-0}" = 1 ]; then
     grep -q "session 1 in jail 24300" "$W/fenestrad.log" && ok "fenestrad started the session in a jail" || bad "no jailed session in fenestrad's log"
     # The kernel's answer: the jail exists, has its own vnet, and the
     # session runs in it as the pool's uid.
+    # And every renderer in a jail of its own, as _fresco-render.
+    check "the renderers run jailed as _fresco-render" yes "$(echo "$RJ" | awk 'NF { n++; if ($1 != "_fresco-render" || $2 == 0) bad = 1 } END { print (n > 0 && !bad) ? "yes" : "no: " NR " lines" }')"
     case "$JL" in *new*60500\ atrium-fenestra-se*) ok "the session runs in its own vnet jail as uid 60500";; *) bad "the session jail: $JL";; esac
     # Its grace (fen_fenestrad) ends it with no viewer; fenestrad's janitor
     # then takes the jail and its network apart.

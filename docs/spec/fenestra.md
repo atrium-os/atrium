@@ -1596,7 +1596,7 @@ reading is cut off, never waited on.
 **Differences from §3.2, for now.** Every window streams while a session is on (the whole
 screen mirrored, §4.2) rather than only windows on remote outputs; remote outputs with the
 viewer's sizes and scales come with the windowed viewer. The renderer answers a want with a
-difference made on demand rather than writing a ring ahead. The renderers in the gate are unconfined (`FRESCOD_RENDERER_LAUNCHER=unconfined`). The trusted
+difference made on demand rather than writing a ring ahead. The gates run renderers unconfined unless `FEN_JAIL=1`. The trusted
 strip and window 0 (the WM's background) are not streamed yet.
 
 **Gates.**
@@ -1608,9 +1608,10 @@ strip and window 0 (the WM's background) are not streamed yet.
 - `scripts/fenestra-desktop-vm.sh` (cloud VM, `NETDEV_EXTRA=hostfwd=udp:127.0.0.1:24300-:24300`):
   frescod in split mode with atrium-sheets, fenestrad and its session in the guest, the
   viewer in the container, minting over real ssh into the guest and driven only from the viewer
-(frescod has no injector). 13/13, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 15/15
-with the session in its jail, checked from the kernel (its own vnet, uid 60500) and gone after
-its grace: the
+(frescod has no injector). 13/13, and with `FEN_JAIL=1` (after `deploy-portcullis.sh`) 16/16
+confined as on Atrium: frescod as `_frescod`, every renderer an `org.atrium.fresco.renderer` jail
+from portcullisd as `_fresco-render`, the session in its jail (its own vnet, uid 60500, checked
+from the kernel) and gone after its grace: the
   viewer's desktop equals frescod's own screen over every window, outside the strip and the
   focus ring; typing before and after a reconnect reaches the host and comes back; every input
   event passed on, none dropped; 0 scene bytes while idle; the second connection resumed
@@ -1674,8 +1675,8 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** The strip and background on the viewer; renderers in their jails in the gate,
-and fenestrad as `_fenestra` in its own; remote outputs at the viewer's size and scale; compressing
+**Next in R2.** The strip and background on the viewer; fenestrad as `_fenestra` in its own jail;
+remote outputs at the viewer's size and scale; compressing
 region updates as blobs are; the TCP fallback when UDP is blocked.
 
 ## 20. Sources

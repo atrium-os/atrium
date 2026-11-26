@@ -51,10 +51,40 @@ fen_setup() {
         g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
     done
 
+    if [ "${FEN_JAIL:-0}" = 1 ]; then
+        # Renderers from portcullisd, each in its org.atrium.fresco.renderer
+        # jail as _fresco-render: the bundle built and signed here, with a
+        # publisher key of the gate's own.
+        put "$ROOT/scripts/fresco-renderer-bundle.sh" "$D/" || gate_abort "copy the renderer bundle script"
+        g "set -e
+            test -f /root/e2e-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out /root/e2e-key.pem
+            openssl ec -in /root/e2e-key.pem -pubout -out /root/e2e-pub.pem 2>/dev/null
+            mkdir -p /etc/atrium/publishers && cp /root/e2e-pub.pem /etc/atrium/publishers/e2e.pem
+            chmod +x $D/fresco-renderer
+            cd /root && sh $D/fresco-renderer-bundle.sh $D/fresco-renderer /usr/local/share/fonts /root/e2e-key.pem /usr/local/bin/opifex
+            # The bundle caps the renderer's memory: jaild must allow rctl.
+            P=/etc/atrium/jaild.policy.toml
+            if grep -q '^allow_rctl' \$P; then sed -i '' 's/^allow_rctl.*/allow_rctl = true/' \$P
+            elif grep -q '^\\[resource_control\\]' \$P; then sed -i '' '/^\\[resource_control\\]/a\\
+allow_rctl = true
+' \$P
+            else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
+            service atrium-jaild restart >/dev/null 2>&1 || true; sleep 2
+            # portcullisd, which frescod asks for each renderer's jail.
+            pkill -x portcullisd || true; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f /atrium/sockets/portcullis/portcullis.sock
+            daemon -f -o /var/log/atrium/portcullisd-fenestra.log /usr/local/bin/portcullisd --socket /atrium/sockets/portcullis/portcullis.sock; sleep 3
+            test -S /atrium/sockets/portcullis/portcullis.sock" \
+            >"${W:-/tmp}/renderer-bundle.log" 2>&1 || { tail -5 "${W:-/tmp}/renderer-bundle.log"; gate_abort "the renderer bundle did not install"; }
+        # As _frescod (portcullisd starts no worker for root), in a
+        # directory it owns.
+        LAUNCH=""; AS_USER="-u _frescod"; g "chown _frescod $G"
+    else
+        LAUNCH="FRESCOD_RENDERER_LAUNCHER=unconfined"; AS_USER=""
+    fi
     echo "=== host"
-    g "cd $G && env FRESCOD_SPLIT=1 FRESCOD_RENDERER_LAUNCHER=unconfined FRESCOD_RENDERER_BIN=$D/fresco-renderer \
+    g "cd $G && env FRESCOD_SPLIT=1 $LAUNCH FRESCOD_RENDERER_BIN=$D/fresco-renderer \
         FRESCOD_HEADLESS_PNG=$G/screen FRESCOD_SOCK=$G/fresco.sock FRESCOD_WM_SOCK=$G/wm.sock \
-        FRESCOD_FENESTRA_SOCK=$G/fenestra.sock daemon -f -o $G/frescod.log $D/frescod </dev/null"
+        FRESCOD_FENESTRA_SOCK=$G/fenestra.sock daemon -f -o $G/frescod.log $AS_USER $D/frescod </dev/null"
     i=0; while [ $i -lt 90 ] && ! g "test -S $G/fresco.sock && test -S $G/fenestra.sock"; do sleep 2; i=$((i+1)); done
     g "test -S $G/fenestra.sock" || { g "tail -20 $G/frescod.log"; gate_abort "frescod did not open the fenestra link"; }
     g "chmod 666 $G/fresco.sock"
