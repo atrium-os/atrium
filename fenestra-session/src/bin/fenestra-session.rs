@@ -161,6 +161,27 @@ async fn run(link: std::os::unix::net::UnixStream, mut how: MintBy, bind: String
                     }
                     let (src, wake, conn, live_tx) = (src.clone(), wake.clone(), n, live_tx.clone());
                     live_tx.send_modify(|v| *v += 1);
+                    {
+                        // A migrated connection (§8.6) has a new address:
+                        // the host's seat shows where the viewer is now.
+                        let (q, src) = (hc.conn.clone(), src.clone());
+                        tokio::spawn(async move {
+                            let mut at = q.remote_address().ip();
+                            loop {
+                                tokio::select! {
+                                    _ = q.closed() => return,
+                                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                                }
+                                let now = q.remote_address().ip();
+                                if now != at {
+                                    at = now;
+                                    if src.peer(now).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
                     tokio::spawn(async move {
                         let stats = Arc::new(ViewerStats::default());
                         let r = serve(hc, src, wake, stats.clone()).await;

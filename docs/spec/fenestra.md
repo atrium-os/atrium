@@ -1093,7 +1093,7 @@ portcullisd for Fenestra: the jails use existing manifest grants (AGENTS.md revi
 
 When a viewer is attached to a session, the host's frescod draws a trusted indicator in the
 chrome lane (F4d) on every local monitor of that session: who (first the address the viewer's
-connection came from, as the host saw it, and how many viewers are connected; then the SSH key's
+connection came from, as the host's session observed it, and how many viewers are connected; then the SSH key's
 comment or the paired device name from the host's own records, never from the viewer at connect
 time, printable characters only, shown as plain text and worded as the key holder's claim, since a
 key holder with a shell can mint with any name unless the key is restricted to the forced
@@ -1822,9 +1822,11 @@ with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture save
 1600x900@1.5 and a stub lock socket. On the display path each monitor scans out the viewed screen
 (the button and pointer on the first) and a spanning window's direct scanout stops; that path
 still keeps the desktop at the monitors' size while viewed, and has not run on a real display yet.
-"By whom" says first what the host itself saw: the address the viewer's connection came from
-(the session's QUIC or TCP peer, sent to fenestrad as a `Peer` record, kind 6, session to fenestrad
-only, an IP address in its canonical spelling), and how many viewers are connected when there are
+"By whom" says first what the host itself saw: the address the viewer's connection came from,
+as observed by the session (its QUIC or TCP peer, sent to fenestrad as a `Peer` record, and again
+when a migrated connection's address changes; kind 6, session to fenestrad
+only, an IP address in its canonical spelling; a viewer that has compromised its session could
+report any address, inside the residual that such a viewer already has the session's use), and how many viewers are connected when there are
 more than one ("by 2 viewers, the latest from ..."), so a second viewer is never hidden behind
 the first's name. Then, as the viewer's own word, "their key says:" the comment on the
 `authorized_keys` line of the key sshd accepted (`fenestra-shell` reads it through sshd's
