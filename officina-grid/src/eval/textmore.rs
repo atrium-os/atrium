@@ -299,3 +299,124 @@ pub(super) fn trimrange(c: &Ctx, a: &[Expr]) -> Ev {
     }
     Ev::R(out)
 }
+
+// ---------- BAHTTEXT, PHONETIC, EUROCONVERT ----------
+
+const THAI_DIGITS: [&str; 10] = ["ศูนย์", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า"];
+const THAI_PLACES: [&str; 6] = ["", "สิบ", "ร้อย", "พัน", "หมื่น", "แสน"];
+
+/// A whole number under 10^6 in Thai words; `after` when something comes
+/// before it (a final 1 is then เอ็ด).
+fn thai_group(n: u64, after: bool) -> String {
+    let digits: Vec<u64> = (0..6).map(|i| n / 10u64.pow(i) % 10).collect();
+    let mut out = String::new();
+    for place in (0..6).rev() {
+        let d = digits[place as usize] as usize;
+        if d == 0 {
+            continue;
+        }
+        let higher = after || n >= 10u64.pow(place as u32 + 1);
+        match (place, d) {
+            (1, 1) => {}
+            (1, 2) => out.push_str("ยี่"),
+            (0, 1) if higher => out.push_str("เอ็ด"),
+            _ => out.push_str(THAI_DIGITS[d]),
+        }
+        out.push_str(THAI_PLACES[place as usize]);
+    }
+    out
+}
+
+/// A whole number in Thai words, millions as ล้าน.
+fn thai_number(n: u64) -> String {
+    if n < 1_000_000 {
+        return thai_group(n, false);
+    }
+    let (high, low) = (n / 1_000_000, n % 1_000_000);
+    let mut out = thai_number(high);
+    out.push_str("ล้าน");
+    out.push_str(&thai_group(low, true));
+    out
+}
+
+/// BAHTTEXT(number): the amount in Thai words, baht and satang.
+pub(super) fn bahttext(c: &Ctx, a: &[Expr]) -> Ev {
+    let x = tri!(c.number(&c.scalar(&a[0])));
+    let cents = (x.abs() * 100.0).round();
+    if !cents.is_finite() || cents >= 1e17 {
+        return Ev::err(ErrorKind::Num);
+    }
+    let cents = cents as u64;
+    let (baht, satang) = (cents / 100, cents % 100);
+    let mut out = String::new();
+    if x < 0.0 && cents > 0 {
+        out.push_str("ลบ");
+    }
+    if baht > 0 || satang == 0 {
+        out.push_str(&if baht == 0 { THAI_DIGITS[0].to_string() } else { thai_number(baht) });
+        out.push_str("บาท");
+    }
+    if satang == 0 {
+        out.push_str("ถ้วน");
+    } else {
+        out.push_str(&thai_group(satang, false));
+        out.push_str("สตางค์");
+    }
+    s(out)
+}
+
+/// PHONETIC(reference): the reading of Japanese text; cells here carry no
+/// readings, so it is the cells' text joined.
+pub(super) fn phonetic(c: &Ctx, a: &[Expr]) -> Ev {
+    let arr = match c.eval(&a[0]) {
+        Ev::R(r) => tri!(c.to_array(Ev::R(r))),
+        Ev::V(Value::Err(k)) => return Ev::err(k),
+        _ => return Ev::err(ErrorKind::Value),
+    };
+    let mut out = String::new();
+    for v in arr.vals.iter() {
+        match v {
+            Value::Str(t) => out.push_str(t),
+            Value::Err(k) => return Ev::err(*k),
+            _ => {}
+        }
+        if out.len() > MAX_TEXT {
+            return Ev::err(ErrorKind::Value);
+        }
+    }
+    s(out)
+}
+
+/// Euro area currencies' fixed rates to the euro and the decimals
+/// EUROCONVERT rounds each to.
+const EURO_RATES: &[(&str, f64, i32)] = &[
+    ("EUR", 1.0, 2), ("BEF", 40.3399, 0), ("LUF", 40.3399, 0), ("DEM", 1.95583, 2), ("ESP", 166.386, 0),
+    ("FRF", 6.55957, 2), ("IEP", 0.787564, 2), ("ITL", 1936.27, 0), ("NLG", 2.20371, 2), ("ATS", 13.7603, 2),
+    ("PTE", 200.482, 0), ("FIM", 5.94573, 2), ("GRD", 340.75, 0), ("SIT", 239.64, 2), ("CYP", 0.585274, 2),
+    ("MTL", 0.4293, 2), ("SKK", 30.126, 2), ("EEK", 15.6466, 2), ("LVL", 0.702804, 2), ("LTL", 3.4528, 2),
+];
+
+/// EUROCONVERT(number, source, target, [full_precision],
+/// [triangulation_precision]).
+pub(super) fn euroconvert(c: &Ctx, a: &[Expr]) -> Ev {
+    let x = tri!(c.number(&c.scalar(&a[0])));
+    let find = |i: usize| -> Result<(f64, i32), ErrorKind> {
+        let code = to_text(&c.scalar(&a[i]))?.to_ascii_uppercase();
+        EURO_RATES.iter().find(|r| r.0 == code).map(|r| (r.1, r.2)).ok_or(ErrorKind::Value)
+    };
+    let ((from, _), (to, places)) = (tri!(find(1)), tri!(find(2)));
+    let full = match a.get(3).filter(|x| !missing(x)) {
+        Some(e) => tri!(super::to_bool(&c.scalar(e))),
+        None => false,
+    };
+    let tri_places = tri!(opt_num(c, a, 4, -1.0)).trunc();
+    if tri_places != -1.0 && tri_places < 3.0 {
+        return Ev::err(ErrorKind::Value);
+    }
+    let mut euros = x / from;
+    if from != 1.0 && to != 1.0 && tri_places >= 3.0 {
+        euros = super::funcs::round_dec(euros, tri_places as i32, 0);
+    }
+    let r = euros * to;
+    Ev::V(Value::num(if full { r } else { super::funcs::round_dec(r, places, 0) }))
+}

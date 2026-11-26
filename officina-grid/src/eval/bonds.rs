@@ -440,3 +440,168 @@ pub(super) fn tbilleq(c: &Ctx, a: &[Expr]) -> Ev {
         Ok((-t + root) / (t - 0.5))
     }))
 }
+
+// ---------- odd first and last periods ----------
+
+/// The normal length of the quasi-coupon period from `start` to `end`.
+fn normal_length(start: f64, end: f64, freq: f64, basis: i32) -> f64 {
+    match basis {
+        1 => end - start,
+        3 => 365.0 / freq,
+        _ => 360.0 / freq,
+    }
+}
+
+/// The most quasi-coupon periods an odd period may span.
+const MAX_QUASI: usize = 1_000;
+
+/// One quasi-coupon period of an odd period, as fractions of its normal
+/// length: the days it counts (DC), the days accrued before settlement (A)
+/// and the days from settlement on (DSC).
+struct Quasi {
+    dc: f64,
+    a: f64,
+    dsc: f64,
+}
+
+/// The quasi-coupon periods covering `from`..`to` (an odd period) on the
+/// schedule through `anchor` (`backward` from it, or forward), with
+/// settlement `s`.
+fn quasi_periods(sys: DateSystem, anchor: f64, from: f64, to: f64, s: f64, freq: f64, basis: i32, backward: bool) -> R<Vec<Quasi>> {
+    let step = 12.0 / freq;
+    let mut out = Vec::new();
+    for i in 0..MAX_QUASI {
+        let k = i as f64;
+        let (start, end) = if backward {
+            (shift(sys, anchor, -(k + 1.0) * step)?, shift(sys, anchor, -k * step)?)
+        } else {
+            (shift(sys, anchor, k * step)?, shift(sys, anchor, (k + 1.0) * step)?)
+        };
+        let nl = normal_length(start, end, freq, basis);
+        let (lo, hi) = (start.max(from), end.min(to));
+        if lo < hi {
+            let dc = day_count(sys, lo, hi, basis)?;
+            let a = if s > lo { day_count(sys, lo, s.min(hi), basis)? } else { 0.0 };
+            let dsc = if s < hi { day_count(sys, s.max(lo), hi, basis)? } else { 0.0 };
+            out.push(Quasi { dc: dc / nl, a: a / nl, dsc: dsc / nl });
+        }
+        if (backward && start <= from) || (!backward && end >= to) {
+            return Ok(out);
+        }
+    }
+    bad()
+}
+
+/// A bond with an odd (short or long) first period.
+struct OddFirst {
+    coupon: f64,
+    redemption: f64,
+    freq: f64,
+    /// Regular coupons after the first one.
+    n: f64,
+    /// Whole quasi-coupon periods from settlement's next quasi date to the
+    /// first coupon, plus settlement's fraction of its own (DSC/E).
+    lead: f64,
+    odd: f64,
+    accrued: f64,
+}
+
+impl OddFirst {
+    fn price(&self, y: f64) -> f64 {
+        let g = 1.0 + y / self.freq;
+        let mut p = self.redemption / g.powf(self.n + self.lead) + self.odd / g.powf(self.lead);
+        let mut k = 1.0;
+        while k <= self.n {
+            p += self.coupon / g.powf(k + self.lead);
+            k += 1.0;
+        }
+        p - self.accrued
+    }
+}
+
+/// ODDFPRICE and ODDFYIELD's bond: settlement, maturity, issue, first
+/// coupon, rate, then (price or yield), redemption, frequency, basis.
+fn odd_first(c: &Ctx, a: &[Expr]) -> R<(OddFirst, f64)> {
+    let sys = c.wb.date_system();
+    let (s, m, issue, first) = (date(c, a, 0)?, date(c, a, 1)?, date(c, a, 2)?, date(c, a, 3)?);
+    let (rate, x, red) = (num(c, a, 4)?, num(c, a, 5)?, num(c, a, 6)?);
+    let (freq, basis) = (frequency(c, a, 7)?, basis(c, a, 8)?);
+    if !(m > first && first > s && s > issue) || rate < 0.0 || x < 0.0 || red <= 0.0 {
+        return bad();
+    }
+    let coupon = 100.0 * rate / freq;
+    let periods = quasi_periods(sys, first, issue, first, s, freq, basis, true)?;
+    let odd = coupon * periods.iter().map(|q| q.dc).sum::<f64>();
+    let accrued = coupon * periods.iter().map(|q| q.a).sum::<f64>();
+    // Settlement's place on the quasi schedule before the first coupon.
+    let step = 12.0 / freq;
+    let mut j = 0.0;
+    while shift(sys, first, -(j + 1.0) * step)? >= s {
+        j += 1.0;
+        if j > MAX_QUASI as f64 {
+            return bad();
+        }
+    }
+    let (start, end) = (shift(sys, first, -(j + 1.0) * step)?, shift(sys, first, -j * step)?);
+    let e = normal_length(start, end, freq, basis);
+    let dsc = match basis {
+        0 | 4 => e - day_count(sys, start, s, basis)?,
+        _ => end - s,
+    };
+    let n = period(sys, first, m, freq)?.count;
+    if n > MAX_COUPONS {
+        return bad();
+    }
+    Ok((OddFirst { coupon, redemption: red, freq, n, lead: j + dsc / e, odd, accrued }, x))
+}
+
+/// ODDFPRICE(settlement, maturity, issue, first_coupon, rate, yld,
+/// redemption, frequency, [basis]).
+pub(super) fn oddfprice(c: &Ctx, a: &[Expr]) -> Ev {
+    ev(odd_first(c, a).map(|(b, y)| b.price(y)))
+}
+
+/// ODDFYIELD(settlement, maturity, issue, first_coupon, rate, pr,
+/// redemption, frequency, [basis]): the yield giving `pr`, by bisection.
+pub(super) fn oddfyield(c: &Ctx, a: &[Expr]) -> Ev {
+    ev((|| {
+        let (b, pr) = odd_first(c, a)?;
+        if pr <= 0.0 {
+            return bad();
+        }
+        invert(&|y| -b.price(y), -pr, -b.freq * 0.999, 1.0).ok_or(ErrorKind::Num)
+    })())
+}
+
+/// ODDLPRICE and ODDLYIELD's sums: Σ DC/NL, Σ A/NL and Σ DSC/NL over the
+/// quasi-coupon periods from last_interest to maturity, and the coupon.
+fn odd_last(c: &Ctx, a: &[Expr]) -> R<(f64, f64, f64, f64, f64, f64, f64)> {
+    let sys = c.wb.date_system();
+    let (s, m, last) = (date(c, a, 0)?, date(c, a, 1)?, date(c, a, 2)?);
+    let (rate, x, red) = (num(c, a, 3)?, num(c, a, 4)?, num(c, a, 5)?);
+    let (freq, basis) = (frequency(c, a, 6)?, basis(c, a, 7)?);
+    if !(m > s && s > last) || rate < 0.0 || x < 0.0 || red <= 0.0 {
+        return bad();
+    }
+    let periods = quasi_periods(sys, last, last, m, s, freq, basis, false)?;
+    let sum = |f: fn(&Quasi) -> f64| periods.iter().map(f).sum::<f64>();
+    Ok((100.0 * rate / freq, sum(|q| q.dc), sum(|q| q.a), sum(|q| q.dsc), x, red, freq))
+}
+
+/// ODDLPRICE(settlement, maturity, last_interest, rate, yld, redemption,
+/// frequency, [basis]).
+pub(super) fn oddlprice(c: &Ctx, a: &[Expr]) -> Ev {
+    ev(odd_last(c, a).map(|(cp, dc, acc, dsc, y, red, freq)| (red + dc * cp) / (1.0 + dsc * y / freq) - acc * cp))
+}
+
+/// ODDLYIELD(settlement, maturity, last_interest, rate, pr, redemption,
+/// frequency, [basis]).
+pub(super) fn oddlyield(c: &Ctx, a: &[Expr]) -> Ev {
+    ev(odd_last(c, a).and_then(|(cp, dc, acc, dsc, pr, red, freq)| {
+        let paid = pr + acc * cp;
+        if pr <= 0.0 || dsc <= 0.0 {
+            return bad();
+        }
+        Ok((red + dc * cp - paid) / paid * freq / dsc)
+    }))
+}

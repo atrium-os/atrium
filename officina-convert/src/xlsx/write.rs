@@ -30,7 +30,7 @@ const FUTURE: &[&str] = &[
     "FORECAST.LINEAR", "COVARIANCE.P", "COVARIANCE.S", "MODE.MULT", "NUMBERVALUE", "ARABIC", "BASE", "DECIMAL", "SHEET", "SHEETS", "ISFORMULA",
     "NORM.DIST", "NORM.INV", "NORM.S.DIST", "NORM.S.INV", "LOGNORM.DIST", "LOGNORM.INV", "T.DIST", "T.DIST.2T", "T.DIST.RT", "T.INV", "T.INV.2T", "CHISQ.DIST", "CHISQ.DIST.RT", "CHISQ.INV", "CHISQ.INV.RT", "F.DIST", "F.DIST.RT", "F.INV", "F.INV.RT", "BINOM.DIST", "BINOM.DIST.RANGE", "BINOM.INV", "NEGBINOM.DIST", "POISSON.DIST", "HYPGEOM.DIST", "EXPON.DIST", "GAMMA.DIST", "GAMMA.INV", "GAMMALN.PRECISE", "BETA.DIST", "BETA.INV", "WEIBULL.DIST", "ERF.PRECISE", "ERFC.PRECISE", "CONFIDENCE.NORM", "CONFIDENCE.T", "T.TEST", "Z.TEST", "CHISQ.TEST", "F.TEST", "PHI", "GAUSS", "GAMMA", "PDURATION", "RRI",
     "AGGREGATE", "CEILING.PRECISE", "FLOOR.PRECISE", "ISO.CEILING", "PERCENTRANK.INC", "PERCENTRANK.EXC", "SKEW.P", "WORKDAY.INTL", "NETWORKDAYS.INTL", "BITAND", "BITOR", "BITXOR", "BITLSHIFT", "BITRSHIFT", "PERMUTATIONA", "COMBINA", "COT", "COTH", "CSC", "CSCH", "SEC", "SECH", "ACOT", "ACOTH", "MUNIT", "IMCOSH", "IMCOT", "IMCSC", "IMCSCH", "IMSEC", "IMSECH", "IMSINH", "IMTAN",
-    "ARRAYTOTEXT", "VALUETOTEXT", "ENCODEURL", "REGEXTEST", "REGEXEXTRACT", "REGEXREPLACE", "PERCENTOF", "TRIMRANGE", "DBCS",
+    "ARRAYTOTEXT", "VALUETOTEXT", "ENCODEURL", "REGEXTEST", "REGEXEXTRACT", "REGEXREPLACE", "PERCENTOF", "TRIMRANGE", "DBCS", "GROUPBY", "PIVOTBY", "BAHTTEXT",
 ];
 
 /// Newer still: in the worksheet-function namespace too (`_xlfn._xlws.FILTER`).
@@ -144,6 +144,8 @@ pub fn formula_out(f: &str) -> String {
     let body = f.strip_prefix('=').unwrap_or(f);
     let b = body.as_bytes();
     let mut out = String::with_capacity(body.len() + 8);
+    // The functions whose parentheses enclose this point ("" for grouping).
+    let mut calls: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
@@ -181,6 +183,12 @@ pub fn formula_out(f: &str) -> String {
                 i += 1;
             }
             let word = &body[start..i];
+            let callee = calls.last().copied().unwrap_or("");
+            if i < b.len() && b[i] == b'(' {
+                calls.push(word);
+            } else if eta_arg(callee, word, body[..start].trim_end().ends_with(','), body[i..].trim_start().starts_with([',', ')'])) {
+                out.push_str("_xleta.");
+            }
             if i < b.len() && b[i] == b'(' && FUTURE_WS.iter().any(|f| f.eq_ignore_ascii_case(word)) {
                 out.push_str("_xlfn._xlws.");
             } else if i < b.len() && b[i] == b'(' && FUTURE.iter().any(|f| f.eq_ignore_ascii_case(word)) {
@@ -189,11 +197,29 @@ pub fn formula_out(f: &str) -> String {
             out.push_str(word);
             continue;
         }
+        if c == b'(' && !body[..i].ends_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.') {
+            calls.push("");
+        } else if c == b')' {
+            calls.pop();
+        }
         let ch = body[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// Functions that take a LAMBDA, where a bare function name is Excel's
+/// eta-reduced lambda (`_xleta.SUM` in files).
+const TAKES_LAMBDA: &[&str] = &["MAP", "REDUCE", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "GROUPBY", "PIVOTBY"];
+
+/// Whether `word`, an argument (after a comma) of `callee`, is a built-in
+/// function's name standing for its lambda.
+fn eta_arg(callee: &str, word: &str, after_comma: bool, ends_arg: bool) -> bool {
+    after_comma
+        && ends_arg
+        && TAKES_LAMBDA.iter().any(|f| f.eq_ignore_ascii_case(callee))
+        && officina_grid::eval::funcs::lookup(&word.to_ascii_uppercase()).is_some()
 }
 
 pub(super) fn esc(out: &mut Vec<u8>, s: &str) {
@@ -1039,6 +1065,8 @@ mod tests {
         assert_eq!(formula_out("=UNICHAR(65)&CEILING.MATH(A1)&CEILING(A1,1)&ISOWEEKNUM(A1)"), "_xlfn.UNICHAR(65)&_xlfn.CEILING.MATH(A1)&CEILING(A1,1)&_xlfn.ISOWEEKNUM(A1)");
         assert_eq!(formula_out("=RANK.EQ(1,A:A)+RANK(1,A:A)+MAXIFS(A:A,B:B,1)+PERCENTILE.INC(A:A,0.5)"), "_xlfn.RANK.EQ(1,A:A)+RANK(1,A:A)+_xlfn.MAXIFS(A:A,B:B,1)+_xlfn.PERCENTILE.INC(A:A,0.5)");
         assert_eq!(formula_out("=\"IFS(\"&IFS(A1,1)"), "\"IFS(\"&_xlfn.IFS(A1,1)");
+        assert_eq!(formula_out("=BYROW(A1:B2,SUM)+SUM(A1,Rate)"), "_xlfn.BYROW(A1:B2,_xleta.SUM)+SUM(A1,Rate)");
+        assert_eq!(formula_out("=GROUPBY(A:A,B:B,PERCENTOF,0,(1))"), "_xlfn.GROUPBY(A:A,B:B,_xleta.PERCENTOF,0,(1))");
         assert_eq!(formula_out("='IFS(x'!A1"), "'IFS(x'!A1");
         assert_eq!(formula_out("=MYIFS(1)"), "MYIFS(1)");
     }
