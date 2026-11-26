@@ -22,6 +22,9 @@ use fresco_render_core::stream::{self, Reader};
 use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 
 /// Where the viewer's input comes from (a window's events, or a script).
+#[cfg(feature = "window")]
+pub mod window;
+
 pub type Inputs = Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<scene::Input>>>;
 
 /// Most remote windows one viewer holds.
@@ -33,12 +36,27 @@ pub struct View {
     pub scene: SceneState,
     pub reader: Reader,
     pub bytes: u64,
+    /// The last raster, and the version it is of.
+    drawn: Option<((u64, u64), (u32, u32, Vec<u32>, String))>,
 }
 
 impl View {
     fn new() -> View {
         let (fe, id) = record::viewer_window(1, 1);
-        View { fe, scene: SceneState::default(), reader: Reader::new(id, record::VIEW_CLIENT), bytes: 0 }
+        View { fe, scene: SceneState::default(), reader: Reader::new(id, record::VIEW_CLIENT), bytes: 0, drawn: None }
+    }
+
+    /// [`View::raster`], drawn again only when the version moved.
+    pub fn raster_cached(&mut self) -> Option<(u32, u32, Vec<u32>, String)> {
+        let held = self.reader.held()?;
+        if let Some((v, r)) = &self.drawn {
+            if *v == held {
+                return Some(r.clone());
+            }
+        }
+        let r = self.raster()?;
+        self.drawn = Some((held, r.clone()));
+        Some(r)
     }
 
     /// The window as drawn here: `(width, height, pixels, sha256)`.
@@ -235,13 +253,33 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, px: &[u32]) -> std::io::Res
 /// The whole desktop as the layout places the windows held: each window
 /// over the ones below it (premultiplied BGRA, source over), on black.
 pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
-    let (screen, placed) = views.layout.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    // A host that sends no layout (the simulator): its windows at the
+    // origin, on a screen as large as the largest.
+    let given = views.layout.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (screen, placed) = match given {
+        Some(l) => l,
+        None => {
+            let ws = views.windows.lock().unwrap_or_else(|e| e.into_inner());
+            let placed: Vec<scene::Placed> = ws
+                .iter()
+                .filter_map(|(id, v)| {
+                    let (w, h) = v.lock().unwrap_or_else(|e| e.into_inner()).reader.size();
+                    (w > 0 && h > 0).then_some((*id, 0, 0, w, h))
+                })
+                .collect();
+            let screen = placed.iter().fold((0, 0), |(a, b), p| (a.max(p.3), b.max(p.4)));
+            if placed.is_empty() {
+                return None;
+            }
+            (screen, placed)
+        }
+    };
     let (sw, sh) = screen;
     let mut out = vec![0xff00_0000u32; sw as usize * sh as usize];
     let windows = views.windows.lock().unwrap_or_else(|e| e.into_inner());
     for (id, x, y, _, _) in placed {
         let Some(v) = windows.get(&id) else { continue };
-        let Some((w, h, px, _)) = v.lock().unwrap_or_else(|e| e.into_inner()).raster() else { continue };
+        let Some((w, h, px, _)) = v.lock().unwrap_or_else(|e| e.into_inner()).raster_cached() else { continue };
         for row in 0..h as i64 {
             let dy = i64::from(y) + row;
             if dy < 0 || dy >= i64::from(sh) {

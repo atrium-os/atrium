@@ -1526,7 +1526,7 @@ VM runs only with the coordinator's go.
 |---|---|---|
 | R0 | This spec reviewed and decided. New crates licence-audited. **Done 2026-11-26** (§19a). | review thread sign-off; audit 0 failing |
 | R1 | **Done 2026-11-26** (§5.6): portable crate, stream writer and reader, fuzzer, recorder; gate 8/8. Wiring the writer into fresco-renderer moves to R2. The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
-| R2 | **In progress** (§19b: QUIC, the session, fenestrad, frescod's stream link, the headless viewer and input are built; loopback 18/18 and cloud VM 12/12). `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
+| R2 | **In progress** (§19b: QUIC, the session, fenestrad, frescod's stream link, the viewer (windowed and headless), input and reconnect are built; loopback 18/18, cloud VM desktop 12/12, bad networks 15/15). `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
 | R4 | Rootless mode: remote windows as local windows, local move and resize (§6.4), popups, host strip, dock badge. | `fenestra-rootless-vm.sh` |
 | R5 | Viewer-scrollable SCROLL groups in frescod (local and remote), Pergola ScrollView and Navigator documents set the flag. | `scroll_bench` locally; scroll latency at 150 ms RTT in the R2 rig |
@@ -1615,11 +1615,27 @@ strip and window 0 (the WM's background) are not streamed yet.
   event passed on, none dropped; 0 scene bytes while idle; the second connection resumed
   without resending (8.8 KB for its typing).
 
-**Next in R2.** Bad networks with a UDP impairment proxy in the container (no `tc` there):
-added RTT, loss, rate, jitter, blackouts, an address change, and click-to-frame at 0, 50, 150
-and 300 ms; the windowed viewer (winit and softbuffer) for the Mac; the strip and background
-on the viewer; renderers and the session in their jails; the SSH mint; cutting the glyph atlas
-bytes of whole states.
+- `scripts/fenestra-netem-vm.sh` (cloud VM; `scripts/lib/udp-impair.py` between the viewer
+  and the guest, since the container has no `tc`): one 575 s session through a schedule of
+  added RTT (50, 150, 300 ms), 2 % and 10 % loss, 1 Mbit/s with a 64 KB queue, 30 ms jitter, a
+  5 s blackout, an address change (the proxy rebinds) and a 3 min blackout, with
+  click-to-frame probes in each (`--input` lines ending `PROBE`). 15/15: every probe answered;
+  each added RTT costs about one round trip (medians under TCG 341, 387, 471, 572 ms: the
+  baseline is the emulated guest's draw, not a product number); the 5 s blackout and the
+  address change kept the connection; the 3 min one past the idle timeout made exactly one
+  reconnect, which resumed without resending; a key pressed during the blackout was not
+  replayed; the final desktop equals frescod's screen.
+
+**The viewer.** `fenestra-view` opens a window by default (winit 0.30 and softbuffer 0.4, the
+`window` feature): the host's desktop drawn on the CPU from each window's raster (cached by
+the held version) composed by the layout, scaled to fit with its aspect kept; keyboard (HID
+usages by key position, modifiers, repeats left to the host), pointer, buttons and wheel go
+back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
+to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
+
+**Next in R2.** The strip and background on the viewer; renderers and the session in their
+jails; the SSH mint; remote outputs at the viewer's size and scale; cutting the glyph-atlas
+bytes of whole states; the TCP fallback when UDP is blocked.
 
 ## 20. Sources
 
