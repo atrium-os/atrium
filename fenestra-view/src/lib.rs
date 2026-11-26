@@ -57,6 +57,9 @@ pub struct Views {
     pub frames: AtomicU64,
     /// Window streams that broke the protocol (each drops its connection).
     pub errors: AtomicU64,
+    /// Whole-desktop sessions: the host's screen and where its windows
+    /// are, bottom to top.
+    pub layout: Mutex<Option<((u32, u32), Vec<scene::Placed>)>>,
 }
 
 impl Views {
@@ -83,6 +86,9 @@ pub async fn run(hc: HostConn, views: Arc<Views>) -> Result<(), WireError> {
                     Ok(Msg::App(b)) => match Control::decode(&b)? {
                         Control::Closed(w) => {
                             views.windows.lock().unwrap_or_else(|e| e.into_inner()).remove(&w);
+                        }
+                        Control::Layout { screen, windows } => {
+                            *views.layout.lock().unwrap_or_else(|e| e.into_inner()) = Some((screen, windows));
                         }
                         Control::Resume(_) => return Err(WireError::Protocol("resume from the host")),
                     },
@@ -175,18 +181,16 @@ pub fn snapshot(views: &Views, dir: &std::path::Path) -> std::io::Result<String>
         let v = v.lock().unwrap_or_else(|e| e.into_inner());
         let Some((w, h, px, sha)) = v.raster() else { continue };
         report += &format!("window {id} {w}x{h} {sha}\n");
-        let f = std::fs::File::create(dir.join(format!("window-{id}.png")))?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut wr = enc.write_header().map_err(std::io::Error::other)?;
-        // BGRA8 words to RGBA bytes.
-        let mut rgba = Vec::with_capacity(px.len() * 4);
-        for p in px {
-            let [b, g, r, a] = p.to_le_bytes();
-            rgba.extend_from_slice(&[r, g, b, a]);
+        write_png(&dir.join(format!("window-{id}.png")), w, h, &px)?;
+    }
+    if let Some((_, placed)) = views.layout.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        for (id, x, y, w, h) in placed {
+            report += &format!("placed {id} {x} {y} {w} {h}\n");
         }
-        wr.write_image_data(&rgba).map_err(std::io::Error::other)?;
+    }
+    if let Some((desk, sha)) = desktop(views) {
+        report += &format!("desktop {}x{} {sha}\n", desk.0, desk.1);
+        write_png(&dir.join("desktop.png"), desk.0, desk.1, &desk.2)?;
     }
     report += &format!(
         "bytes {}\nframes {}\nerrors {}\n",
@@ -196,4 +200,73 @@ pub fn snapshot(views: &Views, dir: &std::path::Path) -> std::io::Result<String>
     );
     std::fs::write(dir.join("viewer.txt"), &report)?;
     Ok(report)
+}
+
+/// BGRA8 words to an RGBA PNG.
+fn write_png(path: &std::path::Path, w: u32, h: u32, px: &[u32]) -> std::io::Result<()> {
+    let f = std::fs::File::create(path)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut wr = enc.write_header().map_err(std::io::Error::other)?;
+    let mut rgba = Vec::with_capacity(px.len() * 4);
+    for p in px {
+        let [b, g, r, a] = p.to_le_bytes();
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+    wr.write_image_data(&rgba).map_err(std::io::Error::other)
+}
+
+/// The whole desktop as the layout places the windows held: each window
+/// over the ones below it (premultiplied BGRA, source over), on black.
+pub fn desktop(views: &Views) -> Option<((u32, u32, Vec<u32>), String)> {
+    let (screen, placed) = views.layout.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let (sw, sh) = screen;
+    let mut out = vec![0xff00_0000u32; sw as usize * sh as usize];
+    let windows = views.windows.lock().unwrap_or_else(|e| e.into_inner());
+    for (id, x, y, _, _) in placed {
+        let Some(v) = windows.get(&id) else { continue };
+        let Some((w, h, px, _)) = v.lock().unwrap_or_else(|e| e.into_inner()).raster() else { continue };
+        for row in 0..h as i64 {
+            let dy = i64::from(y) + row;
+            if dy < 0 || dy >= i64::from(sh) {
+                continue;
+            }
+            for col in 0..w as i64 {
+                let dx = i64::from(x) + col;
+                if dx < 0 || dx >= i64::from(sw) {
+                    continue;
+                }
+                let s = px[(row * i64::from(w) + col) as usize];
+                let d = &mut out[(dy * i64::from(sw) + dx) as usize];
+                *d = over(s, *d);
+            }
+        }
+    }
+    drop(windows);
+    let mut bytes = Vec::with_capacity(out.len() * 4);
+    for p in &out {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    let sha = fresco_scene_server::cas::store::CasStore::hash(&bytes);
+    let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+    Some(((sw, sh, out), hex))
+}
+
+fn over(s: u32, d: u32) -> u32 {
+    let a = s >> 24;
+    if a == 255 {
+        return s;
+    }
+    if a == 0 {
+        return d;
+    }
+    let mut o = 0u32;
+    for sh in [0, 8, 16, 24] {
+        let sc = (s >> sh) & 0xff;
+        let dc = (d >> sh) & 0xff;
+        let c = sc + (dc * (255 - a) + 127) / 255;
+        o |= c.min(255) << sh;
+    }
+    o
 }

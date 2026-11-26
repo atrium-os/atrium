@@ -263,6 +263,9 @@ fn main() -> std::io::Result<()> {
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
         }
+        if let Ok(p) = std::env::var("FRESCOD_FENESTRA_SOCK") {
+            b.serve_fenestra(Path::new(&p), fenestra_uids()?)?;
+        }
     }
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
         gpu_app::serve(Path::new(&p))?;
@@ -1370,6 +1373,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
         }
+        if let Ok(p) = std::env::var("FRESCOD_FENESTRA_SOCK") {
+            b.serve_fenestra(Path::new(&p), fenestra_uids()?)?;
+        }
     }
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
         gpu_app::serve(Path::new(&p))?;
@@ -1513,6 +1519,19 @@ pub(crate) fn split_animating_for(d: Duration) {
 fn animating() -> bool {
     ANIMATING.load(std::sync::atomic::Ordering::Relaxed)
         || video::monotonic_ns() < SPLIT_ANIMATING_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `FRESCOD_FENESTRA_UIDS`: the uids fenestrad may connect as (comma
+/// separated; default root only). A word that is not a uid is an error,
+/// never ignored.
+fn fenestra_uids() -> std::io::Result<Vec<u32>> {
+    match std::env::var("FRESCOD_FENESTRA_UIDS") {
+        Err(_) => Ok(vec![0]),
+        Ok(v) => v
+            .split(',')
+            .map(|w| w.trim().parse::<u32>().map_err(|_| std::io::Error::other(format!("FRESCOD_FENESTRA_UIDS: {w:?} is not a uid"))))
+            .collect(),
+    }
 }
 
 fn render_one_frame(

@@ -29,6 +29,9 @@ use fresco_split::slot::{self, DEFAULT_SLOT_BYTES};
 use fresco_split::{Input, Msg, Role, MAX_WINDOWS, MAX_WINDOW_DIM};
 
 use crate::redraw::Redraw;
+
+#[path = "split_fenestra.rs"]
+mod fenestra;
 use crate::socket_server::{self, EventSubs, Sub, SubTx};
 
 /// One window of a renderer's, as the broker holds it.
@@ -67,6 +70,8 @@ struct Renderer {
     wins: Mutex<HashMap<u32, Win>>,
     /// Its video layers' slots, by (local window, layer).
     videos: Mutex<HashMap<(u32, u32), VRing>>,
+    /// Its scene streams' slots and outstanding wants (split_fenestra.rs).
+    stream: Mutex<fenestra::RStream>,
     proc_: Mutex<Proc>,
 }
 
@@ -113,6 +118,8 @@ pub struct Broker {
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
     subs: Mutex<Option<EventSubs>>,
     next_handle: std::sync::atomic::AtomicU32,
+    /// The link to fenestrad (split_fenestra.rs).
+    fen: Mutex<fenestra::Link>,
 }
 
 /// Most connections one chrome peer may open at once.
@@ -191,6 +198,7 @@ impl Broker {
             renderers: Mutex::new(HashMap::new()),
             subs: Mutex::new(None),
             next_handle: std::sync::atomic::AtomicU32::new(1),
+            fen: Mutex::new(fenestra::Link::default()),
         }))
     }
 
@@ -372,6 +380,7 @@ impl Broker {
             }
             drop(wins);
         }
+        self.send_layout();
     }
 
     /// Window `local` is told it is `s` from now on: note it, and give it
@@ -488,9 +497,13 @@ impl Broker {
             gone: std::sync::atomic::AtomicBool::new(false),
             wins: Mutex::new(HashMap::new()),
             videos: Mutex::new(HashMap::new()),
+            stream: Mutex::new(fenestra::RStream::default()),
             proc_: Mutex::new(proc_),
         });
         self.renderers.lock().unwrap().insert(client_id, r.clone());
+        if self.remote_on() {
+            self.give_stream(&r, true);
+        }
 
         // Its windows' events, as records.
         let (ev_tx, ev_rx) = mpsc::channel::<DisplayEvent>();
@@ -852,6 +865,7 @@ impl Broker {
                 crate::video::VIDEOS.destroy(global as u32, layer);
                 self.redraw.wake();
             }
+            Msg::StreamChanged { .. } | Msg::StreamData { .. } | Msg::StreamEnd { .. } => self.stream_record(r, m)?,
             _ => unreachable!("serve() admits only a renderer's records"),
         }
         Ok(())

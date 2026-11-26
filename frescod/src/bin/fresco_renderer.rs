@@ -54,6 +54,8 @@ use fresco_render_core::pack;
 use fresco_render_core::sprites;
 #[path = "../redraw.rs"]
 mod redraw;
+#[path = "../remote_stream.rs"]
+mod remote_stream;
 #[path = "../credential.rs"]
 #[allow(dead_code)]
 mod credential;
@@ -314,6 +316,8 @@ struct State {
     /// The span the next SPAN_DONE completes: its window, tiles and
     /// hidden strips.
     span: Option<(u32, Vec<fresco_protocol::SpanTile>, Vec<[u32; 4]>)>,
+    /// Scene streams for a remote session (fenestra.md §3.2).
+    remote: remote_stream::Remote,
 }
 
 /// Where the bundle carries the precompiled kernels.
@@ -527,6 +531,7 @@ fn main() {
         }
         declare(&broker, &state, &comp, (sw, sh));
         warming = draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref(), animating);
+        stream(&broker, &state, &frontend, &scene_state);
     }
 }
 
@@ -810,6 +815,23 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
     warming
 }
 
+/// Bring the remote session's scene streams up to date and answer the
+/// broker's wants (remote_stream.rs).
+fn stream(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState) {
+    let mut s = state.lock().unwrap();
+    if !s.remote.on() {
+        return;
+    }
+    let fe = fe.lock().unwrap();
+    let windows: Vec<(u32, (u32, u32))> = s
+        .wins
+        .iter()
+        .filter_map(|(&id, w)| Some((id, w.size?)))
+        .filter(|(id, _)| !fe.window_state(*id).is_some_and(|st| st.in_frame))
+        .collect();
+    s.remote.step(&fe, scene, &windows, &mut |m| send(broker, m));
+}
+
 /// Pixel mode: send `w.px`, which differs from the last drawing inside
 /// `damage` (`None`: anywhere), through free slot `i`.
 #[allow(clippy::too_many_arguments)]
@@ -1048,6 +1070,34 @@ fn from_broker(
                     return log::warn!("fresco-renderer: SPAN_DONE for another window");
                 }
                 let _ = events.send(DisplayEvent::WindowSpan { window_id: local, tiles, hidden });
+            }
+            Msg::Remote { on, bytes } => {
+                let slots = if on {
+                    let mut it = fds.into_iter();
+                    let (Some(a), Some(b), None) = (it.next(), it.next(), it.next()) else {
+                        return log::warn!("fresco-renderer: REMOTE without two fds");
+                    };
+                    if bytes == 0 || bytes > remote_stream::MAX_SLOT_BYTES {
+                        return log::warn!("fresco-renderer: REMOTE slots of {bytes} bytes");
+                    }
+                    match Shm::open(a, bytes as usize).and_then(|a| Ok([a, Shm::open(b, bytes as usize)?])) {
+                        Ok(p) => Some(p),
+                        Err(e) => return log::warn!("fresco-renderer: stream slots: {e}"),
+                    }
+                } else {
+                    None
+                };
+                state.lock().unwrap().remote.set(slots);
+            }
+            Msg::StreamWant { ticket, base, .. } => {
+                if let Err(e) = state.lock().unwrap().remote.want(local, ticket, base) {
+                    return log::warn!("fresco-renderer: {e}");
+                }
+            }
+            Msg::StreamDone { slot } => {
+                if let Err(e) = state.lock().unwrap().remote.done(slot) {
+                    return log::warn!("fresco-renderer: {e}");
+                }
             }
             _ => unreachable!("from_renderer() covers the rest"),
         }

@@ -93,6 +93,36 @@ impl HostScene {
 
 pub use fresco_render_core::record::raster;
 
+/// Where a viewer's differences come from. In-process ([`HostScene`]
+/// behind a mutex) for the simulator; on Atrium each window's difference
+/// is made in its renderer jail and relayed, so this side never parses a
+/// scene record (§3.2).
+pub trait Source: Send + Sync + 'static {
+    /// The windows there are now.
+    fn windows(&self) -> Result<Vec<u32>, WireError>;
+    /// The records that bring a viewer holding `base` (None: nothing) to
+    /// the window's current version, and that version; None if the window
+    /// went. Empty records: the viewer is current.
+    fn diff(&self, win: u32, base: Option<(u64, u64)>) -> impl std::future::Future<Output = Result<Option<(Vec<u8>, (u64, u64))>, WireError>> + Send;
+    /// Whole-desktop sessions: the layout and a number that moves when it
+    /// does. None: the viewer gets no layout (each window stands alone).
+    fn layout(&self) -> Option<(u64, scene::Control)> {
+        None
+    }
+}
+
+impl Source for Mutex<HostScene> {
+    fn windows(&self) -> Result<Vec<u32>, WireError> {
+        Ok(self.lock().map_err(|_| WireError::Protocol("host lock"))?.windows().into_iter().map(|(w, _)| w).collect())
+    }
+
+    async fn diff(&self, win: u32, base: Option<(u64, u64)>) -> Result<Option<(Vec<u8>, (u64, u64))>, WireError> {
+        let h = self.lock().map_err(|_| WireError::Protocol("host lock"))?;
+        let mut bytes = Vec::new();
+        Ok(h.diff(win, base, &mut bytes).map(|now| (bytes, now)))
+    }
+}
+
 /// What one viewer was sent.
 #[derive(Debug, Default)]
 pub struct ViewerStats {
@@ -118,9 +148,9 @@ struct Out {
 
 /// Serve one proven viewer until it goes or breaks the protocol. `wake`
 /// is notified after each changing draw.
-pub async fn serve(
+pub async fn serve<S: Source>(
     mut hc: HostConn,
-    host: Arc<Mutex<HostScene>>,
+    host: Arc<S>,
     mut wake: tokio::sync::watch::Receiver<u64>,
     stats: Arc<ViewerStats>,
 ) -> Result<(), WireError> {
@@ -148,9 +178,18 @@ pub async fn serve(
     stats.resumed.store(held.len() as u64, Ordering::Relaxed);
     let mut outs: BTreeMap<u32, Out> = BTreeMap::new();
     let mut want_whole: std::collections::BTreeSet<u32> = Default::default();
+    let mut layout_sent: Option<u64> = None;
     loop {
+        // Where the windows are, before their contents (a viewer draws a
+        // window it has no place for nowhere).
+        if let Some((gen, l)) = host.layout() {
+            if layout_sent != Some(gen) {
+                control.send(&Msg::App(l.encode())).await?;
+                layout_sent = Some(gen);
+            }
+        }
         // Push what changed to every window, one write at a time.
-        let windows: Vec<u32> = host.lock().map_err(|_| WireError::Protocol("host lock"))?.windows().into_iter().map(|(w, _)| w).collect();
+        let windows = host.windows()?;
         for gone in outs.keys().copied().filter(|w| !windows.contains(w)).collect::<Vec<_>>() {
             if let Some(mut o) = outs.remove(&gone) {
                 let _ = o.stream.finish();
@@ -163,12 +202,7 @@ pub async fn serve(
             } else {
                 outs.get(&win).map_or_else(|| held.get(&win).copied(), |o| o.sent)
             };
-            let mut bytes = Vec::new();
-            let now = {
-                let h = host.lock().map_err(|_| WireError::Protocol("host lock"))?;
-                h.diff(win, base, &mut bytes)
-            };
-            let Some(now) = now else { continue };
+            let Some((bytes, now)) = host.diff(win, base).await? else { continue };
             if bytes.is_empty() {
                 continue;
             }
@@ -236,3 +270,5 @@ pub async fn serve(
 }
 
 pub use scene::MAX_RESUME;
+
+pub mod link;

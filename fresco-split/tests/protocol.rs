@@ -70,7 +70,33 @@ fn samples() -> Vec<Msg> {
         Msg::WindowFullScreen { window: 4, monitor: 0xfeed_beef_0000_0011 },
         Msg::Output { index: 0, count: 2, identity: 0x1234_5678_9abc_def0, rect: [0, 0, 1920, 1080], scale_milli: 1000, refresh_mhz: 60000, internal: true },
         Msg::Output { index: 1, count: 2, identity: 7, rect: [-1280, 0, 1280, 720], scale_milli: 1500, refresh_mhz: 59940, internal: false },
+        Msg::StreamChanged { window: 3 },
+        Msg::StreamData { window: 3, ticket: 9, slot: 1, len: 4 << 20 },
+        Msg::StreamEnd { window: 3, ticket: 9, now: Some((0xdead_beef_0123_4567, 42)) },
+        Msg::StreamEnd { window: 3, ticket: 10, now: None },
+        Msg::StreamWant { window: 3, ticket: 11, base: Some((1, u64::MAX)) },
+        Msg::StreamWant { window: 3, ticket: 12, base: None },
+        Msg::Remote { on: true, bytes: 4 << 20 },
+        Msg::Remote { on: false, bytes: 0 },
+        Msg::StreamDone { slot: 1 },
     ]
+}
+
+#[test]
+fn stream_records_are_bounded() {
+    // A version word without its flag, a third slot, a global record
+    // naming a window: each refused.
+    let mut b = Msg::StreamWant { window: 3, ticket: 1, base: None }.encode();
+    b[16] = 1;
+    assert!(Msg::decode(&b).is_err());
+    let mut b = Msg::StreamData { window: 3, ticket: 1, slot: 0, len: 1 }.encode();
+    b[12] = 2;
+    assert!(Msg::decode(&b).is_err());
+    let mut b = Msg::StreamDone { slot: 0 }.encode();
+    b[4] = 1;
+    assert!(Msg::decode(&b).is_err());
+    assert!(Msg::StreamEnd { window: 1, ticket: 0, now: None }.from_renderer());
+    assert!(!Msg::StreamWant { window: 1, ticket: 0, base: None }.from_renderer());
 }
 
 #[test]

@@ -1,0 +1,100 @@
+use fenestra_link::{read, Placed, Rec, HEADER, MAX_DATA, MAX_LAYOUT};
+
+fn samples() -> Vec<Rec> {
+    vec![
+        Rec::Session { on: true },
+        Rec::Session { on: false },
+        Rec::Want { window: 3, ticket: 7, base: Some((0xfeed_0000_0000_0001, 99)) },
+        Rec::Want { window: 3, ticket: 8, base: None },
+        Rec::Changed { window: 65535 },
+        Rec::Data { window: 1, ticket: 7, bytes: vec![1, 2, 3] },
+        Rec::End { window: 1, ticket: 7, now: Some((5, 6)) },
+        Rec::End { window: 1, ticket: 9, now: None },
+        Rec::Layout { screen: (1280, 720), windows: vec![Placed { window: 2, x: -10, y: 30, width: 640, height: 480 }, Placed { window: 4, x: 0, y: 0, width: 1, height: 1 }] },
+        Rec::Layout { screen: (1, 1), windows: vec![] },
+    ]
+}
+
+#[test]
+fn records_round_trip() {
+    let mut all = Vec::new();
+    for r in samples() {
+        all.extend(r.encode());
+    }
+    let mut cur = std::io::Cursor::new(all);
+    for r in samples() {
+        assert_eq!(read(&mut cur).unwrap(), Some(r));
+    }
+    assert_eq!(read(&mut cur).unwrap(), None);
+}
+
+fn header(r: &Rec) -> [u8; HEADER] {
+    r.encode()[..HEADER].try_into().unwrap()
+}
+
+#[test]
+fn bounds_are_checked_before_buffering() {
+    let mut h = header(&Rec::Data { window: 1, ticket: 0, bytes: vec![0] });
+    h[32..36].copy_from_slice(&((MAX_DATA + 1) as u32).to_le_bytes());
+    assert!(Rec::payload_len(&h).is_err());
+    let mut h = header(&Rec::Layout { screen: (10, 10), windows: vec![] });
+    h[32..36].copy_from_slice(&((MAX_LAYOUT * 20 + 20) as u32).to_le_bytes());
+    assert!(Rec::payload_len(&h).is_err());
+    let mut h = header(&Rec::Changed { window: 1 });
+    h[32..36].copy_from_slice(&1u32.to_le_bytes());
+    assert!(Rec::payload_len(&h).is_err());
+}
+
+#[test]
+fn hostile_records_are_refused() {
+    // Window 0, a version without its flag, a flag of 2, reserved bytes,
+    // a window placed twice, a zero-sized window, empty data.
+    let bad: Vec<Vec<u8>> = vec![
+        {
+            let mut b = Rec::Changed { window: 1 }.encode();
+            b[4..8].copy_from_slice(&0u32.to_le_bytes());
+            b
+        },
+        {
+            let mut b = Rec::Want { window: 1, ticket: 0, base: None }.encode();
+            b[16] = 1;
+            b
+        },
+        {
+            let mut b = Rec::Session { on: true }.encode();
+            b[12] = 2;
+            b
+        },
+        {
+            let mut b = Rec::Session { on: true }.encode();
+            b[38] = 1;
+            b
+        },
+        Rec::Layout { screen: (9, 9), windows: vec![Placed { window: 2, x: 0, y: 0, width: 1, height: 1 }; 2] }.encode(),
+        Rec::Layout { screen: (9, 9), windows: vec![Placed { window: 2, x: 0, y: 0, width: 0, height: 1 }] }.encode(),
+        Rec::Data { window: 1, ticket: 0, bytes: vec![] }.encode(),
+        Rec::Layout { screen: (0, 9), windows: vec![] }.encode(),
+    ];
+    for b in bad {
+        assert!(read(&mut std::io::Cursor::new(b)).is_err());
+    }
+}
+
+#[test]
+fn fuzzed_headers_decode_canonically_or_not_at_all() {
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for r in samples() {
+        let good = r.encode();
+        for _ in 0..2000 {
+            let mut b = good.clone();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let i = (x as usize) % b.len();
+            b[i] ^= (x >> 32) as u8 | 1;
+            if let Ok(Some(d)) = read(&mut std::io::Cursor::new(&b)) {
+                assert_eq!(d.encode(), b[..d.encode().len()].to_vec(), "{d:?}");
+            }
+        }
+    }
+}

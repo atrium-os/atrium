@@ -90,6 +90,14 @@ impl Ack {
 /// Most windows a resume may name.
 pub const MAX_RESUME: usize = 64;
 
+/// Most windows a layout may place.
+pub const MAX_LAYOUT: usize = 256;
+/// The largest screen or window side a layout may give.
+pub const MAX_SIDE: u32 = 65536;
+
+/// A window on the host's screen: `(window, x, y, width, height)`.
+pub type Placed = (u32, i32, i32, u32, u32);
+
 /// Control bodies (inside `Msg::App`): `tag u8`, then fixed fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
@@ -99,6 +107,9 @@ pub enum Control {
     Resume(Vec<(u32, u64, u64)>),
     /// Host: `window` is gone.
     Closed(u32),
+    /// Host, whole-desktop sessions (§3.4): the screen's size and where
+    /// its windows are, bottom to top.
+    Layout { screen: (u32, u32), windows: Vec<Placed> },
 }
 
 impl Control {
@@ -117,6 +128,19 @@ impl Control {
             Control::Closed(w) => {
                 b.push(2);
                 b.extend_from_slice(&w.to_le_bytes());
+            }
+            Control::Layout { screen, windows } => {
+                b.push(3);
+                b.extend_from_slice(&screen.0.to_le_bytes());
+                b.extend_from_slice(&screen.1.to_le_bytes());
+                b.extend_from_slice(&(windows.len().min(MAX_LAYOUT) as u32).to_le_bytes());
+                for (w, x, y, wd, ht) in windows.iter().take(MAX_LAYOUT) {
+                    b.extend_from_slice(&w.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                    b.extend_from_slice(&y.to_le_bytes());
+                    b.extend_from_slice(&wd.to_le_bytes());
+                    b.extend_from_slice(&ht.to_le_bytes());
+                }
             }
         }
         b
@@ -148,6 +172,24 @@ impl Control {
                 Ok(Control::Resume(w))
             }
             Some(2) if b.len() == 5 => Ok(Control::Closed(u32_at(1)?)),
+            Some(3) => {
+                let side = |v: u32| if (1..=MAX_SIDE).contains(&v) { Ok(v) } else { Err(bad()) };
+                let screen = (side(u32_at(1)?)?, side(u32_at(5)?)?);
+                let n = u32_at(9)? as usize;
+                if n > MAX_LAYOUT || b.len() != 13 + n * 20 {
+                    return Err(bad());
+                }
+                let mut windows: Vec<Placed> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let at = 13 + i * 20;
+                    let p = (u32_at(at)?, u32_at(at + 4)? as i32, u32_at(at + 8)? as i32, side(u32_at(at + 12)?)?, side(u32_at(at + 16)?)?);
+                    if windows.iter().any(|q| q.0 == p.0) {
+                        return Err(bad());
+                    }
+                    windows.push(p);
+                }
+                Ok(Control::Layout { screen, windows })
+            }
             _ => Err(bad()),
         }
     }

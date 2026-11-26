@@ -1,0 +1,9 @@
+[package]
+name        = "fenestra-link"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Fenestra's records between frescod's broker, fenestrad and a session jail (fenestra.md §3.2): a fixed header and a bounded payload."
+
+[dependencies]

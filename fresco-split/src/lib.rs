@@ -242,6 +242,23 @@ pub enum Msg {
     SpanHidden { window: u32, rect: [u32; 4] },
     /// The span update is complete (with no tiles: the span ended).
     SpanDone { window: u32 },
+    /// A window's scene stream changed (fenestra.md §3.2): the broker
+    /// passes the wake to `fenestrad`, which asks for differences.
+    StreamChanged { window: u32 },
+    /// `len` bytes of the difference asked for by `ticket` are in stream
+    /// slot `slot`; the broker answers `STREAM_DONE` once it copied them.
+    StreamData { window: u32, ticket: u32, slot: u32, len: u32 },
+    /// The difference for `ticket` is complete and brings a viewer to
+    /// `now` (`None`: the window is not streamed, or went).
+    StreamEnd { window: u32, ticket: u32, now: Option<(u64, u64)> },
+    /// Broker: stream every window (whole-desktop session) or stop. When
+    /// on, two fds carry the stream slots of `bytes` each.
+    Remote { on: bool, bytes: u32 },
+    /// Broker: write the difference from `base` (what a viewer holds;
+    /// `None`: nothing) of `window`'s scene stream.
+    StreamWant { window: u32, ticket: u32, base: Option<(u64, u64)> },
+    /// Broker: stream slot `slot` is free again.
+    StreamDone { slot: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,6 +337,12 @@ mod kind {
     pub const SPAN_TILE: u32 = 0x141;
     pub const SPAN_HIDDEN: u32 = 0x142;
     pub const SPAN_DONE: u32 = 0x143;
+    pub const STREAM_CHANGED: u32 = 21;
+    pub const STREAM_DATA: u32 = 22;
+    pub const STREAM_END: u32 = 23;
+    pub const REMOTE: u32 = 0x160;
+    pub const STREAM_WANT: u32 = 0x161;
+    pub const STREAM_DONE: u32 = 0x162;
 }
 
 /// Layout: word 0 kind, word 1 window, words 2..8 arguments, bytes 32..96
@@ -338,6 +361,25 @@ impl Rec {
     }
     pub(crate) fn get(&self, i: usize) -> u32 {
         u32::from_le_bytes(self.0[i * 4..i * 4 + 4].try_into().unwrap())
+    }
+    /// Words 3..8: a flag, then an (epoch, version) pair.
+    pub(crate) fn version(&mut self, v: Option<(u64, u64)>) {
+        if let Some((e, ver)) = v {
+            self.put(3, 1);
+            self.put(4, e as u32);
+            self.put(5, (e >> 32) as u32);
+            self.put(6, ver as u32);
+            self.put(7, (ver >> 32) as u32);
+        }
+    }
+    fn get_version(&self) -> Result<Option<(u64, u64)>, Refused> {
+        let e = self.get(4) as u64 | (self.get(5) as u64) << 32;
+        let v = self.get(6) as u64 | (self.get(7) as u64) << 32;
+        match flag(self.get(3))? {
+            true => Ok(Some((e, v))),
+            false if e == 0 && v == 0 => Ok(None),
+            false => Err(Refused("version without its flag")),
+        }
     }
     pub(crate) fn title(&mut self, t: &str) {
         let mut n = t.len().min(TITLE_BYTES);
@@ -407,8 +449,12 @@ impl Msg {
             | Msg::SpanTile { window, .. }
             | Msg::SpanHidden { window, .. }
             | Msg::SpanDone { window }
+            | Msg::StreamChanged { window }
+            | Msg::StreamData { window, .. }
+            | Msg::StreamEnd { window, .. }
+            | Msg::StreamWant { window, .. }
             | Msg::WindowFullScreen { window, .. } => window,
-            Msg::Client { .. } | Msg::Appearance { .. } | Msg::Output { .. } => 0,
+            Msg::Client { .. } | Msg::Appearance { .. } | Msg::Output { .. } | Msg::Remote { .. } | Msg::StreamDone { .. } => 0,
         }
     }
 
@@ -746,6 +792,37 @@ impl Msg {
                 r
             }
             Msg::SpanDone { window } => Rec::new(SPAN_DONE, *window),
+            Msg::StreamChanged { window } => Rec::new(STREAM_CHANGED, *window),
+            Msg::StreamData { window, ticket, slot, len } => {
+                let mut r = Rec::new(STREAM_DATA, *window);
+                r.put(2, *ticket);
+                r.put(3, *slot);
+                r.put(4, *len);
+                r
+            }
+            Msg::StreamEnd { window, ticket, now } => {
+                let mut r = Rec::new(STREAM_END, *window);
+                r.put(2, *ticket);
+                r.version(*now);
+                r
+            }
+            Msg::StreamWant { window, ticket, base } => {
+                let mut r = Rec::new(STREAM_WANT, *window);
+                r.put(2, *ticket);
+                r.version(*base);
+                r
+            }
+            Msg::Remote { on, bytes } => {
+                let mut r = Rec::new(REMOTE, 0);
+                r.put(2, *on as u32);
+                r.put(3, *bytes);
+                r
+            }
+            Msg::StreamDone { slot } => {
+                let mut r = Rec::new(STREAM_DONE, 0);
+                r.put(2, *slot);
+                r
+            }
             Msg::WindowFullScreen { window, monitor } => {
                 let mut r = Rec::new(WINDOW_FULL_SCREEN, *window);
                 r.put(2, *monitor as u32);
@@ -778,7 +855,7 @@ impl Msg {
         let b: [u8; MSG_BYTES] = bytes.try_into().map_err(|_| Refused("record size"))?;
         let r = Rec(b);
         let (k, window) = (r.get(0), r.get(1));
-        if matches!(k, CLIENT | APPEARANCE | OUTPUT) != (window == 0) || window > u16::MAX as u32 {
+        if matches!(k, CLIENT | APPEARANCE | OUTPUT | REMOTE | STREAM_DONE) != (window == 0) || window > u16::MAX as u32 {
             return Err(Refused("window id out of range"));
         }
         // Words 2.. this kind uses, and whether it carries a title.
@@ -825,6 +902,11 @@ impl Msg {
             SPAN_TILE => (5, false),
             SPAN_HIDDEN => (4, false),
             SPAN_DONE => (0, false),
+            STREAM_CHANGED => (0, false),
+            STREAM_DATA => (3, false),
+            STREAM_END | STREAM_WANT => (6, false),
+            REMOTE => (2, false),
+            STREAM_DONE => (1, false),
             _ => return Err(Refused("unknown kind")),
         };
         if (2 + args..8).any(|i| r.get(i) != 0) {
@@ -999,6 +1081,12 @@ impl Msg {
             VIDEO_DESTROY => Msg::VideoDestroy { window, layer: r.get(2) },
             VIDEO_RATE => Msg::VideoRate { window, layer: r.get(2), hz_milli: r.get(3) },
             VIDEO_SLOTS => Msg::VideoSlots { window, layer: r.get(2), bytes: r.get(3) },
+            STREAM_CHANGED => Msg::StreamChanged { window },
+            STREAM_DATA => Msg::StreamData { window, ticket: r.get(2), slot: slot(r.get(3))?, len: r.get(4) },
+            STREAM_END => Msg::StreamEnd { window, ticket: r.get(2), now: r.get_version()? },
+            STREAM_WANT => Msg::StreamWant { window, ticket: r.get(2), base: r.get_version()? },
+            REMOTE => Msg::Remote { on: flag(r.get(2))?, bytes: r.get(3) },
+            STREAM_DONE => Msg::StreamDone { slot: slot(r.get(2))? },
             VIDEO_DONE => Msg::VideoDone { window, layer: r.get(2), slot: slot(r.get(3))? },
             VIDEO_PRESENTED => Msg::VideoPresented {
                 window,
@@ -1132,6 +1220,9 @@ impl Msg {
                 | Msg::PopupPlace { .. }
                 | Msg::PopupGrant { .. }
                 | Msg::PopupClaim { .. }
+                | Msg::StreamChanged { .. }
+                | Msg::StreamData { .. }
+                | Msg::StreamEnd { .. }
         )
     }
 }

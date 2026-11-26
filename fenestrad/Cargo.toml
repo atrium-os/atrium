@@ -1,0 +1,10 @@
+[package]
+name        = "fenestrad"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Fenestra's session daemon on the host (fenestra.md §3.2): no network; relays frescod's scene-stream records to and from per-session jails."
+
+[dependencies]
+fenestra-link = { path = "../fenestra-link" }

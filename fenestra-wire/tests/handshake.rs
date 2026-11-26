@@ -162,4 +162,14 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&lie).is_err());
     assert!(Control::decode(&[]).is_err());
     assert_eq!(Control::decode(&Control::Closed(5).encode()).unwrap(), Control::Closed(5));
+    let l = Control::Layout { screen: (1280, 720), windows: vec![(2, -5, 30, 640, 480), (7, 0, 0, 1, 1)] };
+    assert_eq!(Control::decode(&l.encode()).unwrap(), l);
+    // A count past the body, a window placed twice, a zero side: refused.
+    let mut lie = l.encode();
+    lie[9] = 3;
+    assert!(Control::decode(&lie).is_err());
+    let twice = Control::Layout { screen: (9, 9), windows: vec![(2, 0, 0, 1, 1); 2] };
+    assert!(Control::decode(&twice.encode()).is_err());
+    let zero = Control::Layout { screen: (9, 9), windows: vec![(2, 0, 0, 0, 1)] };
+    assert!(Control::decode(&zero.encode()).is_err());
 }
