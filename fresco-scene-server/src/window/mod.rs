@@ -679,7 +679,9 @@ pub struct Compositor {
     /// recorded.
     pub popups_upstream: bool,
     /// The rows at the top of the screen only frescod draws (the trusted
-    /// strip, F4d): an app's pop-up is kept below them.
+    /// strip, F4d): an app's pop-up is kept below them, and a new window
+    /// opens just below them until a WM places it, so a session with no
+    /// WM (per-app compositing) does not put app content under the strip.
     pub popup_top: f32,
     /// The scale (thousandths) a new window opens at: the monitor new
     /// windows land on (resolution-independence.md §3).
@@ -1062,6 +1064,7 @@ impl Compositor {
         }
         self.next_id = id.checked_add(1).unwrap_or(1);
         let mut w = Window::new(id, owner, (size.0 as f32, size.1 as f32));
+        w.pos = (0.0, self.popup_top);
         w.z = self.z_order.len() as u32;
         w.scale_milli = self.new_scale_milli;
         if self.mint_embed_tokens {
@@ -2367,6 +2370,14 @@ mod event_tests {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    #[test]
+    fn a_new_window_opens_below_the_strip() {
+        let mut c = Compositor::new();
+        c.popup_top = 36.0;
+        let a = c.create(1, (300, 200));
+        assert_eq!(c.windows[&a].pos, (0.0, 36.0), "no app content under the trusted strip");
+    }
 
     #[test]
     fn notifications_stay_on_top_inside_their_band() {
