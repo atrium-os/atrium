@@ -20,7 +20,9 @@
 
 pub mod frame;
 pub mod keys;
+pub mod mint;
 pub mod pin;
+pub mod scene;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -208,6 +210,13 @@ impl Host {
 
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"bye");
+    }
+
+    /// Close every connection and wait (bounded) until the peers were
+    /// told, so a viewer sees the session end rather than a lost peer.
+    pub async fn close_and_wait(&self) {
+        self.close();
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.endpoint.wait_idle()).await;
     }
 }
 

@@ -214,9 +214,17 @@ struct Streamed {
     views: Vec<RemoteView>,
 }
 
-const VIEW_CLIENT: u8 = 1;
+/// The client a viewer's frontend gives remote windows to.
+pub const VIEW_CLIENT: u8 = 1;
 
 fn new_view(w: u32, h: u32) -> RemoteView {
+    let (fe, id) = viewer_window(w, h);
+    RemoteView { fe, scene: SceneState::default(), reader: Reader::new(id, VIEW_CLIENT), host_has: None, broken: false }
+}
+
+/// A viewer's frontend with one window of `VIEW_CLIENT`'s for a remote
+/// window to be drawn in: the frontend and the window's id.
+pub fn viewer_window(w: u32, h: u32) -> (EnvelopeFrontend, u16) {
     let mut fe = frontend();
     let p = fresco_protocol::WindowCreatePayload {
         width: w.max(1),
@@ -238,7 +246,7 @@ fn new_view(w: u32, h: u32) -> RemoteView {
         .and_then(|o| o.into_iter().next())
         .and_then(|o| fresco_protocol::decode::<fresco_protocol::WindowCreateReply>(&o.payload).ok())
         .map_or(0, |r| r.window_id as u16);
-    RemoteView { fe, scene: SceneState::default(), reader: Reader::new(id, VIEW_CLIENT), host_has: None, broken: false }
+    (fe, id)
 }
 
 fn frame_bytes(f: &fresco_compute::Frame) -> Vec<u8> {
@@ -250,9 +258,47 @@ fn frame_bytes(f: &fresco_compute::Frame) -> Vec<u8> {
     b
 }
 
-fn packed(fe: &EnvelopeFrontend, scene: &SceneState, win: u32, size: (u32, u32)) -> Option<Vec<u8>> {
+/// Window `win` packed for the kernels at `size`, as the host's renderer
+/// packs it (None if it has drawn nothing).
+pub fn pack_window(fe: &EnvelopeFrontend, scene: &SceneState, win: u32, size: (u32, u32)) -> Option<fresco_compute::Frame> {
     let wf = pack::window_frame(fe, win, (0.0, 0.0), (size.0 as f32, size.1 as f32))?;
-    Some(frame_bytes(&scene.pack(&wf, size.0, size.1)))
+    Some(scene.pack(&wf, size.0, size.1))
+}
+
+fn packed(fe: &EnvelopeFrontend, scene: &SceneState, win: u32, size: (u32, u32)) -> Option<Vec<u8>> {
+    pack_window(fe, scene, win, size).map(|f| frame_bytes(&f))
+}
+
+/// Window `win` at `size`, rastered on the CPU (the compute kernels'
+/// reference): `(width, height, pixels, sha256 hex of the pixels)`.
+pub fn raster(fe: &EnvelopeFrontend, scene: &SceneState, win: u32, size: (u32, u32)) -> Option<(u32, u32, Vec<u32>, String)> {
+    let f = pack_window(fe, scene, win, size)?;
+    let px = fresco_compute::reference::render(&f);
+    let (w, h, pitch) = (f.header.width, f.header.height, f.header.pitch);
+    let mut tight = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        tight.extend_from_slice(&px[(y * pitch) as usize..(y * pitch + w) as usize]);
+    }
+    let mut bytes = Vec::with_capacity(tight.len() * 4);
+    for p in &tight {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    let hex = CasStore::hash(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    Some((w, h, tight, hex))
+}
+
+/// Every client window (not the shared screen) with the size the
+/// compositor gave it, pixels, at most 4096 a side.
+pub fn client_windows(fe: &EnvelopeFrontend) -> Vec<(u32, (u32, u32))> {
+    let comp = fe.compositor_arc().lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<(u32, (u32, u32))> = comp
+        .windows
+        .iter()
+        .filter(|(id, _)| **id != 0)
+        .map(|(id, w)| (*id as u32, (w.size.0.ceil().clamp(1.0, 4096.0) as u32, w.size.1.ceil().clamp(1.0, 4096.0) as u32)))
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 /// Play `events` (see the module docs) with `viewers` viewers per window,
@@ -284,14 +330,7 @@ pub fn replay(events: &[Event], viewers: usize, drop_acks: f64, seed: u64) -> Re
                 scene.apply(u, c);
                 // Every client window (not the shared screen), at the size
                 // the compositor gave it.
-                let sizes: Vec<(u32, (u32, u32))> = {
-                    let comp = host.compositor_arc().lock().unwrap_or_else(|e| e.into_inner());
-                    comp.windows
-                        .iter()
-                        .filter(|(id, _)| **id != 0)
-                        .map(|(id, w)| (*id as u32, (w.size.0.ceil().clamp(1.0, 4096.0) as u32, w.size.1.ceil().clamp(1.0, 4096.0) as u32)))
-                        .collect()
-                };
+                let sizes = client_windows(&host);
                 streams.retain(|id, _| sizes.iter().any(|(w, _)| w == id));
                 for (win, size) in sizes {
                     let Some(st) = host.window_state(win) else { continue };

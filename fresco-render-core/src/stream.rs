@@ -547,6 +547,16 @@ impl Reader {
         }
     }
 
+    /// The stream started again (a new connection): bytes of a record cut
+    /// off on the old one are dropped, and the next record must begin a
+    /// frame. What the viewer holds is kept.
+    pub fn new_stream(&mut self) {
+        self.buf.clear();
+        self.frame = None;
+        self.pending.clear();
+        self.pending_bytes = 0;
+    }
+
     pub fn window(&self) -> u16 {
         self.window
     }

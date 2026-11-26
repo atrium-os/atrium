@@ -96,14 +96,47 @@ impl Control {
     }
 
     pub async fn recv(&mut self) -> Result<Msg, WireError> {
+        recv_on(&mut self.recv).await
+    }
+
+    /// The two halves, so one task can read while another writes
+    /// (`recv` is not cancel-safe: a frame half read is lost).
+    pub fn split(self) -> (ControlSend, ControlRecv) {
+        (ControlSend { send: self.send }, ControlRecv { recv: self.recv })
+    }
+}
+
+pub struct ControlSend {
+    send: quinn::SendStream,
+}
+
+impl ControlSend {
+    pub async fn send(&mut self, m: &Msg) -> Result<(), WireError> {
+        let b = m.encode();
+        self.send.write_all(&b).await.map_err(crate::quic)
+    }
+}
+
+pub struct ControlRecv {
+    recv: quinn::RecvStream,
+}
+
+impl ControlRecv {
+    pub async fn recv(&mut self) -> Result<Msg, WireError> {
+        recv_on(&mut self.recv).await
+    }
+}
+
+async fn recv_on(recv: &mut quinn::RecvStream) -> Result<Msg, WireError> {
+    {
         let mut head = [0u8; 4];
-        self.recv.read_exact(&mut head).await.map_err(crate::quic)?;
+        recv.read_exact(&mut head).await.map_err(crate::quic)?;
         let len = u32::from_le_bytes(head) as usize;
         if len == 0 || len > MAX_CONTROL {
             return Err(WireError::Protocol("control frame length"));
         }
         let mut b = vec![0u8; len];
-        self.recv.read_exact(&mut b).await.map_err(crate::quic)?;
+        recv.read_exact(&mut b).await.map_err(crate::quic)?;
         Msg::decode(b[0], &b[1..])
     }
 }

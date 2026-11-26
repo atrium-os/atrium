@@ -24,16 +24,19 @@ fn bind(host_key: &SessionKey, viewer_pub: &[u8], s: SessionSecret) -> Host {
 }
 
 /// Run the host's accept and the viewer's connect together.
+/// The host's end is kept until both are done (dropping it closes the
+/// connection, maybe before the welcome arrives).
 async fn attempt(host: &Host, viewer: &Viewer, s: &SessionSecret) -> (Result<bool, WireError>, Result<fenestra_wire::HostConn, WireError>) {
     let addr = host.local_addr().unwrap();
     let h = async {
         match tokio::time::timeout(Duration::from_secs(15), host.accept()).await {
-            Ok(r) => r.map(|c| c.is_some()),
+            Ok(r) => r,
             Err(_) => Err(WireError::Timeout),
         }
     };
     let v = viewer.connect(addr, s);
-    tokio::join!(h, v)
+    let (h, v) = tokio::join!(h, v);
+    (h.map(|c| c.is_some()), v)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -108,8 +111,8 @@ async fn a_wrong_session_secret_is_refused() {
     assert!(v.is_err());
     // The right one still works after.
     let (h, v) = attempt(&host, &viewer, &secret(1)).await;
-    assert!(matches!(h, Ok(true)));
-    assert!(v.is_ok());
+    assert!(matches!(h, Ok(true)), "{:?}", h.err());
+    assert!(v.is_ok(), "{:?}", v.err());
 }
 
 /// The host takes no stream from a viewer but the control stream.
@@ -137,4 +140,26 @@ fn control_frames_decode_strictly() {
     let m = frame::Msg::Proof { id: [1; 16], tag: [2; 32] };
     let e = m.encode();
     assert_eq!(frame::Msg::decode(e[4], &e[5..]).unwrap(), m);
+}
+
+#[test]
+fn scene_framing_round_trips_and_refuses() {
+    use fenestra_wire::scene::{Ack, Control, WindowHeader};
+    let h = WindowHeader { window: 9, epoch: 77 };
+    assert_eq!(WindowHeader::decode(&h.encode()).unwrap(), h);
+    let mut bad = h.encode();
+    bad[0] ^= 1;
+    assert!(WindowHeader::decode(&bad).is_err());
+    for a in [Ack::Holds { window: 3, epoch: 4, version: 5 }, Ack::Whole { window: 3 }] {
+        assert_eq!(Ack::decode(&a.encode()).unwrap(), a);
+    }
+    assert!(Ack::decode(&[1; 20]).is_err());
+    assert!(Ack::decode(&[9; 21]).is_err());
+    let r = Control::Resume(vec![(1, 2, 3), (4, 5, 6)]);
+    assert_eq!(Control::decode(&r.encode()).unwrap(), r);
+    let mut lie = r.encode();
+    lie[1] = 200;
+    assert!(Control::decode(&lie).is_err());
+    assert!(Control::decode(&[]).is_err());
+    assert_eq!(Control::decode(&Control::Closed(5).encode()).unwrap(), Control::Closed(5));
 }

@@ -1,0 +1,199 @@
+//! The viewer's side of a session (fenestra.md §3.3, §14): each window's
+//! scene stream into a [`Reader`] over a frontend of its own, acks back as
+//! datagrams, and what it holds kept across connections so a reconnect
+//! resumes (§12).
+//!
+//! The frontend each remote window is applied to is the same validator a
+//! local app meets (H9), in this process. Off Atrium this process is
+//! confined by the OS (§14.3, not in R2 yet); on Atrium the same code
+//! runs in the renderer jail.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use fenestra_wire::frame::Msg;
+use fenestra_wire::scene::{self, Ack, Control, WindowHeader, WINDOW_HEADER_LEN};
+use fenestra_wire::{HostConn, WireError};
+use fresco_render_core::pack::SceneState;
+use fresco_render_core::record;
+use fresco_render_core::stream::{self, Reader};
+use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
+
+/// Most remote windows one viewer holds.
+pub const MAX_WINDOWS: usize = scene::MAX_RESUME;
+const CHUNK: usize = 64 * 1024;
+
+pub struct View {
+    pub fe: EnvelopeFrontend,
+    pub scene: SceneState,
+    pub reader: Reader,
+    pub bytes: u64,
+}
+
+impl View {
+    fn new() -> View {
+        let (fe, id) = record::viewer_window(1, 1);
+        View { fe, scene: SceneState::default(), reader: Reader::new(id, record::VIEW_CLIENT), bytes: 0 }
+    }
+
+    /// The window as drawn here: `(width, height, pixels, sha256)`.
+    pub fn raster(&self) -> Option<(u32, u32, Vec<u32>, String)> {
+        let size = self.reader.size();
+        if size.0 == 0 || size.1 == 0 {
+            return None;
+        }
+        record::raster(&self.fe, &self.scene, self.reader.window() as u32, size)
+    }
+}
+
+/// What the viewer holds, by the host's window id; it outlives
+/// connections.
+#[derive(Default)]
+pub struct Views {
+    pub windows: Mutex<BTreeMap<u32, Arc<Mutex<View>>>>,
+    pub bytes: AtomicU64,
+    pub frames: AtomicU64,
+    /// Window streams that broke the protocol (each drops its connection).
+    pub errors: AtomicU64,
+}
+
+impl Views {
+    fn resume(&self) -> Vec<(u32, u64, u64)> {
+        let w = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        w.iter()
+            .filter_map(|(id, v)| v.lock().ok()?.reader.held().map(|(e, ver)| (*id, e, ver)))
+            .collect()
+    }
+}
+
+/// Take one connection's streams until it ends. Errors from the host's
+/// side of the protocol end the connection (the host is not trusted).
+pub async fn run(hc: HostConn, views: Arc<Views>) -> Result<(), WireError> {
+    let (mut control, mut control_in) = hc.control.split();
+    control.send(&Msg::App(Control::Resume(views.resume()).encode())).await?;
+    let conn = hc.conn.clone();
+    let closing = {
+        let views = views.clone();
+        let conn_c = conn.clone();
+        async move {
+            loop {
+                match control_in.recv().await {
+                    Ok(Msg::App(b)) => match Control::decode(&b)? {
+                        Control::Closed(w) => {
+                            views.windows.lock().unwrap_or_else(|e| e.into_inner()).remove(&w);
+                        }
+                        Control::Resume(_) => return Err(WireError::Protocol("resume from the host")),
+                    },
+                    Ok(_) => return Err(WireError::Protocol("unexpected control message")),
+                    // The host ending the session is an end, not an error.
+                    Err(_) if matches!(conn_c.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(_)) | Some(quinn::ConnectionError::LocallyClosed)) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    };
+    let streams = async {
+        loop {
+            let recv = match conn.accept_uni().await {
+                Ok(r) => r,
+                Err(quinn::ConnectionError::ApplicationClosed(_)) | Err(quinn::ConnectionError::LocallyClosed) => return Ok::<(), WireError>(()),
+                Err(e) => return Err(WireError::Quic(e.to_string())),
+            };
+            let (views, conn) = (views.clone(), conn.clone());
+            let views_e = views.clone();
+            tokio::spawn(async move {
+                if let Err(e) = window_stream(recv, views, conn.clone()).await {
+                    eprintln!("fenestra-view: window stream: {e}");
+                    views_e.errors.fetch_add(1, Ordering::Relaxed);
+                    conn.close(3u32.into(), b"stream");
+                }
+            });
+        }
+    };
+    tokio::select! {
+        r = closing => r,
+        r = streams => r,
+    }
+}
+
+async fn window_stream(mut recv: quinn::RecvStream, views: Arc<Views>, conn: quinn::Connection) -> Result<(), WireError> {
+    let mut head = [0u8; WINDOW_HEADER_LEN];
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut head))
+        .await
+        .map_err(|_| WireError::Timeout)?
+        .map_err(|e| WireError::Quic(e.to_string()))?;
+    let h = WindowHeader::decode(&head)?;
+    let view = {
+        let mut w = views.windows.lock().unwrap_or_else(|e| e.into_inner());
+        if !w.contains_key(&h.window) && w.len() >= MAX_WINDOWS {
+            return Err(WireError::Protocol("too many windows"));
+        }
+        w.entry(h.window).or_insert_with(|| Arc::new(Mutex::new(View::new()))).clone()
+    };
+    view.lock().unwrap_or_else(|e| e.into_inner()).reader.new_stream();
+    loop {
+        let chunk = match recv.read_chunk(CHUNK, true).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(()),
+            // The connection ending (the host closed, or we dropped it to
+            // reconnect) ends the stream; anything else is an error.
+            Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed)) => return Ok(()),
+            Err(e) => return Err(WireError::Quic(format!("{e:?}"))),
+        };
+        let ack = {
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            let v = &mut *v;
+            v.bytes += chunk.bytes.len() as u64;
+            v.reader.feed(&mut v.fe, &mut v.scene, &chunk.bytes).map_err(|e: stream::StreamError| {
+                log::warn!("fenestra-view: window {}: {e}", h.window);
+                WireError::Protocol("the host broke the scene stream")
+            })?
+        };
+        views.bytes.fetch_add(chunk.bytes.len() as u64, Ordering::Relaxed);
+        let a = match ack {
+            stream::Ack::None => continue,
+            stream::Ack::Holds(epoch, version) => {
+                views.frames.fetch_add(1, Ordering::Relaxed);
+                Ack::Holds { window: h.window, epoch, version }
+            }
+            stream::Ack::Whole => Ack::Whole { window: h.window },
+        };
+        // A lost ack is covered by the next one.
+        let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(&a.encode()));
+    }
+}
+
+/// Write each window as a PNG (`window-ID.png`) and the report lines
+/// `window ID WxH SHA256` to `dir/viewer.txt`.
+pub fn snapshot(views: &Views, dir: &std::path::Path) -> std::io::Result<String> {
+    std::fs::create_dir_all(dir)?;
+    let mut report = String::new();
+    let windows: Vec<(u32, Arc<Mutex<View>>)> = views.windows.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect();
+    for (id, v) in windows {
+        let v = v.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((w, h, px, sha)) = v.raster() else { continue };
+        report += &format!("window {id} {w}x{h} {sha}\n");
+        let f = std::fs::File::create(dir.join(format!("window-{id}.png")))?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().map_err(std::io::Error::other)?;
+        // BGRA8 words to RGBA bytes.
+        let mut rgba = Vec::with_capacity(px.len() * 4);
+        for p in px {
+            let [b, g, r, a] = p.to_le_bytes();
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+        wr.write_image_data(&rgba).map_err(std::io::Error::other)?;
+    }
+    report += &format!(
+        "bytes {}\nframes {}\nerrors {}\n",
+        views.bytes.load(Ordering::Relaxed),
+        views.frames.load(Ordering::Relaxed),
+        views.errors.load(Ordering::Relaxed)
+    );
+    std::fs::write(dir.join("viewer.txt"), &report)?;
+    Ok(report)
+}

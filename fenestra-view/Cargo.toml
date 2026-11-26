@@ -1,0 +1,17 @@
+[package]
+name = "fenestra-view"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Fenestra's portable viewer (docs/spec/fenestra.md §14): a host's windows drawn from their scene streams on Linux, macOS or Atrium. Headless mode writes PNGs for gates."
+
+[dependencies]
+fenestra-wire      = { path = "../fenestra-wire" }
+fresco-render-core = { path = "../fresco-render-core" }
+fresco-scene-server = { path = "../fresco-scene-server" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+bytes = "1"
+png = "0.17"
+log = "0.4"
