@@ -320,15 +320,22 @@ person may be sitting at it.
 - **The confirm travels on Stoa's control channel, not in the pane.**
   portcullisd sends stoad (its own `_stoad` uid) the request's words and
   its nonce, as it would send them to the sheet. stoad delivers them to
-  the attached client as a control datagram. The client draws them on
-  its own status row, outside the pane's grid and in a style the pane
-  can't produce. Nothing the pane prints can draw there, and nothing
-  the pane reads sees the ask.
+  the attached client as a control datagram. `stoactl` already
+  emulates the pane into its own grid and redraws the local screen
+  itself; it never passes pane bytes through. It keeps one row below
+  the grid that only it draws, and redraws that row after every frame.
+  So no cursor movement or escape sequence from the pane reaches the
+  row. No colour or style is unforgeable on a plain terminal, so the
+  safety comes from owning the screen, not from the look. Nothing the
+  pane reads sees the ask.
 - **The person answers by typing `allow`.** The client's own key
   handler reads the word, not the pane's input, and sends it back as a
-  control datagram. A single `y` or Enter doesn't count, so a person
-  mid-command can't approve by accident. stoad passes the nonce and the
-  answer to portcullisd.
+  control datagram. When the ask appears, the client flushes queued
+  input, ignores keys for 500 ms, and then takes only `allow` followed
+  by Enter on an empty answer line. A bracketed paste never counts, nor
+  does a single `y` or Enter. So type-ahead, a paste, or a command that
+  happens to contain "allow" can't answer it. stoad passes the nonce and
+  the answer to portcullisd.
 - **What proves it is the person.** The Stoa session itself does: sshd's
   userauth of the person's key, and the session's MAC key anchored in
   the SSH handshake (stoa.md §2). portcullisd takes the answer only:
@@ -336,28 +343,56 @@ person may be sitting at it.
   - for that nonce;
   - for a session that stoad authenticated as the owner of the asking
     jail;
-  - while a client is attached.
+  - from a client that is attached and that itself authenticated as the
+    owner. The check is per client, not per session: view-only clients
+    and other people's never get the ask. With two such clients, both
+    see it, the first answer counts, and the ask is withdrawn from the
+    other.
 
   This is the same trust a GUI press puts in frescod.
+- **Never from this machine.** A workspace can run `stoactl`, or ssh to
+  the host, and may hold the person's key, since Arca's agent is
+  reachable in a workspace (dev-tools M9). If stoad accepted such a
+  client, the pane could answer its own ask. So stoad and sshd refuse
+  clients from this machine's own addresses, loopback and
+  100.64.0.0/16. pf already keeps jails off the host's addresses
+  (network.md §0), and these refusals add a second check. That still
+  leaves a workspace with outbound network: it could reach the host from
+  outside, through a relay, with a key Arca's agent offers it. Only a
+  touch closes that, which is why G10 now requires one.
 - **The same channel answers every ask that needs a press, not only this
   proposal's:** `background allow` and `listen allow`, `pkg install` in a
   workspace (`WorkspaceAdmin`), `make run` (`WorkspaceRun`),
   `opifex side-load` (the install sheet takes a stoad answer bound to its
   own nonce), and `portcullis launch`'s first-launch prompt. So a
   headless person can build, install and run their app end to end.
-- **A security-key touch, optionally.** A person can require that a
-  remote approval also carry a touch of their FIDO2 key, through the
-  forwarded ssh agent (`sk-ecdsa`). The recommendation is to offer it as
-  a setting, off by default (G10).
+- **A security-key touch for remote approvals.** A remote approval also
+  carries a touch of the person's FIDO2 key: stoad sends a challenge,
+  and the client's local agent signs it with an `sk-ecdsa` key that has
+  `verify-required` set and is enrolled for remote approvals. A
+  workspace can't touch a key. The recommendation is on by default,
+  with a person who has no security key able to turn it off knowingly
+  (G10).
 
 **Two things block this today. Both are decisions, not just code:**
 
 1. **sshd.** homes.md §6 says images for people ship without the host's
    sshd, while Stoa and aqueduct-remote authenticate through it. For
    headless use, the recommendation is to ship sshd restricted to the
-   handoff: `ForceCommand` to `stoa-shell` or `aqueduct-shell`, no
-   password logins, no TTY, no forwarding except the agent. The
-   person's uid then exists only for the handoff's few milliseconds,
+   handoff. The config:
+   - `ForceCommand` to `stoa-shell` or `aqueduct-shell`, with no
+     subsystems;
+   - keys only, read from a root-owned `AuthorizedKeysFile` outside the
+     person's key group;
+   - `PermitUserRC`, `PermitUserEnvironment`, `PermitTunnel`,
+     `X11Forwarding`, `AllowTcpForwarding`, `AllowStreamLocalForwarding`
+     and `PermitTTY` all off;
+   - no agent forwarding into the host; the FIDO2 challenge goes to the
+     client over Stoa's own channel;
+   - a login class whose shell is `nologin` for anything but the forced
+     command.
+
+   The person's uid then exists only for the handoff's few milliseconds,
    and the shell runs in a workspace or console jail as always (G9).
 2. **Unlocking the person's data.** A person's workspaces and app data
    are in their persona's key group ([tessera-encryption.md](tessera-encryption.md)),
@@ -367,13 +402,20 @@ person may be sitting at it.
    building needs a remote unlock, such as the person's passphrase or a
    FIDO2 touch over the same channel, handed to Vestibulum and Arca.
    That belongs in Vestibulum's spec, with its own review, so this
-   proposal only names it (G11). Until then, a headless person must
-   have signed in at the screen once since boot.
+   proposal only names it (G11). Until then, headless building works
+   only while that person has a screen session up, possibly locked.
+   Signing out at the screen puts the keys away.
 
 Once the person is unlocked, background apps start at their first Stoa
 sign-in after boot, as at a screen sign-in (§3.3). They stop when the
-person's last session ends, screen or Stoa, before the keys are put
-away.
+keys are put away, just before. Under G11, that happens when the
+person's last session ends: a screen session counts until sign-out, and
+a Stoa session counts while it is attached, or while it is detached
+and still within a keep time this proposal adds (8 hours after its
+last client detached, as a setting). Stoa sessions persist when
+detached, so without that limit a forgotten session would keep the keys
+open forever. A session that is only detached therefore keeps
+background apps running until its keep time runs out.
 
 ## 6. What changes where
 
@@ -459,8 +501,8 @@ read only the manifest and the person's grant.
 | G7 | Templates: Rust first, C after? | Yes |
 | G8 | Should a CLI change that grants be confirmed on a system sheet with portcullisd's own words, while one that only takes away needs no press, and root can act for anyone with a notice? | Yes (§5a) |
 | G9 | Should images for people ship sshd, restricted to the Stoa handoff (ForceCommand, keys only), so that people can use it with no screen? | Yes (§5b); this changes homes.md §6 |
-| G10 | Should remote approvals require a security-key touch? | Offer it as a setting, off by default |
-| G11 | Should remote unlock of a person's data go to its own Vestibulum proposal? | Yes; until then, headless needs one screen sign-in since boot |
+| G10 | Should remote approvals require a security-key touch? | Yes, on by default (a workspace holding the person's key could otherwise approve itself from outside); a person with no key can turn it off knowingly |
+| G11 | Should remote unlock of a person's data go to its own Vestibulum proposal? | Yes; until then, headless works only while a screen session is up |
 
 ### Review
 
@@ -516,3 +558,25 @@ self-approval path, now closed:
    the person gets a notice at their next sign-in.
 8. Low (optional, taken): `disallow` and `quit` from the owner's own
    jails need no press.
+
+§5b (no screen, over Stoa, 03ecaa4ac) had a third review on
+2026-11-26:
+
+1. High: a workspace could attach as the person's own client and answer
+   its own ask. Now stoad and sshd refuse clients from this machine, and
+   remote approvals need a FIDO2 touch by default (G10).
+2. High: with two clients, the wrong one could answer. Now the ask goes
+   only to clients that authenticated as the owner, checked per client;
+   the first answer counts and the ask is withdrawn from the others.
+3. Medium: the status row was claimed to be safe because of its style.
+   Now it is safe because `stoactl` owns the local screen and redraws a
+   reserved row; the style claim is dropped.
+4. Medium: type-ahead or a paste could answer. Now queued input is
+   flushed, keys are ignored for 500 ms, `allow` must be followed by
+   Enter, and paste never counts.
+5. Medium: sshd beyond ForceCommand. Now the full restricted config is
+   listed.
+6. Low: "once since boot" was wrong. Now it reads "while a screen
+   session is up".
+7. Low: "the last session ends" was undefined for detached Stoa
+   sessions. Now it is defined.
