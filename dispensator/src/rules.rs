@@ -20,7 +20,8 @@
 //!   ["vvvv:pppp"]`, whether or not a kernel driver took it (with
 //!   `detach_kernel`, dispensatord detaches that driver first). Placeholders
 //!   `{bus}`, `{addr}`, `{interface}`, and `{usb}` = `B-A-I` naming the
-//!   interface (jail names take no dots). Nodes are typically `ugen{bus}.{addr}`
+//!   interface (jail names take no dots). `usb_interface_number` narrows a
+//!   rule to one bInterfaceNumber. Nodes are typically `ugen{bus}.{addr}`
 //!   and `usb/{bus}.{addr}.0`, with `all_nodes`: libusb opens both.
 //!
 //! - `disk`: one partition of a disk (`da0p1`, `da0s1`), by the disk's
@@ -63,6 +64,11 @@ pub struct Rule {
     /// both must match.
     #[serde(default)]
     pub usb_ids: Vec<String>,
+    /// `usb`: only the interface with this bInterfaceNumber. A Bluetooth
+    /// controller has two interfaces of class E0/01/01 (HCI and SCO); its
+    /// driver takes interface 0 and must not be started twice.
+    #[serde(default)]
+    pub usb_interface_number: Option<u8>,
     /// `usb`: when a kernel driver has the interface, detach it
     /// (`usbconfig detach_kernel_driver`) and start the owner anyway.
     /// Without it such an interface is left to the kernel.
@@ -227,6 +233,8 @@ pub fn parse_whole_disk(name: &str) -> Option<&str> {
 /// One USB interface as devd reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsbInterface {
+    /// bInterfaceNumber.
+    pub number: u8,
     pub vendor: u16,
     pub product: u16,
     pub class: u8,
@@ -366,7 +374,7 @@ impl Rules {
             if self.rules.len() == MAX_RULES {
                 return Err(w(format!("more than {MAX_RULES} rules")));
             }
-            let usb_fields = !r.usb_interface.is_empty() || !r.usb_ids.is_empty() || r.detach_kernel;
+            let usb_fields = !r.usb_interface.is_empty() || !r.usb_ids.is_empty() || r.detach_kernel || r.usb_interface_number.is_some();
             let disk_fields = !r.disk.is_empty();
             match r.class.as_str() {
                 "hid" if r.driver.is_empty() && !usb_fields && !disk_fields => {}
@@ -385,7 +393,7 @@ impl Rules {
                         return Err(w("usb_interface: 1 to 3 bytes; usb_ids: up to 32 \"vvvv:pppp\"".into()));
                     }
                 }
-                "hid" | "driver" | "usb" | "disk" => return Err(w("hid takes any_page, driver takes driver = \"NAME\", usb takes usb_interface/usb_ids/detach_kernel, disk takes disk".into())),
+                "hid" | "driver" | "usb" | "disk" => return Err(w("hid takes any_page, driver takes driver = \"NAME\", usb takes usb_interface/usb_ids/usb_interface_number/detach_kernel, disk takes disk".into())),
                 c => return Err(w(format!("class {c:?}: \"hid\", \"driver\", \"usb\" or \"disk\""))),
             }
             if r.nodes.is_empty() || r.nodes.len() > 8 {
@@ -505,6 +513,7 @@ impl Rules {
         self.best(|r| {
             r.class == "usb"
                 && class.starts_with(&r.usb_interface)
+                && r.usb_interface_number.is_none_or(|n| n == i.number)
                 && (r.usb_ids.is_empty() || r.usb_ids.iter().any(|x| parse_usb_id(x) == Some((i.vendor, i.product))))
         })
     }
@@ -633,10 +642,13 @@ mod tests {
             r.add_toml("x", t).and_then(|_| r.finish())
         };
         let r = load(&rule("usb_interface = [0x0B, 0x00]\nusb_ids = [\"1050:0407\"]")).unwrap();
-        let i = |v, p, c| UsbInterface { vendor: v, product: p, class: c, subclass: 0, protocol: 0 };
+        let i = |v, p, c| UsbInterface { number: 0, vendor: v, product: p, class: c, subclass: 0, protocol: 0 };
         assert!(r.match_usb(&i(0x1050, 0x0407, 0x0B)).is_some());
         assert!(r.match_usb(&i(0x1050, 0x0407, 0x03)).is_none(), "class must match too");
         assert!(r.match_usb(&i(0x1050, 0x0408, 0x0B)).is_none(), "and the id");
+        let r1 = load(&rule("usb_interface = [0x0B]\nusb_interface_number = 0")).unwrap();
+        assert!(r1.match_usb(&i(0x1050, 0x0407, 0x0B)).is_some());
+        assert!(r1.match_usb(&UsbInterface { number: 1, ..i(0x1050, 0x0407, 0x0B) }).is_none(), "only interface 0");
         for bad in ["", "usb_interface = []", "usb_ids = [\"1050-0407\"]", "usb_ids = [\"10500:407\"]", "usb_interface = [1, 2, 3, 4]", "any_page = [1]\nusb_interface = [3]", "driver = \"ukbd\"\nusb_interface = [3]"] {
             assert!(load(&rule(bad)).is_err(), "accepted {bad:?}");
         }

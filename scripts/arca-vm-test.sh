@@ -491,5 +491,10 @@ else
 echo "  SKIP: no /dev/tesserakeys in the guest (load tessera_fs before arcad)"
 fi
 
+# Put arcad's real manifest back: the test one names vinculumd as 50804 and
+# a test web broker, so a guest left with it refuses the real vinculumd
+# (65024) at its next bootstrap start.
+put "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
+
 echo "=== $pass passed, $fail failed"
 [ "$fail" = 0 ]

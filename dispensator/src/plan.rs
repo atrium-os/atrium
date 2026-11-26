@@ -84,7 +84,7 @@ fn usb_interface(d: &devctl::Device) -> Option<(String, u32, u32, u8, UsbInterfa
     let interface: u8 = f.get("interface")?.parse().ok()?;
     let byte = |k: &str| f.hex(k).and_then(|v| u8::try_from(v).ok());
     let word = |k: &str| f.hex(k).and_then(|v| u16::try_from(v).ok());
-    let i = UsbInterface { vendor: word("vendor")?, product: word("product")?, class: byte("intclass")?, subclass: byte("intsubclass")?, protocol: byte("intprotocol")? };
+    let i = UsbInterface { number: interface, vendor: word("vendor")?, product: word("product")?, class: byte("intclass")?, subclass: byte("intsubclass")?, protocol: byte("intprotocol")? };
     Some((ugen.to_string(), bus, addr, interface, i))
 }
 
