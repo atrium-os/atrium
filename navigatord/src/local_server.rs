@@ -35,11 +35,20 @@ pub const REQUESTS_MAX: usize = 256;
 /// The longest answer head line from the fetcher.
 const HEAD_MAX: usize = 64 + navigator_control::URL_MAX;
 
-/// Addresses the person started a navigation to, each good for one `Open`.
+/// Addresses the person started a navigation to, each good for one `Open`,
+/// and the local pages this window opened from one: opening such a page
+/// again on the same connection (its page child came back, a parked page
+/// woke, Back to it) is the same navigation and needs no new grant. Both
+/// are per UI connection, so another window or a new connection starts
+/// with neither.
 #[derive(Default)]
 pub struct Typed {
     held: VecDeque<(String, Instant)>,
+    opened: VecDeque<String>,
 }
+
+/// Local pages one window keeps openable again.
+pub const OPENED_MAX: usize = 64;
 
 impl Typed {
     /// Hold `url` if it is a local address; ignored otherwise.
@@ -52,12 +61,23 @@ impl Typed {
         self.held.push_back((l.url(), now));
     }
 
-    /// Spend the grant for `url`, if one is held and fresh.
+    /// Whether `url` may open: a page this window already opened from a
+    /// grant, or one with a fresh grant held, which this spends.
     pub fn take(&mut self, url: &str, now: Instant) -> bool {
         let Some(l) = local::parse(url) else { return false };
         let want = l.url();
+        if let Some(i) = self.opened.iter().position(|u| *u == want) {
+            // Most recently opened last, so the oldest leaves first.
+            let u = self.opened.remove(i).unwrap_or_default();
+            self.opened.push_back(u);
+            return true;
+        }
         let Some(i) = self.held.iter().position(|(u, at)| *u == want && now.duration_since(*at) < GRANT_LIFE) else { return false };
         self.held.remove(i);
+        if self.opened.len() >= OPENED_MAX {
+            self.opened.pop_front();
+        }
+        self.opened.push_back(want);
         true
     }
 }
@@ -324,10 +344,29 @@ mod tests {
         assert!(!g.take("http://localhost:9090/", t), "another port");
         assert!(!g.take("http://127.0.0.1:8080/", t), "another spelling is another origin");
         assert!(g.take("http://LOCALHOST:8080/#x", t), "the same address in another spelling of case and fragment");
-        assert!(!g.take("http://localhost:8080/", t), "spent");
-        g.grant("http://localhost:8080/", t);
-        assert!(!g.take("http://localhost:8080/", t + GRANT_LIFE), "stale");
+        assert!(g.held.is_empty(), "the grant is spent");
+        g.grant("http://localhost:8080/b", t);
+        assert!(!g.take("http://localhost:8080/b", t + GRANT_LIFE), "stale");
         assert!(!g.take("https://example.com/", t), "not a local address");
+    }
+
+    #[test]
+    fn a_page_opened_from_a_grant_opens_again_in_that_window_only() {
+        let t = Instant::now();
+        let mut g = Typed::default();
+        assert!(!g.take("http://localhost:8080/a", t), "never typed");
+        g.grant("http://localhost:8080/a", t);
+        assert!(g.take("http://localhost:8080/a", t));
+        // Its page child came back, or Back to it, much later.
+        assert!(g.take("http://localhost:8080/a", t + GRANT_LIFE * 100), "the same page again");
+        assert!(!g.take("http://localhost:8080/b", t), "another page of the origin was never opened");
+        assert!(!Typed::default().take("http://localhost:8080/a", t), "another window has no grant");
+        for i in 0..OPENED_MAX {
+            g.grant(&format!("http://localhost:8080/p{i}"), t);
+            assert!(g.take(&format!("http://localhost:8080/p{i}"), t));
+        }
+        assert_eq!(g.opened.len(), OPENED_MAX, "bounded");
+        assert!(!g.take("http://localhost:8080/a", t), "the oldest left");
     }
 
     #[test]

@@ -103,7 +103,7 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={} tools={} more={} show={}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={} tools={} more={} show={} local={}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
@@ -168,6 +168,8 @@ pub fn trace(s: &mut Shell) {
                     v.iter().map(|(id, b)| format!("{id}:{},{}", (b.x() + b.w() / 2.0) as i32, (b.y() + b.h() / 2.0) as i32)).collect::<Vec<_>>().join(";")
                 }
             },
+            // The address bar's chip for your own server: its app, quoted.
+            t.page().and_then(|p| p.facts.local.as_deref()).map_or("-".to_string(), |a| format!("\"{a}\"")),
         );
     }
 }

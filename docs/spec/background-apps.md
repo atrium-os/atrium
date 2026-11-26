@@ -607,12 +607,19 @@ differences:
   exchange, redirects and refusals (`navigator-fetch`), navigatord's
   grants and origin check (`local_server.rs`), the address bar and chip
   (`navigator-ui`), portcullisd's rate, jaild's `ListenTarget`. VM check
-  `scripts/vm-local-server-check.sh` (37 checks): the server side end to
+  `scripts/vm-local-server-check.sh` (41 checks): the server side end to
   end with a stand-in for navigatord (`examples/local_port_ask`), then the
   real navigatord as Navigator's broker with the real fetcher and
   prerender, driven by `navigatord/examples/nav_ask` in the UI's place: an
   untyped Open is refused, a typed one opens and is named as the app's, the
   next open carries the cookie navigatord's jar kept, and nothing of the
-  page reaches navigatord's store. The chip itself is covered by the UI's
-  host tests.
+  page reaches navigatord's store. Then on screen (frescod, forum-wm,
+  limend-dev, navigator-ui as the same uid): `localhost:9000/page` typed
+  into the address bar opens the page in the page child, with the chip
+  "Your computer · Photo Server".
+- A typed grant is spent by one Open, but a page a window opened from one
+  stays openable on that UI connection (at most 64 kept): its page child
+  coming back, a parked page waking and Back reopen the same address. The
+  first on-screen run showed a respawned page child being refused without
+  this. Another window or a new connection starts with none.
 
