@@ -18,30 +18,73 @@ const MIN_CONTRAST: f64 = 4.5;
 
 // ---------- Alt Text ----------
 
-/// The Alt Text bar's text: the chart's alt text now.
-pub fn alt_start(d: &Doc, cursor: (u32, u32)) -> String {
-    crate::data::chart_at(&d.wb, d.sheet, cursor.0, cursor.1)
-        .and_then(|i| d.wb.charts()[i].alt.as_deref().map(|a| a.replace('\n', " ")))
-        .unwrap_or_default()
+/// A chart or a picture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Float {
+    Chart(usize),
+    Picture(usize),
 }
 
-/// Alt Text…: describes the chart at the cursor (`none` clears it). One step.
+/// What Alt Text describes at `cursor`: a chart over the cell, else a
+/// picture over it, else a chart drawn from the cell.
+fn float_at(d: &Doc, cursor: (u32, u32)) -> Option<Float> {
+    let (row, col) = cursor;
+    let over = |a: &officina_grid::charts::Anchor| a.sheet == d.sheet && (a.from.0..=a.to.0).contains(&row) && (a.from.1..=a.to.1).contains(&col);
+    if let Some(i) = d.wb.charts().iter().rposition(|c| over(&c.anchor)) {
+        return Some(Float::Chart(i));
+    }
+    if let Some(i) = d.wb.pictures().iter().rposition(|p| over(&p.anchor)) {
+        return Some(Float::Picture(i));
+    }
+    crate::data::chart_at(&d.wb, d.sheet, row, col).map(Float::Chart)
+}
+
+/// Whether Alt Text has something to describe at `cursor`.
+pub fn can_describe(d: &Doc, cursor: (u32, u32)) -> bool {
+    float_at(d, cursor).is_some()
+}
+
+/// The Alt Text bar's text: the chart's or picture's alt text now.
+pub fn alt_start(d: &Doc, cursor: (u32, u32)) -> String {
+    let alt = match float_at(d, cursor) {
+        Some(Float::Chart(i)) => d.wb.charts()[i].alt.clone(),
+        Some(Float::Picture(i)) => d.wb.pictures()[i].alt.clone(),
+        None => None,
+    };
+    alt.map(|a| a.replace('\n', " ")).unwrap_or_default()
+}
+
+/// Alt Text…: describes the chart or picture at the cursor (`none` clears
+/// it). One step.
 pub fn set_alt(d: &mut Doc, cursor: (u32, u32), typed: &str) -> Result<String, String> {
-    let i = crate::data::chart_at(&d.wb, d.sheet, cursor.0, cursor.1).ok_or("Put the cursor on a chart, or on its data, to describe it.")?;
+    let at = float_at(d, cursor).ok_or("Put the cursor on a chart or picture, or on a chart's data, to describe it.")?;
     let t = typed.trim();
     let alt = if t.is_empty() || t.eq_ignore_ascii_case("none") { None } else { clean_alt(t) };
-    let mut charts = d.wb.charts().to_vec();
-    if charts[i].alt == alt {
-        return Ok("The alt text is already so.".into());
-    }
-    charts[i].alt = alt.clone();
+    let (what, op) = match at {
+        Float::Chart(i) => {
+            let mut charts = d.wb.charts().to_vec();
+            if charts[i].alt == alt {
+                return Ok("The alt text is already so.".into());
+            }
+            charts[i].alt = alt.clone();
+            ("chart", GridOp::Charts(charts))
+        }
+        Float::Picture(i) => {
+            let mut pictures = d.wb.pictures().to_vec();
+            if pictures[i].alt == alt {
+                return Ok("The alt text is already so.".into());
+            }
+            pictures[i].alt = alt.clone();
+            ("picture", GridOp::Pictures(pictures))
+        }
+    };
     d.status.clear();
-    if !d.run_action("Alt Text", vec![GridOp::Charts(charts)]) {
+    if !d.run_action("Alt Text", vec![op]) {
         return Err(std::mem::take(&mut d.status));
     }
     Ok(match alt {
-        Some(a) => format!("The chart is described: “{a}”."),
-        None => "The chart has no alt text now.".into(),
+        Some(a) => format!("The {what} is described: “{a}”."),
+        None => format!("The {what} has no alt text now."),
     })
 }
 
@@ -100,6 +143,11 @@ pub fn issues(d: &Doc) -> (Vec<Issue>, usize) {
         for (n, c) in wb.charts().iter().enumerate().filter(|(_, c)| c.anchor.sheet == sheet) {
             if c.alt.is_none() {
                 add(Issue { sheet, at: (c.anchor.from.0, c.anchor.from.1), say: format!("Missing alt text: chart {} has none. Use Alt Text… to describe it.", n + 1) });
+            }
+        }
+        for (n, p) in wb.pictures().iter().enumerate().filter(|(_, p)| p.anchor.sheet == sheet) {
+            if p.alt.is_none() {
+                add(Issue { sheet, at: (p.anchor.from.0, p.anchor.from.1), say: format!("Missing alt text: picture {} has none. Use Alt Text… to describe it.", n + 1) });
             }
         }
         for t in wb.tables().iter().filter(|t| t.rect.sheet == sheet && !t.header) {
@@ -187,6 +235,13 @@ mod tests {
         assert_eq!(d.wb.charts()[0].alt, None);
         set_alt(&mut d, (0, 0), "x").unwrap();
         assert_eq!(set_alt(&mut d, (0, 0), "none").unwrap(), "The chart has no alt text now.");
+        // A picture over the cell is described ahead of a chart drawn from it.
+        d.wb.add_picture(Picture { anchor: Anchor { sheet: 0, from: (0, 0, 0.0, 0.0), to: (2, 1, 0.0, 0.0) }, bytes: b"\x89PNG\r\n\x1a\n".to_vec().into(), link: None, crop: [0; 4], rotation: 0, alt: None }).unwrap();
+        assert!(issues(&d).0.iter().any(|i| i.say.starts_with("Missing alt text: picture 1")));
+        assert_eq!(set_alt(&mut d, (1, 0), "Company logo").unwrap(), "The picture is described: “Company logo”.");
+        assert_eq!(d.wb.pictures()[0].alt.as_deref(), Some("Company logo"));
+        assert_eq!(alt_start(&d, (2, 1)), "Company logo");
+        assert!(!issues(&d).0.iter().any(|i| i.say.contains("picture")));
     }
 
     #[test]

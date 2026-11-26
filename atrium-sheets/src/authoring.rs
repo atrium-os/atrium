@@ -44,6 +44,9 @@ pub enum AuthorCmd {
     /// Find only cells formatted as the cursor's cell is (Excel's Format…
     /// ▸ Choose Format From Cell); again, any format.
     Format,
+    /// Replace also gives each changed cell the cursor cell's format
+    /// (Excel's Replace with Format…); again, the formats stay.
+    ReplaceFormat,
     Find(bool),
     /// Go to the first match and list every match.
     FindAll,
@@ -86,6 +89,7 @@ pub(super) struct Authoring {
     values: Mutable<bool>,
     comments: Mutable<bool>,
     format: Mutable<Option<officina_grid::style::Style>>,
+    replace_format: Mutable<Option<officina_grid::style::Style>>,
     split: Mutable<Split>,
     extra_scrolls: [Mutable<ScrollState>; 3],
     active: Mutable<usize>,
@@ -107,6 +111,7 @@ impl Authoring {
             values: rev.sibling(false),
             comments: rev.sibling(false),
             format: rev.sibling(None),
+            replace_format: rev.sibling(None),
             split: rev.sibling(Split::None),
             extra_scrolls: std::array::from_fn(|_| rev.sibling(ScrollState::default())),
             active: rev.sibling(0),
@@ -184,7 +189,11 @@ impl Authoring {
         // With a format and nothing typed, Find finds any cell of that format.
         let format = self.format.get_cloned();
         let typed = self.query.get_cloned().text().to_string();
-        let needle = if typed.is_empty() && format.is_some() && replace.is_none() { "*" } else { typed.as_str() };
+        let new_format = self.replace_format.get_cloned();
+        // Nothing typed: Find takes any cell of the format; Replace, with a
+        // format to give, restyles those cells and leaves their text.
+        let text_too = !typed.is_empty();
+        let needle = if !text_too && format.is_some() && (replace.is_none() || new_format.is_some()) { "*" } else { typed.as_str() };
         let search = Search::excel(needle, self.case.get(), self.whole.get())?;
         let replacement = self.replacement.get_cloned();
         if replacement.text().len() > 16_384 { return Err("The replacement text is too long.".into()); }
@@ -204,10 +213,23 @@ impl Authoring {
             let mut ops = Vec::new();
             let mut bytes = 0;
             let mut error = None;
+            let mut cells = 0usize;
             for sheet in sheets {
                 find::inputs(&d.wb, sheet, &mut |at, input, text| {
                     if !all && at != cursor { return true; }
                     if !fmt_ok(&d, at) { return true; }
+                    if !text_too {
+                        // Format only: the cell keeps its text and takes the new format.
+                        if let Some(f) = &new_format {
+                            if cells == 10_000 {
+                                error = Some("The replacement is too large. Narrow the search.".into());
+                                return false;
+                            }
+                            ops.push(GridOp::restyle(&d.wb, officina_grid::Rect::cell(at), |_| f.clone()));
+                            cells += 1;
+                        }
+                        return all;
+                    }
                     let next = match search.replacement(&input, &text, replacement.text()) {
                         Ok(Some(next)) => next,
                         Ok(None) => return true,
@@ -225,11 +247,15 @@ impl Authoring {
                         Input::Value(_) | Input::Empty => 0,
                     };
                     bytes += size + text.len();
-                    if bytes > 8 << 20 || ops.len() == 10_000 {
+                    if bytes > 8 << 20 || cells == 10_000 {
                         error = Some("The replacement is too large. Narrow the search or shorten the replacement.".into());
                         return false;
                     }
                     ops.push(GridOp::set(at, next));
+                    if let Some(f) = &new_format {
+                        ops.push(GridOp::restyle(&d.wb, officina_grid::Rect::cell(at), |_| f.clone()));
+                    }
+                    cells += 1;
                     all
                 });
                 if error.is_some() || (!all && !ops.is_empty()) { break; }
@@ -238,9 +264,10 @@ impl Authoring {
             if ops.is_empty() {
                 return Err(if all { "No matching inputs to replace." } else { "The selected cell has no text to replace. Try Find Next." }.into());
             }
-            let count = ops.len();
+            let count = cells;
+            let what = if !text_too { "the format of" } else if new_format.is_some() { "text and format in" } else { "text in" };
             if d.run_validated(if all { "Replace All" } else { "Replace" }, ops) && d.status.is_empty() {
-                d.status = format!("Replaced text in {count} {}.", if count == 1 { "cell" } else { "cells" });
+                d.status = format!("Replaced {what} {count} {}.", if count == 1 { "cell" } else { "cells" });
             }
             return Ok(());
         }
@@ -356,6 +383,21 @@ impl Authoring {
             AuthorCmd::Workbook => { self.all_sheets.set(!self.all_sheets.get()); Ok(()) }
             AuthorCmd::Values => { self.values.set(!self.values.get()); self.comments.set(false); Ok(()) }
             AuthorCmd::Comments => { self.comments.set(!self.comments.get()); self.values.set(false); Ok(()) }
+            AuthorCmd::ReplaceFormat => {
+                if self.replace_format.get_cloned().is_some() {
+                    self.replace_format.set(None);
+                    s.doc.borrow_mut().status = "Replace leaves formats as they are again.".into();
+                } else {
+                    let d = s.doc.borrow();
+                    let (row, col) = s.grid.get_cloned().cursor;
+                    let st = d.wb.style(CellAddr::new(d.sheet, row, col)).clone();
+                    let say = format!("Replace also gives each cell it changes the format of {}.", a1(row, col));
+                    drop(d);
+                    self.replace_format.set(Some(st));
+                    s.doc.borrow_mut().status = say;
+                }
+                Ok(())
+            }
             AuthorCmd::Format => {
                 if self.format.get_cloned().is_some() {
                     self.format.set(None);
@@ -507,7 +549,7 @@ impl Authoring {
             let width = (w - 12.0).clamp(0.0, 470.0);
             let x = w - width - 6.0;
             let y = TOOLBAR_H + FORMULA_H + 6.0;
-            let back = ctx.push(Node::Rect { rect: Rect::new(x, y, width, 166.0), fill: theme.bg_surface(), radius: 5.0 });
+            let back = ctx.push(Node::Rect { rect: Rect::new(x, y, width, 196.0), fill: theme.bg_surface(), radius: 5.0 });
             ctx.on_click(back, || {});
             let field_width = (width - 16.0).max(0.0);
             let submit = push(AuthorCmd::Find(true));
@@ -521,19 +563,21 @@ impl Authoring {
                 ("All sheets", self.all_sheets.get(), AuthorCmd::Workbook),
                 ("Values", self.values.get(), AuthorCmd::Values),
                 ("Comments", self.comments.get(), AuthorCmd::Comments),
-                ("Format", self.format.get_cloned().is_some(), AuthorCmd::Format)];
-            let n = options.len() as f32;
+                ("Format", self.format.get_cloned().is_some(), AuthorCmd::Format),
+                ("Replace format", self.replace_format.get_cloned().is_some(), AuthorCmd::ReplaceFormat)];
+            // Two rows: what to match, then where to look and formats.
             for (i, (label, on, action)) in options.into_iter().enumerate() {
                 let state = Mutable::new(if on { Check::On } else { Check::Off });
                 let click = push(action);
-                Checkbox::new(state, label).at(x + 8.0 + i as f32 * field_width / n, y + 82.0)
+                let (row, col) = (i / 4, i % 4);
+                Checkbox::new(state, label).at(x + 8.0 + col as f32 * field_width / 4.0, y + 80.0 + row as f32 * 30.0)
                     .on_change(move |_| click()).render(ctx);
             }
             let commands = [("Previous", AuthorCmd::Find(false)), ("Next", AuthorCmd::Find(true)), ("Find All", AuthorCmd::FindAll),
                 ("Replace", AuthorCmd::Replace(false)), ("Replace All", AuthorCmd::Replace(true)), ("Close", AuthorCmd::FindClose)];
             let bw = (field_width - 4.0 * (commands.len() - 1) as f32).max(0.0) / commands.len() as f32;
             for (i, (label, action)) in commands.into_iter().enumerate() {
-                Button::secondary(label).at(x + 8.0 + i as f32 * (bw + 4.0), y + 120.0).width(bw).retain_focus_on_press().on_click(push(action)).render(ctx);
+                Button::secondary(label).at(x + 8.0 + i as f32 * (bw + 4.0), y + 150.0).width(bw).retain_focus_on_press().on_click(push(action)).render(ctx);
             }
             ctx.pop();
         }
@@ -799,6 +843,48 @@ mod tests {
         run(&s, AuthorCmd::Format);
         run(&s, AuthorCmd::FindAll);
         assert_eq!(s.doc.borrow().status, "Found 2 cells: Sheet1!A1, Sheet1!A2.");
+    }
+
+    #[test]
+    fn replace_format_restyles_only_the_cells_it_changes() {
+        let s = sheets(b"pen,pen\npen,ink\n");
+        let bold = officina_grid::style::Style { font: officina_grid::style::Font { bold: true, ..Default::default() }, ..Default::default() };
+        let at = |r, c| CellAddr::new(0, r, c);
+        {
+            let mut d = s.doc.borrow_mut();
+            for (r, c) in [(0, 1), (1, 1)] {
+                d.wb.set_style(&officina_grid::Rect::cell(at(r, c)), bold.clone());
+            }
+        }
+        let go = |r, c| { let mut g = s.grid.get_cloned(); g.cursor = (r, c); g.anchor = (r, c); s.grid.set(g); };
+        run(&s, AuthorCmd::FindOpen);
+        // Format only: find bold, give it A1's plain format, text kept.
+        go(0, 1);
+        run(&s, AuthorCmd::Format);
+        go(0, 0);
+        run(&s, AuthorCmd::ReplaceFormat);
+        assert_eq!(s.doc.borrow().status, "Replace also gives each cell it changes the format of A1.");
+        run(&s, AuthorCmd::Replace(true));
+        assert_eq!(s.doc.borrow().status, "Replaced the format of 2 cells.");
+        assert!(!s.doc.borrow().wb.style(at(0, 1)).font.bold && !s.doc.borrow().wb.style(at(1, 1)).font.bold);
+        assert_eq!(s.doc.borrow().wb.value(0, 1, 1), officina_grid::Value::str("ink"));
+        // One step to undo.
+        assert!(s.doc.borrow_mut().undo());
+        assert!(s.doc.borrow().wb.style(at(0, 1)).font.bold && s.doc.borrow().wb.style(at(1, 1)).font.bold);
+        // Text and format: every pen becomes a bold cap; ink is left alone.
+        run(&s, AuthorCmd::Format);
+        run(&s, AuthorCmd::ReplaceFormat);
+        go(1, 1);
+        run(&s, AuthorCmd::ReplaceFormat);
+        assert_eq!(s.doc.borrow().status, "Replace also gives each cell it changes the format of B2.");
+        s.authoring.query.set(TextEdit::new("pen"));
+        s.authoring.replacement.set(TextEdit::new("cap"));
+        run(&s, AuthorCmd::Replace(true));
+        assert_eq!(s.doc.borrow().status, "Replaced text and format in 3 cells.");
+        let d = s.doc.borrow();
+        assert!(d.wb.style(at(0, 0)).font.bold && d.wb.style(at(1, 0)).font.bold);
+        assert_eq!(d.wb.value(0, 1, 0), officina_grid::Value::str("cap"));
+        assert_eq!(d.wb.value(0, 1, 1), officina_grid::Value::str("ink"));
     }
 
     #[test]

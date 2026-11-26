@@ -739,7 +739,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Insert Line Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Line))));
     v.push((MenuItem::new("Insert Pie Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Pie))));
     v.push((MenuItem::new("Delete Chart").enabled(chart_at(wb, s, row, col).is_some()), Some(DataCmd::DeleteChart)));
-    v.push((MenuItem::new("Alt Text…").enabled(chart_at(wb, s, row, col).is_some()), Some(DataCmd::AltText)));
+    v.push((MenuItem::new("Alt Text…").enabled(crate::accessibility::can_describe(d, (row, col))), Some(DataCmd::AltText)));
     let here = wb.pivot_at(CellAddr::new(s, row, col));
     match here {
         Some((i, _)) => {

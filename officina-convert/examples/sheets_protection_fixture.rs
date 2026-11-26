@@ -40,6 +40,8 @@ fn fixture(format: ProtectionFormat) -> Workbook {
                 "http://www.w3.org/2000/09/xmldsig#sha1"
             ));
         }
+        // The fixture protects sheets, never the workbook's structure.
+        ProtectionFormat::ExcelWorkbook => unreachable!("a sheet fixture"),
     }
     book.sheet_mut(0).protection = Some(protection);
     for (col, title) in ["Locked", "Editable", "Total", "Hidden"]

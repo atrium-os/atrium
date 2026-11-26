@@ -433,7 +433,7 @@ mod tests {
                 .into(),
                 link: None,
                 crop: [0; 4],
-                rotation: 0,
+                rotation: 0, alt: None
             })
             .unwrap();
             wb.set_comments(

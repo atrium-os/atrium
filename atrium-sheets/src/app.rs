@@ -5861,7 +5861,7 @@ mod tests {
             bytes.push(payload);
             Picture {
                 anchor: Anchor { sheet, from: (row, 1, 0.0, 0.0), to: (row + 2, 3, 0.0, 0.0) },
-                bytes: bytes.into(), link: None, crop: [0; 4], rotation: 0,
+                bytes: bytes.into(), link: None, crop: [0; 4], rotation: 0, alt: None
             }
         };
         let removed = picture(0, 2, 1);

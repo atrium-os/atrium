@@ -478,7 +478,7 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(&b"\x89PNG\r\n\x1a\n"[..]);
         {
             let mut d = doc.borrow_mut();
-            d.wb.add_picture(Picture { anchor, bytes: bytes.clone(), link: Some("https://example.invalid/plot.png".into()), crop: [25_000, 0, 0, 0], rotation: 5_400_000 }).unwrap();
+            d.wb.add_picture(Picture { anchor, bytes: bytes.clone(), link: Some("https://example.invalid/plot.png".into()), crop: [25_000, 0, 0, 0], rotation: 5_400_000, alt: None }).unwrap();
             let package = officina_convert::xlsx::write(&d.wb, Vec::new()).unwrap();
             let (imported, _) = officina_convert::xlsx::read(&package).unwrap();
             d.wb = native::load(&native::save_to_vec(&imported)).unwrap();
@@ -524,7 +524,7 @@ mod tests {
         let target = "https://example.invalid/linked.png?x=1&y=2";
         {
             let mut d = doc.borrow_mut();
-            d.wb.add_picture(Picture { anchor, bytes: [].into(), link: Some(target.into()), crop: [0; 4], rotation: 0 }).unwrap();
+            d.wb.add_picture(Picture { anchor, bytes: [].into(), link: Some(target.into()), crop: [0; 4], rotation: 0, alt: None }).unwrap();
             let package = officina_convert::xlsx::write(&d.wb, Vec::new()).unwrap();
             let (imported, _) = officina_convert::xlsx::read(&package).unwrap();
             d.wb = native::load(&native::save_to_vec(&imported)).unwrap();

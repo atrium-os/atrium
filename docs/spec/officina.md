@@ -5388,6 +5388,26 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
     - `authoring`: find by format with and without text; Replace All only in that format.
   - Pergola's grid: a click on the box, a click beside it, Space on a checkbox, Space elsewhere.
 
+### 16.160 Alt text for pictures, Replace Format (2026-11-26)
+
+`Picture::alt` and `PICTURE_ALT` in `officina-grid/src/charts.rs`, the picture paths in `atrium-sheets/src/accessibility.rs`, the Replace format option in `atrium-sheets/src/authoring.rs`, and picture `descr` and `svg:desc` in `officina-convert` (`xlsx/chart.rs`, `ods/chart.rs`).
+
+- **Alt Text… for pictures.** The item now works for a picture as well as a chart. It looks first for a chart over the cursor's cell, then a picture over it, then a chart drawn from the cell's data, and is greyed when there is none. Setting, cleaning (the §16.159 rules) and `none` work as for charts, one undo step each.
+  - `.osheet`: flag bit 13 of the picture says a string follows the link, so older files read as before.
+  - `.xlsx`: `descr` on the picture's `xdr:cNvPr`, read and written, with a line break as `&#10;`.
+  - `.ods`: the picture frame's `svg:desc`.
+  - Check Accessibility now also lists "Missing alt text: picture N", which closes the gap §16.159 left.
+- **Replace Format**, as Excel's Replace ▸ Format… for the replacement. A seventh Find option, Replace format, takes the cursor cell's whole format; turning it off again leaves formats alone. The options now sit in two rows of four.
+  - With text to find, Replace and Replace All change the text as before and give each changed cell that format. The status says "Replaced text and format in N cells".
+  - With nothing typed and a Format to find, Replace All restyles every cell of the found format that has content and leaves its text ("Replaced the format of N cells").
+  - Either way it is one undo step, and at most 10,000 cells at once.
+- `officina-convert/examples/sheets_protection_fixture.rs` builds again: it matches the Excel workbook protection format (§16.143).
+- The new `Picture::alt` field broke two test-only `Picture { … }` literals in `atrium-sheets/src/print.rs`; they now say `alt: None`. Nothing else in that file changed.
+- Tests:
+  - Grid: `charts` (`picture_alt_text_round_trips_with_its_flag`).
+  - Convert: `roundtrip` (`picture_alt_text_round_trips_in_xlsx_and_ods`).
+  - Sheets: `accessibility` (picture alt text set, undone and reported by the check) and `authoring` (`replace_format_restyles_only_the_cells_it_changes`: a format-only replace, its undo, and text with format leaving unmatched cells alone).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

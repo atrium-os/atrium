@@ -94,6 +94,9 @@ pub struct Picture {
     pub crop: [i32; 4],
     /// Clockwise rotation about the anchor's center, in 1/60,000 degrees.
     pub rotation: i32,
+    /// Alt Text: what the picture shows, for a screen reader (see
+    /// [`clean_alt`]).
+    pub alt: Option<Arc<str>>,
 }
 
 pub const MAX_PICTURE_BYTES: usize = 16 * 1024 * 1024;
@@ -104,6 +107,7 @@ pub(crate) const MAX_PICTURE_TOTAL: usize = (64 << 20) - (MAX_PICTURES * 64);
 // Picture records originally started with an unflagged sheet index.
 const PICTURE_TRANSFORM: u16 = 1 << 15;
 const PICTURE_LINK: u16 = 1 << 14;
+const PICTURE_ALT: u16 = 1 << 13;
 pub const MAX_PICTURE_LINK: usize = 4096;
 
 impl Picture {
@@ -114,7 +118,7 @@ impl Picture {
     // There is already room for the anchor and image length in the budget.
     fn extra_bytes(&self) -> usize {
         let transform = if self.has_transform() { 16 } else { 0 };
-        transform + self.link.as_ref().map_or(0, |link| link.len() + 2)
+        transform + self.link.as_ref().map_or(0, |link| link.len() + 2) + self.alt.as_ref().map_or(0, |alt| alt.len() + 2)
     }
 
     pub(crate) fn collection_fits(pictures: &[Self]) -> bool {
@@ -137,7 +141,9 @@ impl Picture {
         let transformed = self.has_transform();
         let transform_flag = if transformed { PICTURE_TRANSFORM } else { 0 };
         let link_flag = if self.link.is_some() { PICTURE_LINK } else { 0 };
-        w.u16(self.anchor.sheet | transform_flag | link_flag);
+        let alt = self.alt.as_deref().filter(|a| !a.is_empty());
+        let alt_flag = if alt.is_some() { PICTURE_ALT } else { 0 };
+        w.u16(self.anchor.sheet | transform_flag | link_flag | alt_flag);
         for (row, col, x, y) in [self.anchor.from, self.anchor.to] {
             w.u32(row);
             w.u32(col);
@@ -153,12 +159,15 @@ impl Picture {
         if let Some(link) = &self.link {
             w.str(link);
         }
+        if let Some(alt) = alt {
+            w.str(alt);
+        }
         w.bytes(&self.bytes);
     }
 
     pub(crate) fn decode(r: &mut Reader, limit: usize) -> Result<Self, WireError> {
         let flags = r.u16()?;
-        let sheet = flags & !(PICTURE_TRANSFORM | PICTURE_LINK);
+        let sheet = flags & !(PICTURE_TRANSFORM | PICTURE_LINK | PICTURE_ALT);
         let mut corner = || -> Result<_, WireError> {
             Ok((r.u32()?, r.u32()?, r.f64()? as f32, r.f64()? as f32))
         };
@@ -176,8 +185,17 @@ impl Picture {
         } else {
             None
         };
+        let alt = if flags & PICTURE_ALT != 0 {
+            let a = r.str("alt text", MAX_ALT as u64)?;
+            if a.is_empty() || a.chars().any(|c| c.is_control() && c != '\n') {
+                return Err(WireError::Invalid("alt text"));
+            }
+            Some(Arc::from(a))
+        } else {
+            None
+        };
         let bytes = Arc::from(r.bytes("picture", limit.min(MAX_PICTURE_BYTES) as u64)?);
-        Ok(Self { anchor, bytes, link, crop, rotation })
+        Ok(Self { anchor, bytes, link, crop, rotation, alt })
     }
 }
 
@@ -664,5 +682,20 @@ mod native_tests {
         let mut b = Vec::new();
         crate::native::save(&wb, &mut b).unwrap();
         assert_eq!(crate::native::load(&b).unwrap().charts(), wb.charts());
+    }
+
+    #[test]
+    fn picture_alt_text_round_trips_with_its_flag() {
+        use super::*;
+        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        let p = Picture { anchor: Anchor { sheet: 4095, from: (1, 1, 0.0, 0.0), to: (5, 4, 0.0, 0.0) }, bytes: png.into(), link: None, crop: [0; 4], rotation: 0, alt: Some("A red logo\non white".into()) };
+        let mut w = Writer::new();
+        p.encode(&mut w);
+        let b = w.into_bytes();
+        assert_eq!(Picture::decode(&mut Reader::new(&b), 1 << 20).unwrap(), p);
+        let plain = Picture { alt: None, ..p.clone() };
+        let mut w = Writer::new();
+        plain.encode(&mut w);
+        assert_eq!(b.len(), w.into_bytes().len() + 1 + "A red logo\non white".len());
     }
 }

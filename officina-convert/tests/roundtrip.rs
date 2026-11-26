@@ -506,3 +506,16 @@ fn formula_text_reads_edited_source_after_foreign_and_native_reopen() {
         assert_eq!(reopened.get(text), Value::str("=10/2"));
     }
 }
+
+#[test]
+fn picture_alt_text_round_trips_in_xlsx_and_ods() {
+    use officina_grid::charts::{Anchor, Picture};
+    let mut wb = book();
+    let png: Vec<u8> = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    let alt = "Logo & \"mark\"\nsecond line";
+    wb.add_picture(Picture { anchor: Anchor { sheet: 0, from: (2, 2, 0.0, 0.0), to: (8, 5, 0.0, 0.0) }, bytes: png.into(), link: None, crop: [0; 4], rotation: 0, alt: Some(alt.into()) }).unwrap();
+    let (back, _) = xlsx::read(&xlsx::write(&wb, Vec::new()).unwrap()).unwrap();
+    assert_eq!(back.pictures()[0].alt.as_deref(), Some(alt), "xlsx");
+    let (back, _) = officina_convert::ods::read(&officina_convert::ods::write(&wb, Vec::new()).unwrap()).unwrap();
+    assert_eq!(back.pictures()[0].alt.as_deref(), Some(alt), "ods");
+}

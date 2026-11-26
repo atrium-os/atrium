@@ -103,7 +103,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         }
                     }
                     b"pic" if !anchor_kind.is_empty() => in_picture = true,
-                    b"cNvPr" if !anchor_kind.is_empty() && !in_picture => descr = attr(&e, b"descr")?,
+                    b"cNvPr" if !anchor_kind.is_empty() => descr = attr(&e, b"descr")?,
                     b"srcRect" if in_picture => {
                         for (inset, side) in crop.iter_mut().zip([b"l", b"t", b"r", b"b"]) {
                             if let Some(value) = attr(&e, side)? {
@@ -179,6 +179,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                             let bytes = bytes.filter(|b| officina_grid::charts::Picture::extension(b).is_some());
                             if wb.add_picture(officina_grid::charts::Picture {
                                 anchor, bytes: Arc::from(bytes.unwrap_or_default()), link: link.take(), crop, rotation,
+                                alt: descr.take().and_then(|d| officina_grid::charts::clean_alt(&d)),
                             }).is_err() {
                                 rep.note(Kind::Dropped, "missing, oversized or unsupported pictures (embedded PNG and JPEG supported)");
                             }
@@ -622,7 +623,8 @@ pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> S
         let embed = if picture.bytes.is_empty() { String::new() } else { format!(r#" r:embed="rIdPic{j}""#) };
         let link = picture.link.as_ref().map(|_| format!(r#" r:link="rIdLink{j}""#)).unwrap_or_default();
         let id = ids.len() + j + 2;
-        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"{embed}{link}/><a:srcRect l="{l}" t="{t}" r="{r}" b="{b}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm rot="{rotation}"/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
+        let descr = picture.alt.as_deref().map_or(String::new(), |a| format!(r#" descr="{}""#, esc(a).replace('\n', "&#10;")));
+        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"{descr}/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"{embed}{link}/><a:srcRect l="{l}" t="{t}" r="{r}" b="{b}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm rot="{rotation}"/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
     }
     o.push_str("</xdr:wsDr>");
     o

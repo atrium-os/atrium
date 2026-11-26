@@ -1114,7 +1114,7 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(&b"\x89PNG\r\n\x1a\n"[..]);
         let picture = |row| Picture {
             anchor: Anchor { sheet: 0, from: (row, 4, 0.0, 0.0), to: (row, 5, 0.0, 0.0) },
-            bytes: bytes.clone(), link: None, crop: [0; 4], rotation: 0,
+            bytes: bytes.clone(), link: None, crop: [0; 4], rotation: 0, alt: None
         };
         for row in 0..MAX_PICTURES as u32 {
             ours.add_picture(picture(row)).unwrap();

@@ -129,6 +129,7 @@ pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, 
                 let Ok(data) = z.read(part) else { return false };
                 wb.add_picture(officina_grid::charts::Picture {
                     anchor, bytes: data.into(), link: None, crop: [0; 4], rotation: 0,
+                    alt: officina_grid::charts::clean_alt(&f.desc),
                 }).is_ok()
             });
             if !added {
@@ -423,8 +424,9 @@ pub(crate) fn picture_path(p: &officina_grid::charts::Picture, i: usize) -> Opti
 pub(crate) fn picture_xml(wb: &Workbook, p: &officina_grid::charts::Picture, i: usize) -> Option<String> {
     let path = picture_path(p, i)?;
     let [x, y, w, h] = frame_inches(wb, p.anchor);
+    let desc = p.alt.as_deref().map_or(String::new(), |a| format!("<svg:desc>{}</svg:desc>", crate::xml::esc(a)));
     Some(format!(
-        r#"<draw:frame draw:name="Picture {}" svg:x="{x}" svg:y="{y}" svg:width="{w}" svg:height="{h}"><draw:image xlink:href="{path}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#,
+        r#"<draw:frame draw:name="Picture {}" svg:x="{x}" svg:y="{y}" svg:width="{w}" svg:height="{h}"><draw:image xlink:href="{path}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>{desc}</draw:frame>"#,
         i + 1,
     ))
 }

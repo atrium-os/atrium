@@ -49,7 +49,7 @@ fn picture(row: u32) -> Picture {
         bytes: png().into(),
         link: None,
         crop: [0; 4],
-        rotation: 0,
+        rotation: 0, alt: None
     }
 }
 

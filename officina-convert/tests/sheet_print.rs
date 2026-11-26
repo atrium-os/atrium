@@ -21,7 +21,7 @@ fn ods_keeps_jpeg_geometry_and_blank_print_bands() {
         bytes: jpeg[..].into(),
         link: None,
         crop: [0; 4],
-        rotation: 0,
+        rotation: 0, alt: None
     })
     .unwrap();
 
