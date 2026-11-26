@@ -7,7 +7,9 @@
 //! (gates, §14.2): draw the host's windows for `--run-secs`, then write
 //! `window-ID.png`, `desktop.png` and `viewer.txt` to `--out`.
 //! `--reconnect-after S` drops the connection after S seconds and connects
-//! again, resuming from what it holds.
+//! again, resuming from what it holds. `--output WxH[@SCALE]` asks the host
+//! for a remote output of that size and scale (§4.1); the windowed viewer
+//! asks for its window's, and again as it is resized.
 //!
 //! The mint (`fenestra_wire::mint`): with `--ssh CMD`, it runs `CMD
 //! fenestra-shell mint KEY` (CMD split at spaces, no shell) and reads the
@@ -67,6 +69,14 @@ fn main() {
     let connect: Option<std::net::SocketAddr> = arg(&args, "--connect").map(|a| a.parse().unwrap_or_else(|_| die("--connect ADDR:PORT")));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap_or_else(|e| die(e));
     let views = Arc::new(Views::default());
+    // `--output WxH[@SCALE]`: the remote output a headless viewer asks for
+    // (SCALE like 1.5); the windowed viewer asks for its window's.
+    if let Some(o) = arg(&args, "--output") {
+        let (size, scale) = o.split_once('@').unwrap_or((o.as_str(), "1"));
+        let (w, h) = size.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))).unwrap_or_else(|| die("--output WxH[@SCALE]"));
+        let s: f64 = scale.parse().ok().filter(|s: &f64| s.is_finite() && *s > 0.0).unwrap_or_else(|| die("--output WxH[@SCALE]"));
+        views.set_output(w, h, (s * 1000.0).round() as u32);
+    }
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Input>(1024);
     let window_input = input_tx.clone();
     let views_w = views.clone();

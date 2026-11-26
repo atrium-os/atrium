@@ -45,6 +45,10 @@ pub(super) struct Link {
     chrome: Option<Rec>,
     /// The chrome could not be carried (logged once until it can again).
     chrome_refused: bool,
+    /// The viewer's output (width, height, scale), and whether the frame
+    /// loop has yet to act on a change of it.
+    output: Option<(u32, u32, u32)>,
+    output_moved: bool,
 }
 
 /// A renderer's side of the remote session.
@@ -131,6 +135,15 @@ impl Broker {
             match rec {
                 Rec::Session { on } => self.set_remote(on),
                 Rec::Want { window, ticket, base } => self.want(window, ticket, base),
+                Rec::Output { width, height, scale_milli } => {
+                    let mut f = self.fen.lock().unwrap();
+                    if f.on && f.output != Some((width, height, scale_milli)) {
+                        f.output = Some((width, height, scale_milli));
+                        f.output_moved = true;
+                        drop(f);
+                        self.redraw.wake();
+                    }
+                }
                 Rec::Input(i) => {
                     // A flood only slows this link (its socket fills).
                     inputs.take();
@@ -180,6 +193,9 @@ impl Broker {
             f.on = on;
             f.layout = None;
             f.chrome = None;
+            if !on && f.output.take().is_some() {
+                f.output_moved = true;
+            }
         }
         log::info!("frescod: remote session {}", if on { "on" } else { "off" });
         let rs: Vec<Arc<Renderer>> = self.renderers.lock().unwrap().values().cloned().collect();
@@ -269,6 +285,13 @@ impl Broker {
             _ => unreachable!("only stream records come here"),
         }
         Ok(())
+    }
+
+    /// The viewer's output, if it changed since the last call: `Some(None)`
+    /// when the session that set it ended (fenestra.md §4.1).
+    pub(crate) fn take_output(&self) -> Option<Option<(u32, u32, u32)>> {
+        let mut f = self.fen.lock().unwrap();
+        std::mem::replace(&mut f.output_moved, false).then_some(f.output)
     }
 
     /// Once a frame, while a session is on: frescod's own chrome layer

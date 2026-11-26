@@ -22,7 +22,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 18 || echo 14) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) ))
+gate_begin fenestra-desktop $(( $([ "${FEN_JAIL:-0}" = 1 ] && echo 18 || echo 14) + $([ "${FEN_TRANSPORT:-auto}" = tcp ] && echo 1 || echo 0) + $([ -n "${FEN_OUTPUT:-}" ] && echo 1 || echo 0) ))
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 fen_setup
 
@@ -54,7 +54,7 @@ cat >"$W/input.txt" <<'EOF'
 88.1 KEY 40 0
 EOF
 fen_fenestrad
-"$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" --transport "${FEN_TRANSPORT:-auto}" \
+"$VIEW" --headless --input "$W/input.txt" --ssh "$FEN_SSH" --out "$W/view" --run-secs "$RUN" --connect "127.0.0.1:$PORT" --transport "${FEN_TRANSPORT:-auto}" ${FEN_OUTPUT:+--output "$FEN_OUTPUT"} \
     --reconnect-after 70 --idle-after 120 >"$W/view.log" 2>&1 &
 VP=$!
 
@@ -104,6 +104,9 @@ case "$r2" in
 esac
 # FEN_TRANSPORT=tcp: the whole run over the TCP fallback (the VM booted
 # with hostfwd=tcp:127.0.0.1:$PORT-:$PORT as well).
+# FEN_OUTPUT=WxH[@SCALE]: the viewer asks for that remote output, and the
+# headless host's screen takes it (fenestra.md §4.1).
+[ -n "${FEN_OUTPUT:-}" ] && check "the host's screen took the viewer's output" "${FEN_OUTPUT%@*}" "$(python3 -I -c 'import sys; from PIL import Image; w, h = Image.open(sys.argv[1]).size; print(f"{w}x{h}")' "$W/host.png")"
 [ "${FEN_TRANSPORT:-auto}" = tcp ] && check "the viewer ran over the TCP fallback" tcp "$(awk '$1 == "transport" { print $2 }' "$W/view/viewer.txt")"
 grep -q "minted session 1 for root" "$W/fenestrad.log" && ok "the viewer minted over ssh, as the seat's user" || bad "no ssh mint in fenestrad's log"
 if [ "${FEN_JAIL:-0}" = 1 ]; then

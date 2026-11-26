@@ -24,6 +24,10 @@ pub const MAX_LAYOUT: usize = 256;
 const PLACED: usize = 20;
 /// The largest screen side a `Layout` may give.
 pub const MAX_SCREEN: u32 = 65536;
+/// A viewer's output (`Output`): each side in device pixels, and its scale
+/// in thousandths (fenestra.md §4.1).
+pub const OUTPUT_SIDE: std::ops::RangeInclusive<u32> = 64..=8192;
+pub const OUTPUT_SCALE: std::ops::RangeInclusive<u32> = 500..=4000;
 
 pub type Version = (u64, u64);
 
@@ -53,6 +57,9 @@ pub enum Rec {
     Layout { screen: (u32, u32), windows: Vec<Placed> },
     /// frescod → fenestrad: its trusted chrome and the background.
     Chrome(chrome::Chrome),
+    /// fenestrad → frescod: the viewer's output, the size and scale its
+    /// remote output should have (§4.1).
+    Output { width: u32, height: u32, scale_milli: u32 },
     /// fenestrad → frescod: the viewer's input, in the host screen's
     /// pixels, routed as frescod routes its own input devices'.
     Input(Input),
@@ -80,6 +87,7 @@ mod kind {
     pub const SESSION: u32 = 1;
     pub const WANT: u32 = 2;
     pub const INPUT: u32 = 3;
+    pub const OUTPUT: u32 = 4;
     pub const CHANGED: u32 = 0x10;
     pub const DATA: u32 = 0x11;
     pub const END: u32 = 0x12;
@@ -170,6 +178,9 @@ impl Rec {
                 };
                 Head { kind: INPUT, window: 0, ticket: sub, flag, a, b, len: 0 }
             }
+            Rec::Output { width, height, scale_milli } => {
+                Head { kind: OUTPUT, window: 0, ticket: 0, flag: 0, a: u64::from(*width) | u64::from(*height) << 32, b: u64::from(*scale_milli), len: 0 }
+            }
             Rec::Layout { screen, windows } => {
                 for p in windows {
                     payload.extend_from_slice(&p.window.to_le_bytes());
@@ -199,7 +210,7 @@ impl Rec {
             kind::DATA => MAX_DATA,
             kind::LAYOUT => MAX_LAYOUT * PLACED,
             kind::CHROME => chrome::MAX_BODY,
-            kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT => 0,
+            kind::SESSION | kind::WANT | kind::CHANGED | kind::END | kind::INPUT | kind::OUTPUT => 0,
             _ => return Err(Refused("unknown kind")),
         };
         if len > max {
@@ -308,6 +319,15 @@ impl Rec {
                     windows.push(p);
                 }
                 Rec::Layout { screen, windows }
+            }
+            OUTPUT => {
+                unused(h.window == 0 && h.ticket == 0 && h.flag == 0)?;
+                let (width, height) = (h.a as u32, (h.a >> 32) as u32);
+                let scale_milli = u32::try_from(h.b).map_err(|_| Refused("output scale"))?;
+                if !OUTPUT_SIDE.contains(&width) || !OUTPUT_SIDE.contains(&height) || !OUTPUT_SCALE.contains(&scale_milli) {
+                    return Err(Refused("output size or scale"));
+                }
+                Rec::Output { width, height, scale_milli }
             }
             CHROME => {
                 unused(h.window == 0 && h.ticket == 0 && h.flag == 0 && h.a == 0 && h.b == 0)?;

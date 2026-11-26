@@ -85,10 +85,33 @@ pub struct Views {
     /// Whole-desktop sessions: the host's trusted chrome and background,
     /// and the chrome as last drawn here.
     pub chrome: Mutex<Option<Chrome>>,
+    /// What the host's remote output should be: this viewer's window or
+    /// screen, device pixels and scale (§4.1). Sent on connect and when it
+    /// changes.
+    output: Mutex<Option<(u32, u32, u32)>>,
+    output_moved: tokio::sync::Notify,
     chrome_drawn: Mutex<ChromeDrawn>,
 }
 
 impl Views {
+    /// Ask for the host's remote output to be `width` x `height` device
+    /// pixels at `scale_milli`, each brought into what the wire takes.
+    pub fn set_output(&self, width: u32, height: u32, scale_milli: u32) {
+        let side = |v: u32| v.clamp(*scene::OUTPUT_SIDE.start(), *scene::OUTPUT_SIDE.end());
+        let scale = scale_milli.clamp(*scene::OUTPUT_SCALE.start(), *scene::OUTPUT_SCALE.end());
+        let new = Some((side(width), side(height), scale));
+        let mut o = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        if *o != new {
+            *o = new;
+            self.output_moved.notify_one();
+        }
+    }
+
+    fn output(&self) -> Option<Control> {
+        let o = *self.output.lock().unwrap_or_else(|e| e.into_inner());
+        o.map(|(width, height, scale_milli)| Control::Output { width, height, scale_milli })
+    }
+
     fn resume(&self) -> Vec<(u32, u64, u64)> {
         let w = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         w.iter()
@@ -102,14 +125,28 @@ impl Views {
 pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), WireError> {
     let (mut control, mut control_in) = hc.control.split();
     control.send(&Msg::App(Control::Resume(views.resume()).encode())).await?;
+    if let Some(o) = views.output() {
+        control.send(&Msg::App(o.encode())).await?;
+    }
     // The person's input, to the host on the control stream. What came
     // while no connection was up is dropped, never replayed (§8.6): it was
     // meant for a screen the person could not see.
+    let views_o = views.clone();
     let sending = async move {
         let mut rx = input.lock().await;
         while rx.try_recv().is_ok() {}
-        while let Some(i) = rx.recv().await {
-            control.send(&Msg::App(Control::Input(i).encode())).await?;
+        loop {
+            tokio::select! {
+                i = rx.recv() => match i {
+                    Some(i) => control.send(&Msg::App(Control::Input(i).encode())).await?,
+                    None => break,
+                },
+                _ = views_o.output_moved.notified() => {
+                    if let Some(o) = views_o.output() {
+                        control.send(&Msg::App(o.encode())).await?;
+                    }
+                }
+            }
         }
         std::future::pending::<Result<(), WireError>>().await
     };
@@ -130,7 +167,7 @@ pub async fn run(hc: HostConn, views: Arc<Views>, input: Inputs) -> Result<(), W
                         Control::Chrome(c) => {
                             *views.chrome.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
                         }
-                        Control::Resume(_) | Control::Input(_) => return Err(WireError::Protocol("a viewer's message from the host")),
+                        Control::Resume(_) | Control::Input(_) | Control::Output { .. } => return Err(WireError::Protocol("a viewer's message from the host")),
                     },
                     Ok(_) => return Err(WireError::Protocol("unexpected control message")),
                     // The host ending the session is an end, not an error.

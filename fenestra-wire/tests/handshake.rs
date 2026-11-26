@@ -172,6 +172,14 @@ fn scene_framing_round_trips_and_refuses() {
     assert!(Control::decode(&twice.encode()).is_err());
     let zero = Control::Layout { screen: (9, 9), windows: vec![(2, 0, 0, 0, 1)] };
     assert!(Control::decode(&zero.encode()).is_err());
+    // A viewer's output: in range, or refused.
+    let o = Control::Output { width: 1600, height: 900, scale_milli: 2000 };
+    assert_eq!(Control::decode(&o.encode()).unwrap(), o);
+    for bad in [(63, 900, 1000), (1600, 8193, 1000), (1600, 900, 499), (1600, 900, 4001)] {
+        let c = Control::Output { width: bad.0, height: bad.1, scale_milli: bad.2 };
+        assert!(Control::decode(&c.encode()).is_err(), "{bad:?}");
+    }
+    assert!(Control::decode(&o.encode()[..12]).is_err());
     use fenestra_wire::scene::Input;
     for i in [
         Input::Key { usage: 0x28, pressed: true, modifiers: 2 },

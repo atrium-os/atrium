@@ -1308,10 +1308,20 @@ fn headless_outputs() -> Vec<fresco_protocol::WmOutput> {
     out
 }
 
+/// A viewer's window or screen as the headless desktop's one output
+/// (fenestra.md §4.1): `w` x `h` device pixels at its scale.
+fn remote_output(w: u32, h: u32, scale_milli: u32) -> fresco_protocol::WmOutput {
+    fresco_protocol::WmOutput {
+        output: 0, identity: 0x4645_4e00, rect: fresco_protocol::WmRect { x: 0, y: 0, w: w as i32, h: h as i32 },
+        refresh_mhz: 60_000, present: true, scale_milli: fresco_protocol::output_scale(scale_milli, 1000), auto_scale_milli: scale_milli,
+        ui_size_milli: 1000, ui_size_set: false, internal: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+    }
+}
+
 fn run_headless(png: &str) -> std::io::Result<()> {
     let outs = headless_outputs();
-    let W: u32 = outs.iter().map(|o| (o.rect.x + o.rect.w) as u32).max().unwrap_or(1280);
-    let H: u32 = outs.iter().map(|o| o.rect.h as u32).max().unwrap_or(720);
+    let mut W: u32 = outs.iter().map(|o| (o.rect.x + o.rect.w) as u32).max().unwrap_or(1280);
+    let mut H: u32 = outs.iter().map(|o| o.rect.h as u32).max().unwrap_or(720);
 
     let mut renderer = Backend::from_env(W, H, None, load_bundles).map_err(io_other)?;
     eprintln!("frescod-headless: renderer {}", renderer.name());
@@ -1432,6 +1442,36 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         eprintln!("start-trace frescod {stage} mono_us={} pid={} {tag}", video::monotonic_ns() / 1000, std::process::id());
     };
     loop {
+        /* A viewer's remote output (fenestra.md §4.1): with no monitor of
+         * its own, the headless desktop takes the viewer's size and scale
+         * while its session is on, and its own outputs back after. */
+        if let Some(change) = split.as_ref().and_then(|b| b.take_output()) {
+            let outs = match change {
+                Some((w, h, s)) => vec![remote_output(w, h, s)],
+                None => headless_outputs(),
+            };
+            let nw: u32 = outs.iter().map(|o| (o.rect.x + o.rect.w) as u32).max().unwrap_or(W);
+            let nh: u32 = outs.iter().map(|o| o.rect.h as u32).max().unwrap_or(H);
+            if (nw, nh) != (W, H) {
+                renderer.resize_headless(nw, nh, load_bundles).map_err(io_other)?;
+                (W, H) = (nw, nh);
+            }
+            let info = {
+                let mut fe = frontend.lock().unwrap();
+                fe.set_outputs(outs);
+                screen::set_outputs(fe.display_outputs().outputs);
+                fe.set_display_mode(W, H, 0);
+                fe.display_info()
+            };
+            screen::set(W, H, 60_000);
+            eprintln!("frescod-headless: {} {W}x{H} at scale {}", if change.is_some() { "the viewer's output:" } else { "own outputs again:" }, info.scale_milli);
+            let _ = ev_tx.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
+                width: info.width, height: info.height,
+                refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
+                scale_milli: info.scale_milli,
+            });
+            last_gen = 0; /* repaint at once */
+        }
         let next_island = socket_server::retire_idle_islands(&comp, island_idle);
         let cur = redraw2.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;

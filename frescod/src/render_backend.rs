@@ -238,6 +238,21 @@ impl<'a> Backend<'a> {
         Ok(())
     }
 
+    /// [`Backend::resize`] with no device: the headless desktop taking a
+    /// viewer's size (the gpu renderer needs its device, so is refused).
+    pub fn resize_headless(&mut self, width: u32, height: u32, load_bundles: impl FnOnce(&mut HeadlessRenderer) -> Result<()>) -> Result<()> {
+        match self {
+            Backend::Compute(_) => self.replace(Backend::Compute(Box::new(Compute::new(width, height)?))),
+            Backend::Gpu(_) => return Err("the gpu renderer cannot resize without its device".into()),
+            Backend::Vulkan(_) => {
+                let mut r = HeadlessRenderer::new(width, height).map_err(|e| format!("HeadlessRenderer::new: {e}"))?;
+                load_bundles(&mut r)?;
+                *self = Backend::Vulkan(Box::new(r));
+            }
+        }
+        Ok(())
+    }
+
     /// Rebuild the renderer for a new screen size (a mode switch), keeping
     /// its kind. `vm` is needed for the gpu renderer, `load_bundles` for Vulkan.
     pub fn resize(

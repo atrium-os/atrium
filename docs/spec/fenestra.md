@@ -1691,6 +1691,19 @@ root side's own; the unprivileged side can ask for a jail but not say what is in
 at most two (one more during a take-over). The root side ends with the other side. fenestrad is not
 yet in a jail of its own (it would need jaild to pass it the frescod link and mint socket). Without `--jaild` a session is a plain child (other systems, hosts without jaild).
 
+**The viewer's size and scale (§4.1), first step.** The viewer asks for a remote output of its
+window's size in device pixels and its scale (`Control::Output`, sides 64 to 8192, scale 0.5 to
+4.0; the windowed viewer on connect and as the window is resized, the headless one with
+`--output WxH[@SCALE]`). The session passes the latest on at most every 250 ms (`Rec::Output`),
+fenestrad only from a session that is on, and frescod's broker keeps it while the session is on.
+A **headless** host (no monitor of its own) makes it its one output: the desktop takes the
+viewer's size and scale (renderer resized, outputs and display mode republished, a
+`DisplayChanged` to every client), so apps lay out and rasterise text at the viewer's scale, and
+it gets its own outputs back when the session ends. `FEN_OUTPUT=1600x900@1.5
+scripts/fenestra-desktop-vm.sh` 15/15: the host's screen is 1600x900 with Sheets at 1.5 and the
+viewer's desktop equals it pixel for pixel. A host with its own monitors does not take it yet: a
+remote output beside them (or mirroring at the viewer's scale, §4.2) is the next step.
+
 **UDP blocked (§8.6).** Rather than a second protocol over TLS-over-TCP, the same QUIC
 connection is carried over TCP on the session's port (`fenestra-wire/src/tcp.rs`): each datagram
 `len u16 | bytes`, bounded at 16 KiB, through a `quinn::AsyncUdpSocket` that takes TCP peers on the
@@ -1720,7 +1733,7 @@ usages by key position, modifiers, repeats left to the host), pointer, buttons a
 back in the host screen's pixels. `--headless --out DIR` is the gates' form. A connection lost
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
-**Next in R2.** fenestrad in a jail of its own; remote outputs at the viewer's size and scale; compressing
+**Next in R2.** fenestrad in a jail of its own; a remote output on a host with its own monitors; compressing
 region updates as blobs are.
 
 ## 20. Sources

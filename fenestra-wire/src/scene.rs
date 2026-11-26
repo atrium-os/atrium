@@ -8,6 +8,8 @@
 //! - on the control stream, `Msg::App` bodies of [`Control`].
 
 pub use fenestra_link::chrome;
+/// The bounds of a viewer's output (`Control::Output`).
+pub use fenestra_link::{OUTPUT_SCALE, OUTPUT_SIDE};
 use crate::WireError;
 
 /// `magic u32 | window u32 | epoch u64` at the start of a window stream.
@@ -116,6 +118,10 @@ pub enum Control {
     /// Host, whole-desktop sessions: frescod's trusted chrome and the
     /// background (§11.5), drawn above and below the windows.
     Chrome(fenestra_link::chrome::Chrome),
+    /// Viewer: the size (device pixels) and scale its remote output should
+    /// have (§4.1): its window or screen. Sent on connect and when it
+    /// changes.
+    Output { width: u32, height: u32, scale_milli: u32 },
 }
 
 /// A viewer's input event (§9).
@@ -169,6 +175,12 @@ impl Control {
                     b.extend_from_slice(&dy.to_le_bytes());
                 }
             },
+            Control::Output { width, height, scale_milli } => {
+                b.push(9);
+                b.extend_from_slice(&width.to_le_bytes());
+                b.extend_from_slice(&height.to_le_bytes());
+                b.extend_from_slice(&scale_milli.to_le_bytes());
+            }
             Control::Chrome(c) => {
                 b.push(8);
                 b.extend_from_slice(&c.encode());
@@ -259,6 +271,14 @@ impl Control {
                     windows.push(p);
                 }
                 Ok(Control::Layout { screen, windows })
+            }
+            Some(9) if b.len() == 13 => {
+                let (width, height, scale_milli) = (u32_at(1)?, u32_at(5)?, u32_at(9)?);
+                let side = &OUTPUT_SIDE;
+                if !side.contains(&width) || !side.contains(&height) || !OUTPUT_SCALE.contains(&scale_milli) {
+                    return Err(bad());
+                }
+                Ok(Control::Output { width, height, scale_milli })
             }
             Some(8) => fenestra_link::chrome::Chrome::decode(&b[1..]).map(Control::Chrome).map_err(|_| bad()),
             _ => Err(bad()),

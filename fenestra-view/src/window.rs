@@ -108,6 +108,8 @@ impl ApplicationHandler<()> for App {
                 return;
             }
         }
+        let size = w.inner_size();
+        self.views.set_output(size.width, size.height, (w.scale_factor() * 1000.0).round() as u32);
         self.window = Some(w);
     }
 
@@ -121,8 +123,10 @@ impl ApplicationHandler<()> for App {
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => self.draw(),
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(size) => {
                 if let Some(w) = &self.window {
+                    // The host's output follows the window (§4.1).
+                    self.views.set_output(size.width, size.height, (w.scale_factor() * 1000.0).round() as u32);
                     w.request_redraw();
                 }
             }

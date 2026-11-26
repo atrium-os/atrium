@@ -45,7 +45,14 @@ struct State {
 pub struct LinkSource {
     out: mpsc::Sender<Rec>,
     state: Mutex<State>,
+    /// The viewer's latest output; sent on at most every [`OUTPUT_EVERY`]
+    /// (a window being dragged larger sends many).
+    output: watch::Sender<Option<(u32, u32, u32)>>,
 }
+
+/// The least time between two outputs passed to frescod (each one
+/// reconfigures its screen and every app re-lays out).
+const OUTPUT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl LinkSource {
     /// Run the link over `io` (read and write halves). Returns the source
@@ -57,7 +64,19 @@ impl LinkSource {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (out, mut rx) = mpsc::channel::<Rec>(1024);
-        let src = Arc::new(LinkSource { out, state: Mutex::new(State::default()) });
+        let (output, mut outputs) = watch::channel(None);
+        let src = Arc::new(LinkSource { out: out.clone(), state: Mutex::new(State::default()), output });
+        tokio::spawn(async move {
+            while outputs.changed().await.is_ok() {
+                let o = *outputs.borrow_and_update();
+                if let Some((width, height, scale_milli)) = o {
+                    if out.send(Rec::Output { width, height, scale_milli }).await.is_err() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(OUTPUT_EVERY).await;
+            }
+        });
         let (wake_tx, wake_rx) = watch::channel(0u64);
         tokio::spawn(async move {
             let mut write = write;
@@ -144,7 +163,7 @@ impl LinkSource {
                     }
                     let _ = p.done.send(Ok(now.map(|v| (p.bytes, v))));
                 }
-                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } => unreachable!("from_broker() refused it"),
             }
         }
     }
@@ -201,6 +220,15 @@ impl Source for LinkSource {
     fn chrome(&self) -> Option<(u64, Control)> {
         let st = self.state.lock().ok()?;
         Some((st.chrome_gen, Control::Chrome(st.chrome.clone()?)))
+    }
+
+    fn output(&self, width: u32, height: u32, scale_milli: u32) {
+        self.output.send_if_modified(|o| {
+            let new = Some((width, height, scale_milli));
+            let moved = *o != new;
+            *o = new;
+            moved
+        });
     }
 
     fn layout(&self) -> Option<(u64, Control)> {

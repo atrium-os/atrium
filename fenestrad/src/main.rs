@@ -204,7 +204,7 @@ impl Relay {
                         Relay::to_session(&mut t, id, Rec::End { window, ticket: theirs, now });
                     }
                 }
-                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) => unreachable!("from_broker() refused it"),
+                Rec::Session { .. } | Rec::Want { .. } | Rec::Input(_) | Rec::Output { .. } => unreachable!("from_broker() refused it"),
             }
             // A session ended for not reading may have been the one on.
             self.sync_on(&mut t);
@@ -247,6 +247,15 @@ impl Relay {
                     t.tickets.insert(ours, (id, ticket));
                     drop(t);
                     if let Err(e) = self.to_frescod(&Rec::Want { window, ticket: ours, base }) {
+                        die(format!("frescod: {e}"));
+                    }
+                }
+                // The viewer's output, from a session that is on only (frescod
+                // paces how often it reconfigures).
+                Rec::Output { .. } if !s.on => {}
+                Rec::Output { .. } => {
+                    drop(t);
+                    if let Err(e) = self.to_frescod(&rec) {
                         die(format!("frescod: {e}"));
                     }
                 }

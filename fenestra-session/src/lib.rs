@@ -117,6 +117,9 @@ pub trait Source: Send + Sync + 'static {
     fn chrome(&self) -> Option<(u64, scene::Control)> {
         None
     }
+    /// A viewer's output (its size in device pixels and scale), already
+    /// bounded by the control decoder. The simulator ignores it.
+    fn output(&self, _width: u32, _height: u32, _scale_milli: u32) {}
     /// A viewer's input, already bounded and rate-limited by [`serve`].
     /// The simulator has nowhere to send it.
     fn input(&self, _i: scene::Input) {}
@@ -201,6 +204,7 @@ pub async fn serve<S: Source>(
                                 stats.inputs_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        Ok(Control::Output { width, height, scale_milli }) => host.output(width, height, scale_milli),
                         Ok(_) => break Err(WireError::Protocol("unexpected control message")),
                         Err(e) => break Err(e),
                     },
