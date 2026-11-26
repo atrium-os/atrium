@@ -1053,6 +1053,24 @@ impl Compositor {
         )
     }
 
+    /// The strip now holds `rows` (device pixels): pop-ups and new windows
+    /// go below it, and a window still where frescod opened it, at
+    /// `(0, the old rows)`, moves to just below the new strip. Anything
+    /// placed by the app's hint, a WM or a drag stays put; a WM lays out
+    /// again on the `DisplayChanged` that follows.
+    pub fn set_strip_rows(&mut self, rows: f32) {
+        let old = self.popup_top;
+        self.popup_top = rows;
+        if old == rows {
+            return;
+        }
+        for w in self.windows.values_mut() {
+            if w.id != 0 && w.popup.is_none() && w.slot.is_none() && w.pos == (0.0, old) {
+                w.pos.1 = rows;
+            }
+        }
+    }
+
     pub fn create(&mut self, owner: ClientId, size: (u32, u32)) -> WindowId {
         /* Take the next free id, wrapping past u16::MAX and skipping the
          * screen (0). A saturating counter handed id 65535 to every window
@@ -2377,6 +2395,13 @@ mod notification_tests {
         c.popup_top = 36.0;
         let a = c.create(1, (300, 200));
         assert_eq!(c.windows[&a].pos, (0.0, 36.0), "no app content under the trusted strip");
+        let b = c.create(1, (300, 200));
+        c.windows.get_mut(&b).unwrap().pos = (0.0, 10.0);
+        c.set_strip_rows(48.0);
+        assert_eq!(c.windows[&a].pos, (0.0, 48.0), "follows the strip when it grows");
+        assert_eq!(c.windows[&b].pos, (0.0, 10.0), "a placed window stays");
+        c.set_strip_rows(24.0);
+        assert_eq!(c.windows[&a].pos, (0.0, 24.0), "and when it shrinks");
     }
 
     #[test]

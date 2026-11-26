@@ -108,7 +108,7 @@ Still to do, with F4f: an "obscured" mark on input when another app's visible co
 - Verified in the amd64 VM with both renderers jailed, using `atrium-chrome-demo`, which plays the Navigator with two documents. Document 2 paints a fake badge in its own window. The strip named `https://bank.example` while document 1 had focus and `https://evil.example:8443` while document 2 had focus, and the ring moved with it (screenshots `frescod-f4d-chrome-*.png`). A click on the strip went to the WM.
 
 - **The WM lays out below the strip.** `DISPLAY_INFO` carries `reserved_top`, the rows frescod's chrome holds (24 in split mode, 0 otherwise). forum-wm starts its screen there, so the bar sits just under the strip and documents under the bar. Verified in the VM: a document under forum-wm on a 1280x720 screen got 1280x624 (strip 24, bar 24, dock 48).
-- **With no WM, a new window opens below the strip.** frescod opens every window at `(0, reserved_top)` until a WM moves it, so a session without forum-wm (per-app compositing, a bare Fenestra session) does not put an app's top rows under the strip.
+- **With no WM, a new window opens below the strip.** frescod opens every window at `(0, reserved_top)` until a WM moves it, so a session without forum-wm (per-app compositing, a bare Fenestra session) does not put an app's top rows under the strip. When the strip's height changes (a new scale), a window still at frescod's spot moves with it; a window placed by its app's hint, a WM or a drag stays where it is.
 
 Still to do:
 - The chrome is drawn only in split mode, where the chrome channel exists.

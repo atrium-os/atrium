@@ -506,7 +506,7 @@ impl EnvelopeFrontend {
     fn update_reserved_top(&mut self, scale_milli: u32) {
         let rows = if self.strip_pt == 0 { 0 } else { fresco_protocol::pt_to_device(self.strip_pt as f32, scale_milli) };
         self.reserved_top = rows;
-        self.compositor.lock().unwrap().popup_top = rows as f32;
+        self.compositor.lock().unwrap().set_strip_rows(rows as f32);
     }
 
     pub fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) {
@@ -634,7 +634,7 @@ impl EnvelopeFrontend {
         let rows = if self.strip_pt == 0 { 0 } else { fresco_protocol::pt_to_device(self.strip_pt as f32, origin.scale_milli) };
         self.reserved_top = rows;
         comp.new_scale_milli = origin.scale_milli;
-        comp.popup_top = rows as f32;
+        comp.set_strip_rows(rows as f32);
         comp.output_scales = present
             .iter()
             .map(|o| {
