@@ -1215,6 +1215,8 @@ mod run {
             // The server is handed the address (share::argv): no DNS.
             no_resolver: true,
             tag: None,
+            // A share server serves its share through FUSE, never a port.
+            listen: vec![],
         };
         let stdio = fuse.is_none();
         Ok(CreateJailRequest {
