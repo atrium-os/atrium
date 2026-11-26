@@ -152,6 +152,9 @@ pub struct CellView {
     pub fill_at: Option<usize>,
     /// How the text spreads over the cell's width beyond `align`.
     pub spread: Spread,
+    /// Several lines spaced evenly from the top edge to the bottom (a
+    /// spreadsheet's vertical Justify and Distributed); one line centred.
+    pub vspread: bool,
 }
 
 /// A spreadsheet's other horizontal alignments, drawn from the left.
@@ -420,7 +423,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, spark: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, mono: false, fill_at: None, spread: Spread::None, vspread: false }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -2674,8 +2677,14 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         let room = (((ch - 2.0 * LINE_PAD) / lh).floor() as usize).max(1);
         let n = lines.len().min(room);
         let top = if lines.len() <= room { cy + line_top(cv.valign, ch, n as f32 * lh) } else { cy + LINE_PAD };
+        // Vertical spread: the first line at the top, the last at the bottom.
+        let (top, step) = match (cv.vspread, n) {
+            (true, 1) => (cy + line_top(CellVAlign::Center, ch, lh), lh),
+            (true, _) => (cy + LINE_PAD, lh + ((ch - 2.0 * LINE_PAD - n as f32 * lh) / (n - 1) as f32).max(0.0)),
+            _ => (top, lh),
+        };
         for (i, (line, last)) in lines.iter().take(n).enumerate() {
-            let y = top + i as f32 * lh;
+            let y = q((top + i as f32 * step) as f64);
             if spread && spread_line(ctx, line, cx + PAD + lead, y, avail, lh, &style, cv, *last) {
                 continue;
             }
@@ -2685,7 +2694,7 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
                 CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
                 CellAlign::Right => cx + q((cw - PAD - w) as f64),
             };
-            cell_text(ctx, Rect::new(tx0, top + i as f32 * lh, w, lh), shown, style.clone(), cv.marks);
+            cell_text(ctx, Rect::new(tx0, y, w, lh), shown, style.clone(), cv.marks);
         }
         return;
     }
@@ -3774,6 +3783,19 @@ mod tests {
         let w = widths(u | acc);
         assert!(w.len() == 1 && w[0] > 80.0, "{w:?}");
         assert_eq!(widths(u | acc | crate::inline::Emphasis::Double as u8).len(), 2);
+        // Vertical justify: wrapped lines spread from the top edge to the
+        // bottom; one line sits in the middle.
+        let ys = |cv: CellView| {
+            let (t, _) = draw(cv, 60.0, 200.0);
+            t.iter().map(|x| x.2).fold(Vec::new(), |mut v: Vec<f32>, y| { if v.last() != Some(&y) { v.push(y); } v })
+        };
+        let words = "one two three four five six";
+        let plain = ys(CellView { wrap: true, ..CellView::text(words) });
+        let spread = ys(CellView { wrap: true, vspread: true, ..CellView::text(words) });
+        assert!(plain.len() >= 3 && spread.len() == plain.len(), "{plain:?} {spread:?}");
+        assert!(spread[0] < 10.0 && *spread.last().unwrap() > 150.0 && *plain.last().unwrap() < 150.0, "{plain:?} {spread:?}");
+        let one = ys(CellView { wrap: true, vspread: true, ..CellView::text("x") });
+        assert!(one.len() == 1 && (one[0] - 90.0).abs() < 15.0, "{one:?}");
     }
 
     #[test]

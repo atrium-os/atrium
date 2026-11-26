@@ -126,6 +126,9 @@ pub enum GridOp {
     Protection { sheet: u16, protection: Option<crate::protection::SheetProtection> },
     /// The workbook's document properties, all replaced.
     Properties(crate::docprops::DocProps),
+    /// The 1904 date system on (`true`) or off: the same serial numbers,
+    /// read as dates four years and a day later. Everything recalculates.
+    DateSystem1904(bool),
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -381,6 +384,11 @@ impl GridOp {
                     }
                     None => w.u8(0),
                 }
+                return w.into_bytes();
+            }
+            GridOp::DateSystem1904(on) => {
+                w.u8(38);
+                w.u8(u8::from(*on));
                 return w.into_bytes();
             }
             GridOp::Properties(p) => {
@@ -680,6 +688,17 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::Protection { sheet, protection });
+        }
+        if kind == 38 {
+            let on = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Invalid("date system")),
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::DateSystem1904(on));
         }
         if kind == 37 {
             let p = crate::docprops::DocProps::decode(&mut r)?;
@@ -1037,6 +1056,15 @@ impl Op<Workbook> for GridOp {
                 GridOp::Protection { sheet, protection }
             }
             GridOp::Properties(p) => GridOp::Properties(std::mem::replace(&mut wb.props, p)),
+            GridOp::DateSystem1904(on) => {
+                use crate::eval::dates::DateSystem;
+                let old = wb.date_system == DateSystem::Excel1904;
+                wb.date_system = if on { DateSystem::Excel1904 } else { DateSystem::Excel1900 };
+                if old != on {
+                    wb.mark_all(None);
+                }
+                GridOp::DateSystem1904(old)
+            }
             GridOp::IgnoredErrors { sheet, mut list } => {
                 match wb.sheets.get_mut(sheet as usize) {
                     Some(sh) if crate::sheetareas::valid_ignored(&list) => std::mem::swap(&mut sh.ignored, &mut list),
@@ -1276,6 +1304,28 @@ mod tests {
     fn a(s: &str) -> CellAddr {
         let (r, c) = crate::addr::parse_a1(s).unwrap();
         CellAddr::new(0, r, c)
+    }
+
+    #[test]
+    fn the_1904_date_system_is_an_op_that_undoes_and_recalculates() {
+        use crate::eval::dates::DateSystem;
+        let mut wb = Workbook::new();
+        wb.add_sheet("One").unwrap();
+        let op = GridOp::DateSystem1904(true);
+        assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        assert_eq!(op.encode(), [38, 1]);
+        assert!(GridOp::decode(&[38, 2]).is_err() && GridOp::decode(&[38, 1, 0]).is_err() && GridOp::decode(&[38]).is_err());
+        wb.set_input(CellAddr::new(0, 0, 0), "=DATE(1904,1,2)").unwrap();
+        wb.recalc();
+        assert_eq!(wb.value(0, 0, 0), Value::Num(1463.0));
+        let mut h: History<GridOp> = History::new();
+        h.run(&mut wb, "Date System", vec![op]);
+        assert_eq!(wb.date_system(), DateSystem::Excel1904);
+        wb.recalc();
+        assert_eq!(wb.value(0, 0, 0), Value::Num(1.0));
+        h.undo(&mut wb);
+        wb.recalc();
+        assert_eq!((wb.date_system(), wb.value(0, 0, 0)), (DateSystem::Excel1900, Value::Num(1463.0)));
     }
 
     #[test]

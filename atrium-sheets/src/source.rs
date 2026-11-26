@@ -214,6 +214,10 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
         VAlign::Center => CellVAlign::Center,
         VAlign::Bottom | VAlign::Justify | VAlign::Distributed => CellVAlign::Bottom,
     };
+    if matches!(st.v_align, VAlign::Justify | VAlign::Distributed) {
+        cv.vspread = true;
+        cv.wrap = true;
+    }
     Some(cv)
 }
 
@@ -1325,6 +1329,43 @@ mod tests {
         drop(d);
         assert!(s.cell(0, 1).unwrap().wrap);
         assert!(s.fit_height(0) > 2.0 * default, "{}", s.fit_height(0));
+    }
+
+    #[test]
+    fn vertical_justify_and_distribute_spread_wrapped_lines() {
+        use crate::data::{run, DataCmd};
+        let s = src(&[(0, 0, "one two three")]);
+        let sel = pergola::widgets::CellRange { r0: 0, c0: 0, r1: 0, c1: 0 };
+        assert!(!s.cell(0, 0).unwrap().vspread);
+        for (cmd, want) in [(DataCmd::AlignJustifyV, VAlign::Justify), (DataCmd::AlignDistributedV, VAlign::Distributed)] {
+            run(&mut s.doc.borrow_mut(), sel, (0, 0), cmd);
+            assert_eq!(s.doc.borrow().wb.style(CellAddr::new(0, 0, 0)).v_align, want);
+            let cv = s.cell(0, 0).unwrap();
+            assert!(cv.vspread && cv.wrap);
+        }
+        run(&mut s.doc.borrow_mut(), sel, (0, 0), DataCmd::AlignTop);
+        assert!(!s.cell(0, 0).unwrap().vspread);
+    }
+
+    #[test]
+    fn the_1904_date_system_switches_and_undoes() {
+        use crate::data::{run, DataCmd};
+        use officina_grid::eval::dates::DateSystem;
+        let s = src(&[(0, 0, "=DATE(2024,1,1)")]);
+        let sel = pergola::widgets::CellRange { r0: 0, c0: 0, r1: 0, c1: 0 };
+        let mut d = s.doc.borrow_mut();
+        d.wb.recalc();
+        let before = d.wb.value(0, 0, 0);
+        run(&mut d, sel, (0, 0), DataCmd::DateSystem1904);
+        assert_eq!(d.wb.date_system(), DateSystem::Excel1904);
+        d.wb.recalc();
+        match (d.wb.value(0, 0, 0), &before) {
+            (Value::Num(a), Value::Num(b)) => assert_eq!(b - a, 1462.0),
+            other => panic!("{other:?}"),
+        }
+        d.undo();
+        d.wb.recalc();
+        assert_eq!((d.wb.date_system(), d.wb.value(0, 0, 0)), (DateSystem::Excel1900, before));
     }
 
     fn src(cells: &[(u32, u32, &str)]) -> SheetSource {

@@ -33,3 +33,4 @@ pub mod dataform;
 pub mod special;
 pub mod symbols;
 pub mod lock;
+pub mod sheetbars;

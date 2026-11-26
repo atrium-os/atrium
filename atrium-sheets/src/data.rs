@@ -271,6 +271,14 @@ pub enum DataCmd {
     Properties,
     /// Insert Symbol (a bar); [`crate::symbols`].
     InsertSymbol,
+    /// Bars in [`crate::sheetbars`]: Font Size…, Move or Copy Sheet…,
+    /// Standard Width… and Standard Height….
+    FontSize,
+    MoveOrCopy,
+    StandardWidth,
+    StandardHeight,
+    /// The workbook's dates counted from 1904 (as old Mac Excel), or 1900.
+    DateSystem1904,
     /// Zero values shown or left blank on this sheet (a view setting).
     ZeroValues,
     /// Shrink to Fit on the selection.
@@ -293,6 +301,8 @@ pub enum DataCmd {
     AlignTop,
     AlignMiddle,
     AlignBottom,
+    AlignJustifyV,
+    AlignDistributedV,
     /// The merged areas the selection meets, back to separate cells.
     Unmerge,
     /// Write or change the cursor's cell comment; the window runs it (a bar
@@ -558,6 +568,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Row Height…"), Some(DataCmd::RowHeight)),
         (MenuItem::new("AutoFit Row Height"), Some(DataCmd::AutoFitRows)),
         (MenuItem::new("Column Width…"), Some(DataCmd::ColWidth)),
+        (MenuItem::new("Standard Height…"), Some(DataCmd::StandardHeight)),
+        (MenuItem::new("Standard Width…"), Some(DataCmd::StandardWidth)),
+        (MenuItem::new("Font Size…"), Some(DataCmd::FontSize)),
         (MenuItem::new("AutoFit Column Width"), Some(DataCmd::AutoFitCols)),
         (MenuItem::new("Unhide Columns").enabled(wb.sheet(s).col_sizes.overrides().iter().any(|&(c, w)| w <= 0.0 && (sel.c0..=sel.c1).contains(&c))), Some(DataCmd::UnhideCols)),
         (MenuItem::new(match wb.comment(s, row, col) {
@@ -590,6 +603,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Align Top").checked(v_at(wb, s, sel) == VAlign::Top), Some(DataCmd::AlignTop)),
         (MenuItem::new("Align Middle").checked(v_at(wb, s, sel) == VAlign::Center), Some(DataCmd::AlignMiddle)),
         (MenuItem::new("Align Bottom").checked(v_at(wb, s, sel) == VAlign::Bottom), Some(DataCmd::AlignBottom)),
+        (MenuItem::new("Justify Vertically").checked(v_at(wb, s, sel) == VAlign::Justify), Some(DataCmd::AlignJustifyV)),
+        (MenuItem::new("Distribute Vertically").checked(v_at(wb, s, sel) == VAlign::Distributed), Some(DataCmd::AlignDistributedV)),
         (MenuItem::new("Reapply Filter").enabled(any_cond).separated(), Some(DataCmd::ReapplyFilter)),
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Custom Sort…").enabled(some), Some(DataCmd::CustomSort)),
@@ -630,6 +645,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
         (MenuItem::new("Calculate Sheet").shortcut("Shift+F9"), Some(DataCmd::CalculateSheet)),
         (MenuItem::new("Manual Calculation").checked(wb.manual_calc()), Some(DataCmd::ManualCalc)),
+        (MenuItem::new("1904 Date System").checked(wb.date_system() == officina_grid::eval::dates::DateSystem::Excel1904), Some(DataCmd::DateSystem1904)),
         (MenuItem::new("Add Watch"), Some(DataCmd::AddWatch)),
         (MenuItem::new("Watch Window…"), Some(DataCmd::WatchWindow)),
         (MenuItem::new("Workbook Statistics…"), Some(DataCmd::WorkbookStats)),
@@ -730,6 +746,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let n = wb.sheet_count() as u16;
     v.push((MenuItem::new("Move Sheet Left").enabled(s > 0), Some(DataCmd::MoveSheetLeft)));
     v.push((MenuItem::new("Move Sheet Right").enabled(s + 1 < n), Some(DataCmd::MoveSheetRight)));
+    v.push((MenuItem::new("Move or Copy…"), Some(DataCmd::MoveOrCopy)));
     v.push((MenuItem::new("Delete Sheet").enabled(n > 1), Some(DataCmd::DeleteSheet)));
     use crate::app::{AuthorCmd, OutlineCmd, Split};
     use officina_grid::shift::Axis;
@@ -999,7 +1016,7 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
 pub fn repeatable(c: DataCmd) -> bool {
     use DataCmd::*;
     matches!(c, InsertRows | InsertCols | DeleteRows | DeleteCols | InsertCellsDown | InsertCellsRight | DeleteCellsUp | DeleteCellsLeft
-        | HideRows | HideCols | Merge | MergeAcross | Unmerge | CenterAcross | WrapText | AlignTop | AlignMiddle | AlignBottom
+        | HideRows | HideCols | Merge | MergeAcross | Unmerge | CenterAcross | WrapText | AlignTop | AlignMiddle | AlignBottom | AlignJustifyV | AlignDistributedV
         | ClearFormats | ClearAll | ClearComments | DeleteComments | RemoveLinks | PasteValues | PasteFormulas | PasteFormats
         | PasteTransposed | PasteComments | PasteSkipBlanks | PasteAdd | PasteSubtract | PasteMultiply | PasteDivide | PasteLink
         | SortAsc | SortDesc | AutoSum | FillCopy | FillSeries | FillFormats | FillNoFormats)
@@ -2879,11 +2896,13 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 Ok(std::mem::take(&mut d.status))
             }
         }
-        DataCmd::AlignTop | DataCmd::AlignMiddle | DataCmd::AlignBottom => {
+        DataCmd::AlignTop | DataCmd::AlignMiddle | DataCmd::AlignBottom | DataCmd::AlignJustifyV | DataCmd::AlignDistributedV => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
             let (to, word) = match cmd {
                 DataCmd::AlignTop => (VAlign::Top, "top"),
                 DataCmd::AlignMiddle => (VAlign::Center, "middle"),
+                DataCmd::AlignJustifyV => (VAlign::Justify, "full height (justified)"),
+                DataCmd::AlignDistributedV => (VAlign::Distributed, "full height (distributed)"),
                 _ => (VAlign::Bottom, "bottom"),
             };
             d.run("Vertical Alignment", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { v_align: to, ..st.clone() })]);
@@ -3139,7 +3158,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);
@@ -3241,6 +3260,13 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::Justify => crate::series::justify(d, sel),
         DataCmd::ProtectWorkbook => protect_workbook(d),
         DataCmd::ManualCalc => crate::formulas::toggle_manual(d),
+        DataCmd::DateSystem1904 => {
+            let on = d.wb.date_system() != officina_grid::eval::dates::DateSystem::Excel1904;
+            if !d.run_action("Date System", vec![GridOp::DateSystem1904(on)]) {
+                return Err(std::mem::take(&mut d.status));
+            }
+            Ok(if on { "Dates count from 1 January 1904; date serials now read four years and a day later.".into() } else { "Dates count from 1900 again.".into() })
+        }
         DataCmd::AddWatch => crate::formulas::add_watches(d, sel),
         DataCmd::ApplyNames => crate::formulas::apply_names(d, sel),
         DataCmd::AutoOutline => crate::formulas::auto_outline(d, sel),
