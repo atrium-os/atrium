@@ -230,38 +230,71 @@ rebinding). But the person can't open it either.
 
 **Proposal: navigatord asks for a connected socket; nothing new can dial.**
 
-- **Only an address the person typed.** The address bar, or a bookmark or
-  history entry they open, naming `localhost`, `127.0.0.1` or `[::1]`
-  with a port. A link, a redirect, a script or a form on any other page
-  never starts it; those stay refused by fetchd's address rules, as now.
-- **Only a port of the person's own server.** The port must be a
-  `this-computer` listen port of one of the person's apps that is running
-  now and that they allowed (§4.2). Any other port says "Nothing of yours
-  is serving port 8080". This keeps a page from probing other local
-  services, and keeps Navigator from reaching another person's servers.
+- **Only an address the person typed, per navigation.** "Typed" comes only
+  from navigator-ui's chrome socket, on a real Enter or press in the
+  address bar, or a bookmark or history entry the person opens; never from
+  the engine. It belongs to that one navigation, not to the tab. After it,
+  a localhost request is allowed only from a document of that exact origin
+  (same scheme, host and port). A link, redirect, script, form or
+  `window.location` from any other page never starts one, even in the tab
+  the person typed into, and neither does Monstrator's "open URL" from
+  another app. Those stay refused by fetchd's address rules, as now.
+- **One parser.** The address bar and fetchd share one parser that accepts
+  exactly `localhost`, `127.0.0.1` and `[::1]` with a port. It refuses
+  the rest of 127/8, `0.0.0.0`, `::ffff:127.0.0.1`, `localhost.` and
+  `*.localhost`. `localhost` is never resolved through DNS.
+- **Only a port of the person's own server, in that persona.** portcullisd
+  takes the person and persona from navigatord's peer uid (the launch
+  registry), never from the request. The port must be a `this-computer`
+  listen port of one of that persona's apps, running now and allowed
+  (§4.2). Any other port says "Nothing of yours is serving port 8080". So
+  a page can't probe other local services, and Navigator can't reach
+  another person's or another persona's servers.
+- **No confused deputy.** For every `OpenLocalPort`, navigatord checks its
+  own record of the page's top-level origin and the requested origin
+  (fetch, XHR, WebSocket, frames alike), never what the engine claims.
 - **How the bytes get there.** navigatord asks portcullisd
-  `OpenLocalPort { port }` (by its peer uid, for the person whose live
-  page it is). portcullisd checks the two rules above and asks jaild for a
-  connection to that app's port; jaild connects (root, which the base
-  rules allow) and passes the connected socket back through portcullisd to
-  navigatord, which hands it to that page's fetchd over its existing
-  socket. fetchd gets a new `Net` that holds only those sockets: it can
-  speak HTTP on them and dial nothing. One socket per request, at most 8
-  at once per page, refused once the server stops or the grant goes.
-- **The page is its own origin.** `http://localhost:8080` is an origin
-  like any other: its cookies and storage are its own, its subresources
-  load only from that same origin (each through a new socket), and links
-  out of it go to the normal web path. It is never cached or shared
-  (threat model §7.3), and the address bar shows a "Your computer" chip,
-  not a padlock. HTTPS to localhost isn't offered in v1.
+  `OpenLocalPort { port }`. portcullisd checks the rules above and asks
+  jaild to connect to that app's own jail address and port (from the
+  registry, never the host's loopback, where anything could listen), with
+  a 5 s connect timeout. jaild connects as root, which the base rules
+  allow, and passes the connected socket back through portcullisd to
+  navigatord. navigatord checks the socket's peer is that address, then
+  hands it to that page's fetchd over its existing socket. fetchd gets a
+  new `Net` that holds only those sockets: it can speak HTTP on them and
+  dial nothing. One socket per request; at most 8 open per page and 32
+  per persona; refused once the server stops or the grant goes.
+- **The origin belongs to the app, not the port.** Cookies, storage and
+  service workers for `http://localhost:8080` are kept per (app id, port),
+  so when another app later takes 8080 it starts empty and never sees the
+  first app's state. The jar is keyed by host and port for localhost
+  (cookies otherwise ignore ports, RFC 6265), so :8080 and :9090 share
+  nothing. Subresources load only from that same origin, each through a
+  new socket. Links out of it go to the normal web path. It is never cached
+  or shared (threat model §7.3). The address bar shows a "Your computer ·
+  Photo Server" chip, naming the app, not a padlock.
+- **Not a secure context.** Other browsers treat `http://localhost` as
+  secure. Navigator doesn't in v1: no service workers, no WebAuthn with
+  rpId `localhost`, no other secure-only APIs. HTTPS to localhost isn't
+  offered in v1.
 - **What it doesn't do.** No other host name that resolves to loopback,
   no LAN addresses (those go through the normal private-network rules),
-  no `listen` port of another person, no UDP.
+  no UDP. Pasting a GET with side effects into the bar is social
+  engineering, as in any browser; that is accepted.
 
 Checks for B6: a typed localhost opens the person's server; the same URL
-as a link from a page is refused; a port no app of theirs serves is
-refused; another person's server port is refused; after Quit the next
-request is refused; fetchd's own dial to 127.0.0.1 still fails.
+as a link, a redirect or a `window.location` from another page, even in
+the typed tab, is refused; a port no app of theirs serves is refused;
+another person's and another persona's ports are refused; after another
+app takes the port it starts with no cookies or storage; :8080 and :9090
+share no cookies; each address the parser refuses (127.0.0.2, 0.0.0.0,
+::ffff:127.0.0.1, localhost., a.localhost) is refused; after Quit the
+next request is refused; fetchd's own dial to 127.0.0.1 still fails.
+
+Review (2026-11-26, standing reviewer): three high findings (state
+outliving the server, persona not person, "typed" per navigation and only
+from the chrome), four medium and three low; all folded in above. Verdict:
+sound once the high ones were in.
 
 ## 5. The SDK and Artifex
 
@@ -361,6 +394,7 @@ Proposed 2026-11-26, open:
 | G12 | Should Navigator open only typed (or bookmarked) localhost addresses, never ones a page links to? | Yes (§4.4) |
 | G13 | Only ports of the person's own running, allowed servers, or any port on this computer? | Only their own servers' `this-computer` ports |
 | G14 | Plain HTTP only to localhost in v1? | Yes; HTTPS to localhost later if a template needs it |
+| G15 | Treat `http://localhost` as a secure context, as other browsers do? | Not in v1: no service workers or WebAuthn there |
 
 ### Review
 
