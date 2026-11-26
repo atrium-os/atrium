@@ -144,11 +144,13 @@ pub enum Event {
 /// A name a device gave (advertising, inquiry, Remote Name Request), made
 /// safe to show beside other devices' names: control characters (C0, C1)
 /// and the bidirectional embeddings, overrides and isolates (U+202A–202E,
-/// U+2066–2069) and marks (U+200E, U+200F, U+061C) are removed, so a
-/// device cannot redraw the line it is shown on or pose as another;
+/// U+2066–2069), direction marks (U+200E, U+200F, U+061C), line and
+/// paragraph separators (U+2028, U+2029) and zero-width characters (U+200B
+/// to U+200D, U+2060, U+FEFF) are removed, so a device cannot break or
+/// redraw the line it is shown on, hide a character or pose as another;
 /// whitespace at the ends is trimmed.
 pub fn clean_name(name: &str) -> String {
-    let keep = |c: &char| !c.is_control() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}');
+    let keep = |c: &char| !c.is_control() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{2060}' | '\u{FEFF}' | '\u{061C}');
     name.chars().filter(keep).collect::<String>().trim().to_string()
 }
 
@@ -231,5 +233,6 @@ mod tests {
         assert_eq!(clean_name(" Keys\u{202E}draobyek\u{202C}\n"), "Keysdraobyek");
         assert_eq!(clean_name("a\u{2066}b\u{0085}c\u{1b}[2J"), "abc[2J");
         assert_eq!(clean_name("Écouteurs ✓"), "Écouteurs ✓");
+        assert_eq!(clean_name("Mo\u{200B}use\u{2028}\u{FEFF}X\u{2029}"), "MouseX");
     }
 }
