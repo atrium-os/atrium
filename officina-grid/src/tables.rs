@@ -96,10 +96,12 @@ impl Table {
         (a <= b).then_some((a, b))
     }
 
-    /// The sheet column of the column named `name` (ignoring case).
+    /// The sheet column of the column named `name` (ignoring case, and a
+    /// carriage return before a line feed, as Excel saves one in a formula).
     pub fn col(&self, name: &str) -> Option<u32> {
-        let k = crate::eval::funcs::text_key(name);
-        self.columns.iter().position(|c| crate::eval::funcs::text_key(c) == k).map(|i| self.rect.c0 + i as u32)
+        let key = |s: &str| crate::eval::funcs::text_key(&s.replace("\r\n", "\n"));
+        let k = key(name);
+        self.columns.iter().position(|c| key(c) == k).map(|i| self.rect.c0 + i as u32)
     }
 
     /// What `t` reaches in this table: a range on the table's sheet, its rows the

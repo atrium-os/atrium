@@ -1662,7 +1662,10 @@ fn find_in(hay: &str, needle: &str, start: usize, ci: bool) -> Option<usize> {
     if n.is_empty() {
         return Some(start);
     }
-    (start..=h.len().saturating_sub(n.len())).find(|&i| h[i..i + n.len()] == n[..])
+    if n.len() > h.len() {
+        return None;
+    }
+    (start..=h.len() - n.len()).find(|&i| h[i..i + n.len()] == n[..])
 }
 fn find(c: &Ctx, a: &[Expr]) -> Ev {
     let needle = tri!(text(c, &a[0]));

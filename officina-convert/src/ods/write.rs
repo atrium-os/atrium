@@ -93,8 +93,12 @@ pub(super) fn esc(out: &mut String, s: &str) {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            // As references: an attribute's raw line ends and tabs read back as spaces.
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' => out.push_str("&#9;"),
             // XML 1.0 can't hold the other control characters.
-            c if (c as u32) < 0x20 && c != '\t' && c != '\n' => {}
+            c if (c as u32) < 0x20 => {}
             c => out.push(c),
         }
     }
@@ -185,7 +189,13 @@ fn text_line(out: &mut String, line: &str) {
                 out.push_str("<text:tab/>");
                 start = false;
             }
-            '\r' => {}
+            // A carriage return (Excel's CRLF in a cell) as a character reference,
+            // which XML keeps where a raw one would be read as a line end.
+            '\r' => {
+                flush(out, &mut spaces, start);
+                start = false;
+                out.push_str("&#13;");
+            }
             c => {
                 flush(out, &mut spaces, start);
                 start = false;
@@ -320,7 +330,12 @@ fn pieces(body: &str) -> Vec<(bool, String)> {
                 out.push((false, String::new()));
                 i += 2;
             }
-            '*' => i += 2, // repeat-fill: not in ODF
+            '*' => {
+                // Repeat-fill: `number:fill-character`.
+                out.push((true, format!("\u{1}{}", ch.get(i + 1).copied().unwrap_or(' '))));
+                out.push((false, String::new()));
+                i += 2;
+            }
             'E' | 'e' if matches!(ch.get(i + 1), Some('+' | '-')) && i > 0 && matches!(ch[i - 1], '0' | '#' | '?' | '.') => {
                 // An exponent: E+ / E- stay with the placeholders.
                 let e: String = ch[i..i + 2].iter().collect();
@@ -365,6 +380,12 @@ fn text_el(out: &mut String, t: &str) {
         out.push_str(r#""> </number:text>"#);
         return;
     }
+    if let Some(f) = t.strip_prefix('\u{1}') {
+        out.push_str("<number:fill-character>");
+        esc(out, f);
+        out.push_str("</number:fill-character>");
+        return;
+    }
     if t.is_empty() {
         return;
     }
@@ -374,7 +395,28 @@ fn text_el(out: &mut String, t: &str) {
 }
 
 fn is_date_body(p: &[(bool, String)]) -> bool {
-    p.iter().any(|(l, s)| !l && (s.contains(['y', 'Y', 'd', 'D', 'h', 'H', 's', 'S']) || s.contains("AM/PM") || s.contains("A/P") || s.starts_with("[h") || s.starts_with("[m") || s.starts_with("[s")) && !s.contains("General"))
+    if p.iter().any(|(l, s)| !l && s.to_ascii_lowercase().contains("general")) {
+        return false;
+    }
+    // Letters inside [..] (colours, [DBNum1], [$-804]) are not date parts.
+    let bare = |s: &str| {
+        let mut out = String::new();
+        let mut depth = 0;
+        for c in s.chars() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth = 0,
+                c if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
+    let digits = p.iter().any(|(l, s)| !l && bare(s).contains(['0', '#', '?', '@']));
+    p.iter().any(|(l, s)| {
+        let b = bare(s);
+        !l && (b.contains(['y', 'Y', 'd', 'D', 'h', 'H', 's', 'S']) || (!digits && b.contains(['m', 'M'])) || b.contains("AM/PM") || b.contains("A/P") || s.starts_with("[h") || s.starts_with("[m") || s.starts_with("[s"))
+    })
 }
 
 /// A date or time body: (element children, is it a date-style, elapsed hours).
@@ -407,11 +449,25 @@ fn date_children(p: &[(bool, String)]) -> (String, bool, bool) {
                 // [h], [hh], [mm], [ss]: elapsed.
                 let e = ch[i..].iter().position(|&d| d == ']').map_or(ch.len(), |p| i + p);
                 let inner: String = ch[i + 1..e].iter().collect();
-                if let Some(k) = inner.chars().next() {
-                    elapsed = true;
-                    toks.push(T::Part(k.to_ascii_lowercase(), inner.len(), 0));
-                }
                 i = e + 1;
+                match inner.chars().next().map(|k| k.to_ascii_lowercase()) {
+                    Some(k @ ('h' | 'm' | 's')) if inner.chars().all(|d| d.to_ascii_lowercase() == k) => {
+                        elapsed = true;
+                        // [ss].00: elapsed seconds with decimals.
+                        let mut dec = 0;
+                        if k == 's' && ch.get(i) == Some(&'.') {
+                            let mut j = i + 1;
+                            while j < ch.len() && ch[j] == '0' {
+                                j += 1;
+                            }
+                            dec = j - i - 1;
+                            i = j;
+                        }
+                        toks.push(T::Part(k, inner.len(), dec));
+                    }
+                    // Colours, locales, [DBNum]: not drawn by ODF's date elements.
+                    _ => {}
+                }
             } else if "ymdhse".contains(lower) {
                 let mut j = i;
                 while j < ch.len() && ch[j].to_ascii_lowercase() == lower {
@@ -499,7 +555,8 @@ fn date_children(p: &[(bool, String)]) -> (String, bool, bool) {
 }
 
 /// A number body's children and the element they belong in.
-fn number_children(p: &[(bool, String)]) -> (String, &'static str) {
+/// `zero`: the zero section, where Excel's `?` placeholders show only blanks.
+fn number_children(p: &[(bool, String)], zero: bool) -> (String, &'static str) {
     let mut out = String::new();
     let mut kind = "number:number-style";
     for (lit, s) in p {
@@ -509,7 +566,9 @@ fn number_children(p: &[(bool, String)]) -> (String, &'static str) {
         }
         if s.eq_ignore_ascii_case("General") || s.to_ascii_lowercase().contains("general") {
             let (a, b) = s.split_at(s.to_ascii_lowercase().find("general").unwrap_or(0));
-            text_el(&mut out, a);
+            // [DBNum1] and other bracketed modifiers draw nothing.
+            let a: String = a.split('[').enumerate().map(|(k, x)| if k == 0 { x } else { x.split_once(']').map_or("", |y| y.1) }).collect();
+            text_el(&mut out, &a);
             out.push_str(r#"<number:number number:min-integer-digits="1"/>"#);
             text_el(&mut out, &b[7.min(b.len())..]);
             continue;
@@ -529,6 +588,11 @@ fn number_children(p: &[(bool, String)]) -> (String, &'static str) {
         let ch: Vec<char> = s.chars().collect();
         let mut i = 0;
         while i < ch.len() {
+            if ch[i] == '[' {
+                // A bracketed modifier ([DBNum1]): nothing to draw.
+                i = ch[i..].iter().position(|&d| d == ']').map_or(ch.len(), |p| i + p + 1);
+                continue;
+            }
             if !(matches!(ch[i], '0' | '#' | '?') || (ch[i] == '.' && ch.get(i + 1).is_some_and(|d| matches!(d, '0' | '#' | '?')))) {
                 if ch[i] == '%' {
                     kind = "number:percentage-style";
@@ -559,7 +623,12 @@ fn number_children(p: &[(bool, String)]) -> (String, &'static str) {
                 break;
             }
             let pat: String = ch[i..j].iter().collect();
-            number_el(&mut out, &pat);
+            if zero && pat.chars().all(|c| c == '?') {
+                // A space per `?` (LibreOffice can't take `?` as a blank's width).
+                text_el(&mut out, &" ".repeat(pat.len()));
+            } else {
+                number_el(&mut out, &pat);
+            }
             i = j;
         }
     }
@@ -620,13 +689,13 @@ fn number_el(out: &mut String, pat: &str) {
 }
 
 /// One section as a data style element named `name`.
-fn data_style(out: &mut String, name: &str, sec: &Section, volatile: bool, maps: &[(String, String)]) {
+fn data_style(out: &mut String, name: &str, sec: &Section, volatile: bool, zero: bool, maps: &[(String, String)]) {
     let p = pieces(&sec.body);
     let (children, el, elapsed) = if is_date_body(&p) {
         let (c, date, elapsed) = date_children(&p);
         (c, if date { "number:date-style" } else { "number:time-style" }, elapsed)
     } else {
-        let (c, el) = number_children(&p);
+        let (c, el) = number_children(&p, zero);
         (c, el, false)
     };
     let _ = write!(out, r#"<{el} style:name="{name}""#);
@@ -656,16 +725,17 @@ pub(super) fn data_styles(code: &str, name: &str) -> Option<String> {
         return None;
     }
     let mut secs: Vec<Section> = sections(code).iter().map(|s| section(s)).collect();
-    // A text section (4th, or any with @ after numbers) is not modelled as a map.
-    if secs.len() == 4 {
-        secs.pop();
+    let explicit = secs.iter().any(|s| s.cond.is_some());
+    // A fourth section (text) takes the style itself, as LibreOffice writes it;
+    // with conditions it is not modelled.
+    if secs.len() > 4 || (secs.len() == 4 && explicit) {
+        secs.truncate(3);
     }
     let mut out = String::new();
     if secs.len() == 1 {
-        data_style(&mut out, name, &secs[0], false, &[]);
+        data_style(&mut out, name, &secs[0], false, false, &[]);
         return Some(out);
     }
-    let explicit = secs.iter().any(|s| s.cond.is_some());
     let mut maps = Vec::new();
     let n = secs.len();
     for (k, s) in secs.iter().enumerate().take(n - 1) {
@@ -674,13 +744,15 @@ pub(super) fn data_styles(code: &str, name: &str) -> Option<String> {
             (None, false, 2, 0) => ">=0".to_string(),
             (None, false, _, 0) => ">0".to_string(),
             (None, false, _, 1) => "<0".to_string(),
+            (None, false, 4, 2) => "=0".to_string(),
             _ => continue,
         };
         let sub = format!("{name}P{k}");
-        data_style(&mut out, &sub, s, true, &[]);
+        let zero = (!explicit && k == 2) || matches!(s.cond.as_deref().map(str::trim), Some("=0" | "==0"));
+        data_style(&mut out, &sub, s, true, zero, &[]);
         maps.push((cond, sub));
     }
-    data_style(&mut out, name, &secs[n - 1], false, &maps);
+    data_style(&mut out, name, &secs[n - 1], false, !explicit && n == 3, &maps);
     Some(out)
 }
 
@@ -1487,8 +1559,8 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
         filter_conditions(&mut out, &f.conds, f.rect.c0, whole_cell);
         out.push_str("</table:database-range>");
     }
-    // Tables as named database ranges, header and data rows (a totals row stays
-    // plain cells).
+    // Tables as named database ranges, header and data rows; a totals row stays
+    // plain cells below, marked `officina:totals`.
     for t in wb.tables() {
         let r = &t.rect;
         let last = r.r1 - (t.totals && r.r1 > r.r0) as u32;
@@ -1499,6 +1571,9 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
         out.push_str(r#"" table:target-range-address=""#);
         esc(&mut out, &addr);
         let _ = write!(out, r#"" table:contains-header="{}""#, t.header);
+        if last < r.r1 {
+            out.push_str(r#" officina:totals="true""#);
+        }
         if let Some(st) = &t.style {
             out.push_str(r#" officina:table-style=""#);
             esc(&mut out, st);

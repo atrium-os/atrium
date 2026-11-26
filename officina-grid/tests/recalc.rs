@@ -324,3 +324,33 @@ fn indirect_and_offset_see_this_recalculation() {
         }
     }
 }
+
+#[test]
+fn indirect_running_count_down_a_column_reads_each_row_above() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("S").unwrap();
+    wb.set_value(CellAddr::new(0, 0, 0), Value::Num(0.0));
+    wb.fill_formula(0, 0, 1, 4999, "=INDIRECT(\"A\"&ROW()-1)+1").unwrap();
+    wb.recalc();
+    assert_eq!(wb.get(CellAddr::new(0, 1, 0)), Value::Num(1.0));
+    assert_eq!(wb.get(CellAddr::new(0, 4999, 0)), Value::Num(4999.0));
+    wb.set_value(CellAddr::new(0, 0, 0), Value::Num(10.0));
+    wb.recalc();
+    assert_eq!(wb.get(CellAddr::new(0, 4999, 0)), Value::Num(5009.0));
+}
+
+#[test]
+fn a_table_column_with_a_line_break_matches_a_formula_saved_with_crlf() {
+    use officina_grid::{addr::Rect, tables::Table};
+    let mut wb = Workbook::new();
+    wb.add_sheet("S").unwrap();
+    wb.set_value(CellAddr::new(0, 0, 0), Value::str("Long\nTitle"));
+    for r in 1..4 {
+        wb.set_value(CellAddr::new(0, r, 0), Value::Num(r as f64));
+    }
+    let t = Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 0 }, header: true, totals: false, columns: vec!["Long\nTitle".into()], style: None, stripes: false, bands: Default::default(), filter: None };
+    wb.add_table(t).unwrap();
+    wb.set_formula(CellAddr::new(0, 0, 3), "=SUM(T[Long\r\nTitle])").unwrap();
+    wb.recalc();
+    assert_eq!(wb.get(CellAddr::new(0, 0, 3)), Value::Num(6.0));
+}

@@ -746,6 +746,12 @@ fn fill_int(toks: &[Tok], int: &str, group: bool) -> String {
         out.push(c);
         *placed += 1;
     };
+    // No integer placeholder (`.0`): a non-zero whole part still shows, by the point.
+    if n_ph == 0 && int.chars().any(|c| c != '0') {
+        for &c in digits.iter().rev() {
+            put(&mut out, c, &mut placed);
+        }
+    }
     for t in toks.iter().rev() {
         match t {
             Tok::Digit(d) => {
@@ -1112,6 +1118,13 @@ mod tests {
         assert_eq!(NumFmt::parse("0.00").format(&Value::num(1.0)).fill, None);
         assert_eq!(NumFmt::parse("0*").format(&Value::num(1.0)).fill, None);
         assert!(!NumFmt::parse("0*").format(&Value::num(1.0)).text.contains(FILL_MARK));
+    }
+
+    #[test]
+    fn no_integer_placeholder_still_shows_the_whole_part() {
+        assert_eq!(f(".0", 45.61911), "45.6");
+        assert_eq!(f(".0", 0.61911), ".6");
+        assert_eq!(f(".00", -3.5), "-3.50");
     }
 
     #[test]

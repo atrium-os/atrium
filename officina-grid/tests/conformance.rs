@@ -224,6 +224,9 @@ const CASES: &[(&str, &str)] = &[
     ("=REPT(\"ab\",3)", "ababab"),
     ("=FIND(\"b\",\"abcb\")", "2"),
     ("=FIND(\"B\",\"abc\")", "#VALUE!"),
+    // A needle longer than the text: not found, not a fault.
+    ("=FIND(\"abc\",\"\")", "#VALUE!"),
+    ("=ISERROR(SEARCH(\"xyz\",\"x\"))", "TRUE"),
     ("=SEARCH(\"B\",\"abc\")", "2"),
     ("=SEARCH(\"?c\",\"abc\")", "2"),
     ("=SUBSTITUTE(\"aaa\",\"a\",\"b\",2)", "aba"),

@@ -1563,6 +1563,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                 Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                     b"sheet" => {
                         let name = attr(&e, b"name")?.unwrap_or_default();
+                        // Our writer escapes `_xHHHH_` in names as text; a decoded
+                        // name a sheet can't have (a line break) stays as written.
+                        let name = match decode_escapes(&name) {
+                            std::borrow::Cow::Owned(d) if !d.chars().any(char::is_control) => d,
+                            _ => name,
+                        };
                         let Some(id) = attr(&e, b"id")? else { continue };
                         // Hidden and very hidden sheets both stay hidden; Unhide shows either.
                         let hide = attr(&e, b"state")?.is_some_and(|v| v == "hidden" || v == "veryHidden");

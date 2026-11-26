@@ -197,6 +197,8 @@ struct DataStyle {
     elapsed: bool,
     /// `loext:blank-width-char` of the `number:text` being read (Excel's `_x`).
     blank: Option<char>,
+    /// Reading a `number:fill-character` (Excel's `*x`).
+    fill: bool,
 }
 
 fn color_name(rgb: u32) -> Option<&'static str> {
@@ -592,10 +594,14 @@ impl Styles {
                                         let h = if long { "hh" } else { "h" };
                                         if std::mem::take(&mut d.elapsed) { format!("[{h}]") } else { h.to_string() }
                                     }
-                                    "number:minutes" => if long { "mm" } else { "m" }.to_string(),
+                                    "number:minutes" => {
+                                        let m = if long { "mm" } else { "m" };
+                                        if std::mem::take(&mut d.elapsed) { format!("[{m}]") } else { m.to_string() }
+                                    }
                                     "number:seconds" => {
                                         let dp = a.get("number:decimal-places").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(3);
-                                        let mut s = if long { "ss" } else { "s" }.to_string();
+                                        let s0 = if long { "ss" } else { "s" };
+                                        let mut s = if std::mem::take(&mut d.elapsed) { format!("[{s0}]") } else { s0.to_string() };
                                         if dp > 0 {
                                             s.push('.');
                                             s.push_str(&"0".repeat(dp));
@@ -611,11 +617,16 @@ impl Styles {
                                 d.code.push_str(&part);
                             }
                         }
-                        "number:text" | "number:currency-symbol" => {
+                        "number:text" | "number:currency-symbol" | "number:fill-character" => {
                             in_text = !empty;
                             text.clear();
                             if let Some((_, d)) = cur_data.as_mut() {
                                 d.blank = a.get("loext:blank-width-char").and_then(|v| v.chars().next());
+                                d.fill = name == "number:fill-character";
+                                if d.fill && empty {
+                                    d.code.push_str("* ");
+                                    d.fill = false;
+                                }
                             }
                         }
                         "number:text-content" => {
@@ -637,9 +648,14 @@ impl Styles {
                         in_body = false;
                     }
                     match name.as_str() {
-                        "number:text" | "number:currency-symbol" => {
+                        "number:text" | "number:currency-symbol" | "number:fill-character" => {
                             in_text = false;
                             if let Some((_, d)) = cur_data.as_mut() {
+                                if std::mem::take(&mut d.fill) {
+                                    d.code.push('*');
+                                    d.code.push(text.chars().next().unwrap_or(' '));
+                                    continue;
+                                }
                                 let mut t = text.as_str();
                                 if let Some(b) = d.blank.take() {
                                     // The blank stands in for the first character.
@@ -692,6 +708,28 @@ impl Styles {
             c.push_str(&d.code);
             c
         };
+        // Excel's implicit sections: positive (or not negative), negative, zero,
+        // with the style itself last (the rest, or text).
+        let mut implicit: [Option<String>; 3] = [None, None, None];
+        let mut plain = !d.maps.is_empty();
+        for (cond, other) in &d.maps {
+            let Some(o) = self.data.get(other) else { continue };
+            let k = match cond.trim().strip_prefix("value()").unwrap_or("").trim() {
+                ">=0" | ">0" => 0,
+                "<0" => 1,
+                "=0" | "==0" => 2,
+                _ => {
+                    plain = false;
+                    break;
+                }
+            };
+            implicit[k] = Some(own(o));
+        }
+        if plain && implicit[0].is_some() && (implicit[2].is_none() || implicit[1].is_some()) {
+            let mut code: Vec<String> = implicit.into_iter().flatten().collect();
+            code.push(own(d));
+            return Some(code.join(";"));
+        }
         let mut secs: Vec<String> = Vec::new();
         for (cond, other) in &d.maps {
             let Some(o) = self.data.get(other) else { continue };
@@ -1059,7 +1097,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut filters: Vec<(Option<String>, String, Vec<(u32, Cond)>)> = Vec::new();
     // Named database ranges: (name, range, header row).
     // Named database ranges: name, target, header, and our table style and bands.
-    let mut db_tables: Vec<(String, String, bool, Option<String>, [bool; 4])> = Vec::new();
+    let mut db_tables: Vec<(String, String, bool, Option<String>, [bool; 4], bool)> = Vec::new();
     // Conditional formats (LibreOffice's) and the one being read.
     let mut cf: Option<CfIn> = None;
     let mut cond_formats: Vec<CfIn> = Vec::new();
@@ -1634,7 +1672,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 for (b, v) in bands.iter_mut().zip(a.get("officina:bands").map_or("", |v| v.as_str()).split(' ')) {
                                     *b = v == "1";
                                 }
-                                db_tables.push((n.clone(), target.clone(), a.get("table:contains-header").map_or(true, |v| !matches!(v.as_str(), "false" | "0")), style, bands));
+                                let totals = a.get("officina:totals").is_some_and(|v| v == "true");
+                                db_tables.push((n.clone(), target.clone(), a.get("table:contains-header").map_or(true, |v| !matches!(v.as_str(), "false" | "0")), style, bands, totals));
                             }
                             if !empty {
                                 db = Some((named.cloned(), target.clone(), buttons, Vec::new()));
@@ -1844,7 +1883,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                     if cc >= MAX_COLS as u64 {
                                         break;
                                     }
-                                    let has = c.value.is_some() || c.formula.is_some() || !c.text.is_empty();
+                                    // An empty string is a value too, unless repeated (a styling run).
+                                    let has = c.value.is_some() || c.formula.is_some() || !c.text.is_empty() || (c.vtype == "string" && *n == 1 && rows_here == 1);
                                     if has {
                                         expanded += 1;
                                         if expanded > MAX_CELLS {
@@ -2000,19 +2040,23 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
 
     // Tables, from named database ranges; their columns are named by the header row.
-    for (name, target, header, style, bands) in db_tables {
-        let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
+    for (name, target, header, style, bands, totals) in db_tables {
+        let Some((s, r0, c0, mut r1, c1)) = target_rect(&wb, &target) else { continue };
+        // A totals row sits just below the database range.
+        let totals = totals && r1 + 1 < officina_grid::addr::MAX_ROWS;
+        r1 += u32::from(totals);
         let mut columns: Vec<Arc<str>> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for c in c0..=c1.min(c0 + 16_383) {
-            let mut n = if header { wb.formatted(CellAddr::new(s, r0, c)).text.trim().to_string() } else { String::new() };
-            if n.is_empty() || n.len() > officina_grid::tables::MAX_COL_NAME || !seen.insert(n.to_lowercase()) {
+            // Excel keeps a header's spaces in the column's name.
+            let mut n = if header { wb.formatted(CellAddr::new(s, r0, c)).text.to_string() } else { String::new() };
+            if n.trim().is_empty() || n.len() > officina_grid::tables::MAX_COL_NAME || !seen.insert(n.to_lowercase()) {
                 n = format!("Column{}", c - c0 + 1);
                 seen.insert(n.to_lowercase());
             }
             columns.push(n.as_str().into());
         }
-        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals: false, columns, style: style.map(|s| s.as_str().into()), stripes: bands[0], bands: officina_grid::tables::TableBands { cols: bands[1], first: bands[2], last: bands[3] }, filter: None };
+        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals, columns, style: style.map(|s| s.as_str().into()), stripes: bands[0], bands: officina_grid::tables::TableBands { cols: bands[1], first: bands[2], last: bands[3] }, filter: None };
         if let Err(why) = wb.add_table(t) {
             rep.note_at(Kind::Dropped, "tables this engine can't use (kept as plain cells)", || format!("{name}: {why}"));
         }

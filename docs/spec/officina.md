@@ -5720,6 +5720,76 @@ Tests:
   - a plain book has neither;
   - odd, non-hex and truncated `officina:views` give no views and a note.
 
+### 16.167 Close-out: the real-workbook sweep (2026-11-27)
+Round 6 of the six-round finishing plan, first part. The Mac VM check of installed Sheets and the as-built summary follow.
+
+**The sweep.** `officina-convert/examples/corpus_sheets.rs` reads every `.xlsx`, `.xlsm`, `.xls` and `.ods` under the directories it is given. It writes each workbook as `.xlsx` and as `.ods`, reads both back, and compares every sheet's name and the shown text of each non-empty cell, up to 200,000 cells a file. Volatile formulas (RAND, NOW, TODAY, INFO, CELL, OFFSET, INDIRECT) are left out of the comparison. Each file gets 120 seconds and a 64 MiB stack, and a panic is caught and reported. The output is TSV: `file result ms sheets xlsx ods`.
+
+```
+cargo run --example corpus_sheets -- DIR [DIR ...] > report.tsv
+```
+
+The corpus is Apache POI's `test-data/spreadsheet` (835 files) and LibreOffice's `sc/qa/unit/data/{xlsx,ods,xls}`, 1,796 files in all. It is test data and stays out of the repository.
+
+**Results**, before and after this round's fixes:
+
+| | First run | After |
+|---|---|---|
+| read | 1,673 | 1,675 |
+| refused, with a reason | 121 | 121 |
+| panics | 2 | 0 |
+| `.xlsx` round trip the same | 1,667 | 1,670 |
+| `.ods` round trip the same | 1,594 | 1,664 |
+
+The slowest read took 905 ms. Every refusal says why:
+- 41 are Excel 95 or older, or not an Excel 97–2003 workbook at all;
+- 4 are encrypted (3 need a password, 1 uses Excel 95's XOR);
+- 5 are XML with undeclared entities (the entity-expansion test files) or broken syntax;
+- the other 71 are damaged or malformed: a broken zip or compound file, a stream past the end of the file, records cut short, bad cell references, a missing part.
+
+**Fixed:**
+- FIND and SEARCH panicked when the text searched for was longer than the text searched (two files).
+- `.xlsx` sheet names now decode `_xHHHH_` escapes, unless the result would hold a control character.
+- `.ods` number styles:
+  - three- and four-section codes come back as sections, not as `[<0]` conditions;
+  - Excel's text section becomes the style itself, with maps for positive, negative and zero, as LibreOffice writes it;
+  - `*x` fills go through `number:fill-character`;
+  - `?` in a zero section is written as spaces;
+  - a code of only `mmmm` is a month;
+  - `[DBNum1]` and locale tags no longer turn General into a date;
+  - `[ss].00` keeps its decimals, and `[mm]` and `[ss]` read back as elapsed.
+  
+  Together these fixed the accounting formats that came back as `" $-2883 "`.
+- `.ods` tables keep their totals row (`officina:totals` on the database range) and their header's spaces in column names. `Table[#Totals]` and `Table[[Field 4 ]]` no longer give #REF!.
+- `.ods` keeps an empty-string cell as text, so `=L12` shows nothing instead of 0.
+- `.ods` keeps carriage returns. A cell's CRLF and line ends inside formula attributes are written as character references, because XML turns raw line ends in an attribute into spaces.
+- The engine:
+  - a filled column that reads its own rows through INDIRECT or OFFSET (a running count down a column) is evaluated top to bottom, where before every row could see the rows above it still uncalculated;
+  - a format with no integer placeholder (`.0`) still shows the whole part (45.6, not .6);
+  - a table column whose name has a line break matches a formula saved with CRLF.
+
+**Left as they are** (10 files):
+- An iterative circular reference converges differently.
+- A sheet past 1,048,576 × 16,384 is refused for `.xlsx` and `.ods`.
+- Outline groups that `.xlsx` can't hold are refused with a reason.
+- A LibreOffice-only function gives #NAME?.
+- In `.ods`:
+  - the `@` implicit intersection and the space intersection operator (OpenFormula has neither);
+  - an icon-set table filter, so SUBTOTAL(9) then counts the rows it hid;
+  - text embedded in decimals (`0.000 000`), since ODF embeds text only in the whole part;
+  - the Japanese era `ggge`;
+  - trailing `?` padding after a fraction.
+
+Tests:
+- grid:
+  - `conformance`: FIND with a longer needle gives #VALUE!, and SEARCH with one is an error;
+  - `numfmt`: `.0` shows 45.6 and .6;
+  - `recalc`: an INDIRECT running count over 5,000 rows, before and after an edit at its top (failed before: every row was 1), and a CRLF column name.
+- convert `ods_numfmt`:
+  - eleven codes (accounting with fills and blanks, euro, red negatives, months, fractions, `[=0]?;0%`) over positive, negative, zero and text values show the same after `.ods`;
+  - `[ss].00`, `[mm]:ss`, `[DBNum1][$-804]General` and `[h]:mm:ss`, an empty string, CRLF text and a CRLF formula result round-trip;
+  - LibreOffice reads the written accounting and four-section styles with the same text.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

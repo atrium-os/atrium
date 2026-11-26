@@ -222,6 +222,12 @@ impl Workbook {
             if scc.len() == 1 {
                 let g = scc[0];
                 let rows = dirty.remove(&g).unwrap_or_default();
+                // INDIRECT/OFFSET may read the group's own rows (a running count
+                // down a column): top to bottom, each row after the one above.
+                if self.group(g).dynamic && !edges.contains(&(g, g)) && rows.len() > 1 {
+                    self.eval_sequential(g, &rows, true, stats);
+                    continue;
+                }
                 if !edges.contains(&(g, g)) {
                     if let Some(rest) = self.eval_parallel(g, &rows, stats, deadline) {
                         dirty.insert(g, rest);
