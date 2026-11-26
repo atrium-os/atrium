@@ -266,6 +266,8 @@ pub enum DataCmd {
     HideDetail,
     ClearOutline,
     ForecastSheet,
+    /// Data Analysis… (the Analysis ToolPak tools, typed).
+    DataAnalysis,
     /// Protect Sheet and Unprotect Sheet (bars for the password when one is
     /// needed) and Protection Options (a bar); [`crate::lock`].
     ProtectSheet,
@@ -706,6 +708,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Scenario Manager…"), Some(DataCmd::Scenarios)),
         (MenuItem::new("Data Form…"), Some(DataCmd::DataForm)),
         (MenuItem::new("Forecast Sheet…"), Some(DataCmd::ForecastSheet)),
+        (MenuItem::new("Data Analysis…"), Some(DataCmd::DataAnalysis)),
         (MenuItem::new("Show Detail"), Some(DataCmd::ShowDetail)),
         (MenuItem::new("Hide Detail"), Some(DataCmd::HideDetail)),
         (MenuItem::new("Clear Outline").enabled([officina_grid::shift::Axis::Rows, officina_grid::shift::Axis::Cols].iter().any(|&a| !wb.sheet(s).outline(a).groups().is_empty())), Some(DataCmd::ClearOutline)),
@@ -3315,7 +3318,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         DataCmd::AddWatch => crate::formulas::add_watches(d, sel),
         DataCmd::ApplyNames => crate::formulas::apply_names(d, sel),
         DataCmd::AutoOutline => crate::formulas::auto_outline(d, sel),
-        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument | DataCmd::DataForm | DataCmd::QuickTotals | DataCmd::GoToSpecial | DataCmd::ForecastSheet => Ok(String::new()),
+        DataCmd::WatchWindow | DataCmd::CreateNames | DataCmd::WorkbookStats | DataCmd::EditRanges | DataCmd::InspectDocument | DataCmd::DataForm | DataCmd::QuickTotals | DataCmd::GoToSpecial | DataCmd::ForecastSheet | DataCmd::DataAnalysis => Ok(String::new()),
         DataCmd::LockCells => crate::special::toggle_protection(d, sel, true),
         DataCmd::HideFormula => crate::special::toggle_protection(d, sel, false),
         DataCmd::ShowDetail => crate::special::detail(d, sel, true),

@@ -39,3 +39,4 @@ pub mod autocorrect;
 pub mod customviews;
 pub mod accessibility;
 pub mod checkbox;
+pub mod analysis;

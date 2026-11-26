@@ -1886,6 +1886,15 @@ impl Sheets {
                             Err(why) => Err(why),
                         }
                     }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::DataAnalysis) => {
+                        // A new sheet is shown; a table placed with to stays where it was put.
+                        let count = self.doc.borrow().wb.sheet_count();
+                        let r = crate::analysis::run(&mut self.doc.borrow_mut(), &typed);
+                        if r.is_ok() && self.doc.borrow().wb.sheet_count() > count {
+                            self.show_sheet(count as u16);
+                        }
+                        r
+                    }
                     _ if self.splitting.get() == Some(crate::data::DataCmd::ForecastSheet) => {
                         let r = crate::special::forecast_sheet(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed);
                         if r.is_ok() {
@@ -4218,7 +4227,7 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText)) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy | crate::data::DataCmd::Iteration | crate::data::DataCmd::Subtotal | crate::data::DataCmd::AdvancedFilter | crate::data::DataCmd::Consolidate | crate::data::DataCmd::DataTable | crate::data::DataCmd::Scenarios | crate::data::DataCmd::Series | crate::data::DataCmd::EvaluateFormula | crate::data::DataCmd::Sparklines | crate::data::DataCmd::FillAcross | crate::data::DataCmd::CreateNames | crate::data::DataCmd::EditRanges | crate::data::DataCmd::DataForm | crate::data::DataCmd::QuickTotals | crate::data::DataCmd::GoToSpecial | crate::data::DataCmd::ForecastSheet | crate::data::DataCmd::DataAnalysis | crate::data::DataCmd::ProtectSheet | crate::data::DataCmd::UnprotectSheet | crate::data::DataCmd::ProtectionOptions | crate::data::DataCmd::WorkbookPassword | crate::data::DataCmd::RangePassword | crate::data::DataCmd::UnlockRange | crate::data::DataCmd::SortLeftToRight | crate::data::DataCmd::Properties | crate::data::DataCmd::InsertSymbol | crate::data::DataCmd::FontSize | crate::data::DataCmd::FontName | crate::data::DataCmd::MoveOrCopy | crate::data::DataCmd::StandardWidth | crate::data::DataCmd::StandardHeight | crate::data::DataCmd::BordersBar | crate::data::DataCmd::PatternFill | crate::data::DataCmd::GridColor | crate::data::DataCmd::AutoCorrect | crate::data::DataCmd::CustomViews | crate::data::DataCmd::AltText)) => {
                     let bare_workbook = c == crate::data::DataCmd::WorkbookPassword && self.doc.borrow().wb.structure_protected() && !crate::lock::workbook_needs_password(&self.doc.borrow());
                     if bare_workbook || (c == crate::data::DataCmd::UnprotectSheet && !crate::lock::needs_password(&self.doc.borrow())) {
                         // No password to ask for.

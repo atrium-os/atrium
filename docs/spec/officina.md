@@ -5408,6 +5408,48 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
   - Convert: `roundtrip` (`picture_alt_text_round_trips_in_xlsx_and_ods`).
   - Sheets: `accessibility` (picture alt text set, undone and reported by the check) and `authoring` (`replace_format_restyles_only_the_cells_it_changes`: a format-only replace, its undo, and text with format leaving unmatched cells alone).
 
+### 16.161 Data Analysis: the Analysis ToolPak's tools (2026-11-26)
+
+`atrium-sheets/src/analysis.rs`, the Data Analysis… item beside Forecast Sheet…, and its bar in `whatif.rs` and `app.rs`.
+
+**Data Analysis…** is Excel's Analysis ToolPak as one typed bar: `TOOL RANGE, options…, to CELL`. It starts on `descriptive` over the selection, with `labels` when the selection's first row is text. `labels` means the range's first row names each column. Without `to`, the result goes on a new sheet named after the tool, and Sheets shows that sheet. With `to CELL` (on any sheet), the result goes there, but only when every cell it needs is empty; otherwise it names the first cell in the way and changes nothing. Either way it is one undo step. It reads at most 1,000,000 cells and writes at most 1,000,000.
+
+- **Descriptive Statistics** (`descriptive`): for each column, Excel's 13 measures: Mean, Standard Error, Median, Mode, Standard Deviation, Sample Variance, Kurtosis, Skewness, Range, Minimum, Maximum, Sum and Count. `confidence 95%` adds the Confidence Level row (CONFIDENCE.T). It handles at most 256 columns.
+- **Histogram** (`histogram`): counts the values that are at or under each bin and over the bin before it, with a More row for the rest.
+  - `bins RANGE` gives the bins. Without it there are ⌈√n⌉ equal bins up to the largest value.
+  - `cumulative` adds the running percentage.
+  - `pareto` adds the bins again, sorted by count.
+- **Rank and Percentile** (`rank`): for each column, the table runs largest first and shows each value's Point (its place in the data), the value, its Rank (ties share one) and its Percent, as PERCENTRANK.INC gives it (three digits, truncated).
+- **Moving Average** (`moving average`, `interval N`, 3 by default): one column or row. Each output is `=AVERAGE(…)` of that point and the N−1 points before it, and the first N−1 outputs are #N/A.
+- **Exponential Smoothing** (`smoothing`, `damping D`, 0.3 by default): the first output is #N/A and the second is the first value. After that, each is `=(1−D)·value before + D·smoothed value above`, written as formulas, as Excel does.
+- **Correlation** and **Covariance**: the lower triangle of CORREL, or of COVARIANCE.P (the population covariance, as the ToolPak uses), for every pair of columns, with labels along both edges. The diagonal of the correlation matrix is 1.
+- **Sampling** (`sampling`):
+  - `periodic N` takes every Nth number.
+  - `random N` draws N numbers with replacement, as the ToolPak does.
+- **Random Number Generation** (`random ROWSxCOLS`): draws from one distribution:
+  - `uniform FROM TO` (0 to 1 by default)
+  - `normal MEAN SD`
+  - `bernoulli P`
+  - `poisson LAMBDA` (at most 1,000)
+
+  `seed N` makes Sampling and Random draw the same numbers each time. The generator is SplitMix64. Without a seed, the clock seeds it.
+
+Differences from Excel:
+- Descriptive Statistics, Correlation and Covariance write formulas, so their results follow later edits to the data. Excel writes fixed values.
+- Histogram, Rank and Percentile, Sampling and Random write values, as Excel does.
+- Not built yet: ANOVA, the F-, t- and z-tests, Regression and Fourier Analysis, and the histogram's chart. LINEST and the T.TEST family cover them in formulas.
+
+Tests (Sheets, `analysis`):
+- Descriptive Statistics on a new sheet, following an edit to the data and undone in one step.
+- A histogram with bins, cumulative and pareto, written in place.
+- A refusal to write over cells.
+- Rank and Percentile with ties.
+- Correlation and covariance checked against worked values.
+- Moving average and smoothing worked by hand.
+- Seeded sampling and random draws that repeat with the same seed, with their bounds checked.
+
+The unused `Rect` import that §16.160 left in `accessibility.rs` is moved into its tests.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

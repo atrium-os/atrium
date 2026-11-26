@@ -20,7 +20,7 @@ use crate::doc::Doc;
 /// The most formula cells Apply Names and Auto Outline look at.
 pub const MAX_CELLS: u64 = 100_000;
 
-fn sheet_ref(wb: &Workbook, s: u16) -> String {
+pub(crate) fn sheet_ref(wb: &Workbook, s: u16) -> String {
     let name = wb.sheet_name(s);
     if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit()) {
         name

@@ -5,7 +5,7 @@
 
 use officina_grid::charts::clean_alt;
 use officina_grid::ops::GridOp;
-use officina_grid::{CellAddr, Rect};
+use officina_grid::CellAddr;
 
 use crate::doc::Doc;
 
@@ -214,6 +214,7 @@ pub fn step(d: &mut Doc) -> Step {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use officina_grid::Rect;
     use officina_grid::style::Style;
 
     #[test]
