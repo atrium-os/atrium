@@ -219,6 +219,50 @@ listen = [{ port = 8080, proto = "tcp", from = "local-network" }]
 - Inbound flows are counted. The bar list shows "3 connections" next to
   the app, and the rate limit keeps a noisy LAN from flooding the jail.
 
+### 4.4 Opening your own server in Navigator (proposed, B6)
+
+Today a typed `http://localhost:8080` opens nothing. Navigator's fetcher,
+`navigator-fetchd`, runs in a jail with its own network stack, under
+Capsicum, reaching out only through casper's `cap_net`. So 127.0.0.1 there
+is its own, and pf blocks apps from every host address. That is right for
+pages: no web page can reach the person's server (local CSRF, DNS
+rebinding). But the person can't open it either.
+
+**Proposal: navigatord asks for a connected socket; nothing new can dial.**
+
+- **Only an address the person typed.** The address bar, or a bookmark or
+  history entry they open, naming `localhost`, `127.0.0.1` or `[::1]`
+  with a port. A link, a redirect, a script or a form on any other page
+  never starts it; those stay refused by fetchd's address rules, as now.
+- **Only a port of the person's own server.** The port must be a
+  `this-computer` listen port of one of the person's apps that is running
+  now and that they allowed (§4.2). Any other port says "Nothing of yours
+  is serving port 8080". This keeps a page from probing other local
+  services, and keeps Navigator from reaching another person's servers.
+- **How the bytes get there.** navigatord asks portcullisd
+  `OpenLocalPort { port }` (by its peer uid, for the person whose live
+  page it is). portcullisd checks the two rules above and asks jaild for a
+  connection to that app's port; jaild connects (root, which the base
+  rules allow) and passes the connected socket back through portcullisd to
+  navigatord, which hands it to that page's fetchd over its existing
+  socket. fetchd gets a new `Net` that holds only those sockets: it can
+  speak HTTP on them and dial nothing. One socket per request, at most 8
+  at once per page, refused once the server stops or the grant goes.
+- **The page is its own origin.** `http://localhost:8080` is an origin
+  like any other: its cookies and storage are its own, its subresources
+  load only from that same origin (each through a new socket), and links
+  out of it go to the normal web path. It is never cached or shared
+  (threat model §7.3), and the address bar shows a "Your computer" chip,
+  not a padlock. HTTPS to localhost isn't offered in v1.
+- **What it doesn't do.** No other host name that resolves to loopback,
+  no LAN addresses (those go through the normal private-network rules),
+  no `listen` port of another person, no UDP.
+
+Checks for B6: a typed localhost opens the person's server; the same URL
+as a link from a page is refused; a port no app of theirs serves is
+refused; another person's server port is refused; after Quit the next
+request is refused; fetchd's own dial to 127.0.0.1 still fails.
+
 ## 5. The SDK and Artifex
 
 - **Templates.** `cargo atrium new --template status-item` makes a bar app
@@ -278,6 +322,10 @@ read only the manifest and the person's grant.
 5. **B5 templates and Artifex.** Both templates, Artifex's New project
    and Package card, the sheet's words; vm-templates-check and
    vm-artifex-check gain one section each.
+6. **B6 your own server in Navigator** (§4.4, proposed). portcullisd
+   `OpenLocalPort`, jaild's connect and fd pass, navigatord's typed-address
+   path, fetchd's socket-only `Net`, the address bar chip; the checks in
+   §4.4.
 
 ## 8. Out of scope, on purpose
 
@@ -305,6 +353,14 @@ read only the manifest and the person's grant.
 | G5 | Should `listen` be allowed per network, with a café Wi-Fi never reached and open Wi-Fi refused? | Yes: per saved network, open networks refused (§4.2) |
 | G6 | Should ports be 1024+ only, with no internet reach? | Yes for v1 (§8) |
 | G7 | Templates: Rust first, C after? | Yes |
+
+Proposed 2026-11-26, open:
+
+| # | Question | Recommendation |
+|---|---|---|
+| G12 | Should Navigator open only typed (or bookmarked) localhost addresses, never ones a page links to? | Yes (§4.4) |
+| G13 | Only ports of the person's own running, allowed servers, or any port on this computer? | Only their own servers' `this-computer` ports |
+| G14 | Plain HTTP only to localhost in v1? | Yes; HTTPS to localhost later if a template needs it |
 
 ### Review
 
