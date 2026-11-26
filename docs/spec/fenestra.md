@@ -1421,7 +1421,7 @@ VM runs only with the coordinator's go.
 
 | Step | What | Gate |
 |---|---|---|
-| R0 | This spec reviewed and decided. QUIC crates licence-audited. | review thread sign-off |
+| R0 | This spec reviewed and decided. New crates licence-audited. **Done 2026-11-26** (§19a). | review thread sign-off; audit 0 failing |
 | R1 | The renderer's core moved into a portable crate (§14.1). Scene stream writer in fresco-renderer (canonical records, versions, acked diff) and a stream reader that applies it in a second renderer; no network. Fuzz the reader with the split fuzzer's harness. | `fenestra-stream-check.sh`: a recorded Pergola, Navigator and Officina session replayed through writer and reader draws bit for bit the same as local (compute renderer), with random drops of acks |
 | R2 | `fenestrad`, `fenestra-session` and `fenestra-net` with QUIC, pinned keys over SSH, remote outputs in frescod, whole-desktop mode, input, cursor, stats. **The first viewer is `fenestra-view` on Linux and macOS** (§14): the gate runs it headless in the cloud container against `cloud-vm.sh`'s VM, with `netem` on the forwarded path; Shankar runs it windowed on the Mac against the Mac VM. | `fenestra-desktop-vm.sh`: connect, type, click, scroll, idle (zero bytes asserted), disconnect, reconnect within grace (bytes asserted small), revoke; click-to-frame at 0, 50, 150, 300 ms added RTT, 3 runs each; the §8.6 profiles under `netem`: 1 Mbit/s, 2 % and 10 % loss, 30 ms jitter, a 5 s and a 3 min blackout (no input replayed, resume bytes asserted small), an address change mid-session, UDP blocked (TCP fallback) |
 | R3 | Security gate: hostile host (fuzzed streams into the viewer's renderer and `fenestra-net`), hostile viewer (bounded input, view-only sends none), jails and uids checked from the kernel, host indicator present, host strip present, clipboard by paste only. | `fenestra-security-vm.sh` |
@@ -1433,6 +1433,36 @@ VM runs only with the coordinator's go.
 | R9 | Pairing without SSH (Arca device keys), mDNS discovery, Concursus for NAT. | pairing and revocation gate |
 | R10 | Real hardware: two Atrium machines on a LAN and over a real WAN; R9700 host for surfaces. | numbers for §6.1, 3 runs per arm |
 | R11 | Retained 3D nodes in the scene stream (after the local renderers draw them), with local camera control on the viewer. | a model viewer orbited at 300 ms RTT with no round trip per frame (asserted by stream bytes) |
+
+## 19a. R0 result: licences of the new crates (2026-11-26)
+
+`scripts/licence-audit.py` run on probe crates holding exactly Fenestra's planned
+dependencies (latest compatible versions on 2026-11-26), then the bundled C and assembly
+sources read by hand, because crates.io's SPDX field does not describe vendored code.
+
+| Group | Crates | Audit | By hand |
+|---|---|---|---|
+| Transport, ring provider | quinn 0.11.12 (quinn-proto 0.11.19, quinn-udp 0.5.16), rustls 0.23.46 (ring), rustls-webpki 0.103.17, ring 0.17.14, tokio, ed25519-dalek 2, spake2 0.4.0, hkdf, hmac, sha2 | 97 versions, 0 failing | ring: new code ISC, BoringSSL-sourced code Apache-2.0, once_cell polyfill MIT/Apache; no file carries the old OpenSSL or SSLeay licence. |
+| Transport, aws-lc provider | quinn, rustls (aws_lc_rs), aws-lc-rs 1.19.0, aws-lc-sys 0.47.0 | 74 versions, 0 failing | aws-lc: OpenSSL- and SSLeay-derived code is now under Apache-2.0 (its LICENSE), the rest ISC, Apache-2.0 or MIT; bundles jitterentropy (BSD-3-Clause, dual with GPL-2.0: we take BSD). Permissive, but larger, needs CMake for the C build, and carries more third-party code. |
+| Viewer window and audio | winit 0.30.13, softbuffer 0.4.8, cpal 0.18.2 (coreaudio-rs 0.14.2 on macOS) | 222 versions, 0 failing | **cpal on Linux always links the system `libasound`, which is LGPL-2.1** (alsa-sys is MIT, the library it binds is not). Not acceptable for anything we distribute. |
+| Media | opus 0.3.1 (audiopus_sys 0.2.2 bundling libopus), zstd 0.14.5 (zstd-sys bundling zstd 1.6.0), rav1e 0.8.1 | 82 versions, 0 failing | libopus BSD-3-Clause; zstd BSD-3-Clause and BSD-2-Clause; rav1e BSD-2-Clause plus the Alliance for Open Media Patent License 1.0 (royalty-free, with the usual defensive termination). |
+
+Choices taken from this:
+
+1. **rustls crypto provider: ring.** Both pass; ring is smaller, has no CMake step for the
+   Tier 3 FreeBSD cross-build, and has fewer bundled third parties. aws-lc-rs stays the
+   fallback if ring lacks something we need (it has everything Fenestra uses: X25519, Ed25519,
+   AES-GCM, ChaCha20-Poly1305, HKDF).
+2. **Linux viewer audio: not cpal.** `fenestra-view` on Linux plays audio through PipeWire
+   directly (libpipewire is MIT), and headless mode has no audio at all. macOS uses cpal or
+   coreaudio-rs (CoreAudio is the OS's own). The licence of the `pipewire` Rust crate and its
+   dependencies is audited when R6 adds audio.
+3. **Video encoder: rav1e** (BSD-2 plus AOM patent licence), as §7.4 says; SVT-AV1 is not
+   added.
+4. **Pairing PAKE: spake2** (RustCrypto, MIT or Apache-2.0), for R9.
+5. Still to check when each step adds it: whether ring and quinn-udp cross-build for
+   `aarch64-unknown-freebsd` with the repo's sysroot (R2, first build), the `pipewire` crate
+   (R6), dav1d and libvpx bindings (already used by the player, R6).
 
 ## 20. Sources
 
