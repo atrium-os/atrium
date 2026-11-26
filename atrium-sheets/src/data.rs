@@ -285,6 +285,8 @@ pub enum DataCmd {
     StandardHeight,
     /// The Borders bar; [`crate::format::borders_typed`].
     BordersBar,
+    /// Spelling (F7, a bar that steps word by word); [`crate::spelling`].
+    Spelling,
     /// The Pattern Fill bar; [`crate::format::pattern_typed`].
     PatternFill,
     /// The sheet's gridline colour (a bar); [`crate::format::grid_color_typed`].
@@ -670,6 +672,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
         (MenuItem::new("Sparklines…"), Some(DataCmd::Sparklines)),
         (MenuItem::new("Allow Edit Ranges…"), Some(DataCmd::EditRanges)),
+        (MenuItem::new("Spelling…").shortcut("F7"), Some(DataCmd::Spelling)),
         (MenuItem::new("Inspect Document…"), Some(DataCmd::InspectDocument)),
         (MenuItem::new("Properties…"), Some(DataCmd::Properties)),
         (MenuItem::new("Insert Symbol…"), Some(DataCmd::InsertSymbol)),
@@ -3176,7 +3179,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::UnprotectSheet if !crate::lock::needs_password(d) => crate::lock::unprotect(d, ""),
         DataCmd::WorkbookPassword if d.wb.structure_protected() && !crate::lock::workbook_needs_password(d) => crate::lock::protect_workbook(d, ""),
-        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor => Ok(String::new()),
+        DataCmd::ProtectSheet | DataCmd::UnprotectSheet | DataCmd::ProtectionOptions | DataCmd::WorkbookPassword | DataCmd::RangePassword | DataCmd::UnlockRange | DataCmd::SortLeftToRight | DataCmd::NextComment | DataCmd::PrevComment | DataCmd::Properties | DataCmd::InsertSymbol | DataCmd::FontSize | DataCmd::FontName | DataCmd::MoveOrCopy | DataCmd::StandardWidth | DataCmd::StandardHeight | DataCmd::BordersBar | DataCmd::PatternFill | DataCmd::GridColor | DataCmd::Spelling => Ok(String::new()),
         DataCmd::Gridlines | DataCmd::Headings => {
             let sheet = d.sheet;
             let sh = d.wb.sheet_mut(sheet);

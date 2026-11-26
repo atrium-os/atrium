@@ -5321,6 +5321,16 @@ Formulas- and Data-tab tools, in the Data menu; `atrium-sheets/src/arrows.rs` an
 - **Values** (a new Find option beside Match case, Whole cell and All sheets), as Excel's Look in: Values: finds what cells show (a formula's result through its number format, `50%`) rather than what was typed. Replace is refused while it is on, as Excel's Replace looks in formulas only. Cells whose value protection hides are skipped.
 - Tests: `officina-grid` `find` (wildcards, `~`, whole cell, case, the greedy replacement, refusals; values as shown), Sheets `sheetbars` (font names and their faces, Plex, unknown and monospace names, refusals, automatic, undo) and `authoring` (wildcard finds, `~*`, a value found only in values, Replace refused there, a wildcard replacement).
 
+### 16.157 Spelling (F7), Find All, Find in comments (2026-11-26)
+
+`atrium-sheets/src/spelling.rs`, the Spelling bar in `atrium-sheets/src/whatif.rs` and `app.rs`, `GridAction::Spelling` in Pergola's grid view, `atrium-sheets/src/authoring.rs`.
+
+- **Spelling…** (Data menu, F7), as Excel's Spelling: walks the sheet's typed text from the cursor, row by row, wrapping once to the cells before it, using `officina-spell`'s en-US dictionary. Each word it doesn't know moves the cursor to its cell and opens a bar: `Not in the dictionary: "wrold" in A1. Suggestions: world, …`. It passes over words with digits, words in capitals, and addresses (`@`, `://`, `www.`), as Excel's defaults do. Formulas and numbers are not checked. At most 200,000 text cells.
+- In the bar: an empty answer or `ignore` (Ignore Once) goes on; `ignore all` skips that word for the rest of the run; a word changes this occurrence to it (at most 255 characters, no control characters); `change all WORD` changes every occurrence on the sheet in one undo step. Edits go through protection as typing would. At the end the status says `The spelling check is complete.` and the bar closes.
+- **Find All** (a Find button): goes to the first match in sheet order and lists the matches in the status, `Found 3 cells: Sheet1!A1, Sheet1!A2, Sheet1!B3.`; past 20, the rest are counted (`and 10 more`).
+- **Comments** (a Find option, exclusive with Values), as Excel's Look in: Comments: searches each comment's text and every reply in its thread instead of cells. Replace is refused while it is on.
+- Tests: Sheets `spelling` (walks from the cursor and wraps, passes digits and capitals, Ignore All, Change All in one step), `app` (the bar steps through the sheet, refuses a 256-character word, closes at the end), `authoring` (Find All's list and count, comments found only in Comments, the exclusive options, Replace refused) and Pergola's grid key test (F7).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

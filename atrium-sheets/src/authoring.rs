@@ -39,7 +39,11 @@ pub enum AuthorCmd {
     Workbook,
     /// Look in values as they show rather than in what was typed.
     Values,
+    /// Look in comments and their replies instead of cells.
+    Comments,
     Find(bool),
+    /// Go to the first match and list every match.
+    FindAll,
     Replace(bool),
     Split(Split),
     Outline(Axis, OutlineCmd),
@@ -52,6 +56,8 @@ pub enum AuthorCmd {
     ChartApply,
 }
 
+/// Matches named in Find All's report; the rest are counted.
+const LISTED: usize = 20;
 const VALUE: usize = 0;
 const CATEGORY: usize = 1;
 const NAME: usize = 2;
@@ -75,6 +81,7 @@ pub(super) struct Authoring {
     whole: Mutable<bool>,
     all_sheets: Mutable<bool>,
     values: Mutable<bool>,
+    comments: Mutable<bool>,
     split: Mutable<Split>,
     extra_scrolls: [Mutable<ScrollState>; 3],
     active: Mutable<usize>,
@@ -94,6 +101,7 @@ impl Authoring {
             whole: rev.sibling(false),
             all_sheets: rev.sibling(false),
             values: rev.sibling(false),
+            comments: rev.sibling(false),
             split: rev.sibling(Split::None),
             extra_scrolls: std::array::from_fn(|_| rev.sibling(ScrollState::default())),
             active: rev.sibling(0),
@@ -163,6 +171,10 @@ impl Authoring {
     }
 
     fn search(&self, s: &Sheets, forward: bool, replace: Option<bool>) -> Result<(), String> {
+        self.find(s, forward, replace, false)
+    }
+
+    fn find(&self, s: &Sheets, forward: bool, replace: Option<bool>, list: bool) -> Result<(), String> {
         // Excel's wildcards: * any run, ? any one, ~ before either as itself.
         let search = Search::excel(self.query.get_cloned().text(), self.case.get(), self.whole.get())?;
         let replacement = self.replacement.get_cloned();
@@ -174,6 +186,9 @@ impl Authoring {
 
         if replace.is_some() && self.values.get() {
             return Err("Replace changes what was typed: turn Values off to replace.".into());
+        }
+        if replace.is_some() && self.comments.get() {
+            return Err("Replace changes cells: turn Comments off to replace.".into());
         }
         if let Some(all) = replace {
             let mut ops = Vec::new();
@@ -221,23 +236,45 @@ impl Authoring {
 
         let mut wrapped = None;
         let mut next = None;
+        let mut count = 0usize;
+        let mut shown: Vec<CellAddr> = Vec::new();
         let better = |a, b| if forward { a < b } else { a > b };
-        let mut seen = |at: CellAddr, text: &str| {
-            if search.matches(text) {
-                if wrapped.is_none_or(|old| better(at, old)) { wrapped = Some(at); }
-                if better(cursor, at) && next.is_none_or(|old| better(at, old)) { next = Some(at); }
-            }
-            true
+        let mut hit = |at: CellAddr| {
+            count += 1;
+            if shown.len() < LISTED { shown.push(at); }
+            if wrapped.is_none_or(|old| better(at, old)) { wrapped = Some(at); }
+            if better(cursor, at) && next.is_none_or(|old| better(at, old)) { next = Some(at); }
         };
         for sheet in sheets {
-            if self.values.get() {
-                find::values(&d.wb, sheet, &mut |at, text| seen(at, &text));
+            if self.comments.get() {
+                for (&(row, col), comment) in d.wb.comments(sheet) {
+                    if search.matches(&comment.text) || comment.thread().iter().any(|m| search.matches(&m.text)) {
+                        hit(CellAddr::new(sheet, row, col));
+                    }
+                }
+            } else if self.values.get() {
+                find::values(&d.wb, sheet, &mut |at, text| { if search.matches(&text) { hit(at); } true });
             } else {
-                find::inputs(&d.wb, sheet, &mut |at, _, text| seen(at, &text));
+                find::inputs(&d.wb, sheet, &mut |at, _, text| { if search.matches(&text) { hit(at); } true });
             }
         }
-        let at = next.or(wrapped).ok_or("No matching cell inputs.")?;
-        let message = format!("Found in {}!{}.", d.wb.sheet_name(at.sheet), a1(at.row, at.col));
+        let none = if self.comments.get() { "No matching comments." } else { "No matching cell inputs." };
+        let message = if list {
+            // Every sheet is walked in order, so the first few matches are the ones listed.
+            let at = wrapped.ok_or(none)?;
+            let names: Vec<String> = shown.iter().map(|a| format!("{}!{}", d.wb.sheet_name(a.sheet), a1(a.row, a.col))).collect();
+            let more = if count > shown.len() { format!(" and {} more", count - shown.len()) } else { String::new() };
+            let message = format!("Found {count} {}: {}{more}.", if count == 1 { "cell" } else { "cells" }, names.join(", "));
+            drop(d);
+            s.show_sheet(at.sheet);
+            s.show_cell(at.row, at.col);
+            s.doc.borrow_mut().status = message;
+            return Ok(());
+        } else {
+            let at = next.or(wrapped).ok_or(none)?;
+            (at, format!("Found in {}!{}.", d.wb.sheet_name(at.sheet), a1(at.row, at.col)))
+        };
+        let (at, message) = message;
         drop(d);
         s.show_sheet(at.sheet);
         s.show_cell(at.row, at.col);
@@ -305,8 +342,10 @@ impl Authoring {
             AuthorCmd::Case => { self.case.set(!self.case.get()); Ok(()) }
             AuthorCmd::Whole => { self.whole.set(!self.whole.get()); Ok(()) }
             AuthorCmd::Workbook => { self.all_sheets.set(!self.all_sheets.get()); Ok(()) }
-            AuthorCmd::Values => { self.values.set(!self.values.get()); Ok(()) }
+            AuthorCmd::Values => { self.values.set(!self.values.get()); self.comments.set(false); Ok(()) }
+            AuthorCmd::Comments => { self.comments.set(!self.comments.get()); self.values.set(false); Ok(()) }
             AuthorCmd::Find(forward) => self.search(s, forward, None),
+            AuthorCmd::FindAll => self.find(s, true, None, true),
             AuthorCmd::Replace(all) => self.search(s, true, Some(all)),
             AuthorCmd::Split(mode) => {
                 if self.split.get() != mode {
@@ -453,7 +492,8 @@ impl Authoring {
             let options = [("Match case", self.case.get(), AuthorCmd::Case),
                 ("Whole cell", self.whole.get(), AuthorCmd::Whole),
                 ("All sheets", self.all_sheets.get(), AuthorCmd::Workbook),
-                ("Values", self.values.get(), AuthorCmd::Values)];
+                ("Values", self.values.get(), AuthorCmd::Values),
+                ("Comments", self.comments.get(), AuthorCmd::Comments)];
             let n = options.len() as f32;
             for (i, (label, on, action)) in options.into_iter().enumerate() {
                 let state = Mutable::new(if on { Check::On } else { Check::Off });
@@ -461,9 +501,9 @@ impl Authoring {
                 Checkbox::new(state, label).at(x + 8.0 + i as f32 * field_width / n, y + 82.0)
                     .on_change(move |_| click()).render(ctx);
             }
-            let commands = [("Previous", AuthorCmd::Find(false)), ("Next", AuthorCmd::Find(true)),
+            let commands = [("Previous", AuthorCmd::Find(false)), ("Next", AuthorCmd::Find(true)), ("Find All", AuthorCmd::FindAll),
                 ("Replace", AuthorCmd::Replace(false)), ("Replace All", AuthorCmd::Replace(true)), ("Close", AuthorCmd::FindClose)];
-            let bw = (field_width - 4.0 * 4.0).max(0.0) / commands.len() as f32;
+            let bw = (field_width - 4.0 * (commands.len() - 1) as f32).max(0.0) / commands.len() as f32;
             for (i, (label, action)) in commands.into_iter().enumerate() {
                 Button::secondary(label).at(x + 8.0 + i as f32 * (bw + 4.0), y + 120.0).width(bw).retain_focus_on_press().on_click(push(action)).render(ctx);
             }
@@ -701,6 +741,44 @@ mod tests {
         s.authoring.replacement.set(TextEdit::new("ow"));
         run(&s, AuthorCmd::Replace(true));
         assert_eq!(s.doc.borrow().wb.value(0, 0, 1), officina_grid::Value::str("cow"));
+    }
+
+    #[test]
+    fn find_all_lists_matches_and_find_looks_in_comments() {
+        use officina_grid::comments::Comment;
+        let s = sheets(b"apple,pear
+apple pie,plum
+fig,apple
+");
+        run(&s, AuthorCmd::FindOpen);
+        s.authoring.query.set(TextEdit::new("apple"));
+        { let mut g = s.grid.get_cloned(); g.cursor = (2, 1); g.anchor = (2, 1); s.grid.set(g); }
+        run(&s, AuthorCmd::FindAll);
+        assert_eq!(s.doc.borrow().status, "Found 3 cells: Sheet1!A1, Sheet1!A2, Sheet1!B3.");
+        assert_eq!(s.grid.get_cloned().cursor, (0, 0));
+        // Past the listed number, the rest are counted.
+        let many: String = (0..30).map(|_| "apple\n").collect();
+        let big = sheets(many.as_bytes());
+        run(&big, AuthorCmd::FindOpen);
+        big.authoring.query.set(TextEdit::new("apple"));
+        run(&big, AuthorCmd::FindAll);
+        assert!(big.doc.borrow().status.starts_with("Found 30 cells: Sheet1!A1,"), "{}", big.doc.borrow().status);
+        assert!(big.doc.borrow().status.ends_with("Sheet1!A20 and 10 more."), "{}", big.doc.borrow().status);
+        // Comments: searched instead of cells, and Replace is refused there.
+        s.doc.borrow_mut().wb.set_comments(0, vec![(1, 1, Some(Comment::new("Ann", "Check the price"))), (2, 0, Some(Comment::new("Bo", "fine")))]);
+        s.authoring.query.set(TextEdit::new("price"));
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.doc.borrow().status, "No matching cell inputs.");
+        run(&s, AuthorCmd::Values);
+        run(&s, AuthorCmd::Comments);
+        assert!(!s.authoring.values.get(), "Comments and Values are exclusive");
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.grid.get_cloned().cursor, (1, 1));
+        s.authoring.query.set(TextEdit::new("apple"));
+        run(&s, AuthorCmd::Find(true));
+        assert_eq!(s.doc.borrow().status, "No matching comments.");
+        run(&s, AuthorCmd::Replace(true));
+        assert!(s.doc.borrow().status.contains("turn Comments off"), "{}", s.doc.borrow().status);
     }
 
     #[test]

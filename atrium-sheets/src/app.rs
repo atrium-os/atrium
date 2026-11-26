@@ -1824,6 +1824,17 @@ impl Sheets {
                         self.split_text.set(TextEdit::new("").secret(true));
                         crate::whatif::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, kind, &typed)
                     }
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::Spelling) => {
+                        // A word that can't be used keeps the bar open.
+                        let r = crate::spelling::answer(&mut self.doc.borrow_mut(), &typed);
+                        match r {
+                            Err(why) => Err(why),
+                            Ok(next) => match self.spelling_step(Ok(next)) {
+                                Some(done) => Ok(done),
+                                None => Err(std::mem::take(&mut self.doc.borrow_mut().status)),
+                            },
+                        }
+                    }
                     _ if self.splitting.get() == Some(crate::data::DataCmd::GoToSpecial) => {
                         // The bar stays open so next can step through what was found.
                         let r = crate::special::go_to_special(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed);
@@ -2139,6 +2150,36 @@ impl Sheets {
     }
 
     /// The status bar's summary of the selection (Average, Count, Sum).
+    /// Shows where a spelling check stopped: the word's cell, the bar with
+    /// its first suggestion, the word and the rest in the status. The
+    /// check's end (or its failure) closes the bar and is returned.
+    fn spelling_step(&self, r: Result<crate::spelling::Next, String>) -> Option<String> {
+        match r {
+            Ok(crate::spelling::Next::Word { cursor, text, say }) => {
+                self.show_cell(cursor.0, cursor.1);
+                let mut g = self.grid.get_cloned();
+                g.anchor = cursor;
+                g.cursor = cursor;
+                self.grid.set(g);
+                let mut ed = TextEdit::new(&text);
+                ed.select_all();
+                self.split_text.set(ed);
+                self.splitting.set(Some(crate::data::DataCmd::Spelling));
+                self.rev.set(self.rev.get().wrapping_add(1));
+                self.doc.borrow_mut().status = say;
+                None
+            }
+            Ok(crate::spelling::Next::Done(m)) | Err(m) => {
+                if self.splitting.get() == Some(crate::data::DataCmd::Spelling) {
+                    self.splitting.set(None);
+                }
+                self.rev.set(self.rev.get().wrapping_add(1));
+                self.set_status(m.clone());
+                Some(m)
+            }
+        }
+    }
+
     pub fn selection_summary(&self) -> Option<String> {
         let sel = self.grid.get_cloned().selection();
         let sheet = self.doc.borrow().sheet;
@@ -2664,6 +2705,7 @@ impl Sheets {
                 // Alt+=: totals; Ctrl+G or F5: the Go To bar.
                 GridAction::AutoSum(_) => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::AutoSum)),
                 GridAction::GoTo => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::GoTo)),
+                GridAction::Spelling => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Spelling)),
                 GridAction::Repeat => cmds.lock().unwrap().push(Cmd::Repeat),
                 // Ctrl+PageUp / Ctrl+PageDown: the sheet before or after; Shift+F11: a new one.
                 GridAction::Sheet(0) => cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Add)),
@@ -2739,7 +2781,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Selected(_) | GridAction::PasteSpecial | GridAction::Zoom(_) | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Spelling | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Selected(_) | GridAction::PasteSpecial | GridAction::Zoom(_) | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -4136,6 +4178,14 @@ impl Sheets {
                         self.split_text.set(ed);
                         self.splitting.set(Some(c));
                     }
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::Spelling) => {
+                    self.close_bars();
+                    let cursor = self.grid.get_cloned().cursor;
+                    let r = crate::spelling::begin(&mut self.doc.borrow_mut(), cursor);
+                    self.spelling_step(r);
                     self.changed();
                     false
                 }
@@ -7622,6 +7672,36 @@ mod tests {
         s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::TraceError));
         s.take_cmds();
         assert!(s.doc.borrow().status.starts_with("Trace Error: A2;"), "{}", s.doc.borrow().status);
+    }
+
+    #[test]
+    fn spelling_steps_through_the_sheet_in_the_bar() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"wrold,fine\nyes,recieve\n");
+        select(&s, (0, 0), (0, 0));
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::Spelling));
+        s.take_cmds();
+        assert_eq!(s.splitting.get(), Some(DataCmd::Spelling));
+        assert_eq!(s.grid.get_cloned().cursor, (0, 0));
+        assert_eq!(s.split_text.get_cloned().text(), "world");
+        assert!(s.doc.borrow().status.contains("\"wrold\" in A1"), "{}", s.doc.borrow().status);
+        let done = || {
+            s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+            s.take_cmds();
+        };
+        done();
+        assert_eq!(shown(&s, 0, 0), "world");
+        assert_eq!(s.grid.get_cloned().cursor, (1, 1));
+        assert_eq!(s.splitting.get(), Some(DataCmd::Spelling), "the bar stays open");
+        // A word that can't be used keeps the bar on the same word.
+        s.split_text.set(TextEdit::new(&"w".repeat(256)));
+        done();
+        assert_eq!((s.splitting.get(), s.grid.get_cloned().cursor), (Some(DataCmd::Spelling), (1, 1)));
+        s.split_text.set(TextEdit::new("ignore"));
+        done();
+        assert!(s.splitting.get().is_none());
+        assert_eq!(s.doc.borrow().status, "The spelling check is complete.");
+        assert_eq!(shown(&s, 1, 1), "recieve");
     }
 
     #[test]

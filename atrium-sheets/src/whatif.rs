@@ -38,6 +38,7 @@ pub fn bar(kind: DataCmd) -> (&'static str, &'static str, &'static str, &'static
         DataCmd::BordersBar => ("Borders", "outside thick; inside dotted", "Draw", "edges (all, outside, inside, top, bottom, left, right, inside horizontal/vertical, diagonal down/up, none), then a line (thin, medium, thick, double, dashed, dotted, hair, dash dot…) and a colour; ; between several"),
         DataCmd::PatternFill => ("Pattern", "thin diagonal stripe red on FFF2CC", "Fill", "a pattern (75% gray … 6.25% gray, thick or thin stripes and crosshatches), its colour, on a background colour; or none"),
         DataCmd::GridColor => ("Gridlines", "automatic", "Set", "a colour name (red, blue…) or six hex digits for this sheet's gridlines, or automatic"),
+        DataCmd::Spelling => ("Change to", "", "Change", "the word to change it to; or ignore, ignore all, change all WORD; the status shows the word and suggestions"),
         DataCmd::FontName => ("Font", "Calibri", "Set", "any font name, kept for Excel; the cells draw in the look-alike Atrium ships (Calibri as Carlito, Arial as Liberation Sans…); automatic for the sheet's own"),
         DataCmd::FontSize => ("Font size", "11", "Set", "points, 1 to 409, in whole or half points"),
         DataCmd::MoveOrCopy => ("Move to", "before Sheet2", "Move", "before NAME, after NAME, first or end; copy first to copy the sheet there"),

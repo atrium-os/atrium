@@ -31,6 +31,8 @@ officina-pdf = { path = "../officina-pdf", default-features = false }
 pergola = { path = "../pergola" }
 # Which bundled face a cell's font name draws in.
 atrium-fonts = { path = "../atrium-fonts" }
+# Spelling (F7), with its built-in English dictionary.
+officina-spell = { path = "../officina-spell" }
 limen = { path = "../limen" }
 monstrator = { path = "../monstrator" }
 fresco-protocol = { path = "../fresco-protocol" }

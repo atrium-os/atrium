@@ -824,6 +824,8 @@ pub enum GridAction {
     AutoSum(CellRange),
     /// Ctrl+G or F5: ask where to go (the app asks).
     GoTo,
+    /// F7: check the spelling (the app does).
+    Spelling,
     /// A formatting key on the selection: `b`, `i`, `u` and `5` (bold,
     /// italic, underline, strikethrough) with Ctrl; `~ ! @ # $ % ^` with
     /// Ctrl+Shift (General, number, time, date, currency, percent,
@@ -3398,6 +3400,10 @@ fn on_key_inner(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut S
             send(GridAction::GoTo);
             return true;
         }
+        Key::F(7) if !cmd && !m.alt && !m.shift && src.fills() => {
+            send(GridAction::Spelling);
+            return true;
+        }
         Key::F(4) if !cmd && !m.alt && src.fills() => {
             send(GridAction::Repeat);
             return true;
@@ -4156,6 +4162,8 @@ mod tests {
         assert!(all.c1 > 3, "{all:?}");
         state.set(kept);
         log.borrow_mut().clear();
+        key(&mut app, Key::F(7), "", Modifiers::default());
+        assert_eq!(log.borrow().last(), Some(&GridAction::Spelling));
         key(&mut app, Key::F(5), "", Modifiers::default());
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
         key(&mut app, Key::Char, "d", Modifiers { ctrl: true, ..Modifiers::default() });

@@ -230,6 +230,7 @@ dependencies = [
  "officina-draw",
  "officina-grid",
  "officina-pdf",
+ "officina-spell",
  "pergola",
  "portcullis-ipc",
  "uuid",
@@ -1401,6 +1402,10 @@ dependencies = [
  "officina-shapes",
  "officina-text",
 ]
+
+[[package]]
+name = "officina-spell"
+version = "0.1.0"
 
 [[package]]
 name = "officina-text"
