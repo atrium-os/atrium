@@ -373,8 +373,10 @@ What changes, all of it additive:
 
 1. **Main sees only what it owns.** Solum gives main an ACPI (or device tree) and PCI view
    with the devices of other domains removed: their functions read as absent in config
-   space, and their ACPI and DMAR/IORT entries are trimmed. newbus never probes a device
-   main doesn't own, so no driver needs to know about Solum.
+   space, and their DMAR/IVRS/IORT and MCFG entries are trimmed. newbus never probes a PCI
+   function main doesn't own, so no driver needs to know about Solum. The DSDT cannot be
+   trimmed without rewriting AML, so main's ACPI namespace still shows other domains'
+   device objects; their methods fault where they touch those devices (§5.6 item 4).
 2. **`solumbus`:** a newbus bus driver that enumerates main's links from the manifest
    (one child per link, with the protocol class as its PNP id). Link class drivers attach
    with ordinary probe and attach. The frame link becomes an `ifnet`; the others hand an
@@ -389,8 +391,25 @@ What changes, all of it additive:
    dispensatord. It detaches a device's kernel driver (`devctl detach`), maps the BARs into
    one jailed process (without config-space mirrors or the MSI-X table), asks Solum for an
    IOMMU domain over that process's pinned pages, and delivers interrupts as kevents. It
-   is the PCI counterpart of `ugen` and `hidraw`, and on a non-Solum boot it can use
-   FreeBSD's own IOMMU (`dmar`, `smmu`) instead.
+   is the PCI counterpart of `ugen` and `hidraw`. The rules:
+   - **Whole groups only:** the whole IOMMU group goes to the process, with ACS or no
+     peer-to-peer (§5.3 item 2).
+   - **Handover:** take the device out of main's static IOMMU domain and reset it (FLR or
+     bus reset) before the process's domain is attached, so DMA the kernel driver left
+     running cannot land in the process's pages.
+   - **Interrupts are MSI or MSI-X only.** A device that can only do shared INTx is
+     refused (or, by quirk, its line stays masked until the process acknowledges each
+     interrupt), so a stalled process cannot storm the kernel.
+   - **Config access** the driver needs (bus master enable, PM state, reading its
+     capabilities) goes through filtered `devassign` calls, never an ECAM mapping.
+   - **Teardown** when the process exits or crashes, in this order: clear bus mastering or
+     reset the device; switch its IOMMU domain to blocking; invalidate the IOTLB and wait
+     for completion; only then unpin and free the pages. Any other order lets the device
+     DMA into pages that already belong to someone else.
+   - **Without Solum:** `devassign` refuses unless the machine has an IOMMU with interrupt
+     remapping on (user-space DMA without them amounts to root). FreeBSD's `dmar` and
+     `smmu` have no per-process domain API today, so this is new kernel work in the fork,
+     not a fallback that already exists.
 5. **Moving a device** between main and a domain is detach in main (`devctl detach`, then
    Solum's move with the §5.3 reset), then attach in the domain. Main's newbus sees a
    removal, as for a hot-unplug.
@@ -422,10 +441,13 @@ more places where the model meets the hypervisor. Each one, and what to do:
    reprogramming a BAR or a bridge window to overlap another domain's MMIO, rewriting MSI
    addresses, or enabling SR-IOV functions Solum does not know about. Solum therefore
    traps main's config space too: the ECAM pages of functions main does not own are
-   unmapped from its stage-2 (reads return all-ones, the "absent" answer); for functions
-   it owns, writes to BARs, bridge windows, the MSI and MSI-X capabilities, SR-IOV control
-   and resizable-BAR control exit and are checked against the manifest's address map, and
-   everything else passes. Config writes happen at boot and when interrupts are set up,
+   unmapped from its stage-2 (reads return all-ones, the "absent" answer); the ECAM pages
+   of functions it owns are **read-only** in stage-2, so every config write exits. Writes
+   to BARs, bridge windows, the MSI and MSI-X capabilities, SR-IOV control and
+   resizable-BAR control are checked against the manifest's address map, and other writes
+   are replayed as they are. On amd64 the legacy **CF8/CFC** ports are trapped too, with the
+   same rules. Devices whose BARs mirror config space need a quirk entry, for main's own
+   devices as for passthrough ones. Config writes happen at boot and when interrupts are set up,
    not in the I/O path, so this costs nothing in §9. **Do:** part of S2.
 4. **ACPI, power and sleep.** The main kernel runs the ACPI interpreter, and AML
    firmware code can touch any I/O port or MMIO address, including the resources of
@@ -438,14 +460,39 @@ more places where the model meets the hypervisor. Each one, and what to do:
    - AML accesses to resources the manifest gives another domain **fault and are logged**
      rather than reaching the device; firmware that needs them goes into a per-machine
      quirk list in the manifest.
-   - **Solum owns the resume path.** main asks Solum to sleep; Solum stops the driver
-     domains and the vault, saves its own state, and points the firmware's waking vector
-     at itself, then lets main enter the sleep state. On wake Solum restores itself,
-     re-checks the IOMMU and stage-2 tables, resumes the domains, then resumes main.
-     Without this, a sleep and wake would leave main running with no Solum underneath.
-   - Power transitions of a domain's device (`_PS0`/`_PS3` and D-states) are the owning
-     domain's to request, over a small **platform link** to main's ACPI service; main
-     runs the method.
+   - **Solum owns the resume path, and main cannot go around it.** Sleep is entered by a
+     write of SLP_TYP and SLP_EN to the PM1a/PM1b control registers (or the hardware-reduced
+     sleep control register), and the waking vector lives in the FACS. So Solum **traps
+     those registers** (I/O bitmap on amd64, stage-2 on MMIO-mapped ones), maps the **FACS
+     read-only** to main, and treats a trapped sleep write as the sleep request itself: it
+     stops the driver domains and the vault, saves its own state, writes its own waking
+     vector, and performs the sleep write. On wake Solum restores itself, re-checks the
+     IOMMU and stage-2 tables, resumes the domains, then resumes main. Main never gets the
+     CPU after wake without Solum underneath.
+   - **The S3 boot script** (the firmware's record of chipset state to replay on resume)
+     must live where main cannot write it: firmware that keeps it in SMRAM or a LockBox.
+     Firmware that keeps it in ACPI NVS that main can write is not supported for sleep
+     under Solum (s2idle only, which never leaves the OS); the machine list in the
+     manifest says which.
+   - **SMIs** run in SMM, which sits below Solum. AML and main can raise them (the APMC
+     port 0xB2 and others), and SMI handlers that take a buffer address from the caller
+     are a known way out of any hypervisor. Solum traps SMI-raising ports for main and
+     passes only a per-machine allow-list from the manifest's quirk list (WMI, backlight
+     and some EC methods will need entries). Where the CPU and firmware offer **SMM
+     isolation** (Intel PPAM / STM, AMD SMM Supervisor), Solum requires it on, and the
+     allow-list can be wider. Either way SMM firmware is in the TCB (§11).
+   - Power transitions of a domain's device are the owning domain's to request, over a
+     small **platform link** to main's ACPI service. They are split: **Solum** performs the
+     device's own part (the PMCSR D-state write in the PCI PM capability, which it already
+     filters, §5.3 item 4), and **main** runs only the platform part (power-resource
+     methods, `_ON`/`_OFF`, GPIO and EC). A `_PS0`/`_PS3` method that touches the device's
+     own config space or MMIO cannot run in main and needs a quirk entry saying which part
+     Solum does.
+   - **Reset and power-off go through Solum.** The FADT `RESET_REG`, port 0xCF9, the
+     keyboard-controller reset and the S5 sleep write are trapped; Solum stops the driver
+     domains, has the vault wipe its keys, and only then resets or powers off. The vault
+     also sets the **TCG Memory Overwrite Request (MOR)** bit while it holds keys, so the
+     firmware wipes RAM after any reset Solum didn't perform (a crash, a reset button).
    **Do:** a new build step for sleep and ACPI (S2a, after S2), with a gate: 100 sleep
    and wake cycles, each followed by an isolation recheck (a main read of a vault page
    still faults).
@@ -456,6 +503,85 @@ bounded, fuzzed parser, and replacing it would not be Solum work. **Hardware cov
 (new Wi-Fi chips, laptop sensors) is the real weakness of FreeBSD's drivers, and Solum
 does not change it: a Linux driver domain would bring GPL code into the shipped system,
 which the licensing policy rules out.
+
+### 5.7 Access, debugging, traps and power
+
+**Who can reach Solum.** Solum has no users, no shell, no login and no network. People
+reach it only through Atrium:
+
+- **`solumd`**, a small jailed Rust service in main with its own uid, is the only holder
+  of `/dev/solum` (devfs ruleset pinned to its jail, binary and uid, as for other device
+  grants). The kernel side of `/dev/solum` turns a few ioctls into hypercalls.
+- **Curia** gets a "Hypervisor" page and the CLI gets **`solumctl`** (Shankar's rule: a
+  CLI for everything the GUI does). Both talk to `solumd`.
+- **Reading:** anyone in the session can see Solum's version and measurement, each
+  domain's state, restarts, exit counters by reason, seal timeouts, and the last crash
+  record. These come from a fixed-size ring of fixed-size event records that Solum
+  writes read-only to `solumd`; there is no free text.
+- **Acting:** restarting a domain or moving a device, only where the manifest allows it,
+  needs the administrator role (Curia's admin authentication, as for other system
+  settings).
+- **Never from Atrium:** changing the manifest, reading another domain's memory, changing
+  IOMMU or stage-2 tables. A new manifest arrives as a signed Opifex base update and takes
+  effect at the next (measured) boot.
+
+**Debugging Solum.** Most of it happens with no hardware at all: Solum under QEMU (TCG
+with `virtualization=on` on arm64, KVM nested on the R9700 box) is debugged with QEMU's
+own gdbstub, which can break into Solum, single-step it and read every domain's memory.
+On real hardware:
+
+- A **debug build** of Solum (a different image, so a different measurement: the vault's
+  seal does not open and the recovery path applies, §7.2) carries a **GDB remote stub**
+  (the `gdbstub` crate, MIT/Apache-2.0) on a serial port Solum owns (a UART, or the BMC's
+  serial-over-LAN on the R9700 box).
+- **Break-in:** a break sequence on that serial port, or the BMC's NMI button, makes
+  Solum stop every CPU (NMI or SGI) and enter the stub. From there it can debug Solum
+  itself and also any domain from below: the main kernel's vCPUs, registers and memory,
+  without ddb or kgdb in the kernel. That replaces today's "dump the guest with QEMU
+  before resetting" on hardware (AGENTS.md).
+- **Release builds have no stub, no break-in and no trace,** only the crash record
+  (§6.3) and the counters. The platform's external debug ports (Intel DCI, Arm JTAG and
+  CoreSight) must be locked by firmware on a release machine, since they reach below
+  Solum; Solum reports their lock state where the platform exposes it.
+- **Performance counters:** main keeps the PMU on its own CPUs for `hwpmc`/`perf`, and
+  Solum saves and restores the PMU around every switch to another domain, so the
+  counters neither leak nor count other domains' work. Solum's own exit trace (a debug
+  ring of exit reason, address and time) exists only in debug builds.
+
+**What traps, in one place.** Everything else runs natively.
+
+| traps (exits to Solum) | when it happens | in the I/O path? |
+|---|---|---|
+| hypercalls (links, seals, status) | link kicks, seals, `solumd` | kicks only, batched |
+| stage-2 faults | only bugs or attacks | no |
+| config-space writes (ECAM read-only pages, CF8/CFC) | boot, interrupt setup, device moves | no |
+| interrupt-controller parts: GICD and ITS routing, SGIs while another domain runs, ICR on amd64 without IPIv | interrupt setup; IPIs on CPUs without IPIv | IPIs on older amd64 only |
+| sleep, reset and power-off registers, FACS writes | sleep, reset, shutdown | no |
+| SMI-raising ports | AML methods that use SMM | no |
+| a few MSRs (virtualisation control, IOMMU, debug) and, on Intel, `CPUID`, `XSETBV` and `GETSEC` (VMX always exits on these) | boot and rare calls | no |
+| the preemption timer (amd64) or EL2 timer (arm64) | only while a driver domain has work or a watchdog is due | no |
+
+Not trapped for main: `HLT`, `MWAIT` and `WFI` (idle runs natively), page faults,
+system calls, timer interrupts (TSC-deadline through APICv, the Arm generic timer
+directly), and device I/O on passthrough devices.
+
+**Sleep and energy: Solum's role.** Main stays the owner of energy policy (Laminar, the
+power posture, energy-policy.md); Solum keeps only what isolation needs and adds no
+wake-ups of its own.
+
+| state | who decides | what Solum does |
+|---|---|---|
+| CPU idle (C-states) | main (Laminar) | nothing: `HLT`/`MWAIT`/`WFI` run natively. A driver domain or the vault going idle returns the CPU to main |
+| CPU frequency (P-states: HWP, CPPC, SCMI) | main | passes the controls through; a domain can't change another's frequency except through main, which is only a denial-of-service risk |
+| CPU on and off (hotplug, PSCI `CPU_ON` and `CPU_OFF`) | main | intercepts, so every CPU comes up in Solum first and then enters main; a CPU running another domain is not taken offline under it |
+| device D-states | the owning domain | Solum does the PMCSR write; main runs the platform AML (§5.6 item 4) |
+| s2idle (modern standby) | main | waits until every domain is idle, then lets main idle the package |
+| S3 (suspend to RAM) | main asks | Solum traps the sleep write, quiesces the domains and the vault, owns the waking vector, and re-checks its tables on wake (§5.6 item 4) |
+| S4 (hibernate) | not offered under Solum | a hibernation image holds unlocked personas' keys and data outside their key group (at-rest rule) and can't include the vault; off on Solum machines |
+| S5 (power off) and reset | main asks | Solum stops the domains, the vault wipes its keys, then Solum powers off or resets (§5.6 item 4) |
+
+Energy gate, added to §9: idle package power and wake-ups per second under Solum within
+run-to-run noise of bare metal, and S3 entry and exit times within 10 % of bare metal.
 
 ## 6. Crash protection
 
@@ -624,6 +750,8 @@ runs per arm, exits counted by a positive-controlled counter:
   runs, and GPU submit latency, within noise.
 - Interrupt latency on passthrough devices: < 5 µs added at p99.
 - Exits per second in steady state: near zero; a steady stream is a bug.
+- Energy: idle package power and wake-ups per second within noise of bare metal; S3 entry
+  and exit within 10 % (§5.7).
 - Link classes (Wi-Fi, USB, audio, cameras): line rate of the device, audio latency within
   one period, input latency < 1 ms added.
 - Switch costs, measured and counted against the gates above: the side-channel flushes on
@@ -673,7 +801,7 @@ platform yet.
   runs. That is an exception to §4.3's "never preempts", limited to vault calls, and both
   costs are counted in §9. No SMT
   sibling sharing while the vault runs; it runs rarely.
-- **Firmware** (SMM, PSP, ME) stays above Solum, as in tpm-boot.md.
+- **Firmware** (SMM, PSP, ME) stays above Solum, as in tpm-boot.md. SMM is in the TCB: Solum limits which SMIs main can raise and requires SMM isolation where the platform has it (§5.6 item 4), but a bug in an SMI handler is still outside what Solum can contain.
 - **Fork changes:** `dmar`/`smmu` in a static-domain mode for main, the module-load hypercall, the link driver, the `ATRIUM-DD` config. Small, but ours to carry.
 - **Size of the job:** a hypervisor is a security product. It needs its own review thread
   pass and fuzzing before any default boot uses it.
@@ -708,6 +836,15 @@ as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after dev
 (§6.1), firmware-table fuzzing (§7.4), the camera indicator in frescod's trusted lane
 (§5.1), the deferred key ceremony (§4.6), and P0's limits (§10).
 
+A third pass (10 findings, on §5.5–§5.6 and the safety study) is folded in too: sleep
+registers and FACS trapped, S3 boot script in SMRAM or a LockBox, SMI port allow-list and
+SMM isolation (§5.6 item 4, §11); devassign handover and teardown order, whole groups,
+MSI-only interrupts, filtered config calls, and an IOMMU required without Solum (§5.5
+item 4); D-states split between Solum and main; reset and power-off through Solum with
+MOR set by the vault; CF8/CFC and read-only ECAM for owned functions (§5.6 item 3); DSDT
+not trimmed (§5.5 item 1); reserved manifest fields rejected and two-consumer seals for
+lockstep (safety study).
+
 ## 13. Decisions (all accepted by Shankar 2026-11-27, as recommended)
 
 1. **Build Solum, a tailored Rust type-1 hypervisor; bhyve is the prototype and the
@@ -738,6 +875,9 @@ as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after dev
    **Accepted by Shankar 2026-11-27** ("keep it compatible, but don't build it").
 7d. **Keep FreeBSD's driver model;** add `solumbus`, static-domain `busdma`, a filtered
    device view for main, and `devassign` for user-space PCI drivers (§5.5). *Recommend yes.*
+7f. **Access, debugging and power** (§5.7): Solum reached only through `solumd`, `solumctl`
+   and Curia; GDB stub in debug builds only; main owns energy policy, Solum owns resume,
+   reset and CPU bring-up; no hibernate under Solum. *Recommend yes; new.*
 7e. **Driver-model weak spots** (§5.6): explicit move sequence in dispensatord, generation
    bump on every move, main's config writes checked, main keeps ACPI with Solum owning
    the resume path (new step S2a). *Recommend yes; this one is new since the acceptance.*

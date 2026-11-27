@@ -169,7 +169,10 @@ This is not a protection but the dominant cost:
    ideally in different clusters (to avoid common-cause faults), optionally with a fixed
    time offset.
 2. **Input replication:** Solum delivers each input record (a sealed sensor frame, a CAN
-   message) to both copies, with the same timestamp. Neither copy reads time, interrupts
+   message) to both copies, with the same timestamp. One sealed input then has **two
+   consumers**, so the seal of the device-interface study §5.2 gains a consumer count and
+   a deadline per consumer, and the pages unseal only when both have released (or the
+   deadline force-unseals and the pair is reported to the health monitor). Neither copy reads time, interrupts
    or shared state directly: the task must be **deterministic given its inputs**
    (single-threaded per frame, no wall clock, no uninitialised memory). That is a
    contract on the task, written into the safety manual.
@@ -220,7 +223,8 @@ safety build. A certified build then contains only the code its evidence covers.
 2. Bound every handler (no unbounded loops); add a WCET note to each handler's doc
    comment.
 3. Leave room in the manifest for reserved cores, cache and bandwidth partitions, and a
-   cyclic schedule, even if `desktop` doesn't parse them yet.
+   cyclic schedule. The `desktop` build **rejects** a manifest that sets them (they must be
+   absent or zero), never ignores them.
 4. Reserve the E2E header fields in the link record format (a CRC, sequence number and
    data ID), unused by `desktop`.
 5. Keep the safety-relevant core (memory ownership, stage-2/IOMMU agreement, interrupt
