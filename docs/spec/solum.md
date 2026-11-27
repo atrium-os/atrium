@@ -1,6 +1,6 @@
 # Solum: a thin hypervisor for Atrium
 
-**Status: proposed 2026-11-27.** Nothing here is built. Shankar asked: "thin hypervisor
+**Status: accepted 2026-11-27** (Shankar: "agreed to all", every §13 decision as recommended). Nothing here is built. Shankar asked: "thin hypervisor
 over bare metal for Atrium without affecting performance. Can bhyve be this hypervisor?
 Should we build one with Rust instead to tailor it for Atrium with jails?" The goals, in
 his words: "crash protection, security, abstracting devices with standardised interfaces,
@@ -397,8 +397,65 @@ What changes, all of it additive:
 6. **Driver domains** (`ATRIUM-DD`) run the same FreeBSD drivers with the same model,
    plus a link back end. No driver code is written twice.
 
-Two gaps that device-assignment.md already lists, late binding and unstable unit numbers,
-are unrelated to Solum and stay with that spec.
+### 5.6 Weak spots in the driver model, and what Solum changes about them
+
+device-assignment.md §3.2 rated two parts of FreeBSD's model weak, and Solum adds two
+more places where the model meets the hypervisor. Each one, and what to do:
+
+1. **Late binding** (only unattached devices are re-probed; no "better driver takes
+   over"). Already handled for the desktop by dispensatord's claim step
+   (device-assignment.md §4.3: `rebind` for the GPU, `detach` and `devmatch_blocklist`
+   for user-space owners). Solum makes it matter more, because devices now leave and come
+   back at run time. So moves are an explicit dispensatord sequence, not a hot-plug
+   emulation: to give a device away, `devctl detach`, then `devctl delete`, then Solum's
+   move; to take it back, Solum's move, then `devctl rescan` of the parent bus, then the
+   claim rules run again as for a fresh device. No virtual hot-plug slot is emulated.
+   **Do:** add the move sequence to dispensatord with S3 (first driver domain).
+2. **Unit numbers are reused** (`hidraw0` after an unplug can be another device). Already
+   handled by dispensatord's stable id (location, serial or BDF, and a generation bumped
+   on every detach; device-assignment.md §4.2 item 4). Under Solum: a move bumps the
+   generation as a detach does, so a device that went to a domain and came back is a new
+   device to every owner and starts hidden; `solumbus` children are named by the
+   manifest's link name, which is stable across boots, never by unit number. **Do:**
+   nothing new beyond that rule.
+3. **PCI config space** is how a driver could break isolation even on a device it owns:
+   reprogramming a BAR or a bridge window to overlap another domain's MMIO, rewriting MSI
+   addresses, or enabling SR-IOV functions Solum does not know about. Solum therefore
+   traps main's config space too: the ECAM pages of functions main does not own are
+   unmapped from its stage-2 (reads return all-ones, the "absent" answer); for functions
+   it owns, writes to BARs, bridge windows, the MSI and MSI-X capabilities, SR-IOV control
+   and resizable-BAR control exit and are checked against the manifest's address map, and
+   everything else passes. Config writes happen at boot and when interrupts are set up,
+   not in the I/O path, so this costs nothing in §9. **Do:** part of S2.
+4. **ACPI, power and sleep.** The main kernel runs the ACPI interpreter, and AML
+   firmware code can touch any I/O port or MMIO address, including the resources of
+   devices in other domains. Sleep (S3, s2idle) hands the CPU to firmware and back, and the
+   resume vector would bring the main kernel back up without Solum underneath. The plan:
+   - **main keeps the platform role** (AML, embedded controller, GPIO, power button, lid,
+     battery, sleep requests), like dom0 in Xen. That gives main control over the
+     other domains' power, which is only a denial-of-service risk, and §11 already accepts
+     that main can deny service.
+   - AML accesses to resources the manifest gives another domain **fault and are logged**
+     rather than reaching the device; firmware that needs them goes into a per-machine
+     quirk list in the manifest.
+   - **Solum owns the resume path.** main asks Solum to sleep; Solum stops the driver
+     domains and the vault, saves its own state, and points the firmware's waking vector
+     at itself, then lets main enter the sleep state. On wake Solum restores itself,
+     re-checks the IOMMU and stage-2 tables, resumes the domains, then resumes main.
+     Without this, a sleep and wake would leave main running with no Solum underneath.
+   - Power transitions of a domain's device (`_PS0`/`_PS3` and D-states) are the owning
+     domain's to request, over a small **platform link** to main's ACPI service; main
+     runs the method.
+   **Do:** a new build step for sleep and ACPI (S2a, after S2), with a gate: 100 sleep
+   and wake cycles, each followed by an isolation recheck (a main read of a vault page
+   still faults).
+
+Not changed, after a look: **devd** stays as the reader of `/dev/devctl`. It is a root
+C++ daemon with string-typed events, but dispensatord already parses its output with a
+bounded, fuzzed parser, and replacing it would not be Solum work. **Hardware coverage**
+(new Wi-Fi chips, laptop sensors) is the real weakness of FreeBSD's drivers, and Solum
+does not change it: a Linux driver domain would bring GPL code into the shipped system,
+which the licensing policy rules out.
 
 ## 6. Crash protection
 
@@ -583,6 +640,7 @@ runs per arm, exits counted by a positive-controlled counter:
 | **S0** | null Solum on amd64: boots from the loader, launches the unchanged kernel on large-block EPT, everything passed through | boots to frescod on the R9700; §9 CPU, NVMe, GPU gates. **Stop rule:** if missed and not fixable, stop lane S |
 | **S1** | memory ownership, hypercalls, domain manifest, the link (arena, kick, epoch, seal, donate) with a test domain that echoes | a main-domain read of another domain's page faults (positive control first); copy vs seal vs donate and kick latency measured, thresholds fixed |
 | **S2** | IOMMU ownership and §5.3 safeguards; main's static superpage IOMMU domain (§5.3 item 8), small domains for the rest; option-ROM and firmware-slot policy | a DMA to another domain's page faults; group, reset and config-filter checks; GPU gates still met |
+| **S2a** | ACPI and sleep under Solum (§5.6 item 4): platform link, AML fault logging and quirks, Solum-owned resume | 100 sleep and wake cycles on the R9700 box, each followed by an isolation recheck |
 | **S3** | first driver domain: usb (xHCI) serving Tactus, file and USB-transfer links; restart path (§6.1) | kill the domain mid-copy: the stick remounts, nothing else stops |
 | **S4** | vault with the TPM (§7.2); arcad's vault ring | arca-vm-test.sh passes; vault memory unreadable from root in the main domain; sealing fails without Solum |
 | **S5** | net domain (Aura Wi-Fi), audio domain | crash and restart gates per class |
@@ -650,7 +708,7 @@ as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after dev
 (§6.1), firmware-table fuzzing (§7.4), the camera indicator in frescod's trusted lane
 (§5.1), the deferred key ceremony (§4.6), and P0's limits (§10).
 
-## 13. Decisions for Shankar
+## 13. Decisions (all accepted by Shankar 2026-11-27, as recommended)
 
 1. **Build Solum, a tailored Rust type-1 hypervisor; bhyve is the prototype and the
    non-Solum VM engine, not the product.** *Recommend yes.*
@@ -680,4 +738,7 @@ as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after dev
    **Accepted by Shankar 2026-11-27** ("keep it compatible, but don't build it").
 7d. **Keep FreeBSD's driver model;** add `solumbus`, static-domain `busdma`, a filtered
    device view for main, and `devassign` for user-space PCI drivers (§5.5). *Recommend yes.*
+7e. **Driver-model weak spots** (§5.6): explicit move sequence in dispensatord, generation
+   bump on every move, main's config writes checked, main keeps ACPI with Solum owning
+   the resume path (new step S2a). *Recommend yes; this one is new since the acceptance.*
 8. **Name: Solum** (Latin: ground, floor, the base the atrium stands on). *Recommend yes.*
