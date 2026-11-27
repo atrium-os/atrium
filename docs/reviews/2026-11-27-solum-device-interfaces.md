@@ -189,6 +189,7 @@ Which of these wins at which size is measured in S1 (solum.md §10) and not assu
 | USB audio, HDA | Lyra's stream rings and clock | lyrad | codec and USB audio class |
 | Bluetooth | HCI (the Bluetooth standard interface) | Vinculum's transport layer | USB transfer layer and the firmware loader |
 | other USB devices | USB transfers for one device (a usbredir-like protocol) | the jailed user-space driver (CCID, and so on) | descriptors and the xHCI driver |
+| cameras | a frame stream: rings of sealed frame buffers with format, stride and a timestamp on the shared clock, plus control records (mode, exposure, focus) | the app holding a camera grant, through a jailed decoder for MJPEG | UVC descriptors and payload headers |
 | graphics (graphics domain) | Fresco | apps, unchanged | the GPU driver |
 
 The main kernel needs only one new driver, the link itself (Rust; its only parsing is of

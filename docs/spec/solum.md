@@ -201,6 +201,30 @@ domain kernel starts with stage-2 already on; it never runs unconfined. With
 `solum.disable=1` on a dev boot, or a CPU without the extensions, the loader starts the
 kernel directly as today: same kernel, with native drivers for everything.
 
+### 4.8 Hardware virtualisation: what Solum uses
+
+Solum is built on the CPUs' own virtualisation support; there is no other way to be thin.
+Without it, the options are binary translation or a paravirtualised kernel, each slower
+and far larger. Solum needs the base features, uses the rest when present, and the
+machine runs without Solum when the base features are missing (§4.7).
+
+| need | Intel | AMD | Arm | use in Solum |
+|---|---|---|---|---|
+| base (required) | VT-x, EPT, unrestricted guest | AMD-V (SVM), NPT | EL2, stage-2 translation, VMID | trap-free main domain on its own stage-2 |
+| large stage-2 blocks (required for near native) | EPT 2 MiB / 1 GiB | NPT 2 MiB / 1 GiB | stage-2 block descriptors | main domain's memory mapped in a few huge blocks (§4.2) |
+| IOMMU with interrupt remapping (required for passthrough) | VT-d with IR | AMD-Vi with IR | SMMUv3 (stage 2, or nested stages) | §5.3 safeguards |
+| interrupt delivery without exits | APICv, posted interrupts | AVIC, x2AVIC | GICv4.1 direct vLPI and vSGI injection | passthrough interrupts straight to the owning vCPU (§4.4); link kicks on newer parts |
+| tagged TLBs | VPID | ASID | VMID | no TLB flush on a domain switch |
+| execute-only and per-mode execute for kernel text | MBEC | GMET | stage-2 XN per EL (FEAT_XNX) | §7.3 kernel text freeze |
+| page-table protection | HLAT, paging-write | — | — | later: protect the main kernel's page tables (§7.3 left this out) |
+| fast domain switch without an exit | VMFUNC EPTP switching | — | — | candidate for vault calls and link kicks; measure in S1 before relying on it (it has known side-channel caveats) |
+| cache and memory-bandwidth partitioning | RDT (CAT, MBA) | QoS (L3 CAT) | MPAM | keep the vault and the driver domains from evicting the main domain's cache; also blunts cache side channels (§11) |
+| confidential computing | TDX (Xeon) | SEV-SNP (EPYC) | CCA / RME (few parts yet) | optional: where present, the vault could run so that even Solum cannot read it. Not on client CPUs today, so not required |
+
+What Solum deliberately does **not** use: nested virtualisation for the main domain (the
+Linux lane's guests are Solum domains, not guests of guests), and the CPU's VM-exit-heavy
+emulation paths (no emulated devices).
+
 ## 5. Devices
 
 ### 5.1 Per class
@@ -214,6 +238,7 @@ kernel directly as today: same kernel, with native drivers for everything.
 | USB host controllers | usb driver domain | Tactus events for HID, Lyra rings for USB audio, file operations for sticks (FAT/exFAT parsed in the domain), HCI for Bluetooth, per-device USB transfers for jailed user-space drivers (CCID) | descriptor and file-system parsing from any plugged device; hot-plug faults |
 | Bluetooth radio | with USB (it is USB) | as above | firmware loader and HCI parsing |
 | HD audio / codecs | audio driver domain (or driver process) | Lyra stream rings and clock | crash-prone codec drivers; audio rates are tiny |
+| cameras (USB UVC, MIPI on arm64 boards) | usb domain or a driver process | a **frame stream**: Lyra-style rings of sealed frame buffers (format, size, stride, timestamp on the shared clock), with control records for mode, exposure and focus | UVC descriptor and payload-header parsing, MJPEG left undecoded for the consumer's jailed decoder; a camera is a privacy device, so the stream opens only through a grant (an app capability plus the indicator in Forum), never by default |
 | SD / card readers, serial, sensors | driver domains or processes | file operations, byte streams | low rate, rare drivers |
 | TPM | vault | none (main domain asks the vault) | keys (§7.2) |
 | platform (timers, interrupt controller, power) | Solum / main direct | real hardware | performance and simplicity |
@@ -463,4 +488,9 @@ hypervisors are read for design only.
    yes.* Alternative: arm64 first, but no arm64 hardware we have can run it at speed today.
 7. **Machines without the hardware features run Atrium without Solum,** with native drivers
    as today. *Recommend yes.*
+7a. **Build on the CPUs' virtualisation support** (VT-x/EPT, AMD-V/NPT, Arm EL2/stage-2,
+   with the IOMMU), using the optional features in §4.8 where present; confidential
+   computing (TDX, SEV-SNP, CCA) only as an extra for the vault. *Recommend yes.*
+7b. **Cameras are a frame-stream link, opened only through a grant** (§5.1). *Recommend
+   yes.*
 8. **Name: Solum** (Latin: ground, floor, the base the atrium stands on). *Recommend yes.*
