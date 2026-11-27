@@ -248,7 +248,7 @@ mod tests {
         let dg = rec(0x000F, 0xF002, &shapes);
         let info = [dgg, vec![0], dg].concat();
         let art = Art::read(&info);
-        assert_eq!(art.main.get(&1025), Some(&Shape { pib: Some(1), ..Shape::default() }));
+        assert_eq!(art.main.get(&1025), Some(&Shape { pib: Some(1), spt: 0xC0, ..Shape::default() }));
         assert!(art.main[&1024].group);
         assert_eq!(art.main[&1026].pib, Some(1));
         assert_eq!(art.main[&1027].pib, None);

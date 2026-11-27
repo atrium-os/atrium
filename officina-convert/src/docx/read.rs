@@ -901,8 +901,8 @@ impl<'a> Reader<'a> {
         if bytes.is_empty() || bytes.len() > MAX_PICTURE {
             return None;
         }
-        let Some((w, h)) = pixel_size(&bytes) else {
-            self.rep.note_at(Kind::Dropped, "pictures in formats not shown (TIFF, SVG, PICT)", || target.clone());
+        let Some((bytes, w, h)) = crate::raster::normalize(bytes) else {
+            self.rep.note_at(Kind::Dropped, "pictures in formats not shown (PICT, damaged TIFF or SVG)", || target.clone());
             return None;
         };
         let i = self.doc.images.add(ImageData { bytes: Arc::from(bytes), width: w, height: h });

@@ -659,7 +659,7 @@ impl Out<'_> {
         }
         let img = self.doc.images.get(i)?;
         let b = &img.bytes;
-        let ext = if let Some(k) = officina_pict::sniff(b) { k.name() } else if b.starts_with(&[0xFF, 0xD8]) { "jpg" } else if b.starts_with(b"GIF8") { "gif" } else if b.starts_with(b"RIFF") { "webp" } else { "png" };
+        let ext = if let Some(k) = officina_pict::sniff(b) { k.name() } else if b.starts_with(&[0xFF, 0xD8]) { "jpg" } else if b.starts_with(b"GIF8") { "gif" } else if b.starts_with(b"RIFF") { "webp" } else if crate::docx::write::is_svg(b) { "svg" } else { "png" };
         let n = format!("Pictures/{}image{}.{ext}", self.prefix, self.media.len() + 1);
         self.media.push((n.clone(), b.to_vec()));
         self.image_names.insert(i, n.clone());
@@ -1495,7 +1495,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text")?;
     let mut manifest = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>"#);
     for (name, _) in &o.media {
-        let mt = if name.ends_with(".emf") { "image/x-emf" } else if name.ends_with(".wmf") { "image/x-wmf" } else if name.ends_with(".bmp") { "image/bmp" } else if name.ends_with(".jpg") { "image/jpeg" } else if name.ends_with(".gif") { "image/gif" } else if name.ends_with(".webp") { "image/webp" } else { "image/png" };
+        let mt = if name.ends_with(".emf") { "image/x-emf" } else if name.ends_with(".wmf") { "image/x-wmf" } else if name.ends_with(".bmp") { "image/bmp" } else if name.ends_with(".jpg") { "image/jpeg" } else if name.ends_with(".gif") { "image/gif" } else if name.ends_with(".webp") { "image/webp" } else if name.ends_with(".svg") { "image/svg+xml" } else { "image/png" };
         let _ = write!(manifest, r#"<manifest:file-entry manifest:full-path="{name}" manifest:media-type="{mt}"/>"#);
     }
     manifest += "</manifest:manifest>";

@@ -22,6 +22,8 @@ pub mod launch;
 mod lookxml;
 pub mod odt;
 pub mod pictures;
+#[cfg(feature = "read")]
+pub mod raster;
 pub mod odfcrypt;
 pub mod odp;
 pub mod ods;

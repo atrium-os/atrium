@@ -30,7 +30,6 @@ use std::sync::Arc;
 use officina_text::fields;
 use officina_text::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
-use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
 use crate::xml::{self, El, Node};
 use crate::zip::Archive;
@@ -1075,8 +1074,8 @@ impl<'a> Reader<'a> {
                 if bytes.is_empty() || bytes.len() > crate::docx::read::MAX_PICTURE || self.images.len() >= crate::docx::read::MAX_PICTURES {
                     return None;
                 }
-                let Some((w, h)) = pixel_size(&bytes) else {
-                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (TIFF, SVG, SVM)", || href.clone());
+                let Some((bytes, w, h)) = crate::raster::normalize(bytes) else {
+                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (SVM, damaged TIFF or SVG)", || href.clone());
                     return None;
                 };
                 let i = self.doc.images.add(ImageData { bytes: Arc::from(bytes), width: w, height: h });

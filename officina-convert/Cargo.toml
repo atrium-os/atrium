@@ -20,7 +20,7 @@ required-features = ["read"]
 # links the crate without them (default-features = false): the writers,
 # protection and the launcher only, so no XML parser.
 default = ["read"]
-read = ["dep:quick-xml", "dep:navigator-image", "dep:navigator-dom", "dep:serde_json"]
+read = ["dep:quick-xml", "dep:navigator-image", "dep:navigator-dom", "dep:serde_json", "dep:tiff", "dep:png"]
 
 [dependencies]
 officina-core = { path = "../officina-core" }
@@ -37,6 +37,12 @@ quick-xml = { version = "0.37", optional = true }
 # The pictures mode of the worker (pictures.rs): the Navigator's memory-safe
 # decoders, with Office's WMF/EMF/BMP.
 navigator-image = { path = "../navigator-image", features = ["office"], optional = true }
+# TIFF pictures in documents, made PNG as they are read (src/raster.rs):
+# tiff MIT, with LZW (weezl, MIT OR Apache-2.0) and Deflate (flate2 over
+# miniz_oxide); no JPEG-in-TIFF, so zune-jpeg keeps navigator-image's
+# scalar build. png is the one navigator-image already uses.
+tiff = { version = "0.11", default-features = false, features = ["lzw", "deflate"], optional = true }
+png = { version = "0.17", optional = true }
 # HTML clipboard import runs in the worker. The parser's registry dependencies
 # and serde_json are already used in-tree and dual MIT/Apache-2.0.
 navigator-dom = { path = "../navigator-dom", optional = true }
