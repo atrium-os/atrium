@@ -32,6 +32,21 @@ pub struct Shape {
     pub posrelv: Option<u32>,
     /// Behind the text (`fBehindDocument`, when it is set at all).
     pub behind: Option<bool>,
+    /// Its outline (`MSOSPT`: 1 rectangle, 2 rounded, 3 oval, 20 line,
+    /// 202 text box …).
+    pub spt: u16,
+    /// Fill and line colours (RGB) and whether each is on, when set; the
+    /// line's width in EMUs.
+    pub fill: Option<u32>,
+    pub filled: Option<bool>,
+    pub line: Option<u32>,
+    pub lined: Option<bool>,
+    pub line_w: Option<u32>,
+}
+
+/// An `OfficeArtCOLORREF` as RGB; `None` for palette and system colours.
+fn colorref(v: u32) -> Option<u32> {
+    (v >> 24 == 0).then(|| (v & 0xFF) << 16 | (v >> 8 & 0xFF) << 8 | (v >> 16 & 0xFF))
 }
 
 /// One picture store entry: where its picture lies.
@@ -156,6 +171,7 @@ fn shape(b: &[u8], out: &mut HashMap<u32, Shape>) {
         match ty {
             0xF00A if body.len() >= 8 => {
                 id = Some(u32_at(body, 0));
+                s.spt = vi >> 4;
                 // fGroup: a group's own shape (its members are drawn with it).
                 s.group = u32_at(body, 4) & 1 != 0;
             }
@@ -175,6 +191,11 @@ fn shape(b: &[u8], out: &mut HashMap<u32, Shape>) {
                         0x0392 => s.posrelv = Some(v),
                         // Group shape booleans: fBehindDocument and its use bit.
                         0x03BF if v & (1 << 21) != 0 => s.behind = Some(v & (1 << 5) != 0),
+                        0x0181 => s.fill = colorref(v),
+                        0x01BF if v & (1 << 20) != 0 => s.filled = Some(v & (1 << 4) != 0),
+                        0x01C0 => s.line = colorref(v),
+                        0x01CB => s.line_w = Some(v),
+                        0x01FF if v & (1 << 19) != 0 => s.lined = Some(v & (1 << 3) != 0),
                         _ => {}
                     }
                 }

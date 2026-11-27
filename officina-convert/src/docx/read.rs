@@ -228,7 +228,7 @@ fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
 }
 
 /// Paragraph properties (`w:pPr`), without the style, list and section.
-fn ppr(e: &El, rep: &mut Report) -> ParaProps {
+fn ppr(e: &El, _rep: &mut Report) -> ParaProps {
     let mut p = ParaProps::default();
     for x in e.els() {
         match x.name.as_str() {
@@ -282,7 +282,8 @@ fn ppr(e: &El, rep: &mut Report) -> ParaProps {
                     let distance = twips(x.attr("w:hSpace")).unwrap_or(0).max(0);
                     p.drop_cap = Some(Some(DropCap { lines, distance, margin: k == "margin" }));
                 }
-                _ => rep.note(Kind::Approximate, "frames (kept in line)"),
+                // Other frames: the paragraph reader makes them text boxes.
+                _ => {}
             },
             _ => {}
         }
@@ -598,6 +599,9 @@ struct Reader<'a> {
     /// A dropped capital's own paragraph just read (block, drop, its text
     /// and runs), waiting for the paragraph it drops into.
     drop: Option<(usize, DropCap, String, Vec<(u32, u32)>)>,
+    /// Framed paragraphs being read (Word's frames): their first block and
+    /// their `w:framePr`; they become a text box in the next paragraph.
+    frame: Option<(usize, El)>,
     /// Text boxes met in the paragraph being read; their paragraphs follow it.
     boxes: Vec<El>,
     box_depth: usize,
@@ -867,30 +871,7 @@ impl<'a> Reader<'a> {
     fn picture(&mut self, drawing: &El) -> Option<ObjectRef> {
         let blip = drawing.find("a:blip")?;
         let rid = blip.attr("r:embed")?;
-        let (_, target, external) = self.rels.get(rid)?.clone();
-        if external {
-            self.rep.note(Kind::Dropped, "linked pictures (not fetched)");
-            return None;
-        }
-        let image = match self.images.get(&target) {
-            Some(&i) => i,
-            None => {
-                if self.images.len() >= MAX_PICTURES {
-                    return None;
-                }
-                let bytes = self.archive.read_name(&target).ok().flatten()?;
-                if bytes.is_empty() || bytes.len() > MAX_PICTURE {
-                    return None;
-                }
-                let Some((w, h)) = pixel_size(&bytes) else {
-                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (TIFF, SVG, PICT)", || target.clone());
-                    return None;
-                };
-                let i = self.doc.images.add(ImageData { bytes: Arc::from(bytes), width: w, height: h });
-                self.images.insert(target.clone(), i);
-                i
-            }
-        };
+        let image = self.image_by_rel(rid)?;
         let ext = drawing.find("wp:extent");
         let emu = |k: &str| ext.and_then(|e| num(e.attr(k))).unwrap_or(0);
         let side = |v: i64| (v / 635).clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
@@ -901,6 +882,230 @@ impl<'a> Reader<'a> {
         // Notes have no page of their own to float on: in line there.
         let float = drawing.child("wp:anchor").filter(|_| !self.in_note).map(|a| self.anchor(a, h));
         Some(ObjectRef { image, width: w, height: h, float, shape: false })
+    }
+
+    /// The picture behind relationship `rid`, read once.
+    fn image_by_rel(&mut self, rid: &str) -> Option<u32> {
+        let (_, target, external) = self.rels.get(rid)?.clone();
+        if external {
+            self.rep.note(Kind::Dropped, "linked pictures (not fetched)");
+            return None;
+        }
+        if let Some(&i) = self.images.get(&target) {
+            return Some(i);
+        }
+        if self.images.len() >= MAX_PICTURES {
+            return None;
+        }
+        let bytes = self.archive.read_name(&target).ok().flatten()?;
+        if bytes.is_empty() || bytes.len() > MAX_PICTURE {
+            return None;
+        }
+        let Some((w, h)) = pixel_size(&bytes) else {
+            self.rep.note_at(Kind::Dropped, "pictures in formats not shown (TIFF, SVG, PICT)", || target.clone());
+            return None;
+        };
+        let i = self.doc.images.add(ImageData { bytes: Arc::from(bytes), width: w, height: h });
+        self.images.insert(target.clone(), i);
+        Some(i)
+    }
+
+    /// A VML picture or shape (`w:pict`, or an embedded object's picture):
+    /// its first shape, sized and placed by its style. Text boxes take
+    /// their `w:txbxContent` as the shape's text (read after the body),
+    /// WordArt its string; a picture its `v:imagedata`.
+    fn vml(&mut self, pict: &El, field: &FieldState) -> Option<ObjectRef> {
+        const SHAPES: [&str; 7] = ["v:shape", "v:rect", "v:roundrect", "v:oval", "v:line", "v:image", "v:group"];
+        let sh = pict.els().find(|e| SHAPES.contains(&e.name.as_str()))?;
+        if sh.name == "v:group" {
+            // A group: its first shape, as big as the group.
+            self.rep.note(Kind::Approximate, "grouped VML shapes (the first kept)");
+            let style = vml_style(sh.attr("style").unwrap_or(""));
+            let kid = sh.els().find(|e| SHAPES[..6].contains(&e.name.as_str()))?;
+            return self.vml_shape(kid, &style, field);
+        }
+        let style = vml_style(sh.attr("style").unwrap_or(""));
+        self.vml_shape(sh, &style, field)
+    }
+
+    fn vml_shape(&mut self, sh: &El, style: &HashMap<String, String>, field: &FieldState) -> Option<ObjectRef> {
+        use officina_text::model::{Dash, Geom, ShapeData, ShapeLine, TextAnchor, DEFAULT_INSET, MAX_SHAPES};
+        let len = |k: &str| style.get(k).and_then(|v| vml_len(v));
+        let side = |v: Option<i64>| v.unwrap_or(0).clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
+        let (mut w, mut h) = (side(len("width")), side(len("height")));
+        if sh.name == "v:line" {
+            let pt = |k: &str| -> (i64, i64) {
+                let v = sh.attr(k).unwrap_or("0,0");
+                let mut it = v.split(',').map(|x| vml_len(x.trim()).unwrap_or(0));
+                (it.next().unwrap_or(0), it.next().unwrap_or(0))
+            };
+            let (a, b) = (pt("from"), pt("to"));
+            (w, h) = (side(Some((b.0 - a.0).abs())), side(Some((b.1 - a.1).abs())));
+        }
+        let float = if style.get("position").is_some_and(|p| p == "absolute") && !self.in_note && !self.in_shape && !field.in_margin { Some(self.vml_float(sh, style, h)) } else { None };
+        // A picture: its data, if it has a part we show.
+        if let Some(rid) = sh.child("v:imagedata").and_then(|d| d.attr("r:id").or_else(|| d.attr("o:relid"))) {
+            if let Some(image) = self.image_by_rel(rid) {
+                self.pictures += 1;
+                if len("width").is_none() || len("height").is_none() {
+                    let px = self.doc.images.get(image).map(|d| (d.width, d.height)).unwrap_or((96, 96));
+                    (w, h) = (side(Some(px.0 as i64 * 15)), side(Some(px.1 as i64 * 15)));
+                }
+                return Some(ObjectRef { image, width: w, height: h, float, shape: false });
+            }
+            return None;
+        }
+        // Shapes only where the reader takes shapes, and only when sized.
+        let sized = len("width").is_some() && len("height").is_some() || sh.name == "v:line";
+        if self.in_shape || field.in_margin || !sized {
+            if sh.find("w:txbxContent").is_some() {
+                let mut b = Vec::new();
+                all_of(sh, "w:txbxContent", &mut b, 0);
+                self.rep.note(Kind::Approximate, "text boxes (their text kept after the paragraph)");
+                self.boxes.extend(b.into_iter().cloned());
+            } else {
+                self.rep.note(Kind::Dropped, if sized { "VML shapes in headers, footers and shapes" } else { "VML shapes without a size" });
+            }
+            return None;
+        }
+        if self.doc.shapes.next_id() as usize >= MAX_SHAPES {
+            self.rep.note(Kind::Dropped, "shapes past the limit");
+            return None;
+        }
+        let spt = sh.attr("o:spt").and_then(|v| v.parse::<u32>().ok()).or_else(|| sh.attr("type").and_then(|t| t.rsplit("_t").next()).and_then(|n| n.parse().ok()));
+        let textbox = sh.child("v:textbox");
+        let geom = match sh.name.as_str() {
+            "v:roundrect" => "roundRect",
+            "v:oval" => "ellipse",
+            "v:line" => "line",
+            _ => match spt {
+                Some(2) => "roundRect",
+                Some(3) => "ellipse",
+                Some(20 | 32) => "line",
+                Some(5) => "triangle",
+                Some(4) => "diamond",
+                Some(1 | 202) | None => "rect",
+                Some(_) if textbox.is_some() => "rect",
+                Some(_) => {
+                    self.rep.note(Kind::Approximate, "VML outlines drawn as rectangles");
+                    "rect"
+                }
+            },
+        };
+        let mut sd = ShapeData::new(Geom::preset(geom));
+        let off = |v: Option<&str>| matches!(v, Some("f" | "false" | "0"));
+        sd.fill = if off(sh.attr("filled")) || geom == "line" { None } else { Some(sh.attr("fillcolor").and_then(vml_color).unwrap_or(0xFFFFFF)) };
+        if let Some(f) = sh.child("v:fill") {
+            if off(f.attr("on")) {
+                sd.fill = None;
+            } else if let Some(c) = f.attr("color").and_then(vml_color) {
+                sd.fill = Some(c);
+            }
+            if f.attr("type").is_some_and(|t| t.starts_with("gradient")) {
+                self.rep.note(Kind::Approximate, "gradient fills in documents drawn in one colour");
+            }
+        }
+        let stroke = sh.child("v:stroke");
+        sd.line = if off(sh.attr("stroked")) || stroke.is_some_and(|s| off(s.attr("on"))) {
+            None
+        } else {
+            let color = sh.attr("strokecolor").or_else(|| stroke.and_then(|s| s.attr("color"))).and_then(vml_color).unwrap_or(0);
+            let width = sh.attr("strokeweight").and_then(vml_len).unwrap_or(15).clamp(0, 2880) as i32;
+            let dash = match stroke.and_then(|s| s.attr("dashstyle")) {
+                Some("dot" | "shortdot") => Dash::Dot,
+                Some("dash" | "shortdash") => Dash::Dash,
+                Some("dashDot" | "shortdashdot") => Dash::DashDot,
+                Some("longDash") => Dash::LongDash,
+                _ => Dash::Solid,
+            };
+            Some(ShapeLine { color, width, dash, head: officina_text::model::ArrowEnd::None, tail: officina_text::model::ArrowEnd::None })
+        };
+        if let Some(r) = style.get("rotation").and_then(|v| v.trim_end_matches("fd").trim_end_matches("deg").trim().parse::<f64>().ok()) {
+            // "fd" is sixty-five-thousand-five-hundred-and-thirty-sixths of a degree.
+            let deg = if style.get("rotation").is_some_and(|v| v.ends_with("fd")) { r / 65536.0 } else { r };
+            sd.rot = ((deg.rem_euclid(360.0)) * 60_000.0) as i32;
+        }
+        if let Some(f) = style.get("flip") {
+            sd.flip_h = f.contains('x');
+            sd.flip_v = f.contains('y');
+        }
+        sd.anchor = match style.get("v-text-anchor").map(String::as_str) {
+            Some(a) if a.starts_with("middle") => TextAnchor::Middle,
+            Some(a) if a.starts_with("bottom") => TextAnchor::Bottom,
+            _ => TextAnchor::Top,
+        };
+        sd.inset = DEFAULT_INSET;
+        if let Some(ins) = textbox.and_then(|t| t.attr("inset")) {
+            for (i, v) in ins.split(',').take(4).enumerate() {
+                if let Some(x) = vml_len(v.trim()) {
+                    sd.inset[i] = x.clamp(0, 31_680) as i32;
+                }
+            }
+        }
+        // WordArt: its string as the shape's text, centred.
+        let mut word_art = None;
+        if let Some(tp) = sh.child("v:textpath") {
+            self.rep.note(Kind::Approximate, "WordArt drawn as plain text");
+            word_art = tp.attr("string").map(|s| s.chars().take(1000).collect::<String>());
+        }
+        let txbx = textbox.and_then(|t| t.find("w:txbxContent")).cloned();
+        let id = self.doc.shapes.add(sd)?;
+        if let Some(t) = txbx {
+            self.shape_text.push((id, Vec::new(), t, None));
+        }
+        if let Some(text) = word_art {
+            if let Some(s) = self.doc.shapes.get(id) {
+                let mut s = (**s).clone();
+                let mut p = officina_text::model::Para::new(self.doc.new_id(), &text, 0);
+                p.props.align = Some(Align::Center);
+                s.paras = vec![p];
+                s.anchor = TextAnchor::Middle;
+                self.doc.shapes.set(id, Some(s));
+            }
+        }
+        Some(ObjectRef { image: id, width: w, height: h, float, shape: true })
+    }
+
+    /// Where a VML shape with `position:absolute` floats.
+    fn vml_float(&mut self, sh: &El, style: &HashMap<String, String>, h: u32) -> Float {
+        let off = |k: &str| style.get(k).and_then(|v| vml_len(v)).unwrap_or(0).clamp(-(MAX_FLOAT_OFFSET as i64), MAX_FLOAT_OFFSET as i64) as i32;
+        let z_behind = style.get("z-index").and_then(|z| z.trim().parse::<i64>().ok()).is_some_and(|z| z < 0);
+        let wrap = match sh.child("w10:wrap").and_then(|w| w.attr("type")) {
+            Some("topAndBottom") => Wrap::TopBottom,
+            Some("square") => Wrap::Square,
+            Some("tight" | "through") => {
+                self.rep.note(Kind::Approximate, "pictures wrapped tight to their outline (wrapped square)");
+                Wrap::Square
+            }
+            _ if z_behind => Wrap::Behind,
+            _ => Wrap::InFront,
+        };
+        let mut f = Float { wrap, ..Float::default() };
+        let rel = |v: Option<&String>, page_like: &[&str], margin_like: &[&str]| match v.map(String::as_str) {
+            Some(x) if page_like.contains(&x) => Rel::Page,
+            Some(x) if margin_like.contains(&x) => Rel::Margin,
+            _ => Rel::Text,
+        };
+        f.h_rel = rel(style.get("mso-position-horizontal-relative"), &["page"], &["margin", "left-margin-area", "right-margin-area", "inner-margin-area", "outer-margin-area"]);
+        f.h_align = match style.get("mso-position-horizontal").map(String::as_str) {
+            Some("left" | "inside") => HAlign::Start,
+            Some("center") => HAlign::Center,
+            Some("right" | "outside") => HAlign::End,
+            _ => {
+                f.x = off("margin-left") + off("left");
+                HAlign::Offset
+            }
+        };
+        f.v_rel = rel(style.get("mso-position-vertical-relative"), &["page", "bottom-margin-area"], &["margin", "top-margin-area"]);
+        let g = &self.doc.page;
+        let area = if f.v_rel == Rel::Page { g.height } else { g.height - g.margin_top - g.margin_bottom };
+        f.y = match style.get("mso-position-vertical").map(String::as_str) {
+            Some("top") => 0,
+            Some("center") => ((area - h as i32) / 2).max(0),
+            Some("bottom") => (area - h as i32).max(0),
+            _ => off("margin-top") + off("top"),
+        };
+        f
     }
 
     /// Whether drawing `d` is a shape this reader reads as one (not in a
@@ -1231,7 +1436,15 @@ impl<'a> Reader<'a> {
                     }
                     for k in kids {
                         let as_shape = k.name == "w:drawing" && self.takes_shape(k, field);
-                        if matches!(k.name.as_str(), "w:drawing" | "w:pict" | "w:object") && self.box_depth < 4 && !as_shape {
+                        // VML: a picture or shape of ours, or (in a header or
+                        // another shape) its text after the paragraph.
+                        let vml = if matches!(k.name.as_str(), "w:pict" | "w:object") && self.box_depth < 4 { Some(self.vml(k, field)) } else { None };
+                        if let Some(o) = &vml {
+                            if o.is_none() && k.name == "w:object" {
+                                self.rep.note(Kind::Dropped, "embedded objects (their picture kept when there is one)");
+                            }
+                        }
+                        if matches!(k.name.as_str(), "w:drawing") && self.box_depth < 4 && !as_shape {
                             let mut b = Vec::new();
                             all_of(k, "w:txbxContent", &mut b, 0);
                             if !b.is_empty() {
@@ -1309,8 +1522,10 @@ impl<'a> Reader<'a> {
                                 }
                             }
                             "w:pict" | "w:object" => {
-                                if k.find("w:txbxContent").is_none() {
-                                    self.rep.note(Kind::Dropped, "VML pictures and embedded objects");
+                                if let Some(o) = vml.flatten() {
+                                    let mut pa = a.clone();
+                                    pa.object = Some(o);
+                                    p.push(&OBJECT_CHAR.to_string(), &pa);
                                 }
                             }
                             // Ruby inside a run (Word writes it there too): the base text.
@@ -1529,10 +1744,97 @@ impl<'a> Reader<'a> {
         p.push(&OBJECT_CHAR.to_string(), &fa);
     }
 
+    /// The framed paragraphs read (the last blocks) taken out into a text
+    /// box floating as their frame says; `None` (and the paragraphs left
+    /// in line) when there are none or they carry what a move would break.
+    fn close_frame(&mut self) -> Option<ObjectRef> {
+        use officina_text::model::{Geom, ShapeData, MAX_SHAPES, MAX_SHAPE_PARAS};
+        let (start, f) = self.frame.take()?;
+        let end = self.doc.blocks.len();
+        let blocked = start >= end
+            || end - start > MAX_SHAPE_PARAS
+            || self.doc.shapes.next_id() as usize >= MAX_SHAPES
+            || self.dels.iter().any(|d| d.0 .0 >= start)
+            || self.del_marks.iter().any(|d| d.0 >= start)
+            || self.drop.as_ref().is_some_and(|d| d.0 >= start)
+            || self.sec_from > start
+            || self.secs.iter().any(|x| x.0.is_some_and(|b| b >= start))
+            || (start..end).any(|k| self.doc.para(k).is_none_or(|p| p.props.section.is_some() || p.props.cell.is_some()));
+        if blocked {
+            self.rep.note(Kind::Approximate, "frames (kept in line)");
+            return None;
+        }
+        let mut paras = Vec::new();
+        while self.doc.blocks.len() > start {
+            if let Some(Block::Para(p)) = self.doc.blocks.remove(start) {
+                paras.push(p);
+            }
+        }
+        // Its size: the frame's, or as wide as the text and as tall as
+        // its lines (a guess the layout doesn't correct).
+        let g = &self.doc.page;
+        let text_w = (g.width - g.margin_start - g.margin_end).max(1440);
+        let w = twips(f.attr("w:w")).filter(|w| *w > 0).unwrap_or(text_w).clamp(144, MAX_OBJECT_TWIPS as i32);
+        let lines: i32 = paras.iter().map(|p| (p.text.chars().count() as i32 * 110 / w.max(1) + 1).min(200)).sum();
+        let h = match twips(f.attr("w:h")) {
+            Some(h) if h > 0 => h,
+            _ => lines * 276,
+        }
+        .clamp(144, MAX_OBJECT_TWIPS as i32);
+        let mut sd = ShapeData::new(Geom::preset("rect"));
+        sd.inset = [0; 4];
+        sd.paras = paras;
+        let id = self.doc.shapes.add(sd)?;
+        let rel = |v: Option<&str>| match v {
+            Some("page") => Rel::Page,
+            Some("margin") => Rel::Margin,
+            _ => Rel::Text,
+        };
+        let gap = [twips(f.attr("w:hSpace")), twips(f.attr("w:vSpace"))].into_iter().flatten().max().unwrap_or(0).clamp(0, 2880);
+        let wrap = match f.attr("w:wrap") {
+            Some("notBeside") => Wrap::TopBottom,
+            Some("none") => Wrap::InFront,
+            _ => Wrap::Square,
+        };
+        let mut fl = Float { wrap, gap, h_rel: rel(f.attr("w:hAnchor").or(Some("text"))), v_rel: rel(f.attr("w:vAnchor").or(Some("margin"))), ..Float::default() };
+        fl.h_align = match f.attr("w:xAlign") {
+            Some("left" | "inside") => HAlign::Start,
+            Some("center") => HAlign::Center,
+            Some("right" | "outside") => HAlign::End,
+            _ => {
+                fl.x = twips(f.attr("w:x")).unwrap_or(0).clamp(-MAX_FLOAT_OFFSET, MAX_FLOAT_OFFSET);
+                HAlign::Offset
+            }
+        };
+        let area = if fl.v_rel == Rel::Page { g.height } else { g.height - g.margin_top - g.margin_bottom };
+        fl.y = match f.attr("w:yAlign") {
+            Some("top" | "inside") => 0,
+            Some("center") => ((area - h) / 2).max(0),
+            Some("bottom" | "outside") => (area - h).max(0),
+            _ => twips(f.attr("w:y")).unwrap_or(0).clamp(-MAX_FLOAT_OFFSET, MAX_FLOAT_OFFSET),
+        };
+        // Without a place down, Word puts it where its paragraph was.
+        if f.attr("w:y").is_none() && f.attr("w:yAlign").is_none() {
+            fl.v_rel = Rel::Text;
+            fl.y = 0;
+        }
+        Some(ObjectRef { image: id, width: w as u32, height: h as u32, float: Some(fl), shape: true })
+    }
+
     /// One `w:p` into the document; returns its block.
     fn para(&mut self, e: &El, cell: Option<CellRef>, field: &mut FieldState) -> usize {
         let toc_before = field.in_toc();
         let pp = e.child("w:pPr");
+        // A frame: framed paragraphs in a row with the same frame are one
+        // text box; the paragraph after them anchors it.
+        let framed = pp.and_then(|p| p.child("w:framePr")).filter(|f| f.attr("w:dropCap").is_none_or(|d| d == "none"));
+        let can_frame = cell.is_none() && !self.in_note && !field.in_margin && !self.in_shape && self.box_depth == 0;
+        if framed.is_some() && !can_frame {
+            self.rep.note(Kind::Approximate, "frames (kept in line)");
+        }
+        let framed = framed.filter(|_| can_frame);
+        let same_frame = matches!((&self.frame, framed), (Some((_, a)), Some(b)) if a.attrs == b.attrs);
+        let anchored = if self.frame.is_some() && !same_frame { self.close_frame() } else { None };
         let mut props = pp.map(|p| ppr(p, &mut self.rep)).unwrap_or_default();
         let style = pp.and_then(|p| p.child("w:pStyle")).and_then(val).and_then(|s| self.styles.get(s).copied()).filter(|&s| self.doc.styles.styles[s as usize].kind == StyleKind::Para).unwrap_or(0);
         if let Some(n) = pp.and_then(|p| p.child("w:numPr")) {
@@ -1602,12 +1904,25 @@ impl<'a> Reader<'a> {
                 self.drop = Some((self.doc.blocks.len(), dc, text.clone(), runs.clone()));
             }
         }
+        // The frame before it floats from its start.
+        if let Some(o) = anchored {
+            let base = runs.first().map(|r| self.doc.attrs.get(r.1).clone()).unwrap_or_default();
+            let a = self.doc.attrs.intern(CharAttrs { object: Some(o), link: None, field: None, note: None, ..base });
+            let n = OBJECT_CHAR.len_utf8() as u32;
+            runs = std::iter::once((0, a)).chain(runs.into_iter().map(|(s, a)| (s + n, a))).collect();
+            text.insert(0, OBJECT_CHAR);
+        }
         let k = self.doc.push_para(&text, style, runs);
         self.doc.blocks.update(k, |b| {
             if let Some(q) = b.as_para_mut() {
                 q.props = props;
             }
         });
+        if let Some(f) = framed {
+            if self.frame.is_none() {
+                self.frame = Some((k, f.clone()));
+            }
+        }
         if !self.open_marks.is_empty() && !self.in_note && !field.in_margin {
             let id = self.doc.para(k).map_or(0, |q| q.id);
             for n in std::mem::take(&mut self.open_marks) {
@@ -2150,6 +2465,77 @@ fn page_field(instr: &str) -> Option<&'static str> {
     }
 }
 
+/// A VML `style` attribute's properties.
+fn vml_style(s: &str) -> HashMap<String, String> {
+    s.split(';')
+        .take(64)
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// A VML length in twips (`pt`, `in`, `cm`, `mm`, `pc`, `px`, `emu`; no
+/// unit is pixels).
+fn vml_len(v: &str) -> Option<i64> {
+    let v = v.trim();
+    let split = v.find(|c: char| c.is_ascii_alphabetic() || c == '%').unwrap_or(v.len());
+    let (n, unit) = v.split_at(split);
+    let n: f64 = n.trim().parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    let tw = match unit.trim() {
+        "pt" => n * 20.0,
+        "in" => n * 1440.0,
+        "cm" => n * 567.0,
+        "mm" => n * 56.7,
+        "pc" => n * 240.0,
+        "emu" => n / 635.0,
+        "px" | "" => n * 15.0,
+        _ => return None,
+    };
+    Some(tw.clamp(-1e7, 1e7) as i64)
+}
+
+/// A VML colour: `#rgb`, `#rrggbb` or a name, with anything after a
+/// space (`[64]`, `window`) left off.
+fn vml_color(v: &str) -> Option<u32> {
+    let v = v.split_whitespace().next()?.trim();
+    if let Some(h) = v.strip_prefix('#') {
+        return match h.len() {
+            6 => u32::from_str_radix(h, 16).ok(),
+            3 => {
+                let x = u32::from_str_radix(h, 16).ok()?;
+                let (r, g, b) = ((x >> 8) & 0xF, (x >> 4) & 0xF, x & 0xF);
+                Some((r * 17) << 16 | (g * 17) << 8 | b * 17)
+            }
+            _ => None,
+        };
+    }
+    Some(match v.to_ascii_lowercase().as_str() {
+        "black" => 0x000000,
+        "white" => 0xFFFFFF,
+        "red" => 0xFF0000,
+        "green" => 0x008000,
+        "lime" => 0x00FF00,
+        "blue" => 0x0000FF,
+        "yellow" => 0xFFFF00,
+        "aqua" | "cyan" => 0x00FFFF,
+        "fuchsia" | "magenta" => 0xFF00FF,
+        "gray" | "grey" => 0x808080,
+        "silver" => 0xC0C0C0,
+        "maroon" => 0x800000,
+        "navy" => 0x000080,
+        "olive" => 0x808000,
+        "purple" => 0x800080,
+        "teal" => 0x008080,
+        _ => return None,
+    })
+}
+
+
 /// A raster picture's size in pixels from its header, for the formats the
 /// document process can draw (PNG, JPEG, GIF, WebP).
 pub fn pixel_size(b: &[u8]) -> Option<(u32, u32)> {
@@ -2216,7 +2602,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, table_styles: HashMap::new(), pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new(), drop: None };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, table_styles: HashMap::new(), pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new(), drop: None, frame: None };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -2289,6 +2675,11 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     r.body(body);
     for more in doc_xml.children("w:body").skip(1).take(16) {
         r.body(more);
+    }
+    // A frame at the very end: in a paragraph of its own.
+    if let Some(o) = r.close_frame() {
+        let a = r.doc.attrs.intern(CharAttrs { object: Some(o), ..CharAttrs::default() });
+        r.doc.push_para(&OBJECT_CHAR.to_string(), 0, vec![(0, a)]);
     }
     r.place_sections();
     r.read_notes();

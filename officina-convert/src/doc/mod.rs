@@ -123,8 +123,9 @@ struct Doc<'a> {
     next_rev: u32,
     /// Comment references in the main text: position → comment id.
     atn_refs: HashMap<u32, usize>,
-    /// Text boxes in the main text: anchor position → their story's range.
-    boxes: HashMap<u32, (u32, u32)>,
+    /// Text boxes in the main text: anchor position → their story's range
+    /// and anchor.
+    boxes: HashMap<u32, (u32, u32, Spa)>,
     /// Header and footer relationship ids, once made.
     hdr_refs: String,
     /// The OfficeArt drawing, and the WordDocument stream its pictures lie in.
@@ -633,6 +634,68 @@ impl<'a> Doc<'a> {
         Some(n)
     }
 
+    /// A floating shape (a text box with `text`, its body XML) as VML,
+    /// placed, sized, filled and outlined as its anchor and shape say.
+    fn vml_shape(&mut self, a: Spa, text: Option<&str>) -> String {
+        let shape = (if a.hdr { &self.art.hdr } else { &self.art.main }).get(&a.id).copied().unwrap_or_default();
+        let (l, t, r, b) = a.rect;
+        let pt = |v: i32| format!("{:.2}pt", v as f64 / 20.0);
+        let h = match shape.posrelh {
+            Some(r) => ["margin", "page", "text", "char"].get(r as usize).copied().unwrap_or("text"),
+            None => ["margin", "page", "text", "text"][a.bx as usize & 3],
+        };
+        let v = match shape.posrelv {
+            Some(r) => ["margin", "page", "text", "line"].get(r as usize).copied().unwrap_or("text"),
+            None => ["margin", "page", "text", "text"][a.by as usize & 3],
+        };
+        let mut style = format!("position:absolute;margin-left:{};margin-top:{};width:{};height:{};mso-position-horizontal-relative:{h};mso-position-vertical-relative:{v}", pt(l), pt(t), pt((r - l).max(1)), pt((b - t).max(1)));
+        if let Some(k @ 1..=5) = shape.posh {
+            style += &format!(";mso-position-horizontal:{}", ["left", "center", "right", "inside", "outside"][k as usize - 1]);
+        }
+        if let Some(k @ 1..=5) = shape.posv {
+            style += &format!(";mso-position-vertical:{}", ["top", "center", "bottom", "inside", "outside"][k as usize - 1]);
+        }
+        let behind = a.wr == 3 && shape.behind.unwrap_or(a.below);
+        if behind {
+            style += ";z-index:-1";
+        }
+        let wrap = match a.wr {
+            1 => r#"<w10:wrap type="topAndBottom"/>"#,
+            3 => "",
+            4 => r#"<w10:wrap type="tight"/>"#,
+            5 => r#"<w10:wrap type="through"/>"#,
+            _ => r#"<w10:wrap type="square"/>"#,
+        };
+        let tag = match shape.spt {
+            2 => "v:roundrect",
+            3 => "v:oval",
+            _ => "v:rect",
+        };
+        let mut attrs = String::new();
+        let hex = |c: u32| format!("#{c:06x}");
+        match (shape.filled, shape.fill) {
+            (Some(false), _) => attrs += r#" filled="f""#,
+            (_, Some(c)) => attrs += &format!(r#" fillcolor="{}""#, hex(c)),
+            _ => {}
+        }
+        match (shape.lined, shape.line) {
+            (Some(false), _) => attrs += r#" stroked="f""#,
+            (_, c) => {
+                if let Some(c) = c {
+                    attrs += &format!(r#" strokecolor="{}""#, hex(c));
+                }
+                if let Some(w) = shape.line_w {
+                    attrs += &format!(r#" strokeweight="{:.2}pt""#, w as f64 / 12700.0);
+                }
+            }
+        }
+        if text.is_none() && !matches!(shape.spt, 1 | 2 | 3 | 202) {
+            self.rep.note(Kind::Approximate, "VML outlines drawn as rectangles");
+        }
+        let body = text.map(|t| format!("<v:textbox><w:txbxContent>{t}</w:txbxContent></v:textbox>")).unwrap_or_default();
+        format!(r#"<w:pict><{tag} style="{style}"{attrs}>{body}{wrap}</{tag}></w:pict>"#)
+    }
+
     /// A floating picture at its anchor, as `w:drawing` with `wp:anchor`.
     /// `None` (and a note) for shapes that aren't pictures.
     fn float_picture(&mut self, a: Spa) -> Option<String> {
@@ -642,10 +705,12 @@ impl<'a> Doc<'a> {
         };
         let pib = match shape.pib {
             Some(p) if !shape.group => p,
-            _ => {
-                self.rep.note(Kind::Dropped, if shape.group { "grouped floating shapes" } else { "floating shapes (drawn shapes, WordArt)" });
+            _ if shape.group => {
+                self.rep.note(Kind::Dropped, "grouped floating shapes");
                 return None;
             }
+            // A drawn shape: as VML, which the reader takes as a shape.
+            _ => return Some(self.vml_shape(a, None)),
         };
         let (ext, bytes) = match self.art.picture(pib, self.word) {
             Ok((e, b)) => (e, b.into_owned()),
@@ -881,16 +946,14 @@ impl<'a> Doc<'a> {
                             }
                         }
                         0x08 if chp.spec => match self.boxes.remove(&k).filter(|_| kind == Story::Main) {
-                            Some((ba, mut bb)) => {
+                            Some((ba, mut bb, spa)) => {
                                 // Each box's text ends with a paragraph mark of its own.
                                 if bb > ba + 1 && self.ch(bb - 1) == 0x0D && self.ch(bb - 2) == 0x0D {
                                     bb -= 1;
                                 }
                                 let body = self.story(ba, bb, Story::Note);
                                 flush(&mut units, &mut items, instr);
-                                items.push_str(r#"<w:pict><v:shape><v:textbox><w:txbxContent>"#);
-                                items.push_str(&body);
-                                items.push_str("</w:txbxContent></v:textbox></v:shape></w:pict>");
+                                items.push_str(&self.vml_shape(spa, Some(&body)));
                             }
                             None => match self.floats.remove(&k).filter(|_| kind != Story::Note) {
                                 Some(a) => {
@@ -944,7 +1007,7 @@ impl<'a> Doc<'a> {
     }
 }
 
-const NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml""#;
+const NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w10="urn:schemas-microsoft-com:office:word" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml""#;
 
 /// The WordprocessingML package for a `.doc`: (part name, bytes).
 fn translate(data: &[u8], password: Option<&str>, rep: &mut Report) -> Result<Vec<(String, Vec<u8>)>, DocError> {
@@ -1112,7 +1175,7 @@ fn translate(data: &[u8], password: Option<&str>, rep: &mut Report) -> Result<Ve
         let Some(&cp) = acps.get(i) else { break };
         match by_spid.get(&u32_at(s, 0)) {
             Some(&r) => {
-                d.boxes.insert(cp, r);
+                d.boxes.insert(cp, (r.0, r.1, Spa::read(s)));
             }
             None => {
                 d.floats.insert(cp, Spa::read(s));
