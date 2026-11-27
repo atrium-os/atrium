@@ -586,6 +586,16 @@ Solum, the vault and the back ends are ours (BSD-2). Likely crates: `x86_64`/`x8
 (Apache-2.0/BSD-3), each through `scripts/licence-audit.py`. bhyve (P0 only) is BSD-2. GPL
 hypervisors are read for design only.
 
+## 11a. A safety profile (study)
+
+`docs/reviews/2026-11-27-solum-functional-safety.md` looks at an ADAS variant. The main
+domain stays non-safety (QM); a `safety` build profile of the same Solum adds reserved
+cores, cache and bandwidth partitioning, a cyclic schedule, E2E protection on links that
+cross criticality, a health monitor, and lockstep (hardware first, Solum's software
+lockstep for small deterministic tasks). Not built. What Solum does now to keep it
+possible: `no_std` with no `alloc` in hypercall and exit paths, a bound on every handler,
+manifest room for partitions, and reserved E2E fields in link records (study §6).
+
 ## 12a. Review, 2026-11-27
 
 The code review thread's adversarial pass (15 findings) is folded in: firmware
@@ -625,4 +635,6 @@ as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after dev
    computing (TDX, SEV-SNP, CCA) only as an extra for the vault. *Recommend yes.*
 7b. **Cameras are a frame-stream link, opened only through a grant** (§5.1). *Recommend
    yes.*
+7c. **No safety variant now; keep Solum compatible with one** (§11a and the study).
+   *Recommend yes.*
 8. **Name: Solum** (Latin: ground, floor, the base the atrium stands on). *Recommend yes.*
