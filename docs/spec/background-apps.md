@@ -665,9 +665,7 @@ differences:
   first on-screen run showed a respawned page child being refused without
   this. Another window or a new connection starts with none.
 
-**B7 (2026-11-26).** Your own server's page live, as §4.5. Built on
-the host; the engine builds only on the Mac, so the live run itself is
-not yet checked in a VM.
+**B7 (2026-11-26).** Your own server's page live, as §4.5. The arm64 Mac VM run and its title-report follow-up are recorded below.
 
 - **navigatord.** `start_live` starts a local run for a local page:
   `LocalUp::start(...).live()` (at most 4096 requests) wrapped in
@@ -749,7 +747,62 @@ not yet checked in a VM.
     that run not even the first reached navigatord. The engine now
     reports every change through `page_did_change_title` and
     `navigator_live_title` (painter.rs, EditorPage.h; control characters
-    become spaces, cut to 256 bytes). It is unbuilt: it needs a Mac
-    engine build and the same run again. If the first title still goes
-    missing, look at the engine's side of `Started`.
+    become spaces, cut to 256 bytes). See the staged worker and repeatable
+    check below.
     Evidence: `~/atrium-vm/evidence/navigator-b7-title-link-20261127/`.
+
+#### B7 title check on the Mac
+
+The probe starts with `<title>live starting</title>`. Before delivering
+those bytes, navigatord's `with_reporter_for` inserts an external classic
+script immediately after the doctype. In the I6 build's LibWeb,
+`HTMLParser::process_script_end_tag_from_rust_parser` pauses the parser
+for a pending blocking script and schedules its resumption.
+`run_until_completion` returns while paused. Thus `paint_document` can
+sample the partial DOM and return to `navigator_counter_started` before
+the parser has reached the title. Its zero-length check then skips the
+title report. The saved log records the broker's receipt of `Started`
+and no title, but contains no measurement of the engine's title length.
+After startup, `drive_page` pumps the event loop. Both the parser's
+title and the probe's later `document.title` assignment can then reach
+`page_did_change_title` with an attached scene.
+
+The worker from d60488558 was built and audited. After the approved boot
+of `~/atrium-vm/b7t2-run` (SSH 24223), stage the bundles and start Photo
+Server as in the earlier run. Check the installed worker against
+`~/atrium-vm/i6-build/audit-title2.txt`. Type `localhost:9000/live`
+in a fresh Navigator window. Open the tier popover and select “Run this
+page live”. At the confirmation prompt, in the repo on the Mac:
+
+```sh
+set -eu
+run="$HOME/atrium-vm/b7t2-run"
+evidence=$(mktemp -d "$HOME/atrium-vm/evidence/b7-title.XXXXXX")
+export VSSH_CONNECT_TIMEOUT=30
+worker=$("$run/vssh" 'sha256 -q /var/lib/atrium/apps/org.atrium.navigator.engine/bin/counter')
+test "$worker" = a8c4d88cb6c872518f05280c5e50809eabf6e54629eed3ee0416df4bd5318d09
+echo "$worker" > "$evidence/worker.sha256"
+offset=$("$run/vssh" 'wc -c < /tmp/widget-run/video.log')
+"$run/click.sh" 1060 63
+```
+
+Once the live page shows its result, before following its link or
+stopping the run, collect the log slice and the same frame. The check
+uses ImageMagick and Tesseract on the host. It reads the two visible
+rows of the 248-pixel rail separately because the page body also
+displays the correct title when the rail is stale.
+
+```sh
+"$run/vssh" "tail -c +$((offset + 1)) /tmp/widget-run/video.log" > "$evidence/video.log"
+"$run/vssh" 'cat /tmp/widget-run/screen.png' > "$evidence/screen.png"
+sh scripts/b7-live-title-check.sh "$evidence/video.log" "$evidence/screen.png"
+```
+
+The default expected visit is 1. For a second press in the same trail,
+capture a fresh slice and frame and pass `2` as the third argument.
+
+Host replay on 2026-11-27 rejected the old run on all three checks:
+the UI never logged the title, and both rail rows read `post=ERR`.
+A synthetic control with the expected log line and the live page text
+placed in both rail rows passed 3/3. The same log paired with the old
+frame failed both rail checks. A real pass with the staged worker is pending.
