@@ -66,7 +66,10 @@ fetch)
     cd "$P0DIR" || die "cd $P0DIR"
     curl -fL --retry 3 -o CHECKSUM.SHA256 "$SNAP/CHECKSUM.SHA256" || die "checksum list"
     curl -fL --retry 3 -C - -o "$IMG_NAME.xz" "$SNAP/$IMG_NAME.xz" || die "image"
-    want=$(sed -n "s/^SHA256 ($IMG_NAME.xz) = //p" CHECKSUM.SHA256)
+    # The list names the dated build (…-BASIC-CLOUDINIT-<date>-<rev>-ufs.raw.xz);
+    # Latest/ serves the same file under the undated name.
+    want=$(sed -n 's/^SHA256 (FreeBSD-16.0-CURRENT-arm64-aarch64-BASIC-CLOUDINIT-[0-9]*-[0-9a-f]*-[0-9]*-ufs\.raw\.xz) = //p' CHECKSUM.SHA256)
+    [ "$(printf '%s\n' "$want" | grep -c .)" -le 1 ] || die "several checksums match"
     [ -n "$want" ] || die "no checksum for $IMG_NAME.xz"
     got=$(shasum -a 256 "$IMG_NAME.xz" | awk '{print $1}')
     [ "$want" = "$got" ] || die "checksum mismatch: $got != $want"
