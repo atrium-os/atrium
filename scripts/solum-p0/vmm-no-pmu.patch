@@ -1,0 +1,341 @@
+--- a/sys/arm64/vmm/arm64.h
++++ b/sys/arm64/vmm/arm64.h
+@@ -387,6 +387,7 @@
+ #define	HYP_FEAT_FGT2			(0x1ul << 3)
+ #define	HYP_FEAT_GICV3_OR_LEGACY	(0x1ul << 4)
+ #define	HYP_FEAT_GICV5			(0x1ul << 5)
++#define	HYP_FEAT_PMU			(0x1ul << 6)	/* FEAT_PMUv3 present */
+ 	bool		vgic_attached;
+ 	struct vgic	*vgic;
+ 	int		vgic_ver;
+--- a/sys/arm64/vmm/vmm_arm64.c
++++ b/sys/arm64/vmm/vmm_arm64.c
+@@ -544,6 +544,16 @@
+ 	if (ID_AA64MMFR1_HCX_VAL(idreg) >= ID_AA64MMFR1_HCX_IMPL)
+ 		hyp->feats |= HYP_FEAT_HCX;
+ 
++	/*
++	 * The PMU is optional: some hypervisors (Apple's nested EL2) give no
++	 * PMUv3, and every PMU register access is then UNDEFINED. Without it
++	 * the guest gets N = 0 and no PMU state is switched.
++	 */
++	get_kernel_reg(ID_AA64DFR0_EL1, &idreg);
++	if (ID_AA64DFR0_PMUVer_VAL(idreg) != ID_AA64DFR0_PMUVer_NONE &&
++	    ID_AA64DFR0_PMUVer_VAL(idreg) != ID_AA64DFR0_PMUVer_IMPL)
++		hyp->feats |= HYP_FEAT_PMU;
++
+ 	get_kernel_reg(ID_AA64PFR2_EL1, &idreg);
+ 	if (ID_AA64PFR2_GCIE_VAL(idreg) >= ID_AA64PFR2_GCIE_IMPL) {
+ 		hyp->feats |= HYP_FEAT_GICV5;
+--- a/sys/arm64/vmm/vmm_hyp.c
++++ b/sys/arm64/vmm/vmm_hyp.c
+@@ -45,7 +45,7 @@
+ uint64_t VMM_HYP_FUNC(do_call_guest)(struct hypctx *);
+ 
+ static void
+-vmm_hyp_reg_store_pmu_debug(struct hypctx *hypctx, bool guest)
++vmm_hyp_reg_store_pmu_debug(struct hypctx *hypctx, struct hyp *hyp, bool guest)
+ {
+ 	uint64_t dfr0;
+ 	hypctx_write_sys_reg(hypctx, DBGCLAIMSET_EL1,
+@@ -106,66 +106,68 @@
+ #undef STORE_DBG_WRP
+ 	}
+ 
+-	/* Store the PMU registers */
+-	hypctx_write_sys_reg(hypctx, PMCR_EL0,
+-	    READ_SPECIALREG(pmcr_el0));
+-	hypctx_write_sys_reg(hypctx, PMCCNTR_EL0,
+-	    READ_SPECIALREG(pmccntr_el0));
+-	hypctx_write_sys_reg(hypctx, PMCCFILTR_EL0,
+-	    READ_SPECIALREG(pmccfiltr_el0));
+-	hypctx_write_sys_reg(hypctx, PMUSERENR_EL0,
+-	    READ_SPECIALREG(pmuserenr_el0));
+-	hypctx_write_sys_reg(hypctx, PMSELR_EL0,
+-	    READ_SPECIALREG(pmselr_el0));
+-	hypctx_write_sys_reg(hypctx, PMCNTENSET_EL0,
+-	    READ_SPECIALREG(pmcntenset_el0));
+-	hypctx_write_sys_reg(hypctx, PMINTENSET_EL1,
+-	    READ_SPECIALREG(pmintenset_el1));
+-	hypctx_write_sys_reg(hypctx, PMOVSSET_EL0,
+-	    READ_SPECIALREG(pmovsset_el0));
++	/* Store the PMU registers; they are UNDEFINED without FEAT_PMUv3 */
++	if ((hyp->feats & HYP_FEAT_PMU) != 0) {
++		hypctx_write_sys_reg(hypctx, PMCR_EL0,
++		    READ_SPECIALREG(pmcr_el0));
++		hypctx_write_sys_reg(hypctx, PMCCNTR_EL0,
++		    READ_SPECIALREG(pmccntr_el0));
++		hypctx_write_sys_reg(hypctx, PMCCFILTR_EL0,
++		    READ_SPECIALREG(pmccfiltr_el0));
++		hypctx_write_sys_reg(hypctx, PMUSERENR_EL0,
++		    READ_SPECIALREG(pmuserenr_el0));
++		hypctx_write_sys_reg(hypctx, PMSELR_EL0,
++		    READ_SPECIALREG(pmselr_el0));
++		hypctx_write_sys_reg(hypctx, PMCNTENSET_EL0,
++		    READ_SPECIALREG(pmcntenset_el0));
++		hypctx_write_sys_reg(hypctx, PMINTENSET_EL1,
++		    READ_SPECIALREG(pmintenset_el1));
++		hypctx_write_sys_reg(hypctx, PMOVSSET_EL0,
++		    READ_SPECIALREG(pmovsset_el0));
+ 
+-	switch ((hypctx_read_sys_reg(hypctx, PMCR_EL0) & PMCR_N_MASK) >>
+-			PMCR_N_SHIFT) {
++		switch ((hypctx_read_sys_reg(hypctx, PMCR_EL0) & PMCR_N_MASK) >>
++				PMCR_N_SHIFT) {
+ #define	STORE_PMU(x)							\
+-	case (x + 1):							\
+-		hypctx_write_sys_reg(hypctx, PMEVCNTR_EL0(x),		\
+-		    READ_SPECIALREG(pmevcntr ## x ## _el0));		\
+-		hypctx_write_sys_reg(hypctx, PMEVTYPER_EL0(x),		\
+-		    READ_SPECIALREG(pmevtyper ## x ## _el0))
+-	STORE_PMU(30);
+-	STORE_PMU(29);
+-	STORE_PMU(28);
+-	STORE_PMU(27);
+-	STORE_PMU(26);
+-	STORE_PMU(25);
+-	STORE_PMU(24);
+-	STORE_PMU(23);
+-	STORE_PMU(22);
+-	STORE_PMU(21);
+-	STORE_PMU(20);
+-	STORE_PMU(19);
+-	STORE_PMU(18);
+-	STORE_PMU(17);
+-	STORE_PMU(16);
+-	STORE_PMU(15);
+-	STORE_PMU(14);
+-	STORE_PMU(13);
+-	STORE_PMU(12);
+-	STORE_PMU(11);
+-	STORE_PMU(10);
+-	STORE_PMU(9);
+-	STORE_PMU(8);
+-	STORE_PMU(7);
+-	STORE_PMU(6);
+-	STORE_PMU(5);
+-	STORE_PMU(4);
+-	STORE_PMU(3);
+-	STORE_PMU(2);
+-	STORE_PMU(1);
+-	STORE_PMU(0);
+-	default:		/* N == 0 when only PMCCNTR_EL0 is available */
+-		break;
++		case (x + 1):							\
++			hypctx_write_sys_reg(hypctx, PMEVCNTR_EL0(x),		\
++			    READ_SPECIALREG(pmevcntr ## x ## _el0));		\
++			hypctx_write_sys_reg(hypctx, PMEVTYPER_EL0(x),		\
++			    READ_SPECIALREG(pmevtyper ## x ## _el0))
++		STORE_PMU(30);
++		STORE_PMU(29);
++		STORE_PMU(28);
++		STORE_PMU(27);
++		STORE_PMU(26);
++		STORE_PMU(25);
++		STORE_PMU(24);
++		STORE_PMU(23);
++		STORE_PMU(22);
++		STORE_PMU(21);
++		STORE_PMU(20);
++		STORE_PMU(19);
++		STORE_PMU(18);
++		STORE_PMU(17);
++		STORE_PMU(16);
++		STORE_PMU(15);
++		STORE_PMU(14);
++		STORE_PMU(13);
++		STORE_PMU(12);
++		STORE_PMU(11);
++		STORE_PMU(10);
++		STORE_PMU(9);
++		STORE_PMU(8);
++		STORE_PMU(7);
++		STORE_PMU(6);
++		STORE_PMU(5);
++		STORE_PMU(4);
++		STORE_PMU(3);
++		STORE_PMU(2);
++		STORE_PMU(1);
++		STORE_PMU(0);
++		default:		/* N == 0 when only PMCCNTR_EL0 is available */
++			break;
+ #undef STORE_PMU
++		}
+ 	}
+ 
+ 	if (!guest)
+@@ -529,74 +531,76 @@
+ }
+ 
+ static void
+-vmm_hyp_reg_restore_pmu_debug(struct hypctx *hypctx)
++vmm_hyp_reg_restore_pmu_debug(struct hypctx *hypctx, struct hyp *hyp)
+ {
+ 	uint64_t dfr0;
+ 
+-	/* Restore the PMU registers */
+-	WRITE_SPECIALREG(pmcr_el0,
+-	    hypctx_read_sys_reg(hypctx, PMCR_EL0));
+-	WRITE_SPECIALREG(pmccntr_el0,
+-	    hypctx_read_sys_reg(hypctx, PMCCNTR_EL0));
+-	WRITE_SPECIALREG(pmccfiltr_el0,
+-	    hypctx_read_sys_reg(hypctx, PMCCFILTR_EL0));
+-	WRITE_SPECIALREG(pmuserenr_el0,
+-	    hypctx_read_sys_reg(hypctx, PMUSERENR_EL0));
+-	WRITE_SPECIALREG(pmselr_el0,
+-	    hypctx_read_sys_reg(hypctx, PMSELR_EL0));
+-	/* Clear all events/interrupts then enable them */
+-	WRITE_SPECIALREG(pmcntenclr_el0, ~0ul);
+-	WRITE_SPECIALREG(pmcntenset_el0,
+-	    hypctx_read_sys_reg(hypctx, PMCNTENSET_EL0));
+-	WRITE_SPECIALREG(pmintenclr_el1, ~0ul);
+-	WRITE_SPECIALREG(pmintenset_el1,
+-	    hypctx_read_sys_reg(hypctx, PMINTENSET_EL1));
+-	WRITE_SPECIALREG(pmovsclr_el0, ~0ul);
+-	WRITE_SPECIALREG(pmovsset_el0,
+-	    hypctx_read_sys_reg(hypctx, PMOVSSET_EL0));
++	/* Restore the PMU registers; they are UNDEFINED without FEAT_PMUv3 */
++	if ((hyp->feats & HYP_FEAT_PMU) != 0) {
++		WRITE_SPECIALREG(pmcr_el0,
++		    hypctx_read_sys_reg(hypctx, PMCR_EL0));
++		WRITE_SPECIALREG(pmccntr_el0,
++		    hypctx_read_sys_reg(hypctx, PMCCNTR_EL0));
++		WRITE_SPECIALREG(pmccfiltr_el0,
++		    hypctx_read_sys_reg(hypctx, PMCCFILTR_EL0));
++		WRITE_SPECIALREG(pmuserenr_el0,
++		    hypctx_read_sys_reg(hypctx, PMUSERENR_EL0));
++		WRITE_SPECIALREG(pmselr_el0,
++		    hypctx_read_sys_reg(hypctx, PMSELR_EL0));
++		/* Clear all events/interrupts then enable them */
++		WRITE_SPECIALREG(pmcntenclr_el0, ~0ul);
++		WRITE_SPECIALREG(pmcntenset_el0,
++		    hypctx_read_sys_reg(hypctx, PMCNTENSET_EL0));
++		WRITE_SPECIALREG(pmintenclr_el1, ~0ul);
++		WRITE_SPECIALREG(pmintenset_el1,
++		    hypctx_read_sys_reg(hypctx, PMINTENSET_EL1));
++		WRITE_SPECIALREG(pmovsclr_el0, ~0ul);
++		WRITE_SPECIALREG(pmovsset_el0,
++		    hypctx_read_sys_reg(hypctx, PMOVSSET_EL0));
+ 
+-	switch ((hypctx_read_sys_reg(hypctx, PMCR_EL0) & PMCR_N_MASK) >>
+-		PMCR_N_SHIFT) {
++		switch ((hypctx_read_sys_reg(hypctx, PMCR_EL0) & PMCR_N_MASK) >>
++			PMCR_N_SHIFT) {
+ #define	LOAD_PMU(x)							\
+-	case (x + 1):							\
+-		WRITE_SPECIALREG(pmevcntr ## x ## _el0,			\
+-		    hypctx_read_sys_reg(hypctx, PMEVCNTR_EL0(x)));	\
+-		WRITE_SPECIALREG(pmevtyper ## x ## _el0,		\
+-		    hypctx_read_sys_reg(hypctx, PMEVTYPER_EL0(x)))
+-	LOAD_PMU(30);
+-	LOAD_PMU(29);
+-	LOAD_PMU(28);
+-	LOAD_PMU(27);
+-	LOAD_PMU(26);
+-	LOAD_PMU(25);
+-	LOAD_PMU(24);
+-	LOAD_PMU(23);
+-	LOAD_PMU(22);
+-	LOAD_PMU(21);
+-	LOAD_PMU(20);
+-	LOAD_PMU(19);
+-	LOAD_PMU(18);
+-	LOAD_PMU(17);
+-	LOAD_PMU(16);
+-	LOAD_PMU(15);
+-	LOAD_PMU(14);
+-	LOAD_PMU(13);
+-	LOAD_PMU(12);
+-	LOAD_PMU(11);
+-	LOAD_PMU(10);
+-	LOAD_PMU(9);
+-	LOAD_PMU(8);
+-	LOAD_PMU(7);
+-	LOAD_PMU(6);
+-	LOAD_PMU(5);
+-	LOAD_PMU(4);
+-	LOAD_PMU(3);
+-	LOAD_PMU(2);
+-	LOAD_PMU(1);
+-	LOAD_PMU(0);
+-	default:		/* N == 0 when only PMCCNTR_EL0 is available */
+-		break;
++		case (x + 1):							\
++			WRITE_SPECIALREG(pmevcntr ## x ## _el0,			\
++			    hypctx_read_sys_reg(hypctx, PMEVCNTR_EL0(x)));	\
++			WRITE_SPECIALREG(pmevtyper ## x ## _el0,		\
++			    hypctx_read_sys_reg(hypctx, PMEVTYPER_EL0(x)))
++		LOAD_PMU(30);
++		LOAD_PMU(29);
++		LOAD_PMU(28);
++		LOAD_PMU(27);
++		LOAD_PMU(26);
++		LOAD_PMU(25);
++		LOAD_PMU(24);
++		LOAD_PMU(23);
++		LOAD_PMU(22);
++		LOAD_PMU(21);
++		LOAD_PMU(20);
++		LOAD_PMU(19);
++		LOAD_PMU(18);
++		LOAD_PMU(17);
++		LOAD_PMU(16);
++		LOAD_PMU(15);
++		LOAD_PMU(14);
++		LOAD_PMU(13);
++		LOAD_PMU(12);
++		LOAD_PMU(11);
++		LOAD_PMU(10);
++		LOAD_PMU(9);
++		LOAD_PMU(8);
++		LOAD_PMU(7);
++		LOAD_PMU(6);
++		LOAD_PMU(5);
++		LOAD_PMU(4);
++		LOAD_PMU(3);
++		LOAD_PMU(2);
++		LOAD_PMU(1);
++		LOAD_PMU(0);
++		default:		/* N == 0 when only PMCCNTR_EL0 is available */
++			break;
+ #undef LOAD_PMU
++		}
+ 	}
+ 
+ 	WRITE_SPECIALREG(dbgclaimclr_el1, ~0ul);
+@@ -856,7 +860,7 @@
+ {
+ 	vmm_hyp_reg_store_vgic(hypctx, hyp, guest);
+ 	vmm_hyp_reg_store_timer(hypctx, hyp, guest);
+-	vmm_hyp_reg_store_pmu_debug(hypctx, guest);
++	vmm_hyp_reg_store_pmu_debug(hypctx, hyp, guest);
+ 	vmm_hyp_reg_store_special(hypctx, hyp, guest);
+ }
+ 
+@@ -864,7 +868,7 @@
+ vmm_hyp_reg_restore(struct hypctx *hypctx, struct hyp *hyp, bool guest)
+ {
+ 	vmm_hyp_reg_restore_special(hypctx, hyp, guest);
+-	vmm_hyp_reg_restore_pmu_debug(hypctx);
++	vmm_hyp_reg_restore_pmu_debug(hypctx, hyp);
+ 	vmm_hyp_reg_restore_timer(hypctx, hyp, guest);
+ 	vmm_hyp_reg_restore_vgic(hypctx, hyp, guest);
+ }
+--- a/sys/arm64/vmm/vmm_reset.c
++++ b/sys/arm64/vmm/vmm_reset.c
+@@ -64,9 +64,12 @@
+ 	*hypctx_sys_reg(el2ctx, SCTLR_EL1) &= ~SCTLR_M & ~SCTLR_C & ~SCTLR_I;
+ 	*hypctx_sys_reg(el2ctx, SCTLR_EL1) |= SCTLR_CP15BEN;
+ 
+-	hypctx_write_sys_reg(el2ctx, PMCR_EL0,
+-	    /* PMCR_LC is unknown when AArch32 is supported or RES1 otherwise */
+-	    (READ_SPECIALREG(pmcr_el0) & PMCR_N_MASK) | PMCR_LC);
++	/* PMCR_LC is unknown when AArch32 is supported or RES1 otherwise */
++	if ((el2ctx->hyp->feats & HYP_FEAT_PMU) != 0)
++		hypctx_write_sys_reg(el2ctx, PMCR_EL0,
++		    (READ_SPECIALREG(pmcr_el0) & PMCR_N_MASK) | PMCR_LC);
++	else
++		hypctx_write_sys_reg(el2ctx, PMCR_EL0, PMCR_LC);
+ }
+ 
+ void
