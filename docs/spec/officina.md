@@ -5837,6 +5837,70 @@ Tests:
 - Pergola `a_menu_with_a_most_height_scrolls_inside_the_window`: 200 items under a 240 px most height draw fewer than 20 and keep within it. The arrows reach item 29 and the wheel the last.
 - Sheets `escape_closes_a_typed_bar_as_its_cancel_does`: Themes…, Format Chart…, Quick Analysis… and Solver… close on Escape, and Escape with nothing open does nothing.
 
+### 16.169 Write finishing plan (proposed 2026-11-27)
+
+After Sheets (§16.162–§16.168), Write gets a fixed plan of seven rounds, the same way: each round is one push and one report, and the plan ends with a close-out. It starts from a real-document sweep, so the order follows what real files lose.
+
+**The sweep.** `officina-convert/examples/corpus_write.rs` reads every `.docx`, `.docm`, `.odt` and `.doc` under the directories it is given. It writes each document as `.docx` and as `.odt`, reads both back, and compares each paragraph's visible text and a count of what the document holds: paragraphs, table cells, pictures, shapes, floats, notes, comments, tracked edits, sections, headers and footers, list items, fields, links, contents entries, tab stops, styled paragraphs, indents and spacing, and the characters that are bold, italic, underlined, sized, coloured, in a named font or highlighted. Each file gets 120 seconds and a 64 MiB stack, and a panic is caught and reported. At the end it ranks the readers' fidelity notes by how many files have each.
+
+```
+cargo run --release --example corpus_write -- DIR [DIR ...] > report.tsv 2> notes.tsv
+```
+
+The corpus is LibreOffice's `sw/qa/extras/{odfexport,odfimport,ooxmlexport,ooxmlimport,ww8export,ww8import}/data` and `sw/qa/core/data`, and Apache POI's `test-data/document`: 2,695 files. It is test data and stays out of the repository. The first run, before any fix:
+
+| | files |
+|---|---|
+| read | 2,532 |
+| refused, with a reason | 163 |
+| panics, time-outs | 0 |
+| `.docx` round trip the same | 2,164 |
+| `.odt` round trip the same | 1,999 |
+
+The slowest file took 414 ms. The text itself comes back in all but 2 (`.odt`). What moves is structure: sections (316 files through `.docx`, 378 through `.odt`; a document that starts with a table gains a section break after it), tab stops (25, 121), indents (50 through `.odt`), list items (39 through `.odt`), sizes and fonts (16 and 11 through `.docx`), headers and footers (11, 5) and contents entries (7). The refusals are Word 95 and older, Word 2, fuzzed compound files, damaged ZIPs and XML, three with a password and one DTD.
+
+What the readers keep only approximately or drop, by files (of 2,532):
+
+| files | what |
+|---|---|
+| 293 | paragraph borders (dropped) |
+| 222 | paragraph shading (dropped) |
+| 214 | capitals and small capitals (shown as typed) |
+| 159 | page breaks inside a paragraph (a line break) |
+| 138 | VML pictures and embedded objects (dropped) |
+| 135 | frames and drop caps (kept in line) |
+| 121 | text boxes (their text kept after the paragraph) |
+| 106 | WordArt (drawn as plain text) |
+| 71 | hidden text (shown) |
+| 69 | merged cells (one wide cell; 8,475 of them) |
+| 53 | nested tables (their text kept in the cell) |
+| 48 | tables in headers and footers (cells one under another) |
+| 46 | equations (dropped) |
+| 45 | cells merged down (each row keeps its own) |
+| 45 | text effects (dropped) |
+| 55 | TIFF, SVG, SVM and PICT pictures (dropped) |
+| 32 | headers and footers of more than one line (joined) |
+| 31 | tight wrap (wrapped square) |
+| 30 | floating shapes in `.doc` (dropped) |
+| 12 | charts and embedded objects; text boxes in headers and footers |
+| 8 | deleted table rows (kept); grouped floating shapes |
+
+**The everyday gap.** Beside the sweep, Write's window lacks much of Word's Home, Insert, Layout, References and Review tabs: font and size pickers, colour and highlight, a Font… and Paragraph… bar, indents and spacing, the ruler, borders and shading, table tools beyond rows and columns, hyperlinks and bookmarks, captions, an index, citations, Word's formatting keys, Format Painter, zoom, Go To, and most of Review's settings. The "Not yet" lists of §16.12–§16.30 and §16.46–§16.52 are folded into the rounds below.
+
+**The rounds.**
+
+1. **Characters, and the sweep's round-trip fixes.** Sections, tabs, indents, lists, sizes and fonts kept through both writers. Capitals and small capitals, hidden text (shown with a dotted underline, hidden in print), double strikethrough, superscript and subscript, character spacing and scale, outline and shadow text effects. Page breaks inside a paragraph as real page breaks. A font and size picker on the toolbar, font colour and highlight, a Font… bar, Clear Formatting, Change Case (Shift+F3), Format Painter, and Word's character keys (Ctrl+Shift+>/<, Ctrl+]/[, Ctrl+=, Ctrl+Shift+=, Ctrl+Space, Ctrl+D, Ctrl+Shift+A/K/H/W/D, Ctrl+Enter).
+2. **Paragraphs and lists.** A Paragraph… bar (indents, first line and hanging, spacing, line spacing, keep with next, keep lines together, widow control, page break before) and Ctrl+M/Ctrl+T/Ctrl+Q/Ctrl+1/2/5. Increase and Decrease Indent. The ruler, with indents and tab stops dragged on it and a Tabs… bar (leaders). Paragraph borders and shading with a Borders bar. Drop caps and frames placed as frames. Lists: restart and start at, the bullet and number gallery, multilevel lists and their levels' settings. Line numbers and automatic hyphenation.
+3. **Tables.** Cells merged across and down, nested tables, cell shading, border styles per side, cell margins and vertical alignment, table styles (Word's built-in gallery and the file's own), header rows repeated and rows split across pages, column widths dragged and AutoFit, tables in headers and footers, and deleted and inserted table rows as tracked changes. A Table Tools bar: insert above, below, left and right, merge and split cells, delete the table, distribute rows and columns, sort, text to table and back, and a formula field (SUM(ABOVE)).
+4. **Objects and pages.** Text boxes as real floats with their own text, WordArt as shapes, VML pictures and shapes, floating shapes in `.doc`, groups of shapes, tight wrap round a picture's outline, dragging and resizing pictures by their handles, floats in headers, footers and notes. TIFF, SVG and PICT pictures (decoded in the converter). Charts in documents, drawn by Sheets' chart code and edited with its Format Chart… bar. Headers and footers of many paragraphs (and their tables). Per section: page size, margins and header and footer, columns of their own widths, column breaks, blank pages for odd and even starts. Watermarks, page colour and page borders.
+5. **References and equations.** Captions (Figure, Table, Equation) and a table of figures; the contents' levels and styles, and clicking an entry to go there. Bookmarks, a hyperlink bar (Ctrl+K), cross-references to bookmarks, numbered items, notes and captions. An index (Mark Entry, Insert Index). Citations and a bibliography (APA, Chicago, IEEE) kept in the document's sources. Footnote and endnote settings (numbering, restart per page or section, symbols, separator). Equations: OMML and ODF MathML read, drawn and written, and an equation bar that takes a linear form (`x = (-b ± √(b^2-4ac))/(2a)`).
+6. **Review, mail merge and files.** Tracked changes in notes, headers, footers and paragraph formatting; filtering the lane by author, Original and All views, review keys; compare side by side; three-way merge with a separate base. Mail merge from a sheet (Sheets workbook or CSV as the source, merge fields, preview, finish to one document or to PDFs). Document properties, Restrict Editing, Mark as Final, Check Accessibility, the Document Inspector, AutoCorrect kept, the word count bar, Go To (Ctrl+G), zoom, Find with wildcards and formatting. `.dotx` templates and New from template, `.rtf` open and save. PDF bookmarks from headings, tagged PDF, PDF/A-2b, export of a page range.
+7. **Close-out.** The sweep again (with LibreOffice's text compared, as §16.18), a Mac VM check of installed Write (open, edit with each round's bars, save, reopen in a new document jail), the as-built summary, and the HANDOFF row moved to Recently finished.
+
+**Out of scope:** master documents (§17 D17: they import as one document), document signing (waits on Sigillum), online and cloud features, co-authoring, VBA (kept inert, as now), Word 95 and older, dictation and translation, SmartArt editing (drawn from its saved picture), and input-method scripts (wait on the IME work).
+
+Then Slides gets its own plan the same way, starting with a sweep of `.pptx`, `.odp` and `.ppt` and the presenting frame gaps on the Mac VM (84–99 ms worst, §16.38).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
