@@ -156,35 +156,37 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
 - The main domain gets one vCPU per physical CPU, each pinned, so Laminar sees the real
   topology and keeps all its scheduling decisions. Solum never preempts it for timeslicing
   on its own account.
-- Driver domains have one vCPU each, no pinned core. They run when there is work: an
-  interrupt for their device or a link kick from the main domain. Solum runs them on the
-  CPU that took the event, for as long as they have work, at higher priority than the
+- Driver domains and the vault have one vCPU each and run only on the **service CPUs**
+  (§4.4), a small set (one core, or one SMT pair) named in the manifest. They run when
+  there is work: an interrupt for their device or a link kick from the main domain. Solum
+  runs them on a service CPU, for as long as they have work, at higher priority than the
   main domain's vCPU there, then returns. This is the only scheduling Solum does: a
   per-CPU priority run queue with a budget per domain so a looping driver domain cannot
   starve the main one (it is stopped and restarted, §6.1).
 - amd64: Solum takes the CPU back for driver domains and watchdogs with the **VMX
   preemption timer** (armed only while a driver domain has pending work or a watchdog is
-  due) and with **NMIs** it sends itself (NMI exiting on). Interrupt delivery is in §4.4:
-  external-interrupt exiting has to be on whenever other domains own devices, and
-  posted interrupts are what keep main's device interrupts exit-free. MSR and I/O bitmaps pass
-  everything except virtualisation control, IOMMU and a few MSRs; VMX hidden in CPUID.
-  **The interrupt-command register is not passed through**: with a direct x2APIC, main could
-  IPI, INIT or NMI a CPU while it runs the vault or a driver domain. Main's ICR writes go
-  through APICv's virtual APIC with **IPI virtualisation (IPIv)** where the CPU has it
-  (Sapphire Rapids and later), and exit to Solum otherwise; on CPUs without IPIv that is
-  one exit per IPI, which §9's `cargo build` gate has to absorb (it is measured, not
-  assumed).
+  due) and with **NMIs** it sends itself (NMI exiting on). These, and external-interrupt
+  exiting, are on only on the service CPUs (§4.4). MSR and I/O bitmaps pass everything
+  except virtualisation control, IOMMU and a few MSRs; VMX hidden in CPUID. **Main's x2APIC
+  ICR is passed through** (no exit per IPI, no need for IPIv): an IPI, NMI or INIT that main
+  sends to a service CPU causes a VM exit there (external-interrupt and NMI exiting are on,
+  and INIT always exits in VMX non-root), so it reaches Solum, never the vault or a driver
+  domain. The worst main can do with it is a storm of exits on the service CPUs, a denial
+  of service, which §11 accepts. An IPI with SMI delivery mode raises an SMI on any CPU,
+  which is one more reason the SMI port filter is best effort and SMM isolation is what
+  bounds SMM (§5.6 item 4).
 - arm64: nVHE, the main domain at EL1 with direct access to its own GIC redistributors and
   CPU interface. The **distributor (GICD) and the ITS are trapped and emulated** by Solum for
   the routing and enable state of interrupts that belong to other domains, so main cannot
   reroute or mask a driver domain's SPIs or LPIs; main's own interrupts go straight through
-  the emulation's fast path. **SGIs (`ICC_SGI1R_EL1`, main's IPI path, the counterpart of
-  the x2APIC ICR) are trapped** through `ICH_HCR_EL2` while any other domain runs on some CPU,
-  so main cannot send an SGI to a CPU running the vault or a driver domain; with only main
-  running, the trap is off. Stage-2 faults on those pages, HVC, and SMC (checked against a
+  the emulation's fast path. SGIs (`ICC_SGI1R_EL1`, main's IPI path) are **not** trapped:
+  service CPUs run with `HCR_EL2.IMO` set, so an SGI that main sends to one is taken at EL2
+  by Solum. The **redistributor frames of the service CPUs** are trapped (stage-2), so main
+  cannot disable the PPIs and SGIs Solum relies on there (its EL2 timer); main's own CPUs'
+  redistributors stay direct. Stage-2 faults on those pages, HVC, and SMC (checked against a
   PSCI allowlist and forwarded) are the traps.
 - So "no device emulation" holds, but Solum does emulate parts of the **interrupt
-  controller** (GICD and ITS on arm64, the ICR without IPIv on amd64). Those emulations
+  controller** (GICD and ITS on arm64, and the service CPUs' redistributor frames). Those emulations
   are small, fixed register sets and are part of Solum's fuzzed surface (§7.4).
 
 ### 4.4 Interrupts
@@ -192,8 +194,34 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
 Every interrupt source belongs to the domain that owns the device. Solum refuses to pass
 a device through on a machine without interrupt remapping.
 
-How an interrupt reaches its owner depends on the hardware, and this decides whether
-interrupt-heavy I/O is near native:
+**Service CPUs.** The manifest names a small set of CPUs (default one core, or one SMT
+pair so the vault never shares a core with main) as service CPUs. Driver domains and the
+vault run only there. Main still runs on every CPU, service CPUs included, so Laminar
+sees the whole machine. The two kinds differ in one thing:
+
+- **Open CPUs** (all but the service ones): main runs with external-interrupt exiting off
+  on amd64 (`HCR_EL2.IMO` clear on arm64). Every interrupt that arrives goes straight to
+  main's own handlers, with no exit, and no other domain ever runs there.
+- **Service CPUs:** external-interrupt and NMI exiting on (`IMO` set on arm64). Every
+  interrupt there exits to Solum, which runs the owning driver domain or re-injects the
+  interrupt into main.
+- Solum owns the interrupt-remapping tables (and the GIC distributor and ITS on arm64),
+  so it routes **every interrupt of a driver domain's device to a service CPU**, never to an
+  open one. Main's device interrupts go to open CPUs. If main asks for one of its
+  interrupts on a service CPU, it gets it, at the price of an exit each time.
+
+The result is near-native interrupt delivery for main on hardware **without** posted
+interrupts or GICv4.1 (the i9-9900K, and very likely the R9700 box's Xeon E-2288G): main's
+NVMe, NIC and GPU interrupts land on open CPUs and never exit. The cost is confined to
+the service CPUs, where main's threads see an exit per interrupt; Laminar can be told to
+keep interrupt-heavy and latency-critical threads off them. The same mechanism gives the
+safety profile its reserved cores (safety study §3.2).
+
+Where the hardware has them, posted interrupts (APICv with VT-d posted interrupts, AVIC)
+and GICv4.1 direct injection remove even the service CPUs' exits for main's interrupts,
+and would let driver domains run on any CPU. They are an improvement, not a requirement.
+
+How the variants compare:
 
 - **amd64 with posted interrupts** (APICv plus VT-d posted interrupts; AVIC on AMD):
   interrupt remapping posts each device interrupt to its owning vCPU's descriptor. Main's
@@ -214,8 +242,9 @@ interrupt-heavy I/O is near native:
   interrupts. On a machine where only main owns devices, `IMO` can stay clear while main
   runs.
 
-So **near-native interrupt rates need posted interrupts or GICv4.1**. Without them Solum
-still works, with a measured cost per interrupt (§9).
+With service CPUs, the "exit per interrupt" cases above apply only on the service CPUs;
+open CPUs never exit on interrupts in any variant. So current hardware without posted
+interrupts runs main near native too, and §9 checks it on such a machine.
 
 ### 4.5 Hypercalls
 
@@ -256,7 +285,7 @@ machine runs without Solum when the base features are missing (§4.7).
 | base (required) | VT-x, EPT, unrestricted guest | AMD-V (SVM), NPT | EL2, stage-2 translation, VMID | trap-free main domain on its own stage-2 |
 | large stage-2 blocks (required for near native) | EPT 2 MiB / 1 GiB | NPT 2 MiB / 1 GiB | stage-2 block descriptors | main domain's memory mapped in a few huge blocks (§4.2) |
 | IOMMU with interrupt remapping (required for passthrough) | VT-d with IR | AMD-Vi with IR | SMMUv3 (stage 2, or nested stages) | §5.3 safeguards |
-| interrupt delivery without exits | APICv, posted interrupts | AVIC, x2AVIC | GICv4.1 direct vLPI and vSGI injection | passthrough interrupts straight to the owning vCPU (§4.4); link kicks on newer parts |
+| interrupt delivery without exits | APICv, posted interrupts | AVIC, x2AVIC | GICv4.1 direct vLPI and vSGI injection | optional: removes the remaining exits on the service CPUs and lets driver domains run anywhere (§4.4); not required, since open CPUs never exit on interrupts |
 | tagged TLBs | VPID | ASID | VMID | no TLB flush on a domain switch |
 | execute-only and per-mode execute for kernel text | MBEC | GMET | stage-2 XN per EL (FEAT_XNX) | §7.3 kernel text freeze |
 | page-table protection | HLAT, paging-write | — | — | later: protect the main kernel's page tables (§7.3 left this out) |
@@ -591,12 +620,13 @@ On real hardware:
 | hypercalls (links, seals, status) | link kicks, seals, `solumd` | kicks only, batched |
 | stage-2 faults | only bugs or attacks | no |
 | config-space writes (ECAM read-only pages, CF8/CFC) | boot, interrupt setup, device moves | no |
-| interrupt-controller parts: GICD and ITS routing, SGIs while another domain runs, ICR on amd64 without IPIv | interrupt setup; IPIs on CPUs without IPIv | IPIs on older amd64 only |
+| interrupt-controller parts: GICD and ITS routing, the service CPUs' redistributors (arm64) | interrupt setup | no |
+| every interrupt, IPI and NMI that arrives **on a service CPU** (§4.4) | driver-domain interrupts, and main's threads there | only on the service CPUs |
 | sleep, reset and power-off registers, FACS writes | sleep, reset, shutdown | no |
 | SMI-raising ports | AML methods that use SMM | no |
 | a few MSRs (virtualisation control, IOMMU, debug) and, on Intel, `CPUID`, `XSETBV` and `GETSEC` (VMX always exits on these) | boot and rare calls | no |
 | trace and profiling hardware: Intel PT (`IA32_RTIT_*` MSRs, allowed only with the VMX "PT uses guest-physical addresses" control, Ice Lake and later, otherwise off); arm64 SPE and TRBE kept under EL2 with `MDCR_EL2` (E2PB, E2TB) | when a tool turns tracing on | no |
-| CPU bring-up on amd64 (INIT/SIPI through the ICR; IPIv does not cover these, so they always exit) | CPU hotplug and boot | no |
+| INIT and SIPI on amd64 (they always exit on the target CPU in VMX non-root; offline CPUs are parked by Solum as main vCPUs waiting for SIPI) | CPU hotplug and boot | no |
 | the preemption timer (amd64) or EL2 timer (arm64) | only while a driver domain has work or a watchdog is due | no |
 
 Not trapped for main: `HLT`, `MWAIT` and `WFI` (idle runs natively), page faults,
@@ -836,7 +866,8 @@ runs per arm, exits counted by a positive-controlled counter:
   each switch into a driver domain or the vault (IBPB, L1D flush, VERW where the CPU needs
   them), the kick round trip, and how often the vault's SMT co-scheduling takes a sibling
   away from main (§11).
-- IPI cost on CPUs without IPIv (§4.3).
+- The service CPUs' cost: exits per second there and main's throughput on them, against the
+  same CPUs on bare metal (§4.4).
 
 ## 10. Build order
 
@@ -863,8 +894,8 @@ TPM and the debug stub. What Solum needs from it is listed in
 `docs/reviews/2026-11-27-solum-vaahana-requests.md`, ordered by build step. Vaahana's answer
 (`docs/reviews/2026-11-27-solum-vaahana-gap-list.md`): nested virtualisation is passed
 down to the host, not emulated. amd64 work runs on Vaahana's x86 KVM machine on the
-Hostkey box (i9-9900K; no APICv, posted interrupts or IPIv, so it exercises §4.4's exit
-path), and arm64 work through HVF's EL2 on the M4 Max (nVHE support still to be probed).
+Hostkey box (i9-9900K; no APICv, posted interrupts or IPIv, so it exercises §4.4's service-CPU
+design), and arm64 work through HVF's EL2 on the M4 Max (nVHE support still to be probed).
 Nothing in the list is fully there yet; Vaahana's own order of work is in that file. Numbers come
 from the R9700 box, natively over PXE (x86_64-port §5). Until Vaahana has a feature a step
 needs, that step's functional check runs on the R9700 box (Linux KVM nested VMX) or under
@@ -929,8 +960,10 @@ item 4); D-states split between Solum and main; reset and power-off through Solu
 MOR set by the vault; CF8/CFC and read-only ECAM for owned functions (§5.6 item 3); DSDT
 not trimmed (§5.5 item 1); reserved manifest fields rejected and two-consumer seals for
 lockstep (safety study). Vaahana's gap list surfaced one more correction: external-interrupt
-exiting must be on when driver domains exist, so near-native interrupt rates need
-posted interrupts or GICv4.1 (§4.4). A fourth pass on §5.7 is folded in as well: Intel PT, SPE and
+exiting must be on wherever a driver domain's interrupts can arrive. The fix is service
+CPUs (§4.4): driver domains and the vault run on a few CPUs with exiting on, main's
+interrupts go to open CPUs with exiting off, and main's ICR is passed through, so current
+hardware without posted interrupts stays near native. A fourth pass on §5.7 is folded in as well: Intel PT, SPE and
 TRBE trapped, debug images signed only with a development key, a physical UART or an
 isolated BMC for the stub, admin-only counters, INIT/SIPI exits, and driver-domain wake
 in the S2a gate.
@@ -971,6 +1004,9 @@ in the S2a gate.
 7g. **Emulators under Solum** (§8.1): software emulators unchanged; accelerated ones use
    a KVM-shaped guest-domain API with a Solum backend in each VMM; no nested
    virtualisation. *Recommend yes; new.*
+7h. **Service CPUs** (§4.4): driver domains and the vault run on a few manifest-named CPUs
+   with interrupt exiting on; main's interrupts and IPIs stay exit-free on the other CPUs;
+   posted interrupts and GICv4.1 optional. *Recommend yes; new.*
 7e. **Driver-model weak spots** (§5.6): explicit move sequence in dispensatord, generation
    bump on every move, main's config writes checked, main keeps ACPI with Solum owning
    the resume path (new step S2a). *Recommend yes; this one is new since the acceptance.*

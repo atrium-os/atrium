@@ -46,9 +46,11 @@ Vaahana's order of work: (1) nested VMX checks, COM2, a control socket and memor
 ## What it changed in Solum
 
 - **Interrupt delivery (solum.md §4.4).** On a CPU without posted interrupts, external-
-  interrupt exiting has to be on once driver domains exist, so every device interrupt
-  exits. The spec said otherwise and is corrected: near-native interrupt rates need posted
-  interrupts (or GICv4.1 on arm64), and §9 measures both kinds of machine.
+  interrupt exiting has to be on wherever a driver domain's interrupts can arrive. The
+  spec missed that. The fix is **service CPUs**: driver domains and the vault run on a few
+  CPUs with exiting on, while main's device interrupts and IPIs go to the other CPUs with
+  exiting off. So hardware without posted interrupts stays near native, and posted
+  interrupts are only an improvement.
 - **The guest-domain API (§8.1)** records Vaahana's wishes for S1.
 - **Test platforms (§10)** name the Hostkey box and the M4 Max's HVF EL2.
 
@@ -58,7 +60,8 @@ Vaahana's order of work: (1) nested VMX checks, COM2, a control socket and memor
   there (solum.md §4.7). Vaahana's step 3 (OVMF) is therefore needed for S0 and should run
   alongside step 1, not after it. We'd rather not add a PVH entry to Solum just for the
   emulator.
-- **An AMD box, or a newer Intel one?** A newer Intel machine with APICv, VT-d posted
-  interrupts and ideally IPIv (Sapphire Rapids or later) is worth it, because the
-  near-native interrupt gates can only be shown on such hardware, and the Hostkey box lacks it
-  (the R9700 box's Coffee Lake Xeon very likely does too; to be confirmed). An AMD box (AVIC, AMD-Vi) can wait until the AMD-V port.
+- **An AMD box, or a newer Intel one?** Not needed for Solum's gates: with service CPUs
+  (solum.md §4.4), the Hostkey box and the R9700 box can show near-native interrupt
+  delivery without posted interrupts. A newer Intel box (APICv, VT-d posted interrupts) is
+  useful later to test the optional posted-interrupt path, and an AMD box for the AMD-V
+  port. An AMD box (AVIC, AMD-Vi) can wait until the AMD-V port.
