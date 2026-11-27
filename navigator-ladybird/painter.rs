@@ -1075,6 +1075,29 @@ pub mod host {
         true
     }
 
+    /// A whole live page set its title (`document.title`, a `<title>`
+    /// change): reported so the trail entry is named by it. Control
+    /// characters become spaces and it is cut to 256 bytes on a character
+    /// boundary, as `Report::Title` takes it; navigatord paces what it tells.
+    ///
+    /// # Safety
+    /// LibWeb owns the UTF-8 buffer for the duration of this call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_live_title(state: &SceneState, title: *const u8, title_len: usize) -> bool {
+        use limen::web_island::Report;
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if title.is_null() || title_len > 64 * 1024 { return false; }
+        // SAFETY: the caller passes LibWeb's live buffer of `title_len` bytes.
+        let Ok(text) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(title, title_len) }) else { return false };
+        let mut cut = String::new();
+        for c in text.chars().map(|c| if c.is_control() { ' ' } else { c }) {
+            if cut.len() + c.len_utf8() > 256 { break; }
+            cut.push(c);
+        }
+        let Some(bytes) = Report::Title(cut.trim()).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
     /// A whole live page's link, GET form or `location` (I6.2): reported
     /// to navigatord, never followed here. False when the address is not
     /// one an engine may report (plain HTTPS, printable, bounded).

@@ -741,3 +741,15 @@ not yet checked in a VM.
     and the local link, address change and never-remembered cases in
     `your_own_servers_page_is_offered_live_only_once_navigatord_named_its_app`
     (navigator-ui).
+  - *Mac re-run (2026-11-27, main 25d4264aa).* The same-origin link
+    passed: `#go` on `/live` ran live again at `http://localhost:9000/go`
+    with the jar's cookie, and Photo Server saw only port-9000 requests.
+    The title did not: the engine reports a title only beside `Started`
+    (`navigator_counter_started`), never a later `document.title`, and on
+    that run not even the first reached navigatord. The engine now
+    reports every change through `page_did_change_title` and
+    `navigator_live_title` (painter.rs, EditorPage.h; control characters
+    become spaces, cut to 256 bytes). It is unbuilt: it needs a Mac
+    engine build and the same run again. If the first title still goes
+    missing, look at the engine's side of `Started`.
+    Evidence: `~/atrium-vm/evidence/navigator-b7-title-link-20261127/`.

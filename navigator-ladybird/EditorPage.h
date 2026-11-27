@@ -18,6 +18,7 @@ extern "C" bool navigator_live_propose(NavigatorScene*, u8 const*, size_t);
 extern "C" bool navigator_live_open_beside(NavigatorScene*, u8 const*, size_t);
 extern "C" bool navigator_live_submit(NavigatorScene*, u8 const*, size_t, u8 const*, size_t);
 extern "C" bool navigator_live_pick_file(NavigatorScene*);
+extern "C" bool navigator_live_title(NavigatorScene*, u8 const*, size_t);
 #endif
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" bool navigator_vpn_script_submit(u8 const*, size_t);
@@ -110,6 +111,16 @@ public:
         }
         warnln("live page: navigation to {} refused (top-level={} get={} same-document={})", url.serialize(),
             target == Web::NavigationTarget::TopLevel, get, same_document);
+    }
+    // Its title as the script sets it after the start (navigatord was told
+    // the first with Started): the trail entry follows it.
+    void page_did_change_title(Utf16String const& title) override
+    {
+        if (!island_scene)
+            return;
+        auto text = title.to_well_formed_utf8();
+        if (!navigator_live_title(island_scene, text.bytes().data(), text.bytes().size()))
+            warnln("live page: its title not reported");
     }
     // A new window it asks for on the person's activation (window.open, a
     // target=_blank link, I6.2; patches/ladybird/live-open-beside.patch):
