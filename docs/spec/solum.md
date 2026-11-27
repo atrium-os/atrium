@@ -530,9 +530,8 @@ reach it only through Atrium:
   IOMMU or stage-2 tables. A new manifest arrives as a signed Opifex base update and takes
   effect at the next (measured) boot.
 
-**Debugging Solum.** Most of it happens with no hardware at all: Solum under QEMU (TCG
-with `virtualization=on` on arm64, KVM nested on the R9700 box) is debugged with QEMU's
-own gdbstub, which can break into Solum, single-step it and read every domain's memory.
+**Debugging Solum.** Most of it happens with no hardware at all: Solum under Vaahana
+(or, until Vaahana has the feature, QEMU) is debugged with the emulator's own gdbstub, which can break into Solum, single-step it and read every domain's memory.
 On real hardware:
 
 - A **debug build** of Solum (a different image, so a different measurement: the vault's
@@ -788,17 +787,19 @@ runs per arm, exits counted by a positive-controlled counter:
 | **S4** | vault with the TPM (§7.2); arcad's vault ring | arca-vm-test.sh passes; vault memory unreadable from root in the main domain; sealing fails without Solum |
 | **S5** | net domain (Aura Wi-Fi), audio domain | crash and restart gates per class |
 | **S6** | kernel text freeze and signed module loads (§7.3); main-domain crash dump and warm restart (§6.3) | a text write from a test kmod faults; a forced panic dumps and restarts |
-| **S7** | arm64 (EL2 nVHE) | S0–S6 gates under QEMU TCG with `virtualization=on`, then on arm64 hardware with EL2 |
+| **S7** | arm64 (EL2 nVHE) | S0–S6 gates under Vaahana (EL2), then on arm64 hardware with EL2 |
 | **S8** | graphics domain (§5.4) | frame-time gates; GPU fault restarts with client replay |
 
 P0's numbers cover passthrough and the virtio hop only; the vault, seal, kick and
 interrupt-emulation costs exist only in Solum and are first measured in S1 and S2.
 
-Test platforms: amd64 on the R9700 box (Linux KVM nested VMX for function, native PXE boot
-for numbers; x86_64-port §5). arm64 under cloud QEMU TCG for function only. The Mac dev VM
-runs under HVF, which offers EL2 to guests only on M3 or later Macs with macOS 15+, and
-QEMU's HVF nested-virtualisation support is still in review, so the Mac is not a Solum
-platform yet.
+Test platforms: **Vaahana**, Atrium's own emulator, instead of QEMU (Shankar,
+2026-11-27), for everything functional: nested VMX and EL2, the IOMMU, ACPI sleep, the
+TPM and the debug stub. What Solum needs from it is listed in
+`docs/reviews/2026-11-27-solum-vaahana-requests.md`, ordered by build step. Numbers come
+from the R9700 box, natively over PXE (x86_64-port §5). Until Vaahana has a feature a step
+needs, that step's functional check runs on the R9700 box (Linux KVM nested VMX) or under
+QEMU TCG, and the check script says which one it used.
 
 ## 11. Risks
 
