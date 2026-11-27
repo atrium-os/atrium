@@ -649,6 +649,9 @@ fn main() -> std::io::Result<()> {
                 _ if viewed::live() => None,
                 viewed::Phase::Off => None,
                 viewed::Phase::Viewed => viewer_output,
+                /* (None if the session ended before its output was
+                 * applied: the layout may then return early, but the
+                 * monitors' picture can't, fill_for covers them.) */
                 viewed::Phase::Ending => desk_remote,
             };
             if want != desk_remote || (desk_reapply && want.is_some()) {
@@ -1064,9 +1067,8 @@ fn upload_head(
         *x = None;
     }
     /* Viewed from elsewhere (viewed.rs, decision 3): the monitor shows
-     * frescod's viewed screen, never the desktop. */
-    if let Some(p) = viewed::picture_for(h.output, h.mode.width, h.mode.height).filter(|p| p.len() == h.staging.len()) {
-        h.staging.copy_from_slice(&p);
+     * frescod's viewed screen, or black, never the desktop. */
+    if viewed::fill_for(h.output, h.mode.width, h.mode.height, &mut h.staging) {
         if h.hdr_on {
             enc.encode(&mut h.staging);
         }
@@ -1660,10 +1662,15 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
         /* The seat's monitors: the viewed screen, or the desktop. */
         if seat {
-            let (sw, sh, mut px) = viewed::picture().unwrap_or_else(|| (W, H, rgba.clone()));
-            if viewed::active() {
-                for p in px.chunks_exact_mut(4) { p.swap(0, 2); }
-            }
+            /* While viewed: the viewed screen, or black, never the desktop. */
+            let (sw, sh, px) = match viewed::picture() {
+                Some((w, h, mut px)) => {
+                    for p in px.chunks_exact_mut(4) { p.swap(0, 2); }
+                    (w, h, px)
+                }
+                None if viewed::active() => (W, H, [0, 0, 0, 255].repeat((W * H) as usize)),
+                None => (W, H, rgba.clone()),
+            };
             if let Some(img) = image::RgbaImage::from_raw(sw, sh, px) {
                 let (seat_out, tmp) = (format!("{png}-seat.png"), format!("{png}-seat.png.new"));
                 if img.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {

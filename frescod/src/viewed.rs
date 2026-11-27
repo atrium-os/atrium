@@ -334,6 +334,20 @@ pub fn picture() -> Option<(u32, u32, Vec<u8>)> {
     Some((w, h, draw(&mut s, w, h, true)))
 }
 
+/// Fill `staging` (monitor `output`, `w` x `h`, BGRA) with what it shows
+/// while viewed: the viewed screen, or black when that can't be had at
+/// this size (never the desktop). False when not viewed: the desktop.
+pub fn fill_for(output: u32, w: u32, h: u32, staging: &mut [u8]) -> bool {
+    if !active() {
+        return false;
+    }
+    match picture_for(output, w, h).filter(|p| p.len() == staging.len()) {
+        Some(p) => staging.copy_from_slice(&p),
+        None => staging.fill(0),
+    }
+    true
+}
+
 /// What monitor `output` (`w` x `h`) shows now, or `None` when it shows
 /// the desktop; made again only when the picture changed.
 pub fn picture_for(output: u32, w: u32, h: u32) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -394,6 +408,26 @@ mod tests {
         s.phase = Phase::Off;
         s.disconnect = false;
         s.viewer.clear();
+    }
+
+    #[test]
+    fn a_monitor_never_falls_back_to_the_desktop_while_viewed() {
+        reset();
+        let mut staging = vec![7u8; 640 * 360 * 4];
+        assert!(!fill_for(0, 640, 360, &mut staging), "not viewed: the desktop");
+        begin(640, 360, 1000);
+        assert!(fill_for(0, 640, 360, &mut staging));
+        assert!(staging.chunks_exact(4).any(|p| p != [0, 0, 0, 0]), "the viewed screen");
+        // A buffer the picture does not fit (padding, a racing mode change).
+        let mut odd = vec![7u8; 640 * 360 * 4 + 64];
+        assert!(fill_for(0, 640, 360, &mut odd));
+        assert!(odd.iter().all(|b| *b == 0), "black, not the desktop");
+        end();
+        let mut staging = vec![7u8; 640 * 360 * 4];
+        assert!(fill_for(0, 640, 360, &mut staging), "still covered while locking");
+        assert!(poll(true));
+        assert!(!fill_for(0, 640, 360, &mut staging));
+        reset();
     }
 
     #[test]
