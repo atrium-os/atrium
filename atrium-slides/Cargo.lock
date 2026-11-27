@@ -1410,6 +1410,7 @@ name = "officina-text"
 version = "0.1.0"
 dependencies = [
  "atrium-fonts",
+ "hyphenation",
  "navigator-fontset",
  "officina-core",
  "officina-pict",

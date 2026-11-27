@@ -27,6 +27,7 @@ use pergola_richtext::editor::{Case, Toggle};
 use pergola_richtext::RichTextView;
 
 use crate::doc::Doc;
+use crate::para::{para_cmd, ParaBar, ParaCmd, ParaKind, ParaMenus, RULER_H};
 
 pub const PICKER_SLOT: u64 = 1;
 pub const TOOLBAR_H: f32 = 48.0;
@@ -55,10 +56,10 @@ pub const SHAPES: [(&str, &str); 12] = [("Rectangle", "rect"), ("Rounded", "roun
 pub const SHAPE_COLORS: [(&str, u32); 9] = [("Blue", 0x4472C4), ("Dark Blue", 0x2F528F), ("Orange", 0xED7D31), ("Green", 0x70AD47), ("Red", 0xC00000), ("Yellow", 0xFFC000), ("Grey", 0xA5A5A5), ("Black", 0x000000), ("White", 0xFFFFFF)];
 
 /// The Format menu, in order (its commands are [`FORMAT_CMDS`]).
-pub const FORMAT: [&str; 18] = ["Font…", "Grow Font", "Shrink Font", "Strikethrough", "Double Strikethrough", "Superscript", "Subscript", "Small Caps", "All Caps", "Hidden", "Clear Formatting", "Sentence case.", "lowercase", "UPPERCASE", "Capitalize Each Word", "tOGGLE cASE", "Format Painter", "Page Break"];
+pub const FORMAT: [&str; 25] = ["Font…", "Grow Font", "Shrink Font", "Strikethrough", "Double Strikethrough", "Superscript", "Subscript", "Small Caps", "All Caps", "Hidden", "Clear Formatting", "Sentence case.", "lowercase", "UPPERCASE", "Capitalize Each Word", "tOGGLE cASE", "Format Painter", "Page Break", "Paragraph…", "Borders and Shading…", "Tabs…", "Bullets and Numbering…", "Line Numbers", "Hyphenation", "Ruler"];
 
 /// What each Format menu item does.
-pub const FORMAT_CMDS: [Cmd; 18] = [Cmd::FontOpen, Cmd::Grow(true), Cmd::Grow(false), Cmd::Toggle(Toggle::Strike), Cmd::Toggle(Toggle::DoubleStrike), Cmd::Toggle(Toggle::Superscript), Cmd::Toggle(Toggle::Subscript), Cmd::Toggle(Toggle::SmallCaps), Cmd::Toggle(Toggle::AllCaps), Cmd::Toggle(Toggle::Hidden), Cmd::ClearFormatting, Cmd::Case(Case::Sentence), Cmd::Case(Case::Lower), Cmd::Case(Case::Upper), Cmd::Case(Case::Title), Cmd::Case(Case::Toggle), Cmd::FormatPainter, Cmd::PageBreak];
+pub const FORMAT_CMDS: [Cmd; 25] = [Cmd::FontOpen, Cmd::Grow(true), Cmd::Grow(false), Cmd::Toggle(Toggle::Strike), Cmd::Toggle(Toggle::DoubleStrike), Cmd::Toggle(Toggle::Superscript), Cmd::Toggle(Toggle::Subscript), Cmd::Toggle(Toggle::SmallCaps), Cmd::Toggle(Toggle::AllCaps), Cmd::Toggle(Toggle::Hidden), Cmd::ClearFormatting, Cmd::Case(Case::Sentence), Cmd::Case(Case::Lower), Cmd::Case(Case::Upper), Cmd::Case(Case::Title), Cmd::Case(Case::Toggle), Cmd::FormatPainter, Cmd::PageBreak, Cmd::Para(ParaCmd::Open(ParaKind::Paragraph)), Cmd::Para(ParaCmd::Open(ParaKind::Borders)), Cmd::Para(ParaCmd::Open(ParaKind::Tabs)), Cmd::Para(ParaCmd::Open(ParaKind::Lists)), Cmd::Para(ParaCmd::LineNumbers), Cmd::Para(ParaCmd::Hyphenation), Cmd::Para(ParaCmd::Ruler)];
 
 /// The Font… bar's sizes, points (Word's list).
 pub const FONT_SIZES: [u16; 16] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
@@ -291,6 +292,8 @@ pub enum Cmd {
     ShapeAnchor,
     ShapeDone,
     ShapeClose,
+    /// The paragraph bars and the ruler.
+    Para(ParaCmd),
 }
 
 /// The character commands of the Format menu and the Font… bar: Some
@@ -614,6 +617,11 @@ pub struct Write {
     pub font_highlight_menu: Mutable<MenuState>,
     pub font_width_menu: Mutable<MenuState>,
     pub line_menu: Mutable<MenuState>,
+    /// The paragraph bars (in the Font… bar's place) and their menus.
+    pub para: Mutable<ParaBar>,
+    pub para_menus: Rc<ParaMenus>,
+    /// The ruler is shown over the pages.
+    pub ruler: Mutable<bool>,
     pub speller: Rc<RefCell<Speller>>,
     /// Where words added to the dictionary are kept (one per line).
     pub words_file: Rc<RefCell<Option<std::path::PathBuf>>>,
@@ -621,7 +629,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), read_was: Cell::new(false), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), format_menu: Mutable::new(MenuState::default()), font_open: Mutable::new(false), font_family_menu: Mutable::new(MenuState::default()), font_size_menu: Mutable::new(MenuState::default()), font_color_menu: Mutable::new(MenuState::default()), font_highlight_menu: Mutable::new(MenuState::default()), font_width_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), read_was: Cell::new(false), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), format_menu: Mutable::new(MenuState::default()), font_open: Mutable::new(false), font_family_menu: Mutable::new(MenuState::default()), font_size_menu: Mutable::new(MenuState::default()), font_color_menu: Mutable::new(MenuState::default()), font_highlight_menu: Mutable::new(MenuState::default()), font_width_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), para: Mutable::new(ParaBar::default()), para_menus: Rc::new(ParaMenus::default()), ruler: Mutable::new(false), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -667,7 +675,8 @@ impl Write {
             return Rect::new(0.0, 0.0, w, h);
         }
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open || self.font_open.get() { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open || self.font_open.get() || self.para_open() { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = top + if self.ruler.get() { RULER_H } else { 0.0 };
         let w = if self.pane.get() || self.outline.get() { (w - PANE_W).max(200.0) } else { w };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
@@ -1316,10 +1325,14 @@ impl Write {
                     self.margin.set(MarginBar::default());
                 }
                 // The Font… bar takes the same place.
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen | Cmd::StyleOpen | Cmd::MarginOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen | Cmd::StyleOpen | Cmd::MarginOpen | Cmd::Para(ParaCmd::Open(_))) {
                     self.font_open.set(false);
                 }
-                if c == Cmd::FontOpen {
+                // So do the paragraph bars.
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen | Cmd::StyleOpen | Cmd::MarginOpen | Cmd::FontOpen) && self.para_open() {
+                    self.para.set(ParaBar { open: None, ..self.para.get_cloned() });
+                }
+                if c == Cmd::FontOpen || matches!(c, Cmd::Para(ParaCmd::Open(_))) {
                     e.review = false;
                     self.style_bar.set(StyleBar::default());
                     self.shape.set(ShapeBar::default());
@@ -1329,6 +1342,15 @@ impl Write {
                     self.spell.set(SpellBar::default());
                     self.note.set(NoteBar::default());
                     self.comment.set(CommentBar::default());
+                }
+                if let Cmd::Para(pc) = c {
+                    let done = para_cmd(&mut e, &self.para, &self.ruler, pc);
+                    drop(e);
+                    drop(d);
+                    if done {
+                        self.changed();
+                    }
+                    return false;
                 }
                 if let Some(done) = font_cmd(&mut e, &self.font_open, c) {
                     drop(e);
@@ -1764,10 +1786,11 @@ impl View for Write {
             // Character formatting beyond B, I and U.
             let cf = self.doc.borrow().ed.borrow().format_at_caret();
             let painting = self.doc.borrow().ed.borrow().painter.is_some();
+            let (line_numbers, hyphenate, ruler) = { let d = self.doc.borrow(); let e = d.ed.borrow(); (e.doc.settings.line_numbers.is_some(), e.doc.settings.hyphenate, self.ruler.get()) };
             let items: Vec<MenuItem> = FORMAT.iter().enumerate().map(|(i, l)| {
                 let m = MenuItem::new(*l);
                 match i {
-                    1 | 3 | 10 | 11 | 16 => m.separated(),
+                    1 | 3 | 10 | 11 | 16 | 18 | 22 => m.separated(),
                     _ => m,
                 }
                 .checked(match i {
@@ -1779,6 +1802,9 @@ impl View for Write {
                     8 => cf.caps == officina_text::model::Caps::All,
                     9 => cf.hidden,
                     16 => painting,
+                    22 => line_numbers,
+                    23 => hyphenate,
+                    24 => ruler,
                     _ => false,
                 })
             }).collect();
@@ -2244,6 +2270,9 @@ impl View for Write {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // The paragraph bars, in the same place.
+        self.para_bar(ctx, w);
+
         // The shape bar: on the caret's shape, its words and look; with none,
         // the shapes to draw.
         let sb = self.shape.get_cloned();
@@ -2401,6 +2430,7 @@ impl View for Write {
         let cmds2 = self.cmds.clone();
         let cmds3 = self.cmds.clone();
         RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).on_font(move || cmds3.lock().unwrap().push(Cmd::FontOpen)).on_comment(move |id| cmds2.lock().unwrap().push(Cmd::CommentOpen(id))).emit(ctx);
+        self.ruler_view(ctx, self.pages_rect(w, h));
 
         // The styles pane: every style in its own look; a click puts it on.
         if self.pane.get() {

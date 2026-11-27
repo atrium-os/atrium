@@ -15,7 +15,7 @@ use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Border, ParaBorders, DropCap, ListDef, ListLevel, LineNumbering, LineSpacing, ParaFormat, Settings, TabStop, TabAlign, Leader, MAX_TABS, LIST_INDENT, Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::PAGE_BREAK;
 use officina_text::model::{RevId, Revision};
@@ -2548,6 +2548,275 @@ impl Editor {
         }
     }
 
+    /// The caret paragraph's format as shown (its style's under its own).
+    pub fn para_format_at_caret(&self) -> ParaFormat {
+        self.doc.para(self.caret.block).map(|p| self.doc.styles.para_format(p.style, &p.props).0).unwrap_or_default()
+    }
+
+    /// Increase Indent (Ctrl+M) and Decrease Indent (Ctrl+Shift+M): list
+    /// items a level deeper or out; other paragraphs half an inch, never
+    /// before the margin.
+    pub fn indent(&mut self, more: bool) -> bool {
+        if self.list_level(if more { 1 } else { -1 }) {
+            return true;
+        }
+        let rev = self.revision;
+        let step = LIST_INDENT;
+        let styles = self.doc.styles.clone();
+        let shown: Vec<i32> = self.selected_paras().iter().map(|(st, pp)| styles.para_format(*st, pp).0.indent_start).collect();
+        let (a, _) = self.selection();
+        let mut ops = Vec::new();
+        for (i, cur) in shown.into_iter().enumerate() {
+            let k = a.block + i;
+            let Some(p) = self.doc.para(k) else { continue };
+            let next = if more { (cur / step + 1) * step } else { ((cur + step - 1) / step - 1).max(0) * step };
+            if next != cur {
+                let mut props = p.props.clone();
+                props.indent_start = Some(next);
+                ops.push(TextOp::SetPara { block: k as u32, style: p.style, props });
+            }
+        }
+        self.apply(if more { "Increase Indent" } else { "Decrease Indent" }, ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// The selected paragraphs' style and direct properties, in order.
+    fn selected_paras(&self) -> Vec<(StyleId, ParaProps)> {
+        let (a, b) = self.selection();
+        (a.block..=b.block).filter_map(|k| self.doc.para(k).map(|p| (p.style, p.props.clone()))).collect()
+    }
+
+    /// Hanging Indent (Ctrl+T, Ctrl+Shift+T back): the text half an inch
+    /// further in, its first line where it was.
+    pub fn hanging_indent(&mut self, more: bool) -> bool {
+        let rev = self.revision;
+        let styles = self.doc.styles.clone();
+        self.set_paragraphs("Hanging Indent", None, move |p| {
+            let (f, _) = styles.para_format(0, p);
+            let hang = (-f.first_line).max(0);
+            let new_hang = if more { hang + LIST_INDENT } else { (hang - LIST_INDENT).max(0) };
+            let start = f.indent_start + (new_hang - hang);
+            if start >= 0 {
+                p.indent_start = Some(start);
+                p.first_line = Some(-new_hang);
+            }
+        });
+        self.revision != rev
+    }
+
+    /// Ctrl+Q: the paragraphs' own formatting off (their style's shows);
+    /// lists, cells and sections stay.
+    pub fn reset_paragraph(&mut self) {
+        self.set_paragraphs("Reset Paragraph", None, |p| {
+            *p = ParaProps { list: p.list, list_start: p.list_start, cell: p.cell, rev: p.rev, toc: p.toc, section: p.section, ..Default::default() };
+        });
+    }
+
+    /// Line spacing (Ctrl+1, Ctrl+5, Ctrl+2: single, one and a half, double).
+    pub fn set_line_spacing(&mut self, s: LineSpacing) {
+        self.set_paragraphs("Line Spacing", None, move |p| p.line_spacing = Some(s));
+    }
+
+    /// Ctrl+0: twelve points before the paragraphs, or none.
+    pub fn toggle_space_before(&mut self) {
+        let on = self.para_format_at_caret().space_before == 0;
+        self.set_paragraphs("Space Before", None, move |p| p.space_before = Some(if on { 240 } else { 0 }));
+    }
+
+    /// The paragraphs' borders and shading (`None` leaves either as it is).
+    pub fn set_box(&mut self, borders: Option<ParaBorders>, shading: Option<Option<u32>>) {
+        self.set_paragraphs("Borders and Shading", None, move |p| {
+            if let Some(b) = borders {
+                p.borders = Some(b);
+            }
+            if let Some(s) = shading {
+                p.shading = Some(s);
+            }
+        });
+    }
+
+    /// Turns one border side on (in `look`) or off: 0 top, 1 bottom, 2
+    /// start, 3 end, 4 between; 5 all four round, 6 none.
+    pub fn toggle_border(&mut self, side: u8, look: Border) {
+        let cur = self.para_format_at_caret().borders;
+        let mut b = cur;
+        let flip = |x: Option<Border>| if x.is_some() { None } else { Some(look) };
+        match side {
+            0 => b.top = flip(b.top),
+            1 => b.bottom = flip(b.bottom),
+            2 => b.start = flip(b.start),
+            3 => b.end = flip(b.end),
+            4 => b.between = flip(b.between),
+            5 => b = ParaBorders { top: Some(look), bottom: Some(look), start: Some(look), end: Some(look), between: None },
+            _ => b = ParaBorders::default(),
+        }
+        self.set_box(Some(b), None);
+    }
+
+    /// Every border side the paragraphs have, in `look` (style, width, colour).
+    pub fn restyle_borders(&mut self, look: Border) {
+        let cur = self.para_format_at_caret().borders;
+        let re = |x: Option<Border>| x.map(|_| look);
+        self.set_box(Some(ParaBorders { top: re(cur.top), bottom: re(cur.bottom), start: re(cur.start), end: re(cur.end), between: re(cur.between) }), None);
+    }
+
+    /// The paragraphs' first letter dropped (or not).
+    pub fn set_drop_cap(&mut self, d: Option<DropCap>) {
+        self.set_paragraphs("Drop Cap", None, move |p| p.drop_cap = Some(d));
+    }
+
+    /// The paragraphs' tab stops.
+    pub fn set_tabs(&mut self, tabs: Vec<TabStop>) {
+        let mut t = tabs;
+        t.sort_by_key(|s| s.pos);
+        t.dedup_by_key(|s| s.pos);
+        t.truncate(MAX_TABS);
+        self.set_paragraphs("Tabs", None, move |p| p.tabs = Some(t.clone()));
+    }
+
+    /// A tab stop at `pos` (twips from the column's start edge) on the
+    /// paragraphs, or the one there moved or restyled.
+    pub fn set_tab(&mut self, pos: i32, align: TabAlign, leader: Leader, from: Option<i32>) {
+        let mut t = self.para_format_at_caret().tabs;
+        if let Some(f) = from {
+            t.retain(|s| s.pos != f);
+        }
+        t.retain(|s| s.pos != pos);
+        t.push(TabStop { pos: pos.clamp(0, 31_680), align, leader });
+        self.set_tabs(t);
+    }
+
+    /// The tab stop at `pos` off the paragraphs (or every one).
+    pub fn clear_tab(&mut self, pos: Option<i32>) {
+        let mut t = self.para_format_at_caret().tabs;
+        match pos {
+            Some(x) => t.retain(|s| s.pos != x),
+            None => t.clear(),
+        }
+        self.set_tabs(t);
+    }
+
+    /// Indents set on the ruler (twips; any left as `None` stays).
+    pub fn set_indents(&mut self, start: Option<i32>, first_line: Option<i32>, end: Option<i32>) {
+        self.set_paragraphs("Indents", None, move |p| {
+            if let Some(v) = start {
+                p.indent_start = Some(v.clamp(-31_680, 31_680));
+            }
+            if let Some(v) = first_line {
+                p.first_line = Some(v.clamp(-31_680, 31_680));
+            }
+            if let Some(v) = end {
+                p.indent_end = Some(v.clamp(-31_680, 31_680));
+            }
+        });
+    }
+
+    /// Line numbers and hyphenation for the document.
+    pub fn set_settings(&mut self, settings: Settings) {
+        if settings != self.doc.settings {
+            self.apply("Layout Options", vec![TextOp::SetSettings { settings }], Kind::Other);
+        }
+    }
+
+    pub fn toggle_line_numbers(&mut self) {
+        let mut s = self.doc.settings;
+        s.line_numbers = if s.line_numbers.is_some() { None } else { Some(LineNumbering::default()) };
+        self.set_settings(s);
+    }
+
+    pub fn toggle_hyphenation(&mut self) {
+        let mut s = self.doc.settings;
+        s.hyphenate = !s.hyphenate;
+        self.set_settings(s);
+    }
+
+    /// The caret paragraph's lines left out of line numbering (or back in).
+    pub fn toggle_suppress_line_numbers(&mut self) {
+        let on = !self.para_format_at_caret().line_numbers;
+        self.set_paragraphs("Suppress Line Numbers", None, move |p| p.line_numbers = Some(on));
+    }
+
+    /// The selected paragraphs made a list with `def` (a gallery's
+    /// pick): a new list of its own, its levels kept.
+    pub fn apply_list(&mut self, kind: ListKind, def: ListDef) {
+        let (a, _) = self.selection();
+        // A list the caret is already in keeps its id (its look changes).
+        let id = match self.list_of(a.block) {
+            Some(l) => l.id,
+            None => self.numbering().max_id.map_or(1, |m| m + 1).max(self.doc.styles.lists.keys().next_back().map_or(1, |m| m + 1)),
+        };
+        let mut ops = vec![TextOp::SetList { id, def: Some(def) }];
+        let (a, b) = self.selection();
+        for k in a.block..=b.block {
+            let Some(p) = self.doc.para(k) else { continue };
+            let mut props = p.props.clone();
+            let level = self.list_of(k).map_or(0, |l| l.level);
+            props.list = Some(Some(ListRef { id, kind, level }));
+            if props != p.props {
+                ops.push(TextOp::SetPara { block: k as u32, style: p.style, props });
+            }
+        }
+        self.apply("List", ops, Kind::Other);
+    }
+
+    /// The caret's list item starts its level again at `n` (Restart
+    /// Numbering is its level's start; Set Numbering Value any number).
+    pub fn restart_numbering(&mut self, n: Option<u32>) -> bool {
+        let b = self.caret.block;
+        let Some(l) = self.list_of(b) else { return false };
+        let start = n.unwrap_or_else(|| self.doc.styles.list_level(l).start).min(officina_text::model::MAX_LIST_START);
+        let rev = self.revision;
+        self.set_paragraphs("Restart Numbering", None, move |p| {
+            p.list_start = Some(start);
+            if p.list.is_none() {
+                p.list = Some(Some(l));
+            }
+        });
+        self.revision != rev
+    }
+
+    /// Continue Numbering: the caret's list item numbers on from the list
+    /// of its kind before it.
+    pub fn continue_numbering(&mut self) -> bool {
+        let b = self.caret.block;
+        let Some(l) = self.list_of(b) else { return false };
+        let prev = (0..b).rev().filter_map(|k| self.list_of(k)).find(|x| x.kind == l.kind && x.id != l.id);
+        let id = prev.map_or(l.id, |x| x.id);
+        let rev = self.revision;
+        // This item and the rest of its list join the one before.
+        let mut ops = Vec::new();
+        for k in b..self.doc.blocks.len() {
+            let Some(x) = self.list_of(k) else { continue };
+            if x.id != l.id {
+                continue;
+            }
+            let Some(p) = self.doc.para(k) else { continue };
+            let mut props = p.props.clone();
+            props.list = Some(Some(ListRef { id, ..x }));
+            if k == b {
+                props.list_start = None;
+            }
+            if props != p.props {
+                ops.push(TextOp::SetPara { block: k as u32, style: p.style, props });
+            }
+        }
+        self.apply("Continue Numbering", ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// A level of the caret's list changed (its format, label, start or
+    /// indents), as Define New Multilevel List sets it.
+    pub fn set_list_level(&mut self, level: u8, f: impl FnOnce(&mut ListLevel)) -> bool {
+        let Some(l) = self.list_of(self.caret.block) else { return false };
+        let mut def = self.doc.styles.lists.get(&l.id).cloned().unwrap_or_else(|| ListDef::builtin(l.kind));
+        let Some(lv) = def.levels.get_mut(level as usize) else { return false };
+        f(lv);
+        *lv = lv.clone().bounded();
+        let rev = self.revision;
+        self.apply("Define List Level", vec![TextOp::SetList { id: l.id, def: Some(def) }], Kind::Other);
+        self.revision != rev
+    }
+
     pub fn align(&mut self, a: Align) {
         self.set_paragraphs("Align", None, move |p| p.align = Some(a));
     }
@@ -3245,12 +3514,35 @@ impl Editor {
                     self.toggle_list(ListKind::Bullet);
                     Outcome::Edited
                 }
-                "0" => {
+                // Word's paragraph keys.
+                "n" if m.shift => {
                     self.style_named("Normal");
                     Outcome::Edited
                 }
-                d @ ("1" | "2" | "3") => {
+                d @ ("1" | "2" | "3") if m.alt => {
                     self.style_named(&format!("Heading {d}"));
+                    Outcome::Edited
+                }
+                "1" => {
+                    self.set_line_spacing(LineSpacing::Multiple(100));
+                    Outcome::Edited
+                }
+                "5" => {
+                    self.set_line_spacing(LineSpacing::Multiple(150));
+                    Outcome::Edited
+                }
+                "2" => {
+                    self.set_line_spacing(LineSpacing::Multiple(200));
+                    Outcome::Edited
+                }
+                "0" => {
+                    self.toggle_space_before();
+                    Outcome::Edited
+                }
+                "m" => edited(self.indent(!m.shift)),
+                "t" => edited(self.hanging_indent(!m.shift)),
+                "q" => {
+                    self.reset_paragraph();
                     Outcome::Edited
                 }
                 _ => Outcome::Ignored,
@@ -3992,7 +4284,7 @@ pub(crate) mod tests {
         assert_eq!(e.doc.attrs.get(p.attr_at(10)).italic, Some(true));
         assert_eq!(e.doc.attrs.get(p.attr_at(9)).italic, None);
         // Styles and alignment.
-        e.key(Key::Char, CTRL, "1", 0);
+        e.key(Key::Char, Modifiers { alt: true, ..CTRL }, "1", 0);
         assert_eq!(e.doc.para(0).unwrap().style, e.doc.styles.by_name("Heading 1").unwrap());
         e.key(Key::Char, CTRL, "e", 0);
         assert_eq!(e.doc.para(0).unwrap().props.align, Some(Align::Center));
@@ -4497,6 +4789,115 @@ pub(crate) mod tests {
         assert_eq!(texts(&e), ["Source\u{000C} target"]);
         assert!(!e.insert("\u{000C}"));
         assert_eq!(e.pages.pages().len() >= 1, true);
+    }
+
+    /// Word's paragraph keys and the paragraph commands each change what
+    /// they say and undo in one step.
+    #[test]
+    fn paragraph_keys_indent_space_and_reset() {
+        let mut e = ed(&["one", "two"]);
+        let f = |e: &Editor| e.para_format_at_caret();
+        e.key(Key::Char, CTRL, "m", 0);
+        assert_eq!(f(&e).indent_start, LIST_INDENT);
+        e.key(Key::Char, CTRL, "m", 0);
+        assert_eq!(f(&e).indent_start, 2 * LIST_INDENT);
+        e.key(Key::Char, CTRL_SHIFT, "m", 0);
+        assert_eq!(f(&e).indent_start, LIST_INDENT);
+        e.key(Key::Char, CTRL_SHIFT, "m", 0);
+        e.key(Key::Char, CTRL_SHIFT, "m", 0);
+        assert_eq!(f(&e).indent_start, 0, "never before the margin");
+        e.key(Key::Char, CTRL, "t", 0);
+        assert_eq!((f(&e).indent_start, f(&e).first_line), (LIST_INDENT, -LIST_INDENT), "hanging: text in, first line where it was");
+        e.key(Key::Char, CTRL, "2", 0);
+        assert_eq!(f(&e).line_spacing, LineSpacing::Multiple(200));
+        e.key(Key::Char, CTRL, "5", 0);
+        assert_eq!(f(&e).line_spacing, LineSpacing::Multiple(150));
+        e.key(Key::Char, CTRL, "0", 0);
+        assert_eq!(f(&e).space_before, 240);
+        e.key(Key::Char, CTRL, "0", 0);
+        assert_eq!(f(&e).space_before, 0);
+        e.key(Key::Char, CTRL, "q", 0);
+        assert_eq!(e.doc.para(0).unwrap().props, ParaProps::default(), "Ctrl+Q: own formatting off");
+        assert!(e.undo());
+        assert_eq!(f(&e).line_spacing, LineSpacing::Multiple(150), "undo brings it back");
+        assert_eq!(e.doc.para(1).unwrap().props, ParaProps::default(), "the other paragraph untouched");
+    }
+
+    /// Borders toggle side by side and restyle together; tabs set, move and
+    /// clear; drop caps and the document's settings go through ops.
+    #[test]
+    fn borders_tabs_drop_caps_and_settings() {
+        let mut e = ed(&["boxed"]);
+        let look = Border { width: 4, ..Border::default() };
+        e.toggle_border(0, look);
+        e.toggle_border(1, look);
+        let b = e.para_format_at_caret().borders;
+        assert!(b.top.is_some() && b.bottom.is_some() && b.start.is_none());
+        e.toggle_border(0, look);
+        assert!(e.para_format_at_caret().borders.top.is_none(), "a second press takes it off");
+        let thick = Border { width: 24, ..look };
+        e.restyle_borders(thick);
+        let b = e.para_format_at_caret().borders;
+        assert_eq!((b.top, b.bottom.map(|x| x.width)), (None, Some(24)), "restyle keeps which sides");
+        e.toggle_border(5, look);
+        assert_eq!(e.para_format_at_caret().borders.sides().iter().flatten().count(), 4);
+        e.toggle_border(6, look);
+        assert!(e.para_format_at_caret().borders.is_empty());
+        e.set_box(None, Some(Some(0xFFEE00)));
+        assert_eq!(e.para_format_at_caret().shading, Some(0xFFEE00));
+
+        e.set_tab(1440, TabAlign::Start, Leader::None, None);
+        e.set_tab(720, TabAlign::End, Leader::Dots, None);
+        assert_eq!(e.para_format_at_caret().tabs.iter().map(|t| t.pos).collect::<Vec<_>>(), vec![720, 1440], "kept in order");
+        e.set_tab(2160, TabAlign::Start, Leader::None, Some(1440));
+        assert_eq!(e.para_format_at_caret().tabs.iter().map(|t| t.pos).collect::<Vec<_>>(), vec![720, 2160], "dragged along the ruler");
+        e.clear_tab(Some(720));
+        assert_eq!(e.para_format_at_caret().tabs.len(), 1);
+        e.clear_tab(None);
+        assert!(e.para_format_at_caret().tabs.is_empty());
+
+        e.set_drop_cap(Some(DropCap { lines: 3, distance: 0, margin: false }));
+        assert_eq!(e.para_format_at_caret().drop_cap.map(|d| d.lines), Some(3));
+        assert!(!e.doc.settings.hyphenate);
+        e.toggle_hyphenation();
+        e.toggle_line_numbers();
+        assert!(e.doc.settings.hyphenate && e.doc.settings.line_numbers.is_some());
+        e.toggle_suppress_line_numbers();
+        assert!(!e.para_format_at_caret().line_numbers);
+        assert!(e.undo() && e.undo());
+        assert!(e.doc.settings.line_numbers.is_none(), "settings undo too");
+    }
+
+    /// A gallery pick makes a list of its own look; Restart and Continue
+    /// Numbering change what the items read.
+    #[test]
+    fn list_gallery_restart_and_continue() {
+        let mut e = ed(&["a", "b", "gap", "c", "d"]);
+        let labels = |e: &mut Editor| {
+            let n = e.numbering();
+            (0..5).map(|k| n.label(k).map(|s| s.to_string()).unwrap_or_default()).collect::<Vec<_>>()
+        };
+        e.anchor = Pos::new(0, 0);
+        e.caret = Pos::new(1, 0);
+        e.toggle_list(ListKind::Numbered);
+        e.anchor = Pos::new(3, 0);
+        e.caret = Pos::new(4, 0);
+        e.toggle_list(ListKind::Numbered);
+        assert_eq!(labels(&mut e), vec!["1.", "2.", "", "1.", "2."], "two lists");
+        e.set_caret(Pos::new(3, 0), false);
+        assert!(e.continue_numbering());
+        assert_eq!(labels(&mut e), vec!["1.", "2.", "", "3.", "4."], "continued");
+        assert!(e.restart_numbering(Some(7)));
+        assert_eq!(labels(&mut e), vec!["1.", "2.", "", "7.", "8."], "set numbering value");
+        let mut def = ListDef::builtin(ListKind::Numbered);
+        def.levels[0].format = officina_text::model::NumFormat::UpperRoman;
+        def.levels[0].text = "(%1)".into();
+        e.set_caret(Pos::new(0, 0), false);
+        e.apply_list(ListKind::Numbered, def);
+        let l = labels(&mut e);
+        assert_eq!(l[0], "(I)", "{l:?}");
+        assert!(e.set_list_level(0, |lv| lv.start = 4));
+        assert_eq!(labels(&mut e)[0], "(IV)");
     }
 }
 

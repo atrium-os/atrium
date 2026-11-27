@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{AttrId, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Border, BorderStyle, ListDef, ListLevel, NumFormat, LineRestart, AttrId, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -163,6 +163,26 @@ pub(crate) fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
     }
 }
 
+/// A border as `fo:border` has it: width, style, colour.
+fn odf_border(b: &Border) -> String {
+    let style = match b.style {
+        BorderStyle::Single | BorderStyle::Thick => "solid",
+        BorderStyle::Double => "double",
+        BorderStyle::Dotted => "dotted",
+        BorderStyle::Dashed => "dashed",
+    };
+    format!("{}pt {style} #{:06x}", b.width as f64 / 8.0, b.color.unwrap_or(0) & 0xff_ffff)
+}
+
+/// Hyphenation is a text property in ODF: a paragraph's own setting goes
+/// in its style's text properties.
+pub(crate) fn hyphenate_props(p: &ParaProps, on: bool) -> String {
+    match p.hyphenate {
+        Some(v) if on => format!(r#"<style:text-properties fo:hyphenate="{v}"/>"#),
+        _ => String::new(),
+    }
+}
+
 /// `tab_base`: the start indent ODF measures the tab stops from.
 pub(crate) fn para_props(p: &ParaProps, tab_base: i32) -> String {
     let mut s = String::new();
@@ -207,6 +227,35 @@ pub(crate) fn para_props(p: &ParaProps, tab_base: i32) -> String {
         let n = if v { 2 } else { 0 };
         let _ = write!(s, r#" fo:widows="{n}" fo:orphans="{n}""#);
     }
+    if let Some(b) = &p.borders {
+        for (side, x) in [("top", b.top), ("bottom", b.bottom), ("left", b.start), ("right", b.end)] {
+            match x {
+                Some(x) => {
+                    let _ = write!(s, r#" fo:border-{side}="{}" fo:padding-{side}="{}""#, odf_border(&x), pt(x.space as i64 * 20));
+                    if x.style == BorderStyle::Double {
+                        let w = x.width as f64 / 8.0 / 3.0;
+                        let _ = write!(s, r#" style:border-line-width-{side}="{w:.2}pt {w:.2}pt {w:.2}pt""#);
+                    }
+                }
+                None => {
+                    let _ = write!(s, r#" fo:border-{side}="none""#);
+                }
+            }
+        }
+        // Paragraphs with the same borders are one box (ODF's default).
+        s += r#" style:join-border="true""#;
+    }
+    if let Some(v) = p.shading {
+        match v {
+            Some(c) => {
+                let _ = write!(s, r##" fo:background-color="#{:06x}""##, c & 0xFF_FFFF);
+            }
+            None => s += r#" fo:background-color="transparent""#,
+        }
+    }
+    if let Some(v) = p.line_numbers {
+        let _ = write!(s, r#" text:number-lines="{v}""#);
+    }
     let mut tabs = String::new();
     if let Some(t) = &p.tabs {
         tabs += "<style:tab-stops>";
@@ -228,10 +277,67 @@ pub(crate) fn para_props(p: &ParaProps, tab_base: i32) -> String {
         }
         tabs += "</style:tab-stops>";
     }
+    if let Some(Some(d)) = p.drop_cap {
+        // ODF has no capital in the margin: it drops in the text.
+        let _ = write!(tabs, r#"<style:drop-cap style:lines="{}" style:length="1" style:distance="{}"/>"#, d.lines, pt(d.distance as i64));
+    }
     match (s.is_empty(), tabs.is_empty()) {
         (true, true) => s,
         (_, true) => format!("<style:paragraph-properties{s}/>"),
         _ => format!("<style:paragraph-properties{s}>{tabs}</style:paragraph-properties>"),
+    }
+}
+
+/// A list level as a `text:list-level-style-*` (`l` from 1): its label
+/// as prefix, the levels shown and suffix.
+fn list_level_xml(l: u8, lv: &ListLevel) -> String {
+    let ind = format!(r#"<style:list-level-properties text:list-level-position-and-space-mode="label-alignment"><style:list-level-label-alignment text:label-followed-by="listtab" text:list-tab-stop-position="{}" fo:text-indent="{}" fo:margin-left="{}"/></style:list-level-properties>"#, pt(lv.indent as i64), pt(-lv.hang as i64), pt(lv.indent as i64));
+    if lv.format == NumFormat::Bullet {
+        let c = lv.text.chars().next().unwrap_or('•');
+        return format!(r#"<text:list-level-style-bullet text:level="{l}" text:bullet-char="{}">{ind}</text:list-level-style-bullet>"#, esc(&c.to_string()));
+    }
+    let f = match lv.format {
+        NumFormat::Decimal => "1",
+        NumFormat::DecimalZero => "01, 02, 03, ...",
+        NumFormat::LowerLetter => "a",
+        NumFormat::UpperLetter => "A",
+        NumFormat::LowerRoman => "i",
+        NumFormat::UpperRoman => "I",
+        NumFormat::Bullet | NumFormat::None => "",
+    };
+    let (prefix, shown, suffix) = label_parts(&lv.text, l);
+    let shown = if shown > 1 { format!(r#" text:display-levels="{shown}""#) } else { String::new() };
+    let start = if lv.start != 1 { format!(r#" text:start-value="{}""#, lv.start) } else { String::new() };
+    // LibreOffice's whole label, for separators other than ".".
+    let mut whole = String::new();
+    let mut it = lv.text.chars().peekable();
+    while let Some(c) = it.next() {
+        whole.push(c);
+        if c == '%' && it.peek().is_some_and(|d| ('1'..='9').contains(d)) {
+            whole.push(it.next().unwrap_or('1'));
+            whole.push('%');
+        }
+    }
+    format!(r#"<text:list-level-style-number text:level="{l}" loext:num-list-format="{}" style:num-prefix="{}" style:num-suffix="{}" style:num-format="{f}"{shown}{start}>{ind}</text:list-level-style-number>"#, esc(&whole), esc(prefix), esc(suffix))
+}
+
+/// A label's text before its first number and after its last, and how
+/// many levels' numbers it shows (ending at its own, `l`, from 1).
+pub(crate) fn label_parts(text: &str, l: u8) -> (&str, u8, &str) {
+    let b = text.as_bytes();
+    let marks: Vec<(usize, u8)> = (0..b.len().saturating_sub(1)).filter(|&i| b[i] == b'%' && (b'1'..=b'9').contains(&b[i + 1])).map(|i| (i, b[i + 1] - b'0')).collect();
+    match (marks.first(), marks.last()) {
+        (Some(&(a, first)), Some(&(z, _))) => (&text[..a], l.saturating_sub(first) + 1, &text[z + 2..]),
+        _ => (text, 0, ""),
+    }
+}
+
+/// The list block `b` is an item of: its own, or its style's.
+fn list_of(doc: &TextDoc, b: usize) -> Option<officina_text::model::ListRef> {
+    let p = doc.para(b)?;
+    match p.props.list {
+        Some(l) => l,
+        None => doc.styles.para_format(p.style, &p.props).0.list,
     }
 }
 
@@ -258,7 +364,7 @@ fn para_key(p: &ParaProps, first: bool, page_change: bool) -> ParaProps {
         Some(s @ (SectionStart::OddPage | SectionStart::EvenPage)) if !first => s,
         _ => SectionStart::NextPage,
     };
-    ParaProps { list: None, cell: None, outline_level: None, section: new_page.then(|| Section { page: own, start, ..Section::default() }), ..p.clone() }
+    ParaProps { list: p.list.filter(|l| l.is_none()), list_start: None, cell: None, outline_level: None, section: new_page.then(|| Section { page: own, start, ..Section::default() }), ..p.clone() }
 }
 
 struct Out<'a> {
@@ -319,8 +425,9 @@ impl Out<'_> {
             return n.clone();
         }
         let base = self.doc.styles.para_format(style, p).0.indent_start.max(0);
-        let body = para_props(&key.1, base);
-        if body.is_empty() && key.1.section.is_none() {
+        let body = para_props(&key.1, base) + &hyphenate_props(&key.1, self.doc.settings.hyphenate);
+        let unlisted = key.1.list == Some(None) && self.doc.styles.para_format(style, &ParaProps::default()).0.list.is_some();
+        if body.is_empty() && key.1.section.is_none() && !unlisted {
             return self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
         }
         let n = format!("{}P{}", self.prefix, self.para_styles.len() + 1);
@@ -349,7 +456,8 @@ impl Out<'_> {
             }
             None => String::new(),
         };
-        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="paragraph" style:parent-style-name="{}"{master}>{body}</style:style>"#, esc(&parent));
+        let unlist = if unlisted { " style:list-style-name=\"\"" } else { "" };
+        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="paragraph" style:parent-style-name="{}"{master}{unlist}>{body}</style:style>"#, esc(&parent));
         self.para_styles.insert(key, n.clone());
         n
     }
@@ -382,18 +490,10 @@ impl Out<'_> {
         }
         let n = format!("L{}", self.list_styles.len() + 1);
         let _ = write!(self.auto, r#"<text:list-style style:name="{n}">"#);
-        for l in 1..=10u32 {
-            let ind = format!(r#"<style:list-level-properties text:list-level-position-and-space-mode="label-alignment"><style:list-level-label-alignment text:label-followed-by="listtab" text:list-tab-stop-position="{p}" fo:text-indent="-18pt" fo:margin-left="{p}"/></style:list-level-properties>"#, p = pt(720 * l as i64));
-            match kind {
-                ListKind::Bullet => {
-                    let c = ["•", "◦", "▪"][(l as usize - 1) % 3];
-                    let _ = write!(self.auto, r#"<text:list-level-style-bullet text:level="{l}" text:bullet-char="{c}">{ind}</text:list-level-style-bullet>"#);
-                }
-                ListKind::Numbered => {
-                    let f = ["1", "a", "i"][(l as usize - 1) % 3];
-                    let _ = write!(self.auto, r#"<text:list-level-style-number text:level="{l}" style:num-suffix="." style:num-format="{f}">{ind}</text:list-level-style-number>"#);
-                }
-            }
+        let def = self.doc.styles.lists.get(&id).cloned().unwrap_or_else(|| ListDef::builtin(kind));
+        for l in 0..10u8 {
+            let lv = def.level(l.min(8)).cloned().unwrap_or_else(|| ListLevel::builtin(kind, l.min(8)));
+            self.auto += &list_level_xml(l + 1, &lv);
         }
         self.auto += "</text:list-style>";
         self.list_styles.insert((id, kind), n.clone());
@@ -865,7 +965,7 @@ impl Out<'_> {
     /// A run of list items from `b`; returns the block after it.
     fn list(&mut self, b: usize, end: usize, out: &mut String) -> usize {
         let doc = self.doc;
-        let first = doc.para(b).and_then(|p| p.props.list.flatten()).expect("a list item");
+        let first = list_of(doc, b).expect("a list item");
         let style = self.list_style(first.id, first.kind);
         let cont = if self.lists_seen.contains(&first.id) { r#" text:continue-numbering="true""# } else { "" };
         self.lists_seen.push(first.id);
@@ -873,7 +973,7 @@ impl Out<'_> {
         let mut open: Vec<bool> = vec![false];
         let mut k = b;
         while k < end {
-            let Some(l) = doc.para(k).and_then(|p| p.props.list.flatten()).filter(|l| l.id == first.id && l.kind == first.kind) else { break };
+            let Some(l) = list_of(doc, k).filter(|l| l.id == first.id && l.kind == first.kind) else { break };
             let lv = l.level as usize;
             while open.len() - 1 > lv {
                 if open.pop() == Some(true) {
@@ -881,11 +981,15 @@ impl Out<'_> {
                 }
                 out.push_str("</text:list>");
             }
+            let item = match doc.para(k).and_then(|p| p.props.list_start) {
+                Some(v) => format!(r#"<text:list-item text:start-value="{v}">"#),
+                None => "<text:list-item>".to_string(),
+            };
             if open.len() - 1 == lv {
                 if open[lv] {
                     out.push_str("</text:list-item>");
                 }
-                out.push_str("<text:list-item>");
+                out.push_str(&item);
                 open[lv] = true;
             }
             while open.len() - 1 < lv {
@@ -940,7 +1044,7 @@ impl Out<'_> {
                 let _ = write!(out, r#"<table:table-cell table:style-name="{cell_style}" office:value-type="string">"#);
                 let mut x = cell.start;
                 while x < cell.end {
-                    if doc.para(x).and_then(|p| p.props.list.flatten()).is_some() {
+                    if list_of(doc, x).is_some() {
                         x = self.list(x, cell.end, out).max(x + 1);
                     } else {
                         self.para(x, out);
@@ -1062,13 +1166,13 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         while b < to {
             if doc.cell(b).is_some() {
                 b = o.table(b, &mut body);
-            } else if doc.para(b).and_then(|p| p.props.list.flatten()).is_some() {
+            } else if list_of(doc, b).is_some() {
                 b = o.list(b, to, &mut body);
             } else if doc.para(b).is_some_and(|p| p.props.toc.is_some()) {
                 // A table of contents: its run of entries as the index body.
                 let mut end = b;
                 let mut depth = 3;
-                while let Some(l) = doc.para(end).filter(|p| end < to && p.props.cell.is_none() && p.props.list.flatten().is_none()).and_then(|p| p.props.toc) {
+                while let Some(l) = doc.para(end).filter(|p| end < to && p.props.cell.is_none() && list_of(doc, end).is_none()).and_then(|p| p.props.toc) {
                     depth = depth.max(l.min(9));
                     end += 1;
                 }
@@ -1096,10 +1200,32 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         let next = st.next.and_then(|p| named.get(p as usize)).filter(|_| st.kind == StyleKind::Para).map(|p| format!(r#" style:next-style-name="{}""#, esc(&p.0))).unwrap_or_default();
         let outline = st.para.outline_level.filter(|_| st.kind == StyleKind::Para).map(|l| format!(r#" style:default-outline-level="{l}""#)).unwrap_or_default();
         let pp = if st.kind == StyleKind::Para { para_props(&st.para, 0) } else { String::new() };
+        // A style's list: a list style of its own among the named ones.
+        let list = match st.para.list.filter(|_| st.kind == StyleKind::Para) {
+            Some(Some(l)) => {
+                let name = format!("WWNum{}", l.id);
+                if !styles.contains(&format!(r#"<text:list-style style:name="{name}">"#)) {
+                    let def = doc.styles.lists.get(&l.id).cloned().unwrap_or_else(|| ListDef::builtin(l.kind));
+                    let _ = write!(styles, r#"<text:list-style style:name="{name}">"#);
+                    for k in 0..10u8 {
+                        let lv = def.level(k.min(8)).cloned().unwrap_or_else(|| ListLevel::builtin(l.kind, k.min(8)));
+                        styles += &list_level_xml(k + 1, &lv);
+                    }
+                    styles += "</text:list-style>";
+                }
+                format!(r#" style:list-style-name="{name}""#)
+            }
+            // Out of the list its parent style puts it in.
+            Some(None) => " style:list-style-name=\"\"".to_string(),
+            None => String::new(),
+        };
         let mut chars = st.chars.clone();
         chars.style = None;
-        let tp = text_props(&chars, &mut o.fonts);
-        let _ = write!(styles, r#"<style:style style:name="{}" style:display-name="{}" style:family="{family}"{parent}{next}{outline}>{pp}{tp}</style:style>"#, esc(name), esc(display));
+        let mut tp = text_props(&chars, &mut o.fonts);
+        if let (Some(v), true, StyleKind::Para) = (st.para.hyphenate, doc.settings.hyphenate, st.kind) {
+            tp = if tp.is_empty() { format!(r#"<style:text-properties fo:hyphenate="{v}"/>"#) } else { tp.replacen("<style:text-properties", &format!(r#"<style:text-properties fo:hyphenate="{v}""#), 1) };
+        }
+        let _ = write!(styles, r#"<style:style style:name="{}" style:display-name="{}" style:family="{family}"{parent}{next}{outline}{list}>{pp}{tp}</style:style>"#, esc(name), esc(display));
     }
     // LibreOffice's Contents styles for the entries' levels.
     let mut levels: Vec<u8> = doc.blocks.iter().filter_map(|b| b.as_para()).filter(|p| p.style == 0).filter_map(|p| p.props.toc).map(|l| l.clamp(1, 9)).collect();
@@ -1111,7 +1237,13 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         }
     }
     let dc = &doc.styles.default_char;
-    let defaults = format!(r#"<style:default-style style:family="paragraph"><style:paragraph-properties fo:margin-bottom="8pt" fo:line-height="115%"/><style:text-properties style:font-name="{}" fo:font-size="{}pt"/></style:default-style>"#, esc(&dc.family), dc.size as f64 / 2.0);
+    let hyph = if doc.settings.hyphenate { r#" fo:hyphenate="true""# } else { "" };
+    let mut defaults = format!(r#"<style:default-style style:family="paragraph"><style:paragraph-properties fo:margin-bottom="8pt" fo:line-height="115%"/><style:text-properties style:font-name="{}" fo:font-size="{}pt"{hyph}/></style:default-style>"#, esc(&dc.family), dc.size as f64 / 2.0);
+    // Line numbers (ODF has no first number: they count from 1).
+    if let Some(n) = doc.settings.line_numbers {
+        let offset = if n.distance > 0 { format!(r#" text:offset="{}""#, pt(n.distance as i64)) } else { String::new() };
+        let _ = write!(defaults, r#"<text:linenumbering-configuration text:number-lines="true" text:increment="{}"{offset} style:num-format="1" text:number-position="left" text:restart-on-page="{}"/>"#, n.count_by, n.restart == LineRestart::Page);
+    }
 
     // The page: ODF's header and footer sit inside the margins, so the page
     // margin is their distance from the edge and their height is the rest.

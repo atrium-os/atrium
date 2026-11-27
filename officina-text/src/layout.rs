@@ -359,6 +359,21 @@ pub struct Line {
     /// are drawn from the left, when some are right to left; empty when that
     /// is their logical order.
     pub visual: Vec<u32>,
+    /// The line ends inside a hyphenated word: a hyphen in this format
+    /// (an index into [`ParaLayout::formats`]) is drawn after it, within
+    /// `width`.
+    pub hyphen: Option<u16>,
+}
+
+/// A dropped capital as laid out: its glyphs in `format`, drawn from `x`
+/// (from the column's left) on the baseline of line `lines - 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropLayout {
+    pub glyphs: Vec<Glyph>,
+    pub format: CharFormat,
+    pub text: String,
+    pub x: i64,
+    pub lines: u8,
 }
 
 /// A paragraph laid out.
@@ -377,6 +392,11 @@ pub struct ParaLayout {
     pub levels: Vec<u8>,
     /// Its base direction is right to left: its start edge is the right.
     pub rtl: bool,
+    /// Room its top and bottom borders take, inside `space_before` and
+    /// `space_after` (the border is drawn in it, round the lines).
+    pub pad_top: i64,
+    pub pad_bottom: i64,
+    pub drop: Option<DropLayout>,
 }
 
 impl ParaLayout {
@@ -591,6 +611,47 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
     if formats.is_empty() {
         formats.push(cf.clone());
     }
+    // A dropped capital: the first letter's glyphs leave the line (no room,
+    // not drawn there) and are shaped again tall enough for its lines.
+    let mut drop: Option<DropLayout> = None;
+    let mut drop_w = 0i64;
+    if let (Some(dc), false) = (pf.drop_cap, rtl) {
+        let first = p.text.chars().next().filter(|c| c.is_alphanumeric());
+        let g0 = glyphs.first().copied().filter(|g| g.face != OBJECT_FACE && g.cluster == 0);
+        if let (Some(c), Some(g0)) = (first, g0) {
+            // The lines' height is the text's after the letter; the letter
+            // keeps its own look (a file may give it another font).
+            let small = formats[g0.fmt as usize].clone();
+            let len = c.len_utf8() as u32;
+            let body = glyphs.iter().find(|g| g.cluster >= len && g.face != OBJECT_FACE).map_or(small.clone(), |g| formats[g.fmt as usize].clone());
+            let (_, _, h) = fonts.metrics(&body);
+            let (asc, _, _) = fonts.metrics(&small);
+            let line_h = match pf.line_spacing {
+                LineSpacing::Multiple(m) => h * m.clamp(25, 1000) as i64 / 100,
+                LineSpacing::Exact(t) => twips(t.clamp(20, 31680) as i64),
+                LineSpacing::AtLeast(t) => h.max(twips(t.clamp(0, 31680) as i64)),
+            };
+            // Capitals stand about three quarters of the ascent.
+            let cap = (asc * 3 / 4).max(1);
+            let target = line_h * (dc.lines as i64 - 1) + cap;
+            let size = (small.size as i64 * target / cap).clamp(2, 3276) as u16;
+            let big = CharFormat { size, underline: false, strike: false, dstrike: false, ..small.clone() };
+            let text = if big.caps == Caps::Normal { c.to_string() } else { capitals(&c.to_string()) };
+            let bg = fonts.shape(&text, &big);
+            let w: i64 = bg.iter().map(|g| g.adv).sum();
+            for g in glyphs.iter_mut().filter(|g| g.cluster < len) {
+                *g = Glyph { face: OBJECT_FACE, id: 0, adv: 0, dx: 0, dy: 0, cluster: g.cluster, fmt: 0 };
+            }
+            let ind = twips(pf.indent_start as i64);
+            let gap = twips(dc.distance as i64);
+            let x = if dc.margin { ind - w - gap } else { ind };
+            drop_w = if dc.margin { 0 } else { w + gap };
+            drop = Some(DropLayout { glyphs: bg, format: big, text, x, lines: dc.lines });
+        }
+    }
+    let drop_lines = drop.as_ref().map_or(0, |d| d.lines as usize);
+    // Automatic hyphenation (English patterns, words of letters only).
+    let hyphenate = doc.settings.hyphenate && pf.hyphenate && !rtl;
     // Width up to each byte: glyphs are in logical order (lines get their
     // visual order below).
     let n = p.text.len();
@@ -644,13 +705,14 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
                 // A right-to-left paragraph starts at the right.
                 let (l, r) = if rtl { (r, l) } else { (l, r) };
                 let (st, en) = (ind_s.max(l), ind_e.max(r));
-                let fl = if k == 0 { twips(first_line as i64) } else { 0 };
+                let fl = if k == 0 { twips(first_line as i64) } else { 0 } + if k < drop_lines { drop_w } else { 0 };
                 geo.push((skip, st + fl, (width - st - en - fl).max(LU)));
                 top += skip + h;
             }
             geo[li].2
         };
         let mut breaks: Vec<(u32, bool)> = Vec::new(); // (end byte, mandatory)
+        let mut hyphens: Vec<u32> = Vec::new(); // ends of lines that break a word
         let mut start = 0u32;
         let mut last_ok: Option<(u32, bool)> = None;
         let mut k = 0;
@@ -673,11 +735,23 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
                 k += 1;
                 continue;
             }
-            // Too wide: break at the last opportunity, or inside the word.
+            // Too wide: break at the last opportunity (or in the word after
+            // it, hyphenated), or inside the word.
             match last_ok.take() {
                 Some((lb, _)) => {
-                    breaks.push((lb, false));
-                    start = lb;
+                    let cut = if hyphenate { hyphen_point(&p.text, lb, b, |e| seg(start, e).0, room, |e| hyphen_width(fonts, &formats[fmt_of(&run_fmt, e) as usize])) } else { None };
+                    match cut {
+                        Some(e) => {
+                            breaks.push((e, false));
+                            hyphens.push(e);
+                            start = e;
+                            continue;
+                        }
+                        None => {
+                            breaks.push((lb, false));
+                            start = lb;
+                        }
+                    }
                 }
                 None => {
                     // Between characters: as many as fit (at least one).
@@ -701,7 +775,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
             room_of(li, &mut geo);
         }
         // Lines.
-        let fmt_at = |b: u32| run_fmt[run_fmt.partition_point(|r| r.0 <= b).saturating_sub(1)].1;
+        let fmt_at = |b: u32| fmt_of(&run_fmt, b);
         lines = Vec::with_capacity(breaks.len());
         let mut s = 0u32;
         let mut gi = 0usize;
@@ -713,6 +787,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
             }
             let (mut w, content_end) = seg(s, e);
             let (skip, base, room) = geo[li];
+            let hyphen = if hyphens.contains(&e) { Some(fmt_at(e.saturating_sub(1))) } else { None };
             // Tabs: each takes the text after it to the next stop, measured from
             // the column's start edge.
             let mut leaders = Vec::new();
@@ -789,6 +864,9 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
                 LineSpacing::Exact(t) => twips(t.clamp(20, 31680) as i64),
                 LineSpacing::AtLeast(t) => nat.max(twips(t.clamp(0, 31680) as i64)),
             };
+            if let Some(fi) = hyphen {
+                w += hyphen_width(fonts, &formats[fi as usize]);
+            }
             let last = li + 1 == count || mand;
             let (x, space_extra) = match pf.align {
                 Align::Start => (base, 0),
@@ -818,7 +896,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
                 Some((lv, r)) => crate::bidi::visual(&glyphs[g0..gi], &p.text, lv, *r, g0),
                 None => Vec::new(),
             };
-            lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height: height + skip, skip, leaders, visual });
+            lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height: height + skip, skip, leaders, visual, hyphen });
             s = e;
         }
         if bands.is_empty() || pass == 2 {
@@ -832,7 +910,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
             let (skip, l, r) = place_line(bands, width, y, h);
             let (l, r) = if rtl { (r, l) } else { (l, r) };
             let (st, en) = (ind_s.max(l), ind_e.max(r));
-            let fl = if k == 0 { twips(first_line as i64) } else { 0 };
+            let fl = if k == 0 { twips(first_line as i64) } else { 0 } + if k < drop_lines { drop_w } else { 0 };
             check.push((skip, st + fl, (width - st - en - fl).max(LU)));
             y += skip + h;
         }
@@ -841,8 +919,50 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
         }
         heights = got;
     }
+    // A paragraph shorter than its dropped capital is as tall as it.
+    let short = drop.as_ref().map_or(0, |d| d.lines as i64 - lines.len() as i64);
+    if let (true, Some(last)) = (short > 0, lines.last_mut()) {
+        last.height += short * nominal;
+    }
     let height = lines.iter().map(|l| l.height).sum();
-    ParaLayout { space_before: twips(pf.space_before.max(0) as i64), space_after: twips(pf.space_after.max(0) as i64), format: pf, formats, glyphs, lines, height, levels: bidi.map(|b| b.0).unwrap_or_default(), rtl }
+    let pad = |b: Option<crate::model::Border>| b.map_or(0, |b| twips((b.space as i64) * 20 + b.thickness() as i64));
+    let (pad_top, pad_bottom) = (pad(pf.borders.top), pad(pf.borders.bottom));
+    ParaLayout { space_before: twips(pf.space_before.max(0) as i64) + pad_top, space_after: twips(pf.space_after.max(0) as i64) + pad_bottom, pad_top, pad_bottom, drop, format: pf, formats, glyphs, lines, height, levels: bidi.map(|b| b.0).unwrap_or_default(), rtl }
+}
+
+/// The format index of the run holding byte `b`.
+fn fmt_of(run_fmt: &[(u32, u16)], b: u32) -> u16 {
+    run_fmt.get(run_fmt.partition_point(|r| r.0 <= b).saturating_sub(1)).map_or(0, |r| r.1)
+}
+
+/// A hyphen's width in `f`.
+fn hyphen_width(fonts: &dyn Fonts, f: &CharFormat) -> i64 {
+    fonts.shape("-", f).iter().map(|g| g.adv).sum()
+}
+
+fn dictionary() -> Option<&'static hyphenation::Standard> {
+    use hyphenation::Load;
+    static D: std::sync::OnceLock<Option<hyphenation::Standard>> = std::sync::OnceLock::new();
+    D.get_or_init(|| hyphenation::Standard::from_embedded(hyphenation::Language::EnglishUS).ok()).as_ref()
+}
+
+/// Shortest word hyphenated, letters.
+pub const MIN_HYPHENATED: usize = 5;
+
+/// Where to end a line inside the word that starts at `from` (and runs to
+/// before `to`): the last hyphenation point after which the line, `width`
+/// wide to there plus a hyphen, still fits `room`.
+fn hyphen_point(text: &str, from: u32, to: u32, width: impl Fn(u32) -> i64, room: i64, hyphen: impl Fn(u32) -> i64) -> Option<u32> {
+    use hyphenation::Hyphenator;
+    let rest = text.get(from as usize..to as usize)?;
+    let word_len = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+    let word = &rest[..word_len];
+    if word.len() < MIN_HYPHENATED {
+        return None;
+    }
+    let d = dictionary()?;
+    let h = d.hyphenate(word);
+    h.breaks.iter().rev().map(|&k| from + k as u32).find(|&e| width(e) + hyphen(e) <= room)
 }
 
 /// Paragraph layouts by block, kept while their inputs hold.
@@ -964,6 +1084,49 @@ mod tests {
         assert_eq!(width_of(CharAttrs { spacing: Some(20), ..Default::default() }).0, plain + 4 * twips(20));
         assert_eq!(width_of(CharAttrs { scale: Some(200), ..Default::default() }).0, plain * 2);
         assert_eq!(capitals("straße ǆ"), "STRAßE Ǆ");
+    }
+
+    /// A paragraph's top and bottom borders take room; a dropped capital
+    /// indents the lines beside it and is as tall as they are; hyphenation
+    /// ends a line inside a word with a hyphen.
+    #[test]
+    fn borders_drop_caps_and_hyphens_take_their_room() {
+        use crate::model::{Border, DropCap, ParaBorders};
+        let mut d = doc("Words words words words words words words words words words");
+        let w = 20 * size_lu(&CharFormat::default()) / 2;
+        let plain = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        let b = Border { width: 8, space: 4, ..Default::default() };
+        d.blocks.update(0, |x| x.as_para_mut().unwrap().props.borders = Some(ParaBorders { top: Some(b), bottom: Some(b), ..Default::default() }));
+        let boxed = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        assert_eq!(boxed.pad_top, twips(4 * 20 + 20));
+        assert_eq!(boxed.space_before, plain.space_before + boxed.pad_top);
+        assert_eq!(boxed.space_after, plain.space_after + boxed.pad_bottom);
+
+        d.blocks.update(0, |x| x.as_para_mut().unwrap().props.drop_cap = Some(Some(DropCap { lines: 3, distance: 0, margin: false })));
+        let dropped = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        let dc = dropped.drop.as_ref().expect("a dropped capital");
+        assert_eq!(dc.text, "W");
+        let dw: i64 = dc.glyphs.iter().map(|g| g.adv).sum();
+        assert!(dc.format.size > CharFormat::default().size * 2);
+        for k in 0..3 {
+            assert_eq!(dropped.lines[k].x, dw, "line {k} sits beside the capital");
+        }
+        assert_eq!(dropped.lines[3].x, 0);
+        assert_eq!(dropped.glyphs[0].adv, 0, "the letter leaves the line");
+
+        let mut d = doc("a hyphenation example of considerable hyphenation");
+        let w = 12 * size_lu(&CharFormat::default()) / 2;
+        let off = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        assert!(off.lines.iter().all(|l| l.hyphen.is_none()));
+        d.settings.hyphenate = true;
+        let on = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        let p = d.para(0).unwrap();
+        let cut = on.lines.iter().find(|l| l.hyphen.is_some()).expect("a hyphenated line");
+        assert!(p.text.as_bytes()[cut.end as usize - 1].is_ascii_alphabetic(), "ends inside a word: {:?}", &p.text[cut.start as usize..cut.end as usize]);
+        assert!(cut.width <= w);
+        assert!(on.lines.len() <= off.lines.len());
+        d.blocks.update(0, |x| x.as_para_mut().unwrap().props.hyphenate = Some(false));
+        assert!(layout_para(&d, d.para(0).unwrap(), w, &FixedFonts).lines.iter().all(|l| l.hyphen.is_none()));
     }
 
     #[test]

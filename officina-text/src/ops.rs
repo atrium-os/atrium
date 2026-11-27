@@ -64,6 +64,11 @@ pub enum TextOp {
     /// attribute table no text uses that named the style taken out (the
     /// inverse names them again).
     PlaceStyle { id: StyleId, style: Option<crate::model::Style>, stale: Vec<AttrId> },
+    /// Sets list `id`'s own definition (None: it numbers as the built-in
+    /// list of its kind).
+    SetList { id: u32, def: Option<crate::model::ListDef> },
+    /// Sets line numbering and hyphenation.
+    SetSettings { settings: crate::model::Settings },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -157,7 +162,7 @@ impl TextOp {
             TextOp::Remove { at, n } => Edit { first: at as usize, last: (at + n) as usize, delta: n as isize },
             TextOp::Insert { at, ref blocks } => Edit { first: at as usize, last: at as usize, delta: -(blocks.len() as isize) },
             // Every page may change (the paginator resets on a new geometry).
-            TextOp::SetPage { .. } | TextOp::SetMargins { .. } => Edit { first: 0, last: 0, delta: 0 },
+            TextOp::SetPage { .. } | TextOp::SetMargins { .. } | TextOp::SetList { .. } | TextOp::SetSettings { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
             TextOp::SetNote { .. } | TextOp::SetShape { .. } | TextOp::SetStyle { .. } => return None,
             // Ids move; nothing looks different.
@@ -433,6 +438,20 @@ impl TextOp {
                 let old = std::mem::replace(&mut d.tracking, on);
                 TextOp::SetTracking { on: old }
             }
+            TextOp::SetList { id, def } => {
+                let def = def.map(|x| crate::model::ListDef { levels: x.levels.into_iter().take(crate::model::MAX_LIST_LEVEL as usize + 1).map(|l| l.bounded()).collect() });
+                let old = match def {
+                    Some(x) => {
+                        if !d.styles.lists.contains_key(&id) && d.styles.lists.len() >= crate::model::MAX_LIST_DEFS {
+                            return TextOp::Nop;
+                        }
+                        d.styles.lists.insert(id, x)
+                    }
+                    None => d.styles.lists.remove(&id),
+                };
+                TextOp::SetList { id, def: old }
+            }
+            TextOp::SetSettings { settings } => TextOp::SetSettings { settings: std::mem::replace(&mut d.settings, settings) },
             TextOp::SetMargins { header, footer, first_page, even_pages } => TextOp::SetMargins {
                 header: std::mem::replace(&mut d.header, header),
                 footer: std::mem::replace(&mut d.footer, footer),

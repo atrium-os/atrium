@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::layout::{object_height, size_lu, vert_shift, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
 use crate::lists::Numbering;
-use crate::model::{ArrowEnd, Dash, PathCmd, Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use crate::model::{Border, BorderStyle, LineRestart, ArrowEnd, Dash, PathCmd, Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
 use crate::paginate::{Page, NOTE_HANG, NOTE_RULE_SPACE};
 use crate::twips;
 
@@ -367,6 +367,10 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         float(&mut out, f);
     }
 
+    // Line numbers count on from the pages before (unless they start again
+    // on each page).
+    let numbering_lines = doc.settings.line_numbers;
+    let mut line_no = numbering_lines.map_or(0, |n| lines_before(doc, pages, i, n.restart, cache, fonts));
     for s in &page.slices {
         let Some(p) = doc.para(s.block) else { continue };
         // The width the slice was laid out in (its column's, a cell's inside),
@@ -374,13 +378,30 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         let w = s.w;
         let l = cache.get_wrapped(doc, p, w, fonts, s.wrap.as_deref().map_or(&[], |v| v.as_slice()));
         let left = mx + s.x;
+        para_box(&mut out, doc, &l, s, left, my);
         if s.lines.start == 0 {
             if let Some(label) = numbering.label(s.block) {
                 list_label(&mut out, &l, &label, fonts, left, my + s.y);
             }
         }
+        drop_cap(&mut out, &l, s.lines.clone(), left, my + s.y);
+        let counted = p.props.cell.is_none() && l.format.line_numbers;
         let mut ly = s.y;
         for li in s.lines.clone() {
+            if let (Some(n), true) = (numbering_lines, counted) {
+                if numbering_lines.is_some_and(|x| x.restart == LineRestart::Section) && li == 0 && p.props.section.is_some() {
+                    line_no = 0;
+                }
+                line_no += 1;
+                let k = n.start.saturating_add(line_no - 1);
+                if k % n.count_by.max(1) as u32 == 0 {
+                    let fmt = CharFormat { size: doc.styles.default_char.size, color: doc.styles.default_char.color, family: doc.styles.default_char.family.clone(), ..Default::default() };
+                    let gap = twips(if n.distance > 0 { n.distance } else { 360 } as i64);
+                    let label = k.to_string();
+                    let wn: i64 = fonts.shape(&label, &fmt).iter().map(|g| g.adv).sum();
+                    runs(&mut out, fonts, &label, &fmt, mx - gap - wn, baseline_of(&l, li, my + ly));
+                }
+            }
             line(&mut out, doc, fonts, &l, li, &p.text, left, my + ly, Some(s.block));
             ly += l.lines[li].height;
         }
@@ -426,6 +447,135 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         }
     }
     expand_shapes(out, doc, cache, fonts)
+}
+
+/// How many numbered lines the pages before page `i` hold since numbering
+/// last started again.
+fn lines_before(doc: &TextDoc, pages: &[Page], i: usize, restart: LineRestart, cache: &mut LayoutCache, fonts: &dyn Fonts) -> u32 {
+    if restart == LineRestart::Page {
+        return 0;
+    }
+    let mut n = 0u32;
+    for page in &pages[..i.min(pages.len())] {
+        for s in &page.slices {
+            let Some(p) = doc.para(s.block) else { continue };
+            if p.props.cell.is_some() {
+                continue;
+            }
+            if restart == LineRestart::Section && s.lines.start == 0 && p.props.section.is_some() {
+                n = 0;
+            }
+            let l = cache.get_wrapped(doc, p, s.w, fonts, s.wrap.as_deref().map_or(&[], |v| v.as_slice()));
+            if l.format.line_numbers {
+                n = n.saturating_add(s.lines.len() as u32);
+            }
+        }
+    }
+    n
+}
+
+/// Whether block `b` is a paragraph in the same box as one whose format
+/// is `l` (the same borders and shading, both in or out of a cell).
+fn same_box(doc: &TextDoc, b: usize, l: &ParaLayout, cell: bool) -> bool {
+    let Some(q) = doc.para(b) else { return false };
+    if q.props.cell.is_some() != cell {
+        return false;
+    }
+    let (f, _) = doc.styles.para_format(q.style, &q.props);
+    f.borders == l.format.borders && f.shading == l.format.shading && f.indent_start == l.format.indent_start && f.indent_end == l.format.indent_end
+}
+
+/// Slice `s`'s shading and borders, behind its text. Paragraphs in one box
+/// draw the top border above the first and the bottom below the last, the
+/// shading over the space between them.
+fn para_box(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, s: &crate::paginate::Slice, left: i64, my: i64) {
+    let b = l.format.borders;
+    if b.is_empty() && l.format.shading.is_none() {
+        return;
+    }
+    let cell = doc.para(s.block).is_some_and(|p| p.props.cell.is_some());
+    let above = s.block > 0 && same_box(doc, s.block - 1, l, cell);
+    let below = same_box(doc, s.block + 1, l, cell);
+    let starts = s.lines.start == 0;
+    let ends = s.lines.end >= l.lines.len();
+    let lines_h: i64 = s.lines.clone().filter_map(|k| l.lines.get(k)).map(|x| x.height).sum();
+    let top = my + s.y - if starts { if above { l.space_before } else { l.pad_top } } else { 0 };
+    let bottom = my + s.y + lines_h + if ends { if below { l.space_after } else { l.pad_bottom } } else { 0 };
+    let room = |x: Option<Border>| x.map_or(0, |x| twips(x.space as i64 * 20 + x.thickness() as i64));
+    let x0 = left + twips(l.format.indent_start as i64) - room(b.start);
+    let x1 = left + s.w - twips(l.format.indent_end as i64) + room(b.end);
+    if let Some(c) = l.format.shading {
+        out.push(Item::Rect { x: x0, y: top, w: (x1 - x0).max(0), h: (bottom - top).max(0), color: c });
+    }
+    let thick = |x: &Border| twips(x.thickness() as i64).max(1);
+    if starts {
+        let edge = if above { b.between } else { b.top };
+        if let Some(x) = edge {
+            rule(out, &x, x0, top, x1 - x0, thick(&x), true);
+        }
+    }
+    if ends && !below {
+        if let Some(x) = b.bottom {
+            rule(out, &x, x0, bottom - thick(&x), x1 - x0, thick(&x), true);
+        }
+    }
+    if let Some(x) = b.start {
+        rule(out, &x, x0, top, bottom - top, thick(&x), false);
+    }
+    if let Some(x) = b.end {
+        rule(out, &x, x1 - thick(&x), top, bottom - top, thick(&x), false);
+    }
+}
+
+/// A border line `len` long from (`x`, `y`), across (`flat`) or down,
+/// `t` thick, in its style.
+fn rule(out: &mut Vec<Item>, b: &Border, x: i64, y: i64, len: i64, t: i64, flat: bool) {
+    let color = b.color.unwrap_or(0);
+    let mut seg = |a: i64, n: i64, off: i64, th: i64| {
+        if flat {
+            out.push(Item::Rect { x: x + a, y: y + off, w: n, h: th, color });
+        } else {
+            out.push(Item::Rect { x: x + off, y: y + a, w: th, h: n, color });
+        }
+    };
+    match b.style {
+        BorderStyle::Single | BorderStyle::Thick => seg(0, len, 0, t),
+        BorderStyle::Double => {
+            let th = (t / 3).max(1);
+            seg(0, len, 0, th);
+            seg(0, len, t - th, th);
+        }
+        BorderStyle::Dotted | BorderStyle::Dashed => {
+            let (on, off) = if b.style == BorderStyle::Dotted { (t, t) } else { (t * 3, t * 2) };
+            let mut a = 0;
+            while a < len {
+                seg(a, on.min(len - a), 0, t);
+                a += on + off;
+            }
+        }
+    }
+}
+
+/// A dropped capital, on the baseline of its last line, when slice
+/// `lines` holds that line (`top`: the slice's first line's top).
+fn drop_cap(out: &mut Vec<Item>, l: &ParaLayout, lines: Range<usize>, left: i64, top: i64) {
+    let Some(d) = &l.drop else { return };
+    let last = (d.lines as usize).min(l.lines.len()).saturating_sub(1);
+    if !lines.contains(&last) || lines.start != 0 {
+        return;
+    }
+    let y: i64 = l.lines[..last].iter().map(|x| x.height).sum();
+    let baseline = baseline_of(l, last, top + y);
+    let mut run = GlyphRun { face: d.glyphs.first().map_or(0, |g| g.face), size: size_lu(&d.format), color: d.format.color, x: left + d.x, y: baseline, glyphs: Vec::new(), text: d.text.clone(), turn: None };
+    let mut pen = 0;
+    for (k, g) in d.glyphs.iter().enumerate() {
+        let range = if k == 0 { 0..d.text.len() as u32 } else { d.text.len() as u32..d.text.len() as u32 };
+        run.glyphs.push(PaintGlyph { id: g.id, x: pen + g.dx, dy: g.dy, text: range });
+        pen += g.adv;
+    }
+    if !run.glyphs.is_empty() {
+        out.push(Item::Glyphs(run));
+    }
 }
 
 /// A picture's or shape's item in the frame.
@@ -566,6 +716,11 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
             out.push(Item::Link { x: rx, y: top, w: rw, h: lh, uri: u.to_string() });
         }
     }
+    if let Some(fi) = line.hyphen {
+        if let Some(f) = l.formats.get(fi as usize) {
+            runs(out, fonts, "-", f, left + pen, baseline);
+        }
+    }
     // Tab leaders, in the format of the text after the tab.
     for &(a, b, leader) in &line.leaders {
         let fi = gl.iter().find(|g| bytes.get(g.cluster as usize) == Some(&b'\t')).map_or(0, |g| g.fmt);
@@ -642,6 +797,7 @@ pub fn paint_para(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &Par
             _ => list_label(out, l, label, fonts, left, top),
         }
     }
+    drop_cap(out, l, 0..l.lines.len(), left, top);
     let mut y = top;
     for li in 0..l.lines.len() {
         line(out, doc, fonts, l, li, text, left, y, None);
@@ -716,6 +872,43 @@ mod tests {
                 assert_eq!(joined, r.text);
             }
         }
+    }
+
+    /// Two paragraphs with the same borders and shading are one box: one
+    /// top and one bottom border, the shading over the gap between; a
+    /// dropped capital is drawn large; line numbers stand in the margin.
+    #[test]
+    fn boxes_drop_caps_and_line_numbers_paint() {
+        use crate::model::{Border, DropCap, LineNumbering, ParaBorders};
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        let b = Border { color: Some(0x0000ff), ..Default::default() };
+        for t in ["One", "Two", "Plain"] {
+            let k = d.push_para(t, 0, vec![]);
+            if t != "Plain" {
+                d.blocks.update(k, |x| {
+                    let p = &mut x.as_para_mut().unwrap().props;
+                    p.borders = Some(ParaBorders { top: Some(b), bottom: Some(b), ..Default::default() });
+                    p.shading = Some(Some(0xeeeeee));
+                });
+            }
+        }
+        d.blocks.update(2, |x| x.as_para_mut().unwrap().props.drop_cap = Some(Some(DropCap { lines: 2, distance: 0, margin: false })));
+        d.settings.line_numbers = Some(LineNumbering::default());
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "1");
+        let rects = |c: u32| items.iter().filter_map(|i| if let Item::Rect { y, h, color, .. } = i { (*color == c).then_some((*y, *h)) } else { None }).collect::<Vec<_>>();
+        assert_eq!(rects(0x0000ff).len(), 2, "one top and one bottom border");
+        let shade = rects(0xeeeeee);
+        assert_eq!(shade.len(), 2);
+        assert_eq!(shade[0].0 + shade[0].1, shade[1].0, "the shading runs on over the gap");
+        let texts: Vec<String> = items.iter().filter_map(|i| if let Item::Glyphs(r) = i { Some(r.text.clone()) } else { None }).collect();
+        assert_eq!(texts, ["1", "One", "2", "Two", "P", "3", "lain"]);
+        let big = items.iter().find_map(|i| if let Item::Glyphs(r) = i { (r.text == "P").then_some(r.size) } else { None }).unwrap();
+        assert!(big > size_lu(&CharFormat::default()) * 2);
     }
 
     #[test]

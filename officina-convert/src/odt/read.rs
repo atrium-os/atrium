@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -304,8 +304,132 @@ pub(crate) fn para_props(e: &El) -> ParaProps {
         v.dedup_by_key(|s| s.pos);
         p.tabs = Some(v);
     }
+    // Borders: each side's own, else all four from fo:border; the room
+    // beside each from its padding.
+    let sides = ["top", "bottom", "left", "right"];
+    let mut b = [None; 4];
+    let mut any = false;
+    for (k, side) in sides.iter().enumerate() {
+        let v = e.attr(&format!("fo:border-{side}")).or_else(|| e.attr("fo:border"));
+        if v.is_some() {
+            any = true;
+        }
+        b[k] = v.and_then(odf_border).map(|mut x| {
+            let pad = e.attr(&format!("fo:padding-{side}")).or_else(|| e.attr("fo:padding")).and_then(length).unwrap_or(0);
+            x.space = (pad / 20).clamp(0, 31) as u16;
+            x
+        });
+    }
+    if any {
+        p.borders = Some(ParaBorders { top: b[0], bottom: b[1], start: b[2], end: b[3], between: None });
+    }
+    match e.attr("fo:background-color") {
+        Some("transparent") => p.shading = Some(None),
+        c @ Some(_) => p.shading = color(c).map(Some),
+        None => {}
+    }
+    if let Some(v) = e.attr("text:number-lines") {
+        p.line_numbers = Some(v == "true");
+    }
+    if let Some(d) = e.child("style:drop-cap") {
+        let lines = d.attr("style:lines").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
+        let length = d.attr("style:length").map_or(Some(1), |v| v.parse::<u32>().ok().or(if v == "word" { Some(1) } else { None }));
+        p.drop_cap = Some((DROP_CAP_LINES.contains(&lines) && length.is_some_and(|n| n >= 1)).then(|| DropCap { lines, distance: tw(d.attr("style:distance")).unwrap_or(0).max(0), margin: false }));
+    }
     p
 }
+
+/// A style's hyphenation, from its text properties.
+fn hyphenation_of(s: &El) -> Option<bool> {
+    s.child("style:text-properties").and_then(|t| t.attr("fo:hyphenate")).map(|v| v == "true")
+}
+
+/// An `fo:border` value: width, style and colour in any order; `none` is none.
+fn odf_border(v: &str) -> Option<Border> {
+    let mut b = Border { space: 0, ..Border::default() };
+    let mut seen = false;
+    for t in v.split_whitespace() {
+        match t {
+            "none" | "hidden" => return None,
+            "solid" | "groove" | "ridge" | "inset" | "outset" => seen = true,
+            "double" => {
+                b.style = BorderStyle::Double;
+                seen = true;
+            }
+            "dotted" => {
+                b.style = BorderStyle::Dotted;
+                seen = true;
+            }
+            "dashed" => {
+                b.style = BorderStyle::Dashed;
+                seen = true;
+            }
+            "thin" => b.width = 2,
+            "medium" => b.width = 6,
+            "thick" => b.width = 12,
+            _ if t.starts_with('#') => b.color = color(Some(t)).filter(|&c| c != 0),
+            _ => {
+                if let Some(w) = length(t) {
+                    b.width = (w * 8 / 20).clamp(1, 96) as u16;
+                }
+            }
+        }
+    }
+    seen.then_some(b)
+}
+
+/// A `text:list-level-style-*` as a level (`level` from 0).
+fn odf_list_level(l: &El, level: u8) -> (ListKind, ListLevel) {
+    let bullet = l.name == "text:list-level-style-bullet" || l.name == "text:list-level-style-image";
+    let kind = if bullet { ListKind::Bullet } else { ListKind::Numbered };
+    let mut lv = ListLevel::builtin(kind, level);
+    if bullet {
+        if let Some(c) = l.attr("text:bullet-char") {
+            // Symbol-font bullets are private-use characters: a plain bullet.
+            lv.text = c.chars().map(|c| if ('\u{f000}'..='\u{f0ff}').contains(&c) { '•' } else { c }).collect::<String>().into();
+        }
+    } else {
+        lv.format = match l.attr("style:num-format") {
+            Some("a") => NumFormat::LowerLetter,
+            Some("A") => NumFormat::UpperLetter,
+            Some("i") => NumFormat::LowerRoman,
+            Some("I") => NumFormat::UpperRoman,
+            Some(f) if f.starts_with("01") => NumFormat::DecimalZero,
+            Some("") => NumFormat::None,
+            _ => NumFormat::Decimal,
+        };
+        let shown = l.attr("text:display-levels").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1).clamp(1, level + 1);
+        let nums: Vec<String> = (level + 2 - shown..=level + 1).map(|k| format!("%{k}")).collect();
+        let body = if lv.format == NumFormat::None { String::new() } else { nums.join(".") };
+        lv.text = match l.attr("loext:num-list-format") {
+            // LibreOffice's whole label: %1% for level 1's number.
+            Some(w) => w.replace('%', "\u{1}").split('\u{1}').enumerate().map(|(i, part)| if i % 2 == 1 && part.len() == 1 && part.as_bytes()[0].is_ascii_digit() { format!("%{part}") } else { part.to_string() }).collect::<String>().into(),
+            None => format!("{}{}{}", l.attr("style:num-prefix").unwrap_or(""), body, l.attr("style:num-suffix").unwrap_or("")).into(),
+        };
+        if let Some(v) = l.attr("text:start-value").and_then(|v| v.parse::<u32>().ok()) {
+            lv.start = v.min(MAX_LIST_START);
+        }
+    }
+    let props = l.child("style:list-level-properties");
+    if let Some(a) = props.and_then(|p| p.child("style:list-level-label-alignment")) {
+        if let Some(m) = tw(a.attr("fo:margin-left")) {
+            lv.indent = m;
+        }
+        if let Some(t) = tw(a.attr("fo:text-indent")) {
+            lv.hang = (-t).max(0);
+        }
+    } else if let Some(p) = props {
+        // The older mode: the label's space from where it starts.
+        let start = tw(p.attr("text:space-before")).unwrap_or(0);
+        let width = tw(p.attr("text:min-label-width")).unwrap_or(LIST_HANG_ODF);
+        lv.indent = start + width;
+        lv.hang = width.max(0);
+    }
+    (kind, lv.bounded())
+}
+
+/// The label width ODF's older list mode gives when none is set.
+const LIST_HANG_ODF: i32 = 360;
 
 /// The body's first paragraph, in sections and lists too.
 fn first_para(e: &El, depth: usize) -> Option<&El> {
@@ -392,27 +516,7 @@ struct OStyle {
 }
 
 fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
-    ParaProps {
-        align: over.align.or(under.align),
-        indent_start: over.indent_start.or(under.indent_start),
-        indent_end: over.indent_end.or(under.indent_end),
-        first_line: over.first_line.or(under.first_line),
-        space_before: over.space_before.or(under.space_before),
-        space_after: over.space_after.or(under.space_after),
-        line_spacing: over.line_spacing.or(under.line_spacing),
-        keep_with_next: over.keep_with_next.or(under.keep_with_next),
-        keep_together: over.keep_together.or(under.keep_together),
-        page_break_before: over.page_break_before.or(under.page_break_before),
-        widows: over.widows.or(under.widows),
-        outline_level: over.outline_level.or(under.outline_level),
-        list: over.list.or(under.list),
-        cell: over.cell.or(under.cell),
-        rev: over.rev.or(under.rev),
-        tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
-        toc: over.toc.or(under.toc),
-        section: over.section.or(under.section),
-        rtl: over.rtl.or(under.rtl),
-    }
+    over.over(under)
 }
 
 struct Reader<'a> {
@@ -439,6 +543,8 @@ struct Reader<'a> {
     ours: HashMap<String, StyleId>,
     /// List styles: kind per level.
     lists: HashMap<String, Vec<ListKind>>,
+    /// List styles as our lists' definitions.
+    list_defs: HashMap<String, ListDef>,
     /// Column widths by column style name.
     columns: HashMap<String, u32>,
     /// Graphic styles: parent and graphic properties, by name.
@@ -709,6 +815,7 @@ impl<'a> Reader<'a> {
                                     if s.attr("style:master-page-name").is_some_and(|m| !m.is_empty()) && s.attr("style:family") == Some("paragraph") {
                                         q.page_break_before = Some(true);
                                     }
+                                    q.hyphenate = hyphenation_of(s);
                                     q
                                 },
                                 chars: s.child("style:text-properties").map(|t| text_props(t, &self.fonts)).unwrap_or_default(),
@@ -738,11 +845,18 @@ impl<'a> Reader<'a> {
                 "text:list-style" => {
                     let Some(name) = s.attr("style:name") else { continue };
                     let mut kinds = vec![ListKind::Numbered; MAX_LIST_LEVEL as usize + 1];
+                    let mut def = ListDef::builtin(ListKind::Numbered);
                     for l in s.els() {
-                        let lv = l.attr("text:level").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, MAX_LIST_LEVEL as usize + 1) - 1;
-                        kinds[lv] = if l.name == "text:list-level-style-bullet" || l.name == "text:list-level-style-image" { ListKind::Bullet } else { ListKind::Numbered };
+                        let lv = l.attr("text:level").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 10) - 1;
+                        if lv > MAX_LIST_LEVEL as usize {
+                            continue;
+                        }
+                        let (k, x) = odf_list_level(l, lv as u8);
+                        kinds[lv] = k;
+                        def.levels[lv] = x;
                     }
                     self.lists.insert(name.to_string(), kinds);
+                    self.list_defs.insert(name.to_string(), def);
                 }
                 _ => {}
             }
@@ -792,6 +906,16 @@ impl<'a> Reader<'a> {
             self.ours.insert(name.clone(), sid);
         }
         let defaults = st.children("style:default-style").find(|d| d.attr("style:family") == Some("paragraph"));
+        // Hyphenation: on for the document when any style turns it on; the
+        // default style's setting is Normal's.
+        let default_hyph = defaults.and_then(hyphenation_of);
+        self.doc.settings.hyphenate = default_hyph == Some(true) || self.styles.values().any(|o| o.para.hyphenate == Some(true));
+        if let Some(n) = st.child("text:linenumbering-configuration").filter(|n| n.attr("text:number-lines") == Some("true")) {
+            let count_by = n.attr("text:increment").and_then(|v| v.parse::<u16>().ok()).unwrap_or(1).clamp(1, 100);
+            let restart = if n.attr("text:restart-on-page") == Some("true") { LineRestart::Page } else { LineRestart::Continuous };
+            let distance = tw(n.attr("text:offset")).unwrap_or(0).max(0);
+            self.doc.settings.line_numbers = Some(LineNumbering { start: 1, count_by, distance, restart });
+        }
         let (dp, dc) = defaults.map(|d| (d.child("style:paragraph-properties").map(para_props).unwrap_or_default(), d.child("style:text-properties").map(|t| text_props(t, &self.fonts)).unwrap_or_default())).unwrap_or_default();
         for (name, _, _) in &named {
             let Some(&sid) = self.ours.get(name) else { continue };
@@ -801,9 +925,14 @@ impl<'a> Reader<'a> {
             if sid == 0 {
                 para = props_over(&para, &dp);
                 chars = chars.over(&dc);
+                if self.doc.settings.hyphenate {
+                    para.hyphenate = para.hyphenate.or(default_hyph);
+                }
             }
             para.outline_level = o.outline.or(self.doc.styles.styles[sid as usize].para.outline_level);
-            if let Some(ls) = &o.list_style {
+            if o.list_style.as_deref() == Some("") {
+                para.list = Some(None);
+            } else if let Some(ls) = &o.list_style {
                 if let Some(k) = self.lists.get(ls).map(|k| k[0]) {
                     para.list = Some(Some(ListRef { id: self.list_id(ls, true), kind: k, level: 0 }));
                 }
@@ -838,6 +967,11 @@ impl<'a> Reader<'a> {
         }
         self.next_list += 1;
         self.last_list.insert(style.to_string(), self.next_list);
+        if let Some(d) = self.list_defs.get(style) {
+            if self.doc.styles.lists.len() < officina_text::model::MAX_LIST_DEFS {
+                self.doc.styles.lists.insert(self.next_list, d.clone());
+            }
+        }
         self.next_list
     }
 
@@ -851,7 +985,12 @@ impl<'a> Reader<'a> {
         match self.styles.get(name) {
             Some(o) => {
                 let sid = o.parent.as_ref().and_then(|p| self.ours.get(p).copied()).unwrap_or(0);
-                (sid, o.para.clone(), o.chars.clone())
+                let mut para = o.para.clone();
+                // Out of its paragraph style's list.
+                if o.list_style.as_deref() == Some("") {
+                    para.list = Some(None);
+                }
+                (sid, para, o.chars.clone())
             }
             None => (0, ParaProps::default(), CharAttrs::default()),
         }
@@ -1728,11 +1867,20 @@ impl<'a> Reader<'a> {
             if item.name != "text:list-item" && item.name != "text:list-header" {
                 continue;
             }
+            let mut start = item.attr("text:start-value").and_then(|v| v.parse::<u32>().ok()).map(|v| v.min(MAX_LIST_START));
             for x in item.els() {
                 match x.name.as_str() {
                     "text:p" | "text:h" => {
                         let l = if item.name == "text:list-header" { None } else { Some(Some(ListRef { id, kind, level: level.min(MAX_LIST_LEVEL) })) };
+                        let before = self.doc.blocks.len();
                         self.para(x, cell, l);
+                        if let (Some(v), true) = (start.take(), self.doc.blocks.len() > before) {
+                            self.doc.blocks.update(before, |b| {
+                                if let Some(p) = b.as_para_mut() {
+                                    p.props.list_start = Some(v);
+                                }
+                            });
+                        }
                     }
                     "text:list" => self.list(x, level.saturating_add(1), style.clone(), Some(id), cell),
                     "table:table" => self.table(x),
@@ -2050,7 +2198,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), list_defs: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {

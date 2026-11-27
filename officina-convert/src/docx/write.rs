@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Border, BorderStyle, ListDef, ListLevel, NumFormat, LineRestart, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -120,6 +120,19 @@ fn rpr(a: &CharAttrs, styles: &[String]) -> String {
     }
 }
 
+/// A `w:pBdr` side.
+fn border_xml(name: &str, b: &Border) -> String {
+    let val = match b.style {
+        BorderStyle::Single => "single",
+        BorderStyle::Double => "double",
+        BorderStyle::Dotted => "dotted",
+        BorderStyle::Dashed => "dashed",
+        BorderStyle::Thick => "thick",
+    };
+    let color = b.color.map_or("auto".to_string(), |c| format!("{c:06X}"));
+    format!(r#"<w:{name} w:val="{val}" w:sz="{}" w:space="{}" w:color="{color}"/>"#, b.width, b.space)
+}
+
 /// Paragraph properties, after `w:pStyle` and `w:numPr`.
 fn ppr_body(p: &ParaProps) -> String {
     let mut s = String::new();
@@ -134,6 +147,30 @@ fn ppr_body(p: &ParaProps) -> String {
     }
     if let Some(v) = p.widows {
         s += &on("widowControl", v);
+    }
+    if let Some(v) = p.line_numbers {
+        s += &on("suppressLineNumbers", !v);
+    }
+    if let Some(b) = &p.borders {
+        s += "<w:pBdr>";
+        for (name, x) in [("top", b.top), ("left", b.start), ("bottom", b.bottom), ("right", b.end), ("between", b.between)] {
+            match x {
+                Some(x) => s += &border_xml(name, &x),
+                None if b.is_empty() => {
+                    let _ = write!(s, r#"<w:{name} w:val="nil"/>"#);
+                }
+                None => {}
+            }
+        }
+        s += "</w:pBdr>";
+    }
+    if let Some(v) = p.shading {
+        match v {
+            Some(c) => {
+                let _ = write!(s, r#"<w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/>"#);
+            }
+            None => s += r#"<w:shd w:val="clear" w:color="auto" w:fill="auto"/>"#,
+        }
     }
     if let Some(tabs) = &p.tabs {
         s += "<w:tabs>";
@@ -153,6 +190,9 @@ fn ppr_body(p: &ParaProps) -> String {
             let _ = write!(s, r#"<w:tab w:val="{val}"{leader} w:pos="{}"/>"#, t.pos);
         }
         s += "</w:tabs>";
+    }
+    if let Some(v) = p.hyphenate {
+        s += &on("suppressAutoHyphens", !v);
     }
     // w:bidi comes before w:spacing in a w:pPr.
     if let Some(v) = p.rtl {
@@ -252,7 +292,11 @@ struct Out {
     media: Vec<(String, Vec<u8>)>,
     image_rel: HashMap<u32, String>,
     link_rel: HashMap<String, String>,
-    lists: HashMap<(u32, ListKind), (u32, ListKind)>,
+    /// Each list's abstract numbering and the `w:num` its items use now
+    /// (a restart moves it to a new one).
+    lists: HashMap<(u32, ListKind), (u32, u32)>,
+    /// The `w:num`s that start a list again: num, list, level, number.
+    restarts: Vec<(u32, (u32, ListKind), u8, u32)>,
     styles: Vec<String>,
     pic: u32,
     /// Our note id to (kind, the id the file gives it).
@@ -493,6 +537,32 @@ impl Out {
 
     /// Paragraph `p`; `lead` goes before its runs (a note's number).
     fn para_of(&mut self, doc: &TextDoc, p: &Para, out: &mut String, lead: &str, tail: &str) {
+        // A dropped capital: Word's frame paragraph holding the letter, then
+        // the paragraph without it.
+        if let (Some(Some(dc)), Some(c)) = (p.props.drop_cap, p.text.chars().next().filter(|c| c.is_alphanumeric())) {
+            let n = c.len_utf8() as u32;
+            let (_, cf) = doc.styles.para_format(p.style, &p.props);
+            let body = doc.styles.char_format(&cf, doc.attrs.get(p.attr_at(n))).size as u32;
+            let big = (body * dc.lines as u32 * 3 / 2).clamp(2, 3276) as u16;
+            let line = dc.lines as u32 * body * 23 / 2;
+            let letter = rpr(&CharAttrs { size: Some(big), ..doc.attrs.get(p.attr_at(0)).clone() }, &self.styles);
+            let style = if p.style != 0 { self.styles.get(p.style as usize).map(|id| format!(r#"<w:pStyle w:val="{}"/>"#, esc(id))).unwrap_or_default() } else { String::new() };
+            let _ = write!(out, r#"<w:p><w:pPr>{style}<w:keepNext/><w:framePr w:dropCap="{}" w:lines="{}" w:hSpace="{}" w:wrap="around" w:vAnchor="text" w:hAnchor="text"/><w:spacing w:before="0" w:after="0" w:line="{line}" w:lineRule="exact"/><w:textAlignment w:val="baseline"/></w:pPr><w:r>{letter}<w:t>{}</w:t></w:r></w:p>"#, if dc.margin { "margin" } else { "drop" }, dc.lines, dc.distance, esc(&c.to_string()));
+            let mut q = p.clone();
+            q.text = p.text[n as usize..].to_string();
+            q.runs = p.runs.iter().map(|&(s, a)| (s.saturating_sub(n), a)).collect();
+            q.runs.dedup_by(|b, a| a.0 == b.0 && {
+                a.1 = b.1;
+                true
+            });
+            q.props.drop_cap = None;
+            if let Some(m) = self.cur.and_then(|b| self.marks.get_mut(&b)) {
+                for x in m.iter_mut() {
+                    x.0 = x.0.saturating_sub(n);
+                }
+            }
+            return self.para_of(doc, &q, out, lead, tail);
+        }
         let mut pp = String::new();
         // A contents entry in Normal goes out in Word's TOC style of its level.
         if let (0, Some(l)) = (p.style, p.props.toc.filter(|_| self.cur.is_some())) {
@@ -504,8 +574,16 @@ impl Out {
         }
         match p.props.list {
             Some(Some(l)) => {
-                let n = self.lists.len() as u32 + 1;
-                let (num, _) = *self.lists.entry((l.id, l.kind)).or_insert((n, l.kind));
+                let fresh = self.lists.len() as u32 + self.restarts.len() as u32 + 1;
+                let key = (l.id, l.kind);
+                let (_, mut num) = *self.lists.entry(key).or_insert((fresh, fresh));
+                if let Some(start) = p.props.list_start {
+                    num = self.lists.len() as u32 + self.restarts.len() as u32 + 1;
+                    self.restarts.push((num, key, l.level.min(8), start));
+                    if let Some(e) = self.lists.get_mut(&key) {
+                        e.1 = num;
+                    }
+                }
                 let _ = write!(pp, r#"<w:numPr><w:ilvl w:val="{}"/><w:numId w:val="{num}"/></w:numPr>"#, l.level.min(8));
             }
             Some(None) => pp += r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>"#,
@@ -799,8 +877,8 @@ fn margin_part(hf: &HeaderFooter, tag: &str) -> String {
     format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} {W_NS}><w:p><w:pPr><w:jc w:val="{jc}"/></w:pPr>{body}</w:p></w:{tag}>"#)
 }
 
-fn styles_part(doc: &TextDoc, ids: &[String]) -> String {
-    let mut s = styles_part_ours(doc, ids);
+fn styles_part(doc: &TextDoc, ids: &[String], lists: &mut HashMap<(u32, ListKind), (u32, u32)>, restarts: usize) -> String {
+    let mut s = styles_part_ours(doc, ids, lists, restarts);
     // Word's TOC styles for the entries' levels (based on Normal, the
     // entries' own properties direct).
     let mut levels: Vec<u8> = doc.blocks.iter().filter_map(|b| b.as_para()).filter(|p| p.style == 0).filter_map(|p| p.props.toc).map(|l| l.clamp(1, 9)).collect();
@@ -815,7 +893,7 @@ fn styles_part(doc: &TextDoc, ids: &[String]) -> String {
     s + &tail
 }
 
-fn styles_part_ours(doc: &TextDoc, ids: &[String]) -> String {
+fn styles_part_ours(doc: &TextDoc, ids: &[String], lists: &mut HashMap<(u32, ListKind), (u32, u32)>, restarts: usize) -> String {
     let mut s = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles {W_NS}><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="{f}" w:hAnsi="{f}" w:cs="{f}"/><w:sz w:val="{z}"/><w:szCs w:val="{z}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>"#, f = esc(&doc.styles.default_char.family), z = doc.styles.default_char.size);
     for (i, st) in doc.styles.styles.iter().enumerate() {
         let kind = if st.kind == StyleKind::Para { "paragraph" } else { "character" };
@@ -829,7 +907,17 @@ fn styles_part_ours(doc: &TextDoc, ids: &[String]) -> String {
         }
         if st.kind == StyleKind::Para {
             s += r#"<w:qFormat/>"#;
-            let body = ppr_body(&st.para);
+            // A style's list: a numbering of its own, as the text's lists.
+            let num = match st.para.list {
+                Some(Some(l)) => {
+                    let fresh = lists.len() as u32 + restarts as u32 + 1;
+                    let (_, n) = *lists.entry((l.id, l.kind)).or_insert((fresh, fresh));
+                    format!(r#"<w:numPr><w:ilvl w:val="{}"/><w:numId w:val="{n}"/></w:numPr>"#, l.level.min(8))
+                }
+                Some(None) => r#"<w:numPr><w:numId w:val="0"/></w:numPr>"#.to_string(),
+                None => String::new(),
+            };
+            let body = num + &ppr_body(&st.para);
             if !body.is_empty() {
                 let _ = write!(s, "<w:pPr>{body}</w:pPr>");
             }
@@ -843,23 +931,40 @@ fn styles_part_ours(doc: &TextDoc, ids: &[String]) -> String {
     s
 }
 
-fn numbering_part(lists: &HashMap<(u32, ListKind), (u32, ListKind)>) -> String {
+/// A list level as a `w:lvl`.
+fn lvl_xml(l: u8, lv: &ListLevel) -> String {
+    let fmt = match lv.format {
+        NumFormat::Decimal => "decimal",
+        NumFormat::DecimalZero => "decimalZero",
+        NumFormat::LowerLetter => "lowerLetter",
+        NumFormat::UpperLetter => "upperLetter",
+        NumFormat::LowerRoman => "lowerRoman",
+        NumFormat::UpperRoman => "upperRoman",
+        NumFormat::Bullet => "bullet",
+        NumFormat::None => "none",
+    };
+    format!(r#"<w:lvl w:ilvl="{l}"><w:start w:val="{}"/><w:numFmt w:val="{fmt}"/><w:lvlText w:val="{}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="{}" w:hanging="{}"/></w:pPr></w:lvl>"#, lv.start, esc(&lv.text), lv.indent, lv.hang)
+}
+
+fn numbering_part(lists: &HashMap<(u32, ListKind), (u32, u32)>, restarts: &[(u32, (u32, ListKind), u8, u32)], doc: &TextDoc) -> String {
     let mut s = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering {W_NS}>"#);
-    let mut v: Vec<(u32, ListKind)> = lists.values().copied().collect();
-    v.sort_by_key(|x| x.0);
-    for &(n, kind) in &v {
+    let mut v: Vec<((u32, ListKind), u32)> = lists.iter().map(|(k, x)| (*k, x.0)).collect();
+    v.sort_by_key(|x| x.1);
+    for &((id, kind), n) in &v {
         let _ = write!(s, r#"<w:abstractNum w:abstractNumId="{n}"><w:multiLevelType w:val="hybridMultilevel"/>"#);
-        for l in 0..9u32 {
-            let (fmt, text) = match kind {
-                ListKind::Bullet => ("bullet", ["•", "◦", "▪"][l as usize % 3].to_string()),
-                ListKind::Numbered => (["decimal", "lowerLetter", "lowerRoman"][l as usize % 3], format!("%{}.", l + 1)),
-            };
-            let _ = write!(s, r#"<w:lvl w:ilvl="{l}"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/><w:lvlText w:val="{text}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="{}" w:hanging="360"/></w:pPr></w:lvl>"#, 720 * (l + 1));
+        let def = doc.styles.lists.get(&id).cloned().unwrap_or_else(|| ListDef::builtin(kind));
+        for l in 0..9u8 {
+            let lv = def.level(l).cloned().unwrap_or_else(|| ListLevel::builtin(kind, l));
+            s += &lvl_xml(l, &lv);
         }
         s += "</w:abstractNum>";
     }
-    for &(n, _) in &v {
+    for &(_, n) in &v {
         let _ = write!(s, r#"<w:num w:numId="{n}"><w:abstractNumId w:val="{n}"/></w:num>"#);
+    }
+    for &(num, key, level, start) in restarts {
+        let Some(&(abs, _)) = lists.get(&key) else { continue };
+        let _ = write!(s, r#"<w:num w:numId="{num}"><w:abstractNumId w:val="{abs}"/><w:lvlOverride w:ilvl="{level}"><w:startOverride w:val="{start}"/></w:lvlOverride></w:num>"#);
     }
     s += "</w:numbering>";
     s
@@ -880,7 +985,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let ids: Vec<String> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_id(&s.name, i)).collect();
     // Notes are numbered in the file in anchor order, each kind from 1.
     let notes: HashMap<NoteId, (NoteKind, u32)> = doc.note_numbers().iter().map(|(&id, &k)| (id, k)).collect();
-    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
+    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), restarts: Vec::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
     // Paragraphs that fields refer to get bookmarks.
     for bl in doc.blocks.iter() {
         if let Some(p) = bl.as_para() {
@@ -966,7 +1071,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             continue;
         }
         ours.sort_unstable();
-        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
+        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), restarts: Vec::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
         let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{part} {W_NS} {DRAW_NS}><w:{tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:{tag}><w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>"#);
         // Lists in notes come out as plain paragraphs (the numbering part is the body's).
         for (n, id) in ours {
@@ -1062,7 +1167,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 continue;
             }
             // Its own paragraphs, with their pictures beside the part.
-            let mut ho = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 10_000 * n, notes: HashMap::new(), media_stem: if k == 0 { "hdr_image" } else { "ftr_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
+            let mut ho = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), restarts: Vec::new(), styles: ids.clone(), pic: 10_000 * n, notes: HashMap::new(), media_stem: if k == 0 { "hdr_image" } else { "ftr_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
             let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} {W_NS} {DRAW_NS}>"#);
             for p in &hf.paras {
                 let mut q = p.clone();
@@ -1095,7 +1200,16 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             SectionStart::EvenPage => r#"<w:type w:val="evenPage"/>"#,
         };
         let cols = if x.columns > 1 || x.rule { format!(r#"<w:cols w:num="{}" w:space="{}"{}/>"#, x.columns, x.gap, if x.rule { r#" w:sep="1""# } else { "" }) } else { String::new() };
-        let geo = geo(x.page.as_ref().unwrap_or(&doc.page));
+        let mut geo = geo(x.page.as_ref().unwrap_or(&doc.page));
+        if let Some(n) = doc.settings.line_numbers {
+            let restart = match n.restart {
+                LineRestart::Page => "newPage",
+                LineRestart::Section => "newSection",
+                LineRestart::Continuous => "continuous",
+            };
+            let distance = if n.distance > 0 { format!(r#" w:distance="{}""#, n.distance) } else { String::new() };
+            let _ = write!(geo, r#"<w:lnNumType w:countBy="{}" w:start="{}"{distance} w:restart="{restart}"/>"#, n.count_by, n.start.saturating_sub(1));
+        }
         // The first page's own header: the first section's first page.
         let title = if doc.first_page.is_some() && std::ptr::eq(x, &secs[0].1) { "<w:titlePg/>" } else { "" };
         format!("<w:sectPr>{sect}{ty}{geo}{cols}{title}</w:sectPr>")
@@ -1116,12 +1230,15 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS} {DRAW_NS}><w:body>{body}{sect}</w:body></w:document>"#);
 
     // Settings: tracking on, even pages' own headers.
-    if doc.tracking || doc.even_pages.is_some() {
+    if doc.tracking || doc.even_pages.is_some() || doc.settings.hyphenate {
         let even = if doc.even_pages.is_some() { "<w:evenAndOddHeaders/>" } else { "" };
         let track = if doc.tracking { "<w:trackRevisions/>" } else { "" };
+        let hyph = if doc.settings.hyphenate { "<w:autoHyphenation/>" } else { "" };
         o.rel("settings", "settings.xml".into(), false);
-        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}>{track}{even}</w:settings>"#)));
+        // Schema order: trackRevisions, autoHyphenation, evenAndOddHeaders.
+        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}>{track}{hyph}{even}</w:settings>"#)));
     }
+    let styles_xml = styles_part(doc, &ids, &mut o.lists, o.restarts.len());
     let mut z = ZipWriter::new(out);
     let mut types = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="webp" ContentType="image/webp"/><Default Extension="emf" ContentType="image/x-emf"/><Default Extension="wmf" ContentType="image/x-wmf"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#);
     if !o.lists.is_empty() {
@@ -1147,10 +1264,10 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     z.add("[Content_Types].xml", types.as_bytes())?;
     z.add("_rels/.rels", format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#).as_bytes())?;
     z.add("word/document.xml", document.as_bytes())?;
-    z.add("word/styles.xml", styles_part(doc, &ids).as_bytes())?;
+    z.add("word/styles.xml", styles_xml.as_bytes())?;
     let mut rels = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/styles" Target="styles.xml"/>"#);
     if !o.lists.is_empty() {
-        z.add("word/numbering.xml", numbering_part(&o.lists).as_bytes())?;
+        z.add("word/numbering.xml", numbering_part(&o.lists, &o.restarts, doc).as_bytes())?;
         let _ = write!(rels, r#"<Relationship Id="rId2" Type="{REL}/numbering" Target="numbering.xml"/>"#);
     }
     for (id, kind, target, external) in &o.rels {

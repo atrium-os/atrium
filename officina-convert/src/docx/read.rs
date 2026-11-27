@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use officina_text::fields;
 use officina_text::paginate::PAGE_BREAK;
-use officina_text::model::{Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -267,40 +267,55 @@ fn ppr(e: &El, rep: &mut Report) -> ParaProps {
             "w:pageBreakBefore" => p.page_break_before = Some(on(x)),
             "w:widowControl" => p.widows = Some(on(x)),
             "w:outlineLvl" => p.outline_level = num(val(x)).filter(|v| (0..9).contains(v)).map(|v| v as u8 + 1),
-            "w:pStyle" | "w:numPr" | "w:sectPr" | "w:rPr" | "w:contextualSpacing" | "w:snapToGrid" | "w:suppressAutoHyphens" | "w:autoSpaceDE" | "w:autoSpaceDN" | "w:adjustRightInd" | "w:textAlignment" | "w:kinsoku" | "w:wordWrap" | "w:overflowPunct" | "w:topLinePunct" | "w:suppressLineNumbers" => {}
+            "w:pStyle" | "w:numPr" | "w:sectPr" | "w:rPr" | "w:contextualSpacing" | "w:snapToGrid" | "w:autoSpaceDE" | "w:autoSpaceDN" | "w:adjustRightInd" | "w:textAlignment" | "w:kinsoku" | "w:wordWrap" | "w:overflowPunct" | "w:topLinePunct" => {}
+            "w:suppressAutoHyphens" => p.hyphenate = Some(!on(x)),
+            "w:suppressLineNumbers" => p.line_numbers = Some(!on(x)),
             "w:tabs" => p.tabs = Some(tab_stops(x).0),
-            "w:pBdr" => rep.note(Kind::Approximate, "paragraph borders (dropped)"),
-            "w:shd" => rep.note(Kind::Approximate, "paragraph shading (dropped)"),
-            "w:framePr" => rep.note(Kind::Approximate, "frames and drop caps (kept in line)"),
+            "w:pBdr" => {
+                let side = |n: &str| x.child(n).and_then(border);
+                p.borders = Some(ParaBorders { top: side("w:top"), bottom: side("w:bottom"), start: side("w:left").or_else(|| side("w:start")), end: side("w:right").or_else(|| side("w:end")), between: side("w:between") });
+            }
+            "w:shd" => p.shading = Some(shading(x)),
+            "w:framePr" => match x.attr("w:dropCap") {
+                Some(k @ ("drop" | "margin")) => {
+                    let lines = num(x.attr("w:lines")).unwrap_or(3).clamp(*DROP_CAP_LINES.start() as i64, *DROP_CAP_LINES.end() as i64) as u8;
+                    let distance = twips(x.attr("w:hSpace")).unwrap_or(0).max(0);
+                    p.drop_cap = Some(Some(DropCap { lines, distance, margin: k == "margin" }));
+                }
+                _ => rep.note(Kind::Approximate, "frames (kept in line)"),
+            },
             _ => {}
         }
     }
     p
 }
 
+/// A border side (`w:top` and the rest); `nil` and `none` are no border.
+fn border(e: &El) -> Option<Border> {
+    let style = match val(e)? {
+        "nil" | "none" => return None,
+        "double" | "thinThickSmallGap" | "thickThinSmallGap" | "thinThickMediumGap" | "thickThinMediumGap" | "thinThickLargeGap" | "thickThinLargeGap" | "triple" | "doubleWave" => BorderStyle::Double,
+        "dotted" => BorderStyle::Dotted,
+        "dashed" | "dashSmallGap" | "dotDash" | "dotDotDash" | "dashDotStroked" => BorderStyle::Dashed,
+        "thick" => BorderStyle::Thick,
+        _ => BorderStyle::Single,
+    };
+    let width = num(e.attr("w:sz")).unwrap_or(4).clamp(1, 96) as u16;
+    let space = num(e.attr("w:space")).unwrap_or(0).clamp(0, 31) as u16;
+    Some(Border { style, width, color: color(e.attr("w:color")), space })
+}
+
+/// A `w:shd`'s colour: the fill, or a solid pattern's colour.
+fn shading(e: &El) -> Option<u32> {
+    match val(e) {
+        Some("solid") => color(e.attr("w:color")).or(Some(0)),
+        _ => color(e.attr("w:fill")),
+    }
+}
+
 /// `under` with the fields `over` sets replaced.
 fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
-    ParaProps {
-        align: over.align.or(under.align),
-        indent_start: over.indent_start.or(under.indent_start),
-        indent_end: over.indent_end.or(under.indent_end),
-        first_line: over.first_line.or(under.first_line),
-        space_before: over.space_before.or(under.space_before),
-        space_after: over.space_after.or(under.space_after),
-        line_spacing: over.line_spacing.or(under.line_spacing),
-        keep_with_next: over.keep_with_next.or(under.keep_with_next),
-        keep_together: over.keep_together.or(under.keep_together),
-        page_break_before: over.page_break_before.or(under.page_break_before),
-        widows: over.widows.or(under.widows),
-        outline_level: over.outline_level.or(under.outline_level),
-        list: over.list.or(under.list),
-        cell: over.cell.or(under.cell),
-        rev: over.rev.or(under.rev),
-        tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
-        toc: over.toc.or(under.toc),
-        section: over.section.or(under.section),
-        rtl: over.rtl.or(under.rtl),
-    }
+    over.over(under)
 }
 
 /// A `w:sectPr`'s columns and how its section starts.
@@ -372,33 +387,91 @@ fn tab_stops(e: &El) -> (Vec<TabStop>, Vec<i32>) {
     (v, clears)
 }
 
-/// List kinds by numbering id and level.
+/// List kinds by numbering id and level, and each list's definition.
 struct Numbering {
     kinds: HashMap<(String, u8), ListKind>,
+    defs: HashMap<u32, ListDef>,
+}
+
+/// A `w:lvl`'s format, label, start and indents.
+fn list_level(l: &El, level: u8) -> (ListKind, ListLevel) {
+    let fmt = l.child("w:numFmt").and_then(val).unwrap_or("decimal");
+    let format = match fmt {
+        "bullet" => NumFormat::Bullet,
+        "none" => NumFormat::None,
+        "decimalZero" => NumFormat::DecimalZero,
+        "lowerLetter" => NumFormat::LowerLetter,
+        "upperLetter" => NumFormat::UpperLetter,
+        "lowerRoman" => NumFormat::LowerRoman,
+        "upperRoman" => NumFormat::UpperRoman,
+        _ => NumFormat::Decimal,
+    };
+    let kind = if matches!(format, NumFormat::Bullet | NumFormat::None) { ListKind::Bullet } else { ListKind::Numbered };
+    let mut lv = ListLevel::builtin(kind, level);
+    lv.format = format;
+    if let Some(t) = l.child("w:lvlText").and_then(val) {
+        // Symbol-font bullets are private-use characters: a plain bullet.
+        let t: String = t.chars().map(|c| if ('\u{f000}'..='\u{f0ff}').contains(&c) { '•' } else { c }).collect();
+        lv.text = t.into();
+    }
+    if let Some(v) = num(l.child("w:start").and_then(val)) {
+        lv.start = v.clamp(0, MAX_LIST_START as i64) as u32;
+    }
+    if let Some(ind) = l.child("w:pPr").and_then(|p| p.child("w:ind")) {
+        if let Some(v) = twips(ind.attr("w:left").or_else(|| ind.attr("w:start"))) {
+            lv.indent = v;
+        }
+        if let Some(h) = twips(ind.attr("w:hanging")) {
+            lv.hang = h.max(0);
+        } else if ind.attr("w:firstLine").is_some() {
+            lv.hang = 0;
+        }
+    }
+    (kind, lv.bounded())
 }
 
 impl Numbering {
     fn read(e: Option<&El>) -> Numbering {
         let mut kinds = HashMap::new();
-        let Some(e) = e else { return Numbering { kinds } };
-        let mut abs: HashMap<String, Vec<(u8, ListKind)>> = HashMap::new();
+        let mut defs = HashMap::new();
+        let Some(e) = e else { return Numbering { kinds, defs } };
+        let mut abs: HashMap<String, Vec<(u8, ListKind, ListLevel)>> = HashMap::new();
         for a in e.children("w:abstractNum") {
             let Some(id) = a.attr("w:abstractNumId") else { continue };
             let mut lv = Vec::new();
-            for l in a.children("w:lvl") {
+            for l in a.children("w:lvl").take(MAX_LIST_LEVEL as usize + 1) {
                 let level = num(l.attr("w:ilvl")).unwrap_or(0).clamp(0, MAX_LIST_LEVEL as i64) as u8;
-                let fmt = l.child("w:numFmt").and_then(val).unwrap_or("decimal");
-                lv.push((level, if fmt == "bullet" || fmt == "none" { ListKind::Bullet } else { ListKind::Numbered }));
+                let (k, x) = list_level(l, level);
+                lv.push((level, k, x));
             }
             abs.insert(id.to_string(), lv);
         }
         for n in e.children("w:num") {
             let (Some(id), Some(a)) = (n.attr("w:numId"), n.child("w:abstractNumId").and_then(val)) else { continue };
-            for &(l, k) in abs.get(a).map(Vec::as_slice).unwrap_or(&[]) {
-                kinds.insert((id.to_string(), l), k);
+            let Ok(nid) = id.parse::<u32>() else { continue };
+            let levels = abs.get(a).map(Vec::as_slice).unwrap_or(&[]);
+            let mut def = ListDef::builtin(levels.first().map_or(ListKind::Numbered, |x| x.1));
+            for (l, k, x) in levels {
+                kinds.insert((id.to_string(), *l), *k);
+                def.levels[*l as usize] = x.clone();
+            }
+            // A list's own overrides: a new start, or a whole level.
+            for o in n.children("w:lvlOverride") {
+                let Some(l) = num(o.attr("w:ilvl")).filter(|l| (0..=MAX_LIST_LEVEL as i64).contains(l)).map(|l| l as u8) else { continue };
+                if let Some(x) = o.child("w:lvl") {
+                    let (k, x) = list_level(x, l);
+                    kinds.insert((id.to_string(), l), k);
+                    def.levels[l as usize] = x;
+                }
+                if let Some(v) = num(o.child("w:startOverride").and_then(val)) {
+                    def.levels[l as usize].start = v.clamp(0, MAX_LIST_START as i64) as u32;
+                }
+            }
+            if !levels.is_empty() && defs.len() < officina_text::model::MAX_LIST_DEFS {
+                defs.insert(nid, def);
             }
         }
-        Numbering { kinds }
+        Numbering { kinds, defs }
     }
 
     fn list(&self, numpr: &El) -> Option<Option<ListRef>> {
@@ -425,6 +498,9 @@ struct Reader<'a> {
     pictures: u64,
     /// The settings turn on separate even-page headers and footers.
     even_odd: bool,
+    /// A dropped capital's own paragraph just read (block, drop, its text
+    /// and runs), waiting for the paragraph it drops into.
+    drop: Option<(usize, DropCap, String, Vec<(u32, u32)>)>,
     /// Text boxes met in the paragraph being read; their paragraphs follow it.
     boxes: Vec<El>,
     box_depth: usize,
@@ -1376,7 +1452,32 @@ impl<'a> Reader<'a> {
             all.truncate(MAX_TABS);
             props.tabs = Some(all);
         }
-        let k = self.doc.push_para(&p.text, style, runs);
+        // Word's dropped capital is a paragraph of its own (a frame holding
+        // the letter) before the one it drops into: its text and runs go to
+        // the front of that one, which takes the drop.
+        let mut text = p.text.clone();
+        let mut runs = runs;
+        let mut props = props;
+        let dropped = matches!(props.drop_cap, Some(Some(_))) && cell.is_none() && !text.is_empty() && !text.contains(OBJECT_CHAR);
+        if let Some((at, dc, dtext, druns)) = self.drop.take() {
+            if at + 1 == self.doc.blocks.len() && !dropped {
+                self.doc.blocks.remove(at);
+                let n = dtext.len() as u32;
+                // The letter's size was the frame's: the drop sizes it now.
+                let body = runs.first().map(|r| self.doc.attrs.get(r.1).size).unwrap_or(None);
+                let druns: Vec<(u32, u32)> = druns.into_iter().map(|(s, a)| (s, self.doc.attrs.intern(CharAttrs { size: body, ..self.doc.attrs.get(a).clone() }))).collect();
+                runs = druns.into_iter().chain(runs.into_iter().map(|(s, a)| (s + n, a))).collect();
+                runs.dedup_by(|b, a| a.1 == b.1);
+                text = format!("{dtext}{text}");
+                props.drop_cap = Some(Some(dc));
+            }
+        }
+        if dropped {
+            if let Some(Some(dc)) = props.drop_cap.take() {
+                self.drop = Some((self.doc.blocks.len(), dc, text.clone(), runs.clone()));
+            }
+        }
+        let k = self.doc.push_para(&text, style, runs);
         self.doc.blocks.update(k, |b| {
             if let Some(q) = b.as_para_mut() {
                 q.props = props;
@@ -1894,7 +1995,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new(), drop: None };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1944,6 +2045,21 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
         let st = part(&archive, &p)?;
         r.even_odd = st.as_ref().is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
         r.doc.tracking = st.as_ref().is_some_and(|s| s.child("w:trackRevisions").is_some_and(on));
+        r.doc.settings.hyphenate = st.as_ref().is_some_and(|s| s.child("w:autoHyphenation").is_some_and(on));
+    }
+    r.doc.styles.lists = r.numbering.defs.iter().map(|(k, v)| (*k, v.clone())).collect();
+    // Line numbers: Word sets them per section; the first section's here.
+    if let Some(n) = doc_xml.child("w:body").and_then(|b| b.find("w:lnNumType")) {
+        let restart = match n.attr("w:restart") {
+            Some("continuous") => LineRestart::Continuous,
+            Some("newSection") => LineRestart::Section,
+            _ => LineRestart::Page,
+        };
+        // Word keeps the first number less one.
+        let start = num(n.attr("w:start")).unwrap_or(0).clamp(0, MAX_LIST_START as i64 - 1) as u32 + 1;
+        let count_by = num(n.attr("w:countBy")).unwrap_or(1).clamp(1, 100) as u16;
+        let distance = twips(n.attr("w:distance")).unwrap_or(0).max(0);
+        r.doc.settings.line_numbers = Some(LineNumbering { start, count_by, distance, restart });
     }
     if let Some(t) = find("theme").map(|p| part(&archive, &p)).transpose()?.flatten() {
         r.theme = Some(crate::pptx::read::read_theme(&t));

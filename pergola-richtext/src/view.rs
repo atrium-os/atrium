@@ -265,6 +265,20 @@ impl RichTextView {
         g.page_at(self.scroll.get().physics.y + self.rect.h() as f64 / 2.0, e.pages.pages().len().max(1))
     }
 
+    /// Where a ruler over the caret's page puts its marks: the view x of
+    /// the page's start margin, view units per twip, and the width between
+    /// the margins (twips).
+    pub fn ruler(&self) -> (f32, f32, i32) {
+        let mut e = self.editor.borrow_mut();
+        let g = Geom::of(&e, self.rect, self.zoom);
+        let c = e.caret;
+        let pg = e.spot(c).page;
+        let b = g.page(pg);
+        let s = e.pages.pages().get(pg).map_or(e.doc.page, |p| p.setup);
+        let per = twips(1440) as f64 * g.k / 1440.0;
+        (self.rect.x() + (g.left_of(pg) + b.mx) as f32, per as f32, (s.width - s.margin_start - s.margin_end).max(0))
+    }
+
     /// Scrolls so the editor's caret shows (after a command moved it: find,
     /// go to); in read mode, to the top of the caret's page.
     pub fn reveal_caret(&self) {

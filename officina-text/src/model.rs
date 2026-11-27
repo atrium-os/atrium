@@ -901,6 +901,90 @@ pub enum LineSpacing {
     AtLeast(i32),
 }
 
+/// A border line's look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BorderStyle {
+    #[default]
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+    /// A single line drawn thick (Word's thick and the heavier styles).
+    Thick,
+}
+
+/// One side's border: its look, width (eighths of a point), colour (sRGB;
+/// `None` is automatic, black) and the room between it and the text
+/// (points).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Border {
+    pub style: BorderStyle,
+    pub width: u16,
+    pub color: Option<u32>,
+    pub space: u16,
+}
+
+impl Default for Border {
+    fn default() -> Self {
+        Border { style: BorderStyle::Single, width: 4, color: None, space: 1 }
+    }
+}
+
+/// Widest border, eighths of a point (12 pt), and the most room beside one (31 pt).
+pub const MAX_BORDER_WIDTH: u16 = 96;
+pub const MAX_BORDER_SPACE: u16 = 31;
+
+impl Border {
+    /// Bounded to what a file can say.
+    pub fn bounded(self) -> Border {
+        Border { width: self.width.clamp(1, MAX_BORDER_WIDTH), space: self.space.min(MAX_BORDER_SPACE), ..self }
+    }
+
+    /// Its drawn thickness, twips (a double line takes three widths).
+    pub fn thickness(&self) -> i32 {
+        let w = (self.width as i32 * 20 / 8).max(1);
+        match self.style {
+            BorderStyle::Double => w * 3,
+            BorderStyle::Thick => w.max(30),
+            _ => w,
+        }
+    }
+}
+
+/// A paragraph's borders. Consecutive paragraphs with the same borders are
+/// one box: the top border above the first, the bottom below the last, and
+/// `between` (when set) between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ParaBorders {
+    pub top: Option<Border>,
+    pub bottom: Option<Border>,
+    pub start: Option<Border>,
+    pub end: Option<Border>,
+    pub between: Option<Border>,
+}
+
+impl ParaBorders {
+    pub fn is_empty(&self) -> bool {
+        [self.top, self.bottom, self.start, self.end, self.between].iter().all(|b| b.is_none())
+    }
+
+    pub fn sides(&self) -> [Option<Border>; 5] {
+        [self.top, self.bottom, self.start, self.end, self.between]
+    }
+}
+
+/// A dropped capital: the paragraph's first letter as tall as `lines`
+/// lines (2–10), `distance` twips from the text beside it; `margin` puts
+/// it in the margin, before the text's start edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DropCap {
+    pub lines: u8,
+    pub distance: i32,
+    pub margin: bool,
+}
+
+pub const DROP_CAP_LINES: std::ops::RangeInclusive<u8> = 2..=10;
+
 /// Direct paragraph properties; `None` takes the style's value. Lengths in twips.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ParaProps {
@@ -939,6 +1023,52 @@ pub struct ParaProps {
     /// Right to left (`true`) or left to right; unset, the paragraph's first
     /// strong character decides (UAX #9).
     pub rtl: Option<bool>,
+    /// Borders round the paragraph (`Some` of an empty set takes the
+    /// style's off).
+    pub borders: Option<ParaBorders>,
+    /// Background colour (sRGB); `Some(None)` takes the style's off.
+    pub shading: Option<Option<u32>>,
+    /// The first letter dropped; `Some(None)` takes the style's off.
+    pub drop_cap: Option<Option<DropCap>>,
+    /// A list item that starts its list (at its level) again at this number.
+    pub list_start: Option<u32>,
+    /// `false`: the paragraph's lines are left out of line numbering.
+    pub line_numbers: Option<bool>,
+    /// `false`: the paragraph's words are never hyphenated.
+    pub hyphenate: Option<bool>,
+}
+
+impl ParaProps {
+    /// `under` with the fields `self` sets replaced.
+    pub fn over(&self, under: &ParaProps) -> ParaProps {
+        ParaProps {
+            align: self.align.or(under.align),
+            indent_start: self.indent_start.or(under.indent_start),
+            indent_end: self.indent_end.or(under.indent_end),
+            first_line: self.first_line.or(under.first_line),
+            space_before: self.space_before.or(under.space_before),
+            space_after: self.space_after.or(under.space_after),
+            line_spacing: self.line_spacing.or(under.line_spacing),
+            keep_with_next: self.keep_with_next.or(under.keep_with_next),
+            keep_together: self.keep_together.or(under.keep_together),
+            page_break_before: self.page_break_before.or(under.page_break_before),
+            widows: self.widows.or(under.widows),
+            outline_level: self.outline_level.or(under.outline_level),
+            list: self.list.or(under.list),
+            cell: self.cell.or(under.cell),
+            rev: self.rev.or(under.rev),
+            tabs: self.tabs.clone().or_else(|| under.tabs.clone()),
+            toc: self.toc.or(under.toc),
+            section: self.section.or(under.section),
+            rtl: self.rtl.or(under.rtl),
+            borders: self.borders.or(under.borders),
+            shading: self.shading.or(under.shading),
+            drop_cap: self.drop_cap.or(under.drop_cap),
+            list_start: self.list_start.or(under.list_start),
+            line_numbers: self.line_numbers.or(under.line_numbers),
+            hyphenate: self.hyphenate.or(under.hyphenate),
+        }
+    }
 }
 
 /// How a section begins.
@@ -1052,6 +1182,121 @@ pub enum ListKind {
     Numbered,
 }
 
+/// How a list level counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NumFormat {
+    Decimal,
+    /// 01, 02, …
+    DecimalZero,
+    LowerLetter,
+    UpperLetter,
+    LowerRoman,
+    UpperRoman,
+    /// The level's text is its bullet.
+    Bullet,
+    /// No number: the level's text alone.
+    None,
+}
+
+/// One level of a list's definition: how it counts, its label (`%1` to
+/// `%9` stand for the numbers of levels 1 to 9, so "%1.%2." labels a
+/// second-level item 3.2.; a bullet level's text is its bullet), the
+/// number it starts at, and where its text and label sit (twips).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListLevel {
+    pub format: NumFormat,
+    pub text: Arc<str>,
+    pub start: u32,
+    pub indent: i32,
+    pub hang: i32,
+}
+
+/// Longest level label, bytes, and the largest start number.
+pub const MAX_LEVEL_TEXT: usize = 64;
+pub const MAX_LIST_START: u32 = 32_767;
+/// Lists a document may define.
+pub const MAX_LIST_DEFS: usize = 4096;
+
+impl ListLevel {
+    /// The level the built-in lists give `level` of `kind`.
+    pub fn builtin(kind: ListKind, level: u8) -> ListLevel {
+        let l = level.min(MAX_LIST_LEVEL);
+        let indent = LIST_INDENT * (l as i32 + 1);
+        match kind {
+            ListKind::Bullet => ListLevel { format: NumFormat::Bullet, text: ["•", "◦", "▪"][l as usize % 3].into(), start: 1, indent, hang: LIST_HANG },
+            ListKind::Numbered => {
+                let format = [NumFormat::Decimal, NumFormat::LowerLetter, NumFormat::LowerRoman][l as usize % 3];
+                ListLevel { format, text: format!("%{}.", l + 1).into(), start: 1, indent, hang: LIST_HANG }
+            }
+        }
+    }
+
+    /// Bounded to what the file format holds.
+    pub fn bounded(mut self) -> ListLevel {
+        if self.text.len() > MAX_LEVEL_TEXT {
+            let mut e = MAX_LEVEL_TEXT;
+            while !self.text.is_char_boundary(e) {
+                e -= 1;
+            }
+            self.text = self.text[..e].into();
+        }
+        self.start = self.start.min(MAX_LIST_START);
+        self.indent = self.indent.clamp(-31_680, 31_680);
+        self.hang = self.hang.clamp(0, 31_680);
+        self
+    }
+}
+
+/// A list's own definition: its nine levels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListDef {
+    pub levels: Vec<ListLevel>,
+}
+
+impl ListDef {
+    /// The built-in list of `kind`, every level.
+    pub fn builtin(kind: ListKind) -> ListDef {
+        ListDef { levels: (0..=MAX_LIST_LEVEL).map(|l| ListLevel::builtin(kind, l)).collect() }
+    }
+
+    pub fn level(&self, level: u8) -> Option<&ListLevel> {
+        self.levels.get(level as usize)
+    }
+}
+
+/// Where line numbers start again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LineRestart {
+    #[default]
+    Page,
+    Section,
+    Continuous,
+}
+
+/// Numbers beside the lines, in the start margin: from `start`, every
+/// `count_by`th line shown, `distance` twips from the text (0: a quarter inch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LineNumbering {
+    pub start: u32,
+    pub count_by: u16,
+    pub distance: i32,
+    pub restart: LineRestart,
+}
+
+impl Default for LineNumbering {
+    fn default() -> Self {
+        LineNumbering { start: 1, count_by: 1, distance: 0, restart: LineRestart::Page }
+    }
+}
+
+/// The document's settings for line numbers and hyphenation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Settings {
+    pub line_numbers: Option<LineNumbering>,
+    /// Words are hyphenated at line ends.
+    pub hyphenate: bool,
+}
+
 /// A paragraph's place in a list: which list (items of one list number on
 /// from each other, across paragraphs between), its kind, and its level (0–8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1086,11 +1331,16 @@ pub struct ParaFormat {
     pub tabs: Vec<TabStop>,
     /// Direction; `None`: from the text.
     pub rtl: Option<bool>,
+    pub borders: ParaBorders,
+    pub shading: Option<u32>,
+    pub drop_cap: Option<DropCap>,
+    pub line_numbers: bool,
+    pub hyphenate: bool,
 }
 
 impl Default for ParaFormat {
     fn default() -> Self {
-        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None, tabs: Vec::new(), rtl: None }
+        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None, tabs: Vec::new(), rtl: None, borders: ParaBorders::default(), shading: None, drop_cap: None, line_numbers: true, hyphenate: true }
     }
 }
 
@@ -1108,6 +1358,22 @@ impl ParaFormat {
         }
         if let Some(t) = &p.tabs {
             self.tabs = t.iter().take(MAX_TABS).copied().collect();
+        }
+        if let Some(b) = p.borders {
+            let f = |x: Option<Border>| x.map(Border::bounded);
+            self.borders = ParaBorders { top: f(b.top), bottom: f(b.bottom), start: f(b.start), end: f(b.end), between: f(b.between) };
+        }
+        if let Some(v) = p.shading {
+            self.shading = v.map(|c| c & 0xff_ffff);
+        }
+        if let Some(d) = p.drop_cap {
+            self.drop_cap = d.filter(|d| DROP_CAP_LINES.contains(&d.lines)).map(|d| DropCap { distance: d.distance.clamp(0, 1440 * 22), ..d });
+        }
+        if let Some(v) = p.line_numbers {
+            self.line_numbers = v;
+        }
+        if let Some(v) = p.hyphenate {
+            self.hyphenate = v;
         }
         if let Some(l) = p.list {
             self.list = l.map(|mut l| {
@@ -1154,6 +1420,9 @@ pub struct StyleUses {
 pub struct StyleSheet {
     pub styles: Vec<Style>,
     pub default_char: CharFormat,
+    /// Lists' own definitions by list id; a list without one numbers as
+    /// the built-in list of its kind.
+    pub lists: std::collections::BTreeMap<u32, ListDef>,
 }
 
 impl Default for StyleSheet {
@@ -1171,6 +1440,7 @@ impl Default for StyleSheet {
                 p("Title", Some(0), ParaProps { space_after: Some(240), ..Default::default() }, CharAttrs { size: Some(52), ..Default::default() }),
             ],
             default_char: CharFormat::default(),
+            lists: Default::default(),
         }
     }
 }
@@ -1214,14 +1484,21 @@ impl StyleSheet {
         // A list item hangs its label at its level's indent, unless the
         // paragraph sets its own indents.
         if let Some(l) = pf.list {
+            let lv = self.list_level(l);
             if direct.indent_start.is_none() {
-                pf.indent_start = LIST_INDENT * (l.level as i32 + 1);
+                pf.indent_start = lv.indent;
             }
             if direct.first_line.is_none() {
-                pf.first_line = -LIST_HANG;
+                pf.first_line = -lv.hang;
             }
         }
         (pf, cf)
+    }
+
+    /// The level a list item's label and indents come from: its list's own
+    /// definition, else the built-in list of its kind.
+    pub fn list_level(&self, l: ListRef) -> ListLevel {
+        self.lists.get(&l.id).and_then(|d| d.level(l.level)).cloned().unwrap_or_else(|| ListLevel::builtin(l.kind, l.level))
     }
 
     /// What a run shows: its paragraph's character format, then its character
@@ -1519,6 +1796,8 @@ pub struct TextDoc {
     pub conflicts: Conflicts,
     /// Edits are tracked (a setting the file keeps).
     pub tracking: bool,
+    /// Line numbers and hyphenation.
+    pub settings: Settings,
     /// What each field shows, as last worked out (derived: not saved, not
     /// part of undo); see [`crate::fields`].
     pub field_values: HashMap<Field, Arc<str>>,
@@ -1560,7 +1839,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, field_values: HashMap::new(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, settings: Settings::default(), field_values: HashMap::new(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

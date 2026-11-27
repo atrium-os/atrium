@@ -5925,6 +5925,33 @@ What is left is mostly by design: `.odt` has no continuous one-column section (5
 
 **Not yet:** hidden text is always hidden (no "show hidden" view with a dotted underline yet), and word-only underline (Ctrl+Shift+W) has no model field. Both go to round 7.
 
+### 16.171 Round 2 as built (2026-11-27): paragraphs and lists
+
+Round 2 of the seven in §16.169.
+
+**Model and native file.** `ParaProps` and `ParaFormat` gained `borders` (`ParaBorders`: top, bottom, start, end and between, each a `Border` of style, width in eighths of a point within `MAX_BORDER_WIDTH`, colour and space), `shading`, `drop_cap` (`DropCap`: 2–10 lines, distance, in the margin), `list_start` (an item that starts its level again), `line_numbers` (false: this paragraph's lines are left out) and `hyphenate`. `ParaProps::over` now merges a style's properties under a paragraph's for both readers. `StyleSheet.lists` holds each list's own definition (`ListDef`, nine `ListLevel`s of format, label template with `%1`–`%9`, start, indent and hang, bounded by `MAX_LEVEL_TEXT`, `MAX_LIST_START` and `MAX_LIST_DEFS`), with the built-in levels as the fallback. `TextDoc.settings` holds line numbering (start, count by, distance, restart per page, section or continuous) and automatic hyphenation. The native file carries the paragraph fields behind ext-mask bit 5 and a sub-mask byte, lists in chunk 14 and settings in chunk 15, and the ops `SetList` (19) and `SetSettings` (20); the decoder refuses anything out of range.
+
+**Layout and paint.** Top and bottom borders take room inside the paragraph's spacing. Paint joins neighbouring paragraphs with the same borders, shading and indents into one box: the top border on the first, the bottom on the last, the between border in between, and the shading carried across the gaps. A drop cap takes its letter out of the line flow, sets it at the height of its lines from the body's line height, and indents the first lines past it (a paragraph shorter than the drop is padded). Hyphenation uses the `hyphenation` crate's embedded en-US patterns (the same dependency Pergola has): words of five or more ASCII letters break at a pattern point when the paragraph, the document and the direction allow it, and paint draws the hyphen. Line numbers are drawn in the start margin by paint alone, counting from the page, section or document start.
+
+**Lists.** Numbering is precomputed per paragraph with each level's own format and template (decimal, decimal with zero, letters, Roman numerals, bullets, none), honouring each level's start and an item's restart. `.docx` reads and writes `numbering.xml`'s `numFmt`, `lvlText`, `start`, `ind` and `lvlOverride/startOverride` (a restart becomes a new `w:num`), and a style's list as `numPr` in `styles.xml`. `.odt` reads and writes level prefix, suffix and display levels, `loext:num-list-format`, `text:start-value` on an item, an empty `style:list-style-name` for "not in a list", and wraps paragraphs whose list comes from their style in `text:list`. Private-use bullet characters from Symbol and Wingdings read as •.
+
+**Other formats.** `.docx`: `pBdr`, `shd`, `framePr` drop caps (Word's separate frame paragraph is merged into the next paragraph on read and written again as a frame), `suppressLineNumbers`, `suppressAutoHyphens`, `lnNumType` (from the first section) and `autoHyphenation`. `.odt`: `fo:border-*`, `fo:padding-*`, `style:join-border`, `fo:background-color`, `style:drop-cap`, `text:number-lines`, `fo:hyphenate` and `text:linenumbering-configuration`. `.doc`: the border, shading (SHD80 and SHD), drop cap and suppress sprms, and the section's line numbering sprms.
+
+**The UI.** The Format menu gained Paragraph…, Borders and Shading…, Tabs…, Bullets and Numbering…, Line Numbers, Hyphenation and Ruler. Each … item opens a two-row bar in the Font… bar's place (one bar at a time; another bar closes it), applied as each value is picked, one undo step each:
+
+- Paragraph…: left and right indent, first line or hanging, space before and after, line spacing (single, 1.15, 1.5, double, at least, exactly), keep with next, keep lines together, widow control, page break before, no line numbers here, and the document's line numbers, hyphenation and ruler.
+- Borders and Shading…: top, bottom, left, right, between, box and none; style, width and colour (a new look restyles the sides already on); shading; drop cap (2–5 lines, or 3 in the margin).
+- Tabs…: a stop's place, alignment (left, centre, right, decimal) and leader (dots, dashes, line); set, clear, clear all; the paragraph's stops listed to pick one.
+- Bullets and Numbering…: a gallery of six bullets, six number styles, legal-style multilevel and 01.; restart, continue, the item's number; and for one level its format, start and indent.
+
+The ruler (`atrium-write/src/para.rs`, geometry from `RichTextView::ruler`) shows the caret page's text width in inches with the caret paragraph's first-line, start and end markers and its tab stops. Dragging a marker sets that indent, a click sets a tab, a tab dragged along moves and dragged off the ruler clears; places snap to a sixteenth of an inch. Word's keys: Ctrl+M and Ctrl+Shift+M (indent, a list item's level), Ctrl+T and Ctrl+Shift+T (hanging indent), Ctrl+Q (reset paragraph), Ctrl+1, Ctrl+5, Ctrl+2 (line spacing), Ctrl+0 (space before), Ctrl+Shift+N (Normal), Ctrl+Alt+1/2/3 (headings).
+
+**The sweep.** 2,532 files read with no panics; 2,476 the same through `.docx` (round 1: 2,477, with the sweep now also comparing borders, shading, drop caps, list labels, line numbers and hyphenation, and measuring indents and spacing on the resolved format) and 2,402 through `.odt` (was 2,378). What is left: `.docx` tabs 25, sections 17, margins 8, contents 7, fields 2, spacing 1; `.odt` sections 58, tabs 44, indents 12, list labels 8, margins 5.
+
+**Checks.** Unit and integration tests pass in officina-text (85), officina-convert (including the new `tests/paragraphs.rs` through `.docx`, `.odt` and native), pergola-richtext (43, three new for the paragraph commands, borders, tabs, gallery picks, restart and continue), atrium-write (32, five new in `para.rs` that draw each bar and drive the ruler's drag handler), and the dependents officina-pdf, officina-slides and atrium-slides.
+
+**Not yet:** hyphenation has English patterns only; ODF has no first line number and no between border, so those don't survive `.odt`; frames other than drop caps stay in line until text boxes in round 4; `.doc`'s automatic hyphenation setting isn't read; `.docx` line numbering comes from the first section only; the ruler follows the page's margins, not a column's.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

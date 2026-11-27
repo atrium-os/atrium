@@ -305,8 +305,58 @@ pub struct Pap {
     pub tabs_add: Vec<Tab>,
     pub tabs_del: Vec<i16>,
     pub frame: bool,
-    pub borders: bool,
-    pub shading: bool,
+    /// Border sides as `w:pBdr` children: top, left, bottom, right, between.
+    pub borders: [Option<String>; 5],
+    /// The shading's colour (`w:shd`'s fill), or none set to clear it.
+    pub shading: Option<Option<u32>>,
+    /// A dropped capital: 1 in the text, 2 in the margin; its lines.
+    pub drop_cap: Option<(u8, u8)>,
+    /// A frame's distance from the text beside it (twips).
+    pub from_text: Option<i16>,
+    pub no_line_numbers: Option<bool>,
+    pub no_hyphenation: Option<bool>,
+}
+
+/// A border (`BRC80`, 4 bytes, or `BRC`, 8) as a `w:pBdr` side named `name`;
+/// none when it is no border.
+fn brc_xml(name: &str, arg: &[u8]) -> Option<String> {
+    let (dpt, ty, color, space) = match arg.len() {
+        4.. if arg.len() < 8 => {
+            if arg[..4] == [0xFF; 4] {
+                return None;
+            }
+            (arg[0], arg[1], ico(arg[2]), arg[3] & 0x1F)
+        }
+        8.. => {
+            let auto = arg[3] == 0xFF;
+            (arg[4], arg[5], (!auto).then(|| (arg[0] as u32) << 16 | (arg[1] as u32) << 8 | arg[2] as u32), arg[6] & 0x1F)
+        }
+        _ => return None,
+    };
+    let val = match ty {
+        0 | 255 => return None,
+        2 => "thick",
+        3 => "double",
+        6 => "dotted",
+        7 => "dashed",
+        8 => "dotDash",
+        9 => "dotDotDash",
+        10 => "triple",
+        11..=19 => "thinThickSmallGap",
+        21 => "doubleWave",
+        22 => "dashSmallGap",
+        _ => "single",
+    };
+    let color = color.map_or("auto".to_string(), |c| format!("{c:06X}"));
+    Some(format!(r#"<w:{name} w:val="{val}" w:sz="{}" w:space="{space}" w:color="{color}"/>"#, dpt.max(1)))
+}
+
+/// A COLORREF's colour (none when automatic).
+fn colorref(b: &[u8]) -> Option<u32> {
+    match b {
+        [r, g, bl, a, ..] if *a != 0xFF => Some((*r as u32) << 16 | (*g as u32) << 8 | *bl as u32),
+        _ => None,
+    }
 }
 
 fn tabs(arg: &[u8], add: &mut Vec<Tab>, del: &mut Vec<i16>, close: bool) {
@@ -355,9 +405,34 @@ impl Pap {
                     let arg = if s.arg.first() == Some(&255) { &s.arg[1..] } else { s.arg };
                     tabs(arg, &mut self.tabs_add, &mut self.tabs_del, s.arg.first() == Some(&255));
                 }
-                0x8418 | 0x8419 | 0x261B | 0x2423 | 0x442B | 0x842F | 0x8430 => self.frame = true,
-                0x6424 | 0x6425 | 0x6426 | 0x6427 | 0xC64E | 0xC64F | 0xC650 | 0xC651 => self.borders = true,
-                0x442D | 0xC64D => self.shading = true,
+                0x842F => {
+                    self.from_text = Some(s.i16());
+                    self.frame = true;
+                }
+                0x8418 | 0x8419 | 0x261B | 0x2423 | 0x442B | 0x8430 => self.frame = true,
+                0x6424 | 0xC64E => self.borders[0] = brc_xml("top", s.arg),
+                0x6425 | 0xC64F => self.borders[1] = brc_xml("left", s.arg),
+                0x6426 | 0xC650 => self.borders[2] = brc_xml("bottom", s.arg),
+                0x6427 | 0xC651 => self.borders[3] = brc_xml("right", s.arg),
+                0x6428 | 0xC652 => self.borders[4] = brc_xml("between", s.arg),
+                // SHD80: foreground and background colour indexes, pattern.
+                0x442D => {
+                    let v = s.u16();
+                    let (fore, back, pat) = ((v & 0x1F) as u8, ((v >> 5) & 0x1F) as u8, (v >> 10) as u8);
+                    self.shading = Some(if pat == 1 { ico(fore).or(Some(0)) } else { ico(back) });
+                }
+                // SHD: foreground and background COLORREFs, pattern.
+                0xC64D if s.arg.len() >= 10 => {
+                    let pat = u16::from_le_bytes([s.arg[8], s.arg[9]]);
+                    self.shading = Some(if pat == 1 { colorref(&s.arg[0..4]).or(Some(0)) } else { colorref(&s.arg[4..8]) });
+                }
+                0x442C => {
+                    let v = s.u16();
+                    let (kind, lines) = ((v & 7) as u8, ((v >> 3) & 0x1F) as u8);
+                    self.drop_cap = (kind == 1 || kind == 2).then_some((kind, lines));
+                }
+                0x240C => self.no_line_numbers = Some(s.u8() != 0),
+                0x242A => self.no_hyphenation = Some(s.u8() != 0),
                 _ => {}
             }
         }
@@ -371,6 +446,29 @@ impl Pap {
         }
         if self.keep == Some(true) {
             out.push_str("<w:keepLines/>");
+        }
+        match self.drop_cap {
+            Some((kind, lines)) => out.push_str(&format!(r#"<w:framePr w:dropCap="{}" w:lines="{}" w:hSpace="{}"/>"#, if kind == 2 { "margin" } else { "drop" }, lines.max(1), self.from_text.unwrap_or(0).max(0))),
+            None if self.frame => out.push_str("<w:framePr/>"),
+            None => {}
+        }
+        if let Some(v) = self.no_line_numbers {
+            out.push_str(&format!(r#"<w:suppressLineNumbers w:val="{}"/>"#, v as u8));
+        }
+        if self.borders.iter().any(Option::is_some) {
+            out.push_str("<w:pBdr>");
+            for b in self.borders.iter().flatten() {
+                out.push_str(b);
+            }
+            out.push_str("</w:pBdr>");
+        }
+        match self.shading {
+            Some(Some(c)) => out.push_str(&format!(r#"<w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/>"#)),
+            Some(None) => out.push_str(r#"<w:shd w:val="clear" w:color="auto" w:fill="auto"/>"#),
+            None => {}
+        }
+        if let Some(v) = self.no_hyphenation {
+            out.push_str(&format!(r#"<w:suppressAutoHyphens w:val="{}"/>"#, v as u8));
         }
         if let Some(v) = self.page_break {
             out.push_str(&format!(r#"<w:pageBreakBefore w:val="{}"/>"#, v as u8));
@@ -450,15 +548,6 @@ impl Pap {
         if let Some(o) = self.outline.filter(|&o| o < 9) {
             out.push_str(&format!(r#"<w:outlineLvl w:val="{o}"/>"#));
         }
-        if self.borders {
-            out.push_str("<w:pBdr/>");
-        }
-        if self.shading {
-            out.push_str("<w:shd/>");
-        }
-        if self.frame {
-            out.push_str("<w:framePr/>");
-        }
     }
 }
 
@@ -531,11 +620,16 @@ pub struct Sep {
     pub gap: u16,
     pub rule: bool,
     pub title_page: bool,
+    /// Line numbers: every how many (0: none), distance, restart, first less one.
+    pub lnn_mod: u16,
+    pub lnn_dxa: i16,
+    pub lnc: u8,
+    pub lnn_min: u16,
 }
 
 impl Default for Sep {
     fn default() -> Self {
-        Sep { bkc: 2, width: 12240, height: 15840, left: 1800, right: 1800, top: 1440, bottom: 1440, columns: 1, gap: 720, rule: false, title_page: false }
+        Sep { bkc: 2, width: 12240, height: 15840, left: 1800, right: 1800, top: 1440, bottom: 1440, columns: 1, gap: 720, rule: false, title_page: false, lnn_mod: 0, lnn_dxa: 0, lnc: 0, lnn_min: 0 }
     }
 }
 
@@ -555,6 +649,10 @@ impl Sep {
                 0x900C => p.gap = s.u16(),
                 0x3019 => p.rule = s.u8() != 0,
                 0x300A => p.title_page = s.u8() != 0,
+                0x5015 => p.lnn_mod = s.u16(),
+                0x9016 => p.lnn_dxa = s.i16(),
+                0x3013 => p.lnc = s.u8(),
+                0x501B => p.lnn_min = s.u16(),
                 _ => {}
             }
         }
@@ -571,6 +669,14 @@ impl Sep {
             _ => "nextPage",
         };
         out.push_str(&format!(r#"<w:type w:val="{ty}"/><w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}"/>"#, self.width.max(1440), self.height.max(1440), self.top, self.right, self.bottom, self.left));
+        if self.lnn_mod > 0 {
+            let restart = match self.lnc {
+                1 => "newSection",
+                2 => "continuous",
+                _ => "newPage",
+            };
+            out.push_str(&format!(r#"<w:lnNumType w:countBy="{}" w:start="{}" w:distance="{}" w:restart="{restart}"/>"#, self.lnn_mod, self.lnn_min, self.lnn_dxa.max(0)));
+        }
         if self.columns > 1 {
             out.push_str(&format!(r#"<w:cols w:num="{}" w:space="{}" w:sep="{}"/>"#, self.columns, self.gap, self.rule as u8));
         }
@@ -608,5 +714,19 @@ mod tests {
         let mut x = String::new();
         p.xml(&mut x);
         assert!(x.contains(r#"w:left="720""#) && x.contains(r#"w:hanging="360""#) && x.contains(r#"w:after="240""#) && x.contains(r#"w:line="280" w:lineRule="exact""#) && x.contains("center"), "{x}");
+    }
+
+    #[test]
+    fn border_shading_and_drop_cap_sprms() {
+        let mut p = Pap::default();
+        // A top BRC80 (1 pt double, red, 4 pt away), a bottom BRC (blue
+        // COLORREF, single), SHD80 back colour yellow, a 3-line drop cap,
+        // no line numbers.
+        p.apply(&[0x24, 0x64, 8, 3, 6, 4, 0x50, 0xC6, 8, 0, 0, 0xFF, 0, 4, 1, 2, 0, 0x2D, 0x44, 7 << 5, 0, 0x2C, 0x44, 1 | 3 << 3, 0, 0x0C, 0x24, 1]);
+        let mut x = String::new();
+        p.xml(&mut x);
+        assert!(x.contains(r#"<w:top w:val="double" w:sz="8" w:space="4" w:color="FF0000"/>"#), "{x}");
+        assert!(x.contains(r#"<w:bottom w:val="single" w:sz="4" w:space="2" w:color="0000FF"/>"#), "{x}");
+        assert!(x.contains(r#"w:fill="FFFF00""#) && x.contains(r#"w:dropCap="drop" w:lines="3""#) && x.contains("suppressLineNumbers"), "{x}");
     }
 }

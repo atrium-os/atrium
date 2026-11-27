@@ -31,7 +31,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, MAX_BORDER_WIDTH, MAX_BORDER_SPACE, ListDef, ListLevel, NumFormat, MAX_LEVEL_TEXT, MAX_LIST_START, MAX_LIST_DEFS, LineNumbering, LineRestart, Settings, Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -48,6 +48,10 @@ pub const DELETIONS: u16 = 10;
 pub const CONFLICTS: u16 = 11;
 pub const MARGINS: u16 = 12;
 pub const SHAPE: u16 = 13;
+/// Lists' own definitions.
+pub const LISTS: u16 = 14;
+/// Line numbers and hyphenation.
+pub const SETTINGS: u16 = 15;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -410,13 +414,19 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
         }
     }
     // Bit 15: a second mask follows (tab stops, table of contents entry).
-    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3 | (p.rtl.is_some() as u16) << 4;
+    let more = box_mask(p);
+    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3 | (p.rtl.is_some() as u16) << 4 | ((more != 0) as u16) << 5;
     if ext != 0 {
         m |= 1 << 15;
     }
     w.u16(m);
     if ext != 0 {
         w.u16(ext);
+    }
+    // Bit 5 of the second mask: a third (borders, shading, drop cap, list
+    // start, line numbers, hyphenation) follows.
+    if more != 0 {
+        w.u8(more);
     }
     if let Some(a) = p.align {
         w.u8(a as u8);
@@ -506,6 +516,187 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     if let Some(v) = p.rtl {
         w.u8(v as u8);
     }
+    if let Some(b) = &p.borders {
+        for x in b.sides() {
+            match x {
+                None => w.u8(0),
+                Some(x) => {
+                    w.u8(1);
+                    encode_border(w, &x);
+                }
+            }
+        }
+    }
+    if let Some(v) = p.shading {
+        match v {
+            None => w.u8(0),
+            Some(c) => {
+                w.u8(1);
+                w.var(c as u64 & 0xff_ffff);
+            }
+        }
+    }
+    if let Some(d) = p.drop_cap {
+        match d {
+            None => w.u8(0),
+            Some(d) => {
+                w.u8(1 + d.margin as u8);
+                w.u8(d.lines);
+                w.ivar(d.distance as i64);
+            }
+        }
+    }
+    if let Some(v) = p.list_start {
+        w.var(v as u64);
+    }
+    for v in [p.line_numbers, p.hyphenate].into_iter().flatten() {
+        w.u8(v as u8);
+    }
+}
+
+fn box_mask(p: &ParaProps) -> u8 {
+    p.borders.is_some() as u8 | (p.shading.is_some() as u8) << 1 | (p.drop_cap.is_some() as u8) << 2 | (p.list_start.is_some() as u8) << 3 | (p.line_numbers.is_some() as u8) << 4 | (p.hyphenate.is_some() as u8) << 5
+}
+
+fn encode_border(w: &mut Writer, b: &Border) {
+    w.u8(match b.style {
+        BorderStyle::Single => 0,
+        BorderStyle::Double => 1,
+        BorderStyle::Dotted => 2,
+        BorderStyle::Dashed => 3,
+        BorderStyle::Thick => 4,
+    });
+    w.u8(b.width.min(MAX_BORDER_WIDTH) as u8);
+    w.u8(b.space.min(MAX_BORDER_SPACE) as u8);
+    match b.color {
+        None => w.u8(0),
+        Some(c) => {
+            w.u8(1);
+            w.var(c as u64 & 0xff_ffff);
+        }
+    }
+}
+
+fn decode_border(r: &mut Reader) -> Result<Border, WireError> {
+    let style = match r.u8()? {
+        0 => BorderStyle::Single,
+        1 => BorderStyle::Double,
+        2 => BorderStyle::Dotted,
+        3 => BorderStyle::Dashed,
+        4 => BorderStyle::Thick,
+        _ => return Err(WireError::Invalid("border style")),
+    };
+    let width = r.u8()? as u16;
+    let space = r.u8()? as u16;
+    if !(1..=MAX_BORDER_WIDTH).contains(&width) || space > MAX_BORDER_SPACE {
+        return Err(WireError::Invalid("border"));
+    }
+    let color = decode_color(r)?;
+    Ok(Border { style, width, color, space })
+}
+
+/// `0`, or `1` then an sRGB colour.
+fn decode_color(r: &mut Reader) -> Result<Option<u32>, WireError> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(r.len("colour", 0xff_ffff)? as u32)),
+        _ => Err(WireError::Invalid("colour")),
+    }
+}
+
+/// A list's definition: its levels (each format, label, start, indents).
+pub fn encode_list(w: &mut Writer, d: &ListDef) {
+    w.var(d.levels.len().min(MAX_LIST_LEVEL as usize + 1) as u64);
+    for l in d.levels.iter().take(MAX_LIST_LEVEL as usize + 1) {
+        w.u8(match l.format {
+            NumFormat::Decimal => 0,
+            NumFormat::DecimalZero => 1,
+            NumFormat::LowerLetter => 2,
+            NumFormat::UpperLetter => 3,
+            NumFormat::LowerRoman => 4,
+            NumFormat::UpperRoman => 5,
+            NumFormat::Bullet => 6,
+            NumFormat::None => 7,
+        });
+        let l = l.clone().bounded();
+        w.str(&l.text);
+        w.var(l.start as u64);
+        w.ivar(l.indent as i64);
+        w.ivar(l.hang as i64);
+    }
+}
+
+pub fn decode_list(r: &mut Reader) -> Result<ListDef, WireError> {
+    let n = r.count("list levels", MAX_LIST_LEVEL as u64 + 1, 5)?;
+    let mut levels = Vec::with_capacity(n);
+    for _ in 0..n {
+        let format = match r.u8()? {
+            0 => NumFormat::Decimal,
+            1 => NumFormat::DecimalZero,
+            2 => NumFormat::LowerLetter,
+            3 => NumFormat::UpperLetter,
+            4 => NumFormat::LowerRoman,
+            5 => NumFormat::UpperRoman,
+            6 => NumFormat::Bullet,
+            7 => NumFormat::None,
+            _ => return Err(WireError::Invalid("number format")),
+        };
+        let text: Arc<str> = r.str("list label", MAX_LEVEL_TEXT as u64)?.into();
+        let start = r.len("list start", MAX_LIST_START as u64)? as u32;
+        let (indent, hang) = (r.ivar()?, r.ivar()?);
+        if indent.abs() > MAX_TWIPS || !(0..=MAX_TWIPS).contains(&hang) {
+            return Err(WireError::Invalid("list indent"));
+        }
+        levels.push(ListLevel { format, text, start, indent: indent as i32, hang: hang as i32 });
+    }
+    Ok(ListDef { levels })
+}
+
+/// Line numbers and hyphenation.
+pub fn encode_settings(w: &mut Writer, s: &Settings) {
+    w.u8(s.hyphenate as u8);
+    match &s.line_numbers {
+        None => w.u8(0),
+        Some(l) => {
+            w.u8(1);
+            w.var(l.start as u64);
+            w.var(l.count_by as u64);
+            w.ivar(l.distance as i64);
+            w.u8(match l.restart {
+                LineRestart::Page => 0,
+                LineRestart::Section => 1,
+                LineRestart::Continuous => 2,
+            });
+        }
+    }
+}
+
+pub fn decode_settings(r: &mut Reader) -> Result<Settings, WireError> {
+    let hyphenate = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(WireError::Invalid("hyphenation")),
+    };
+    let line_numbers = match r.u8()? {
+        0 => None,
+        1 => {
+            let start = r.len("line number start", MAX_LIST_START as u64)? as u32;
+            let count_by = r.len("line number step", 100)? as u16;
+            let distance = r.ivar()?;
+            if count_by == 0 || !(0..=MAX_TWIPS).contains(&distance) {
+                return Err(WireError::Invalid("line numbers"));
+            }
+            let restart = match r.u8()? {
+                0 => LineRestart::Page,
+                1 => LineRestart::Section,
+                2 => LineRestart::Continuous,
+                _ => return Err(WireError::Invalid("line number restart")),
+            };
+            Some(LineNumbering { start, count_by, distance: distance as i32, restart })
+        }
+        _ => return Err(WireError::Invalid("line numbers")),
+    };
+    Ok(Settings { line_numbers, hyphenate })
 }
 
 /// Twips a length may be (±22 inches).
@@ -514,7 +705,11 @@ const MAX_TWIPS: i64 = 31_680;
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 5 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
+    if ext >> 6 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
+        return Err(WireError::Invalid("paragraph mask"));
+    }
+    let more = if ext & 32 != 0 { r.u8()? } else { 0 };
+    if more >> 6 != 0 || (ext & 32 != 0 && more == 0) {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -650,6 +845,49 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
             1 => true,
             _ => return Err(WireError::Invalid("direction")),
         });
+    }
+    let flag = |r: &mut Reader| -> Result<bool, WireError> {
+        match r.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WireError::Invalid("flag")),
+        }
+    };
+    if more & 1 != 0 {
+        let mut sides = [None; 5];
+        for x in sides.iter_mut() {
+            if flag(r)? {
+                *x = Some(decode_border(r)?);
+            }
+        }
+        let [top, bottom, start, end, between] = sides;
+        p.borders = Some(ParaBorders { top, bottom, start, end, between });
+    }
+    if more & 2 != 0 {
+        p.shading = Some(decode_color(r)?);
+    }
+    if more & 4 != 0 {
+        p.drop_cap = Some(match r.u8()? {
+            0 => None,
+            k @ (1 | 2) => {
+                let lines = r.u8()?;
+                let distance = r.ivar()?;
+                if !DROP_CAP_LINES.contains(&lines) || !(0..=MAX_TWIPS).contains(&distance) {
+                    return Err(WireError::Invalid("drop cap"));
+                }
+                Some(DropCap { lines, distance: distance as i32, margin: k == 2 })
+            }
+            _ => return Err(WireError::Invalid("drop cap")),
+        });
+    }
+    if more & 8 != 0 {
+        p.list_start = Some(r.len("list start", MAX_LIST_START as u64)? as u32);
+    }
+    if more & 16 != 0 {
+        p.line_numbers = Some(flag(r)?);
+    }
+    if more & 32 != 0 {
+        p.hyphenate = Some(flag(r)?);
     }
     Ok(p)
 }
@@ -1186,6 +1424,21 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             w.u8(13);
             w.u8(*on as u8);
         }
+        TextOp::SetList { id, def } => {
+            w.u8(19);
+            w.var(*id as u64);
+            match def {
+                None => w.u8(0),
+                Some(d) => {
+                    w.u8(1);
+                    encode_list(&mut w, d);
+                }
+            }
+        }
+        TextOp::SetSettings { settings } => {
+            w.u8(20);
+            encode_settings(&mut w, settings);
+        }
         TextOp::SetConflict { id, alt } => {
             w.u8(14);
             w.var(*id as u64);
@@ -1469,6 +1722,16 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
                 _ => return Err(WireError::Invalid("tracking flag")),
             },
         },
+        19 => {
+            let id = r.len("list", u32::MAX as u64)? as u32;
+            let def = match r.u8()? {
+                0 => None,
+                1 => Some(decode_list(&mut r)?),
+                _ => return Err(WireError::Invalid("list")),
+            };
+            TextOp::SetList { id, def }
+        }
+        20 => TextOp::SetSettings { settings: decode_settings(&mut r)? },
         _ => return Err(WireError::Invalid("op")),
     };
     if !r.is_empty() {
@@ -1626,6 +1889,21 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         c.add(MARGINS, &w.into_bytes())?;
     }
 
+    if !doc.styles.lists.is_empty() {
+        let mut w = Writer::new();
+        w.var(doc.styles.lists.len().min(MAX_LIST_DEFS) as u64);
+        for (id, d) in doc.styles.lists.iter().take(MAX_LIST_DEFS) {
+            w.var(*id as u64);
+            encode_list(&mut w, d);
+        }
+        c.add(LISTS, &w.into_bytes())?;
+    }
+    if doc.settings != Settings::default() {
+        let mut w = Writer::new();
+        encode_settings(&mut w, &doc.settings);
+        c.add(SETTINGS, &w.into_bytes())?;
+    }
+
     if !checkpoints.is_empty() {
         let mut w = Writer::new();
         w.var(checkpoints.len() as u64);
@@ -1714,6 +1992,27 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
         styles.push(decode_style(&mut r, n)?);
     }
     doc.styles = StyleSheet { styles, ..StyleSheet::default() };
+    if c.entries().iter().any(|e| e.kind == LISTS) {
+        let mut r = Reader::new(one(LISTS, "LISTS chunk")?);
+        let n = r.count("lists", MAX_LIST_DEFS as u64, 2)?;
+        for _ in 0..n {
+            let id = r.len("list", u32::MAX as u64)? as u32;
+            let d = decode_list(&mut r)?;
+            if doc.styles.lists.insert(id, d).is_some() {
+                return Err(LoadError::Bad("list defined twice"));
+            }
+        }
+        if !r.is_empty() {
+            return Err(LoadError::Bad("LISTS chunk"));
+        }
+    }
+    if c.entries().iter().any(|e| e.kind == SETTINGS) {
+        let mut r = Reader::new(one(SETTINGS, "SETTINGS chunk")?);
+        doc.settings = decode_settings(&mut r)?;
+        if !r.is_empty() {
+            return Err(LoadError::Bad("SETTINGS chunk"));
+        }
+    }
 
     let mut images: Vec<(u64, ImageData)> = Vec::new();
     for (i, e) in c.entries().iter().enumerate() {
@@ -2004,6 +2303,44 @@ mod tests {
         assert_eq!(a.note_numbers(), b.note_numbers());
         assert_eq!(a.comments.iter().collect::<Vec<_>>(), b.comments.iter().collect::<Vec<_>>());
         assert_eq!(a.comment_ranges(), b.comment_ranges());
+    }
+
+    #[test]
+    fn boxes_drop_caps_lists_and_settings_round_trip() {
+        use crate::model::{Border, BorderStyle, DropCap, LineNumbering, LineRestart, ListDef, ListLevel, NumFormat, ParaBorders, Settings};
+        let mut d = TextDoc::new();
+        let b = Border { style: BorderStyle::Double, width: 12, color: Some(0x123456), space: 3 };
+        d.blocks.update(0, |x| {
+            let p = &mut x.as_para_mut().unwrap().props;
+            p.borders = Some(ParaBorders { top: Some(b), start: Some(Border::default()), ..Default::default() });
+            p.shading = Some(Some(0xffee00));
+            p.drop_cap = Some(Some(DropCap { lines: 3, distance: 144, margin: true }));
+            p.list_start = Some(5);
+            p.line_numbers = Some(false);
+            p.hyphenate = Some(false);
+        });
+        let a = d.push_para("off", 0, vec![]);
+        d.blocks.update(a, |x| {
+            let p = &mut x.as_para_mut().unwrap().props;
+            p.shading = Some(None);
+            p.drop_cap = Some(None);
+        });
+        let mut def = ListDef::builtin(crate::model::ListKind::Numbered);
+        def.levels[2] = ListLevel { format: NumFormat::UpperLetter, text: "(%3)".into(), start: 4, indent: 2000, hang: 300 };
+        d.styles.lists.insert(9, def.clone());
+        d.settings = Settings { hyphenate: true, line_numbers: Some(LineNumbering { start: 2, count_by: 5, distance: 300, restart: LineRestart::Continuous }) };
+        let r = load(&save_to_vec(&d, &[])).unwrap().doc;
+        assert_eq!(r.para(0).unwrap().props, d.para(0).unwrap().props);
+        assert_eq!(r.para(a).unwrap().props, d.para(a).unwrap().props);
+        assert_eq!(r.styles.lists.get(&9), Some(&def));
+        assert_eq!(r.settings, d.settings);
+        // The ops round-trip too, and a bad border is refused.
+        for op in [TextOp::SetList { id: 9, def: Some(def.clone()) }, TextOp::SetList { id: 2, def: None }, TextOp::SetSettings { settings: d.settings }] {
+            assert_eq!(decode_op(&encode_op(&op), 1, 1).unwrap(), op);
+        }
+        let mut w = Writer::new();
+        encode_border(&mut w, &Border { width: 0, ..b });
+        assert!(decode_border(&mut Reader::new(&w.into_bytes())).is_err());
     }
 
     #[test]

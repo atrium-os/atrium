@@ -87,6 +87,12 @@ struct Counts {
     styled: usize,
     indented: usize,
     spaced: usize,
+    boxed: usize,
+    shaded: usize,
+    dropped: usize,
+    labels: usize,
+    line_numbers: usize,
+    hyphenation: usize,
 }
 
 impl Counts {
@@ -101,12 +107,17 @@ impl Counts {
             let pr = &p.props;
             c.cells += k * pr.cell.is_some() as usize;
             c.sections += pr.section.is_some() as usize;
-            c.list_items += k * matches!(pr.list, Some(Some(_))) as usize;
+            // Lists, indents and spacing as shown (a style's or the paragraph's own).
+            let (f, _) = d.styles.para_format(p.style, pr);
+            c.list_items += k * f.list.is_some() as usize;
             c.toc += k * pr.toc.is_some() as usize;
             c.tabs += k * pr.tabs.as_ref().is_some_and(|t| !t.is_empty()) as usize;
             c.styled += p.text.split('\u{000C}').filter(|t| p.style != 0 && !t.trim().is_empty()).count();
-            c.indented += k * (pr.indent_start.unwrap_or(0) != 0 || pr.first_line.unwrap_or(0) != 0) as usize;
-            c.spaced += k * (pr.space_before.unwrap_or(0) != 0 || pr.space_after.unwrap_or(0) != 0 || pr.line_spacing.is_some()) as usize;
+            // Over paragraphs with text (a writer may add empty ones, as
+            // Word's after a table).
+            let k_text = p.text.split('\u{000C}').filter(|t| !t.trim().is_empty()).count();
+            c.indented += k_text * (f.indent_start != 0 || f.first_line != 0) as usize;
+            c.spaced += k_text * (f.space_before != 0 || f.space_after != 0 || f.line_spacing != officina_text::model::ParaFormat::default().line_spacing) as usize;
             // A page break inside a paragraph, or before one (ODF has only that).
             c.page_breaks += p.text.matches('\u{000C}').count() + (b > 0 && pr.page_break_before == Some(true)) as usize;
             for (s, e, a) in p.spans() {
@@ -142,6 +153,24 @@ impl Counts {
                 }
             }
         }
+        {
+            let numbering = officina_text::lists::Numbering::build(d);
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for b in 0..d.blocks.len() {
+                let Some(p) = d.para(b) else { continue };
+                let (f, _) = d.styles.para_format(p.style, &p.props);
+                let k = p.text.split('\u{000C}').count();
+                c.boxed += k * !f.borders.is_empty() as usize;
+                c.shaded += k * f.shading.is_some() as usize;
+                c.dropped += f.drop_cap.is_some() as usize;
+                if let Some(l) = numbering.label(b) {
+                    std::hash::Hash::hash(&l, &mut h);
+                }
+            }
+            c.labels = (std::hash::Hasher::finish(&h) % 1_000_000) as usize;
+            c.line_numbers = d.settings.line_numbers.is_some() as usize;
+            c.hyphenation = d.settings.hyphenate as usize;
+        }
         c.notes = d.note_numbers().len();
         c.comments = d.live_comments().len();
         c.edits = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.edits().len())).unwrap_or(0);
@@ -173,6 +202,12 @@ impl Counts {
             ("coloured", self.coloured),
             ("font", self.font),
             ("highlight", self.highlight),
+            ("boxed", self.boxed),
+            ("shaded", self.shaded),
+            ("dropped", self.dropped),
+            ("labels", self.labels),
+            ("line_numbers", self.line_numbers),
+            ("hyphenation", self.hyphenation),
             ("caps", self.caps),
             ("hidden", self.hidden),
             ("dstrike", self.dstrike),

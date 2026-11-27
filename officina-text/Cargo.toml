@@ -17,6 +17,9 @@ rustybuzz = "0.20"
 ttf-parser = "0.25"
 unicode-linebreak = "0.1.5"
 unicode-bidi = "0.3.18"
+# Automatic hyphenation: Knuth-Liang with the en-US TeX patterns built in
+# (the same crate and patterns as pergola's wrapped text).
+hyphenation = { version = "0.8", features = ["embed_en-us"] }
 
 [profile.release]
 debug = 1

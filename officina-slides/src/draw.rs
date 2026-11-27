@@ -347,7 +347,7 @@ pub fn styled_doc(theme: &Theme, levels: &ListStyle, bullets: &[Bullet], body: &
     }
     let mut def = CharFormat { family: theme.minor.clone(), size: scale_size(36), color: theme.colors[0], ..CharFormat::default() };
     def.family = theme.minor.clone();
-    d.styles = StyleSheet { styles, default_char: def };
+    d.styles = StyleSheet { styles, default_char: def, lists: Default::default() };
     // Runs: theme fonts named, sizes scaled.
     let mut table = officina_text::model::AttrTable::default();
     let n = d.blocks.len();
