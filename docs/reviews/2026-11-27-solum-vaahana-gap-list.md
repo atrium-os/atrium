@@ -60,5 +60,5 @@ Vaahana's order of work: (1) nested VMX checks, COM2, a control socket and memor
   emulator.
 - **An AMD box, or a newer Intel one?** A newer Intel machine with APICv, VT-d posted
   interrupts and ideally IPIv (Sapphire Rapids or later) is worth it, because the
-  near-native interrupt gates can only be shown on such hardware, and both the R9700 box
-  and the Hostkey box lack it. An AMD box (AVIC, AMD-Vi) can wait until the AMD-V port.
+  near-native interrupt gates can only be shown on such hardware, and the Hostkey box lacks it
+  (the R9700 box's Coffee Lake Xeon very likely does too; to be confirmed). An AMD box (AVIC, AMD-Vi) can wait until the AMD-V port.

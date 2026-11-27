@@ -199,8 +199,8 @@ interrupt-heavy I/O is near native:
   interrupt remapping posts each device interrupt to its owning vCPU's descriptor. Main's
   device interrupts arrive with no exit. External-interrupt exiting is on, but only Solum's
   own vectors and posted-interrupt notifications for vCPUs that aren't running reach it.
-- **amd64 without posted interrupts** (for example Coffee Lake parts such as the R9700
-  box's Xeon E-2288G and the i9-9900K): with external-interrupt exiting off, every
+- **amd64 without posted interrupts** (for example the i9-9900K, and very likely the R9700
+  box's Xeon E-2288G, also Coffee Lake: to be confirmed from its VMX capability MSRs): with external-interrupt exiting off, every
   physical interrupt on a CPU running main would go straight to main's IDT, including the
   ones that belong to a driver domain, so it has to be on. **Every device interrupt then
   exits** and Solum re-injects it into its owner. That costs roughly an exit and an entry
