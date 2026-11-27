@@ -635,6 +635,36 @@ one that never gets a group (`/home/a5plain`). What differs from the plan above:
   error", Mail's for "coredumpsize limit is 0".
 - Logout and a second device grep are not in it.
 
+<a id="a5-rust-module"></a>
+
+**Rust decoder module for A5 (host build, 2026-11-27).** The last recorded guest run
+passed 46/46 on Atrium `e1840947b` with the C module (SHA-256
+`8c41a61a3303fdd1f90057c1c3d6898716badc96d9af9efcc7a7da68eb05b82b`).
+Its A1 check matched the staged module to the boot module. The plain controls found
+the marker on both raw devices and 16,384 times on the plain swap backing disk.
+See `~/atrium-vm/evidence/tessera/latch-no-clear-2026-11-25/a5-run1/gate.log`.
+
+The Mac built the default, non-LTO Rust decoder module from Atrium `e29285651`
+(same Tessera sources as that C run) for the arm64 **ATRIUM** development kernel
+`9f2eed03a36c`, ELF build ID `8004f97d78996b08c6b98cfb0d0d6fce61bbbd94`.
+The host buildenv supplied the cross tools. A private copy of that kernel revision’s
+`sys` supplied the headers, with the patched Rust KPI at `7f9efe4` and
+`nightly-2025-07-23`. Running FreeBSD config for ATRIUM and generating the selected
+interface headers supplied bindgen’s prerequisites. The generated configuration
+matched the archive kernel’s embedded configuration byte for byte.
+
+Module SHA-256 is `31c28979e83b23e4a314f02c2377a0c2d13cee84138dda4e89037f17cd269998`.
+The linked module defines all 43 decoder functions declared in `tessera_rs.h` and
+`tessera_vop_mknod`. The kernel exports all 317 symbols the module imports.
+All 20 host decoder unit tests passed. The module, build recipe, logs and symbol lists
+are in `~/atrium-vm/evidence/mail/a5-rust-host-2026-11-27/`.
+
+**Pending guest acceptance.** Once Shankar assigns a disposable Mac VM slot, install
+this module on the private boot overlay before booting the test root. Put the same
+module in the A5 stage and run `scripts/mail-at-rest-vm-check.sh run STAGE EVIDENCE`
+with the owned `a5-zram-backing` disk. Record the boot kernel, A1 module match and
+all 46 results.
+
 **Not proposed:** evicting the whole store at screen lock (a while-unlocked class). That
 would stop background sync, which writes new mail while the screen is locked. If it is
 wanted later, the right shape is a Tessera "complete unless open" class: writes allowed
