@@ -315,6 +315,13 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
     let (mx, my) = (twips(g.margin_start as i64), twips(g.margin_top as i64));
     let (pw, ph) = (twips(g.width as i64), twips(g.height as i64));
 
+    // Cells' backgrounds, under everything on the page.
+    for c in &page.cells {
+        if let Some(color) = c.paint.shading {
+            out.push(Item::Rect { x: mx + c.x, y: my + c.y, w: c.w, h: c.h, color });
+        }
+    }
+
     // Header and footer, in the margins.
     let (head, foot) = doc.margins_of(i);
     for (hf, top) in [(head, true), (foot, false)] {
@@ -343,19 +350,34 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         text_line(&mut out, fonts, &text, &fmt, hf.align, mx, width, baseline);
     }
 
-    // Table rules: each cell draws its top and left rule; the right and
-    // bottom ones only where no cell continues, so shared edges come once.
+    // Table rules: each cell draws its top and start rule (or, without
+    // one, its neighbour's bottom or end rule there); the end and bottom
+    // ones only where no cell continues, so shared edges come once. A
+    // cell merged up has no rule over it.
+    let thick = |b: &Border| twips(b.thickness() as i64).max(RULE);
     for c in &page.cells {
         let (x, y, w, h) = (mx + c.x, my + c.y, c.w, c.h);
-        let right = !page.cells.iter().any(|d| d.y == c.y && d.x == c.x + c.w);
-        let below = !page.cells.iter().any(|d| d.y == c.y + c.h && d.x < c.x + c.w && d.x + d.w > c.x);
-        out.push(Item::Rect { x, y, w, h: RULE, color: RULE_COLOR });
-        out.push(Item::Rect { x, y, w: RULE, h, color: RULE_COLOR });
-        if right {
-            out.push(Item::Rect { x: x + w, y, w: RULE, h: h + RULE, color: RULE_COLOR });
+        let near = page.cells.iter().filter(|d| d.inner == c.inner);
+        let right = near.clone().find(|d| d.y == c.y && d.x == c.x + c.w);
+        let left = near.clone().find(|d| d.y == c.y && d.x + d.w == c.x);
+        let above = near.clone().find(|d| d.y + d.h == c.y && d.x < c.x + c.w && d.x + d.w > c.x);
+        let below = near.clone().find(|d| d.y == c.y + c.h && d.x < c.x + c.w && d.x + d.w > c.x);
+        let top = if c.merged_up { None } else { c.paint.top.or(above.and_then(|d| d.paint.bottom)) };
+        if let Some(b) = top {
+            rule(&mut out, &b, x, y, w, thick(&b), true);
         }
-        if below {
-            out.push(Item::Rect { x, y: y + h, w: w + RULE, h: RULE, color: RULE_COLOR });
+        if let Some(b) = c.paint.start.or(left.and_then(|d| d.paint.end)) {
+            rule(&mut out, &b, x, y, h, thick(&b), false);
+        }
+        if right.is_none() {
+            if let Some(b) = c.paint.end {
+                rule(&mut out, &b, x + w, y, h + RULE, thick(&b), false);
+            }
+        }
+        if below.is_none() {
+            if let Some(b) = c.paint.bottom {
+                rule(&mut out, &b, x, y + h, w + RULE, thick(&b), true);
+            }
         }
     }
 
@@ -875,6 +897,40 @@ mod tests {
     }
 
     /// Two paragraphs with the same borders and shading are one box: one
+    /// A table style shades its header row and banded rows; a cell's own
+    /// shading and borders win; a cell merged up has no rule over it.
+    #[test]
+    fn table_styles_shading_and_merged_cells_paint() {
+        use crate::model::{Border, CellRef, TableLook, TableStyle, RegionLook, TableBorders, LOOK_HEADER, LOOK_BANDED_ROWS};
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        for r in 0..4u32 {
+            for c in 0..2u16 {
+                let k = d.push_para(&format!("r{r}c{c}"), 0, vec![]);
+                d.blocks.update(k, |x| x.as_para_mut().unwrap().props.cell = Some(CellRef { table: 1, row: r, col: c, width: 2000, ..Default::default() }));
+            }
+        }
+        let red = Border { color: Some(0xff0000), ..Default::default() };
+        d.styles.tables.insert("Grid".into(), TableStyle { borders: TableBorders { inside_h: Some(red), ..Default::default() }, header: RegionLook { shading: Some(0x112233), ..Default::default() }, band_row: Some(0x445566), ..Default::default() });
+        d.tables.insert(1, TableLook { style: Some("Grid".into()), look: LOOK_HEADER | LOOK_BANDED_ROWS, ..Default::default() });
+        // Row 3's second cell continues row 2's; row 3's first has its own shading.
+        d.blocks.update(7, |x| x.as_para_mut().unwrap().props.cell.as_mut().unwrap().merged_up = true);
+        d.blocks.update(6, |x| x.as_para_mut().unwrap().props.cell.as_mut().unwrap().look.shading = Some(Some(0x00ff00)));
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "1");
+        let rects = |c: u32| items.iter().filter_map(|i| if let Item::Rect { x, y, w, h, color } = i { (*color == c).then_some((*x, *y, *w, *h)) } else { None }).collect::<Vec<_>>();
+        assert_eq!(rects(0x112233).len(), 2, "the header row's two cells");
+        assert_eq!(rects(0x445566).len(), 3, "row 1 is the first data row and is banded: rows 1 and 3, less the cell shaded green");
+        assert_eq!(rects(0x00ff00).len(), 1);
+        let rules = rects(0xff0000);
+        // Rules between rows: 3 boundaries × 2 cells, less the merged one.
+        assert_eq!(rules.len(), 5, "{rules:?}");
+        assert!(rects(0).is_empty(), "the style has no outside borders");
+    }
+
     /// top and one bottom border, the shading over the gap between; a
     /// dropped capital is drawn large; line numbers stand in the margin.
     #[test]
@@ -1067,7 +1123,7 @@ mod tests {
     #[test]
     fn a_headers_table_rows_become_lines() {
         use crate::model::{rows_as_lines, CellRef, Para};
-        let cell = |row, col| Some(CellRef { table: 1, row, col, width: 1000 });
+        let cell = |row, col| Some(CellRef { table: 1, row, col, width: 1000, ..Default::default() });
         let mk = |t: &str, c| Para { props: crate::model::ParaProps { cell: c, ..Default::default() }, ..Para::new(0, t, 0) };
         let v = rows_as_lines(vec![mk("Title", None), mk("A", cell(0, 0)), mk("B", cell(0, 1)), mk("b2", cell(0, 1)), mk("C", cell(1, 0)), mk("", cell(1, 1)), mk("D", cell(1, 2))]);
         assert_eq!(v.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["Title", "A\tB b2", "C\tD"]);

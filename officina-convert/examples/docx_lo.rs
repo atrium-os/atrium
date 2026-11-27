@@ -74,7 +74,7 @@ pub fn sample() -> TextDoc {
     for r in 0..2u32 {
         for c in 0..3u16 {
             let k = d.push_para(&format!("r{r}c{c}"), 0, vec![]);
-            d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r, col: c, width: 2000 + c as u32 * 500 }), space_after: Some(0), ..Default::default() });
+            d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r, col: c, width: 2000 + c as u32 * 500, ..Default::default() }), space_after: Some(0), ..Default::default() });
         }
     }
     let img = d.images.add(ImageData { bytes: Arc::from(png(40, 20)), width: 40, height: 20 });

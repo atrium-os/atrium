@@ -94,6 +94,12 @@ pub struct CellBox {
     pub y: i64,
     pub w: i64,
     pub h: i64,
+    /// Its rules and background.
+    pub paint: crate::model::CellPaint,
+    /// It continues the cell above (no rule between them).
+    pub merged_up: bool,
+    /// It is a cell of a table inside a cell.
+    pub inner: bool,
 }
 
 /// Lines `lines` of paragraph `para` of note `note`, the first line's top `y`
@@ -529,38 +535,97 @@ impl Paginator {
     /// the cell boxes, the row's height and the block after it.
     #[allow(clippy::too_many_arguments)]
     fn row(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, b: usize, y: i64, x0: i64, col_w: i64) -> (Vec<Slice>, Vec<CellBox>, i64, usize, Vec<PlacedFloat>) {
-        let row = doc.row_range(b);
-        let row = b..row.end.max(b + 1);
-        let pad = twips(crate::model::CELL_PAD as i64);
+        let mut floats = Fill::default();
+        let (slices, boxes, row_h, end) = self.row_in(doc, cache, fonts, &mut floats, b, usize::MAX, y, x0, col_w, false);
+        (slices, boxes, row_h, end, floats.floats)
+    }
+
+    /// Lays out one row of the table at a depth (`inner`: the table inside a
+    /// cell), its blocks ending at `limit` at most.
+    #[allow(clippy::too_many_arguments)]
+    fn row_in(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, floats: &mut Fill, b: usize, limit: usize, y: i64, x0: i64, col_w: i64, inner: bool) -> (Vec<Slice>, Vec<CellBox>, i64, usize) {
+        let row = doc.row_range_at(b, inner);
+        let row = b..row.end.max(b + 1).min(limit.max(b + 1));
         let mut slices = Vec::new();
         let mut boxes = Vec::new();
-        let mut floats = Fill::default();
         let mut row_h = 0;
-        for (blocks, x, w) in doc.row_cells(row.clone(), col_w) {
+        let cells = doc.row_cells_at(row.clone(), col_w, inner);
+        let paints = doc.row_paints_at(row.clone(), cells.len(), inner);
+        // Each cell's slices and the height its text takes.
+        let mut spans = Vec::new();
+        let mut nested = Vec::new();
+        for (j, (blocks, x, w)) in cells.into_iter().enumerate() {
             let x = x + x0;
-            let mut yy = y + pad;
+            let pad = doc.cell_pad_at(blocks.start, inner);
+            let (pt, pb, ps, pe) = (twips(pad.top as i64), twips(pad.bottom as i64), twips(pad.start as i64), twips(pad.end as i64));
+            let text_w = (w - ps - pe).max(crate::LU);
+            let mut yy = y + pt;
             let last = blocks.end - 1;
-            for k in blocks {
+            let first_slice = slices.len();
+            let merged_up = doc.cell_at(blocks.start, inner).is_some_and(|c| c.merged_up);
+            let mut k = blocks.start;
+            while k < blocks.end {
+                if !inner && doc.inner_cell(k).is_some() {
+                    // A table inside this cell: its rows, one under another.
+                    let (s, c, h, next) = self.row_in(doc, cache, fonts, floats, k, blocks.end, yy, x + ps, text_w, true);
+                    slices.extend(s);
+                    nested.extend(c);
+                    yy += h;
+                    k = next.max(k + 1);
+                    continue;
+                }
                 let l = self.layout(doc, cache, fonts, k);
                 // Floats in a cell are placed from it, but its text doesn't go round them.
-                self.anchor_floats(doc, &mut floats, k, x + pad, (w - 2 * pad).max(crate::LU), yy);
-                slices.push(Slice { block: k, lines: 0..l.lines.len(), y: yy, x: x + pad, w: (w - 2 * pad).max(crate::LU), wrap: None });
+                self.anchor_floats(doc, floats, k, x + ps, text_w, yy);
+                slices.push(Slice { block: k, lines: 0..l.lines.len(), y: yy, x: x + ps, w: text_w, wrap: None });
                 yy += l.height + if k < last { l.space_after } else { 0 };
+                k += 1;
             }
-            row_h = row_h.max(yy + pad - y);
-            boxes.push(CellBox { x, y, w, h: 0 });
+            row_h = row_h.max(yy + pb - y);
+            spans.push((first_slice..slices.len(), yy + pb - y));
+            boxes.push(CellBox { x, y, w, h: 0, paint: paints.get(j).copied().unwrap_or_default(), merged_up, inner });
+        }
+        // The row's own height: at least, or exactly (the text then clipped
+        // by paint's page, not here).
+        if let Some(c) = doc.cell_at(b, inner) {
+            let want = twips(c.row_look.height as i64);
+            if c.row_look.exact && want > 0 {
+                row_h = want;
+            } else {
+                row_h = row_h.max(want);
+            }
+        }
+        // Text centred or at the bottom of its cell.
+        for (bx, (range, h)) in boxes.iter().zip(spans) {
+            let shift = match bx.paint.valign {
+                crate::model::VAlign::Top => 0,
+                crate::model::VAlign::Center => (row_h - h).max(0) / 2,
+                crate::model::VAlign::Bottom => (row_h - h).max(0),
+            };
+            if shift > 0 {
+                for sl in &mut slices[range.clone()] {
+                    sl.y += shift;
+                }
+                for nb in nested.iter_mut().filter(|n: &&mut CellBox| n.x >= bx.x && n.x < bx.x + bx.w) {
+                    nb.y += shift;
+                }
+            }
         }
         // A cell grows to hold the pictures its text wraps round (Word lays
         // them out in the cell); ones in front of or behind the text don't.
-        for p in &floats.floats {
-            if p.object.float.is_some_and(|fl| !matches!(fl.wrap, Wrap::InFront | Wrap::Behind)) && p.y >= y {
-                row_h = row_h.max(p.y + p.h + pad - y);
+        if !inner {
+            for p in &floats.floats {
+                if p.object.float.is_some_and(|fl| !matches!(fl.wrap, Wrap::InFront | Wrap::Behind)) && p.y >= y {
+                    row_h = row_h.max(p.y + p.h + twips(crate::model::CELL_PAD as i64) - y);
+                }
             }
         }
         for c in &mut boxes {
             c.h = row_h;
         }
-        (slices, boxes, row_h, row.end, floats.floats)
+        // The inner tables' cells paint after (over) their outer cell.
+        boxes.extend(nested);
+        (slices, boxes, row_h, row.end)
     }
 
     /// Height that must fit for block `b` to start here, when it keeps with the
@@ -907,6 +972,23 @@ impl Paginator {
                 return (Stop::Section(b), y);
             }
             if doc.cell(b).is_some() {
+                // A table carried on from the page before starts with its
+                // header rows again.
+                if empty {
+                    if let Some(hr) = doc.header_rows(b) {
+                        let mut k = hr.start;
+                        while k < hr.end {
+                            let (s, c, h_row, next, _) = self.row(doc, cache, fonts, k, y, x, w);
+                            if y + h_row > h || next <= k {
+                                break;
+                            }
+                            f.slices.extend(s);
+                            f.cells.extend(c);
+                            y += h_row;
+                            k = next;
+                        }
+                    }
+                }
                 // A table row: whole, in this column if it fits (with its notes).
                 let (s, c, h_row, next, fl) = self.row(doc, cache, fonts, b, y, x, w);
                 let new_notes: Vec<NoteId> = if has_notes { (b..next).flat_map(|k| self.footnotes_in(doc, k, None)).filter(|id| !f.foot.contains(id)).collect() } else { Vec::new() };
@@ -1217,7 +1299,7 @@ mod tests {
                 let id = d.new_id();
                 let mut p = Para::new(id, &format!("r{r}c{c}"), 0);
                 p.props.space_after = Some(0);
-                p.props.cell = Some(crate::model::CellRef { table: 1, row: r as u32, col: c as u16, width: w });
+                p.props.cell = Some(crate::model::CellRef { table: 1, row: r as u32, col: c as u16, width: w, ..Default::default() });
                 d.blocks.insert(at + r * cols + c, Block::Para(p));
             }
         }
@@ -1245,6 +1327,76 @@ mod tests {
             }
         }
         assert!(p.pages().len() >= 2, "4 rows and 2 lines don't fit 5 lines");
+    }
+
+    /// Header rows come again at the top of each page the table runs
+    /// onto; a row's own height and its cells' vertical alignment place
+    /// the text.
+    #[test]
+    fn header_rows_repeat_and_rows_take_their_height() {
+        let mut d = with_table(&[1], 5, 1, 12, 2);
+        for k in 1..3 {
+            d.blocks.update(k, |b| b.as_para_mut().unwrap().props.cell.as_mut().unwrap().row_look.header = true);
+        }
+        let (p, _) = all(&d);
+        assert!(p.pages().len() >= 3, "{} pages", p.pages().len());
+        for (i, pg) in p.pages().iter().enumerate().skip(1) {
+            if pg.slices.iter().any(|s| d.cell(s.block).is_some()) {
+                let first = pg.slices.iter().map(|s| s.block).min().unwrap();
+                assert!(pg.slices.iter().filter(|s| s.block == 1 || s.block == 2).count() == 2, "page {i} starts with the header row");
+                assert!(first == 1, "page {i}");
+            }
+        }
+        // A row at least an inch high, its text centred down it.
+        let mut d = with_table(&[1], 40, 1, 2, 2);
+        for k in 1..3 {
+            d.blocks.update(k, |b| {
+                let c = b.as_para_mut().unwrap().props.cell.as_mut().unwrap();
+                c.row_look.height = 1440;
+                c.look.valign = crate::model::VAlign::Center;
+            });
+        }
+        let (p, _) = all(&d);
+        let pg = &p.pages()[0];
+        let c0 = pg.cells[0];
+        assert_eq!(c0.h, crate::twips(1440));
+        let s = pg.slices.iter().find(|s| s.block == 1).unwrap();
+        assert!(s.y > c0.y + c0.h / 4, "centred: {} in {}..{}", s.y, c0.y, c0.y + c0.h);
+    }
+
+    /// A table inside a cell: its rows stack inside the outer cell, side
+    /// by side across it, and the outer row grows to hold them.
+    #[test]
+    fn a_table_inside_a_cell_lays_out_inside_it() {
+        // One outer row of two cells; the first holds a 2x2 table.
+        let mut d = with_table(&[1], 5, 1, 1, 2);
+        let outer = d.cell(1).unwrap();
+        for r in 0..2u32 {
+            for c in 0..2u16 {
+                let id = d.new_id();
+                let mut p = Para::new(id, &format!("in{r}{c}"), 0);
+                p.props.space_after = Some(0);
+                p.props.cell = Some(outer);
+                p.props.inner = Some(crate::model::CellRef { table: 2, row: r, col: c, width: outer.width / 3, ..Default::default() });
+                d.blocks.insert(2 + (r as usize) * 2 + c as usize, Block::Para(p));
+            }
+        }
+        // Blocks: 0 text, 1 outer cell text, 2..6 inner cells, 6 outer cell 2.
+        let (p, _) = all(&d);
+        let pg = p.pages().iter().find(|pg| pg.slices.iter().any(|s| s.block == 1)).unwrap();
+        let at = |b: usize| pg.slices.iter().find(|s| s.block == b).cloned().unwrap();
+        let (a, i00, i01, i10, o2) = (at(1), at(2), at(3), at(4), at(6));
+        assert!(i00.y > a.y, "the inner table is under the cell's text");
+        assert_eq!(i00.y, i01.y);
+        assert!(i01.x > i00.x && i10.y > i00.y && i10.x == i00.x);
+        assert!(i00.x >= a.x && i01.x + i01.w <= o2.x, "inside the first cell");
+        assert_eq!(o2.y, a.y, "the second outer cell is beside the first");
+        let outer_box = pg.cells.iter().find(|c| !c.inner && c.x <= a.x && a.x < c.x + c.w).unwrap();
+        let inner: Vec<_> = pg.cells.iter().filter(|c| c.inner).collect();
+        assert_eq!(inner.len(), 4);
+        assert!(inner.iter().all(|c| c.y + c.h <= outer_box.y + outer_box.h), "the outer row holds the inner one");
+        // The layout width is the inner cell's.
+        assert!(d.block_box(2, 100_000).1 < d.block_box(1, 100_000).1 / 2);
     }
 
     #[test]

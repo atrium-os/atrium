@@ -14,6 +14,6 @@ pub mod editor;
 pub mod pictures;
 pub mod view;
 
-pub use editor::{Checker, Editor, Logged, MarginPages, DragKind, Motion, ObjectDrag, Outcome, Pos, Spot};
+pub use editor::{CellEdges, Checker, Editor, Logged, MarginPages, DragKind, Motion, ObjectDrag, Outcome, Pos, Spot};
 
 pub use view::RichTextView;

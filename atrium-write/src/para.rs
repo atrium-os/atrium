@@ -16,6 +16,7 @@ use pergola::{Mutable, TextStyle};
 use pergola_richtext::{Editor, RichTextView};
 
 use crate::app::{Cmd, Write, FIND_H, MARGIN_H, SHAPE_COLORS, TOOLBAR_H};
+use crate::table::{table_cmd, TableCmd};
 
 /// The ruler's height, over the pages while it is shown.
 pub const RULER_H: f32 = 24.0;
@@ -27,6 +28,8 @@ pub enum ParaKind {
     Borders,
     Tabs,
     Lists,
+    /// Table Tools (crate::table).
+    Table,
 }
 
 /// The paragraph bars' state: which is open, the border look new sides
@@ -57,12 +60,17 @@ pub struct ParaMenus {
     pub tab_align: Mutable<MenuState>,
     pub tab_leader: Mutable<MenuState>,
     pub level_format: Mutable<MenuState>,
+    pub table_style: Mutable<MenuState>,
+    pub cell_shade: Mutable<MenuState>,
+    pub cell_valign: Mutable<MenuState>,
+    pub cell_edges: Mutable<MenuState>,
+    pub table_align: Mutable<MenuState>,
 }
 
 impl Default for ParaMenus {
     fn default() -> Self {
         let m = || Mutable::new(MenuState::default());
-        ParaMenus { spacing: m(), border_style: m(), border_color: m(), shading: m(), drop: m(), tab_align: m(), tab_leader: m(), level_format: m() }
+        ParaMenus { spacing: m(), border_style: m(), border_color: m(), shading: m(), drop: m(), tab_align: m(), tab_leader: m(), level_format: m(), table_style: m(), cell_shade: m(), cell_valign: m(), cell_edges: m(), table_align: m() }
     }
 }
 
@@ -139,6 +147,8 @@ pub enum ParaCmd {
     /// A tab stop dragged from one place to another (off the ruler: none),
     /// or a new one clicked in (from none).
     RulerTab(Option<i32>, Option<i32>),
+    /// A Table Tools command.
+    Table(TableCmd),
 }
 
 pub const INDENT_STEP: i32 = 360;
@@ -336,6 +346,7 @@ pub fn para_cmd(e: &mut Editor, bar: &Mutable<ParaBar>, ruler: &Mutable<bool>, c
             }
             None => e.clear_tab(from),
         },
+        ParaCmd::Table(tc) => table_cmd(e, &b, tc),
     }
     let changed = b != bar.get_cloned();
     if changed {
@@ -522,6 +533,7 @@ impl Write {
                     lbl(ctx, x, ry2, 400.0, "Pick a list above; the caret's list then shows its levels here.");
                 }
             }
+            ParaKind::Table => self.table_rows(ctx, w),
         }
         Button::secondary("Close").at(w - 76.0, ry).width(64.0).on_click(push(ParaCmd::Close)).render(ctx);
         ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Border, BorderStyle, ListDef, ListLevel, NumFormat, LineRestart, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{CellPad, RegionLook, TableBorders, TableStyle, VAlign, HAlign as TableAlign, LOOK_HEADER, LOOK_TOTAL, LOOK_FIRST_COLUMN, LOOK_LAST_COLUMN, LOOK_BANDED_ROWS, LOOK_BANDED_COLUMNS, Border, BorderStyle, ListDef, ListLevel, NumFormat, LineRestart, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -703,41 +703,247 @@ impl Out {
 
     /// The table starting at block `b`; returns the block after it.
     fn table(&mut self, doc: &TextDoc, b: usize, out: &mut String) -> usize {
-        let t = doc.cell(b).map(|c| c.table);
+        self.table_at(doc, b, doc.blocks.len(), false, out)
+    }
+
+    /// The table at a depth (`inner`: the one in a cell, ending by
+    /// `limit`) starting at block `b`; returns the block after it.
+    fn table_at(&mut self, doc: &TextDoc, b: usize, limit: usize, inner: bool, out: &mut String) -> usize {
+        let t = doc.cell_at(b, inner).map(|c| c.table);
         let mut end = b;
-        while end < doc.blocks.len() && doc.cell(end).map(|c| c.table) == t {
+        while end < limit && doc.cell_at(end, inner).map(|c| c.table) == t {
             end += 1;
         }
-        let first_row = doc.row_range(b);
-        let grid: Vec<u32> = cells_of(doc, first_row).into_iter().map(|c| doc.cell(c.start).map_or(1440, |x| x.width)).collect();
-        out.push_str(r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>"#);
-        for side in ["top", "left", "bottom", "right", "insideH", "insideV"] {
-            let _ = write!(out, r#"<w:{side} w:val="single" w:sz="4" w:space="0" w:color="8C9199"/>"#);
-        }
-        out.push_str(r#"</w:tblBorders><w:tblLayout w:type="fixed"/><w:tblCellMar><w:left w:w="80" w:type="dxa"/><w:right w:w="80" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>"#);
-        for w in &grid {
-            let _ = write!(out, r#"<w:gridCol w:w="{w}"/>"#);
-        }
-        out.push_str("</w:tblGrid>");
+        // Rows and their cells (blocks, start and end across, in twips).
+        let mut rows: Vec<Vec<(std::ops::Range<usize>, u32, u32)>> = Vec::new();
         let mut k = b;
         while k < end {
-            let row = doc.row_range(k);
+            let row = doc.row_range_at(k, inner);
             let row = k..row.end.max(k + 1).min(end);
+            let mut x = 0u32;
+            rows.push(
+                cells_of(doc, row.clone(), inner)
+                    .into_iter()
+                    .map(|c| {
+                        let w = doc.cell_at(c.start, inner).map_or(1440, |x| x.width);
+                        let r = (c, x, x + w);
+                        x += w;
+                        r
+                    })
+                    .collect(),
+            );
+            k = row.end;
+        }
+        // The grid: every cell edge of every row (within 20 twips, one).
+        let mut edges: Vec<u32> = rows.iter().flatten().flat_map(|c| [c.1, c.2]).collect();
+        edges.sort_unstable();
+        edges.dedup_by(|a, b| a.abs_diff(*b) <= 20);
+        edges.truncate(64);
+        let col_of = |x: u32| edges.iter().position(|e| e.abs_diff(x) <= 20).unwrap_or(edges.len().saturating_sub(1));
+        let look = t.and_then(|t| doc.tables.get(&t)).cloned().unwrap_or_default();
+        out.push_str("<w:tbl><w:tblPr>");
+        if let Some(n) = &look.style {
+            let _ = write!(out, r#"<w:tblStyle w:val="{}"/>"#, esc(&table_style_id(n)));
+        }
+        out.push_str(r#"<w:tblW w:w="0" w:type="auto"/>"#);
+        match look.align {
+            TableAlign::Center => out.push_str(r#"<w:jc w:val="center"/>"#),
+            TableAlign::End => out.push_str(r#"<w:jc w:val="right"/>"#),
+            _ => {}
+        }
+        if look.indent != 0 {
+            let _ = write!(out, r#"<w:tblInd w:w="{}" w:type="dxa"/>"#, look.indent);
+        }
+        // Without a style or borders of its own, a table has rules everywhere.
+        let borders = look.borders.or(if look.style.is_none() { Some(TableBorders::grid()) } else { None });
+        if let Some(bs) = borders {
+            out.push_str(&table_borders_xml(&bs));
+        }
+        if let Some(c) = look.shading {
+            let _ = write!(out, r#"<w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/>"#);
+        }
+        if !look.autofit {
+            out.push_str(r#"<w:tblLayout w:type="fixed"/>"#);
+        }
+        out.push_str(&pad_xml("tblCellMar", look.pad.unwrap_or_default()));
+        out.push_str(&look_xml(look.look));
+        out.push_str("</w:tblPr><w:tblGrid>");
+        for w in edges.windows(2) {
+            let _ = write!(out, r#"<w:gridCol w:w="{}"/>"#, w[1] - w[0]);
+        }
+        out.push_str("</w:tblGrid>");
+        for (ri, row) in rows.iter().enumerate() {
             out.push_str("<w:tr>");
-            for cell in cells_of(doc, row.clone()) {
-                let w = doc.cell(cell.start).map_or(1440, |c| c.width);
-                let _ = write!(out, r#"<w:tc><w:tcPr><w:tcW w:w="{w}" w:type="dxa"/></w:tcPr>"#);
-                for x in cell {
-                    self.para(doc, x, out);
+            let rl = row.first().and_then(|c| doc.cell_at(c.0.start, inner)).map(|c| c.row_look).unwrap_or_default();
+            let mut trpr = String::new();
+            if rl.cant_split {
+                trpr += "<w:cantSplit/>";
+            }
+            if rl.height > 0 {
+                let _ = write!(trpr, r#"<w:trHeight w:val="{}"{}/>"#, rl.height, if rl.exact { r#" w:hRule="exact""# } else { "" });
+            }
+            if rl.header {
+                trpr += "<w:tblHeader/>";
+            }
+            if !trpr.is_empty() {
+                let _ = write!(out, "<w:trPr>{trpr}</w:trPr>");
+            }
+            for (cell, x0, x1) in row {
+                let Some(c) = doc.cell_at(cell.start, inner) else { continue };
+                let span = col_of(*x1).saturating_sub(col_of(*x0)).max(1);
+                let _ = write!(out, r#"<w:tc><w:tcPr><w:tcW w:w="{}" w:type="dxa"/>"#, c.width);
+                if span > 1 {
+                    let _ = write!(out, r#"<w:gridSpan w:val="{span}"/>"#);
+                }
+                // Merged down: the first of the run restarts it.
+                let below = rows.get(ri + 1).and_then(|r| r.iter().find(|d| d.1.abs_diff(*x0) <= 20)).and_then(|d| doc.cell_at(d.0.start, inner)).is_some_and(|d| d.merged_up);
+                if c.merged_up {
+                    out.push_str("<w:vMerge/>");
+                } else if below {
+                    out.push_str(r#"<w:vMerge w:val="restart"/>"#);
+                }
+                let cb = c.look.borders;
+                if !cb.is_empty() {
+                    out.push_str("<w:tcBorders>");
+                    for (name, side) in [("top", cb.top), ("left", cb.start), ("bottom", cb.bottom), ("right", cb.end)] {
+                        match side {
+                            None => {}
+                            Some(None) => {
+                                let _ = write!(out, r#"<w:{name} w:val="nil"/>"#);
+                            }
+                            Some(Some(x)) => out.push_str(&border_xml(name, &x)),
+                        }
+                    }
+                    out.push_str("</w:tcBorders>");
+                }
+                match c.look.shading {
+                    None => {}
+                    Some(None) => out.push_str(r#"<w:shd w:val="clear" w:color="auto" w:fill="auto"/>"#),
+                    Some(Some(f)) => {
+                        let _ = write!(out, r#"<w:shd w:val="clear" w:color="auto" w:fill="{f:06X}"/>"#);
+                    }
+                }
+                if let Some(pd) = c.look.pad {
+                    out.push_str(&pad_xml("tcMar", pd));
+                }
+                match c.look.valign {
+                    VAlign::Top => {}
+                    VAlign::Center => out.push_str(r#"<w:vAlign w:val="center"/>"#),
+                    VAlign::Bottom => out.push_str(r#"<w:vAlign w:val="bottom"/>"#),
+                }
+                out.push_str("</w:tcPr>");
+                // A table in the cell, then (Word wants a cell to end so)
+                // a paragraph after it.
+                let mut x = cell.start;
+                let mut last_table = false;
+                while x < cell.end {
+                    if !inner && doc.inner_cell(x).is_some() {
+                        x = self.table_at(doc, x, cell.end, true, out).max(x + 1);
+                        last_table = true;
+                    } else {
+                        self.para(doc, x, out);
+                        x += 1;
+                        last_table = false;
+                    }
+                }
+                // A table ending the cell (or only empty paragraphs after
+                // it) gets the paragraph Word wants, which reading drops.
+                let mut k = cell.end;
+                while k > cell.start && doc.inner_cell(k - 1).is_none() && doc.para(k - 1).is_some_and(|p| p.text.is_empty() && p.props.section.is_none()) {
+                    k -= 1;
+                }
+                if !inner && (last_table || k > cell.start && doc.inner_cell(k - 1).is_some()) {
+                    out.push_str("<w:p/>");
                 }
                 out.push_str("</w:tc>");
             }
             out.push_str("</w:tr>");
-            k = row.end;
         }
         out.push_str("</w:tbl>");
         end
     }
+}
+
+/// A table style's id in `styles.xml`: its name's letters and digits.
+fn table_style_id(name: &str) -> String {
+    let id: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if id.is_empty() { "Table".to_string() } else { id }
+}
+
+fn table_borders_xml(b: &TableBorders) -> String {
+    let mut s = String::from("<w:tblBorders>");
+    for (name, side) in [("top", b.top), ("left", b.start), ("bottom", b.bottom), ("right", b.end), ("insideH", b.inside_h), ("insideV", b.inside_v)] {
+        match side {
+            Some(x) => s += &border_xml(name, &x),
+            None => s += &format!(r#"<w:{name} w:val="nil"/>"#),
+        }
+    }
+    s + "</w:tblBorders>"
+}
+
+fn pad_xml(name: &str, p: CellPad) -> String {
+    format!(r#"<w:{name}><w:top w:w="{}" w:type="dxa"/><w:left w:w="{}" w:type="dxa"/><w:bottom w:w="{}" w:type="dxa"/><w:right w:w="{}" w:type="dxa"/></w:{name}>"#, p.top, p.start, p.bottom, p.end)
+}
+
+/// `w:tblLook`, with both the attributes and Word 2007's hex value.
+fn look_xml(look: u8) -> String {
+    let on = |bit: u8| look & bit != 0;
+    let mut v = 0u16;
+    for (bit, mask) in [(LOOK_HEADER, 0x20), (LOOK_TOTAL, 0x40), (LOOK_FIRST_COLUMN, 0x80), (LOOK_LAST_COLUMN, 0x100)] {
+        if on(bit) {
+            v |= mask;
+        }
+    }
+    if !on(LOOK_BANDED_ROWS) {
+        v |= 0x200;
+    }
+    if !on(LOOK_BANDED_COLUMNS) {
+        v |= 0x400;
+    }
+    let b = |x: bool| if x { "1" } else { "0" };
+    format!(r#"<w:tblLook w:val="{v:04X}" w:firstRow="{}" w:lastRow="{}" w:firstColumn="{}" w:lastColumn="{}" w:noHBand="{}" w:noVBand="{}"/>"#, b(on(LOOK_HEADER)), b(on(LOOK_TOTAL)), b(on(LOOK_FIRST_COLUMN)), b(on(LOOK_LAST_COLUMN)), b(!on(LOOK_BANDED_ROWS)), b(!on(LOOK_BANDED_COLUMNS)))
+}
+
+/// A table style as a `w:style w:type="table"`.
+fn table_style_xml(name: &str, t: &TableStyle) -> String {
+    let mut s = format!(r#"<w:style w:type="table" w:styleId="{}"><w:name w:val="{}"/><w:tblPr>{}</w:tblPr>"#, esc(&table_style_id(name)), esc(name), table_borders_xml(&t.borders));
+    if let Some(c) = t.shading {
+        let _ = write!(s, r#"<w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/></w:tcPr>"#);
+    }
+    let region = |s: &mut String, ty: &str, r: &RegionLook, under: bool| {
+        if *r == RegionLook::default() {
+            return;
+        }
+        let _ = write!(s, r#"<w:tblStylePr w:type="{ty}">"#);
+        if r.bold || r.color.is_some() {
+            *s += "<w:rPr>";
+            if r.bold {
+                *s += "<w:b/>";
+            }
+            if let Some(c) = r.color {
+                let _ = write!(s, r#"<w:color w:val="{c:06X}"/>"#);
+            }
+            *s += "</w:rPr>";
+        }
+        *s += "<w:tcPr>";
+        if let Some(b) = r.rule {
+            let _ = write!(s, "<w:tcBorders>{}</w:tcBorders>", border_xml(if under { "bottom" } else { "top" }, &b));
+        }
+        if let Some(c) = r.shading {
+            let _ = write!(s, r#"<w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/>"#);
+        }
+        *s += "</w:tcPr></w:tblStylePr>";
+    };
+    region(&mut s, "firstRow", &t.header, true);
+    region(&mut s, "lastRow", &t.total, false);
+    region(&mut s, "firstCol", &t.first_col, true);
+    region(&mut s, "lastCol", &t.last_col, true);
+    for (ty, c) in [("band1Horz", t.band_row), ("band1Vert", t.band_col)] {
+        if let Some(c) = c {
+            let _ = write!(s, r#"<w:tblStylePr w:type="{ty}"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/></w:tcPr></w:tblStylePr>"#);
+        }
+    }
+    s + "</w:style>"
 }
 
 /// The deepest heading level the table of contents starting at `b` lists (at least 3).
@@ -752,11 +958,11 @@ fn toc_depth(doc: &TextDoc, b: usize) -> u8 {
 }
 
 /// The cells of a row as block ranges.
-fn cells_of(doc: &TextDoc, row: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+fn cells_of(doc: &TextDoc, row: std::ops::Range<usize>, inner: bool) -> Vec<std::ops::Range<usize>> {
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
     for k in row {
         match out.last_mut() {
-            Some(r) if doc.same_cell(r.start, k) => r.end = k + 1,
+            Some(r) if doc.same_cell_at(r.start, k, inner) => r.end = k + 1,
             _ => out.push(k..k + 1),
         }
     }
@@ -926,6 +1132,9 @@ fn styles_part_ours(doc: &TextDoc, ids: &[String], lists: &mut HashMap<(u32, Lis
         chars.style = None;
         s += &rpr(&chars, ids);
         s += "</w:style>";
+    }
+    for (name, t) in &doc.styles.tables {
+        s += &table_style_xml(name, t);
     }
     s += "</w:styles>";
     s

@@ -38,7 +38,7 @@ fn main() {
     for (r, row) in rows.iter().enumerate() {
         for (c, text) in row.iter().enumerate() {
             let k = d.push_para(text, 0, if r == 0 { vec![(0, bold)] } else { vec![] });
-            d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r as u32, col: c as u16, width: widths[c] }), space_after: Some(0), ..Default::default() });
+            d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r as u32, col: c as u16, width: widths[c], ..Default::default() }), space_after: Some(0), ..Default::default() });
         }
     }
     let j = "Justified text stretches the spaces of every line but the last, so both edges of the column are straight. It is the usual setting for books and long reports, and the paginator treats it like any other paragraph: what changes is only where the glyphs sit on each line.";

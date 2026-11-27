@@ -34,7 +34,7 @@ pub(crate) mod tests {
         for r in 0..2u32 {
             for c in 0..3u16 {
                 let k = d.push_para(&format!("r{r}c{c}"), 0, vec![]);
-                d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r, col: c, width: 2000 + c as u32 * 500 }), space_after: Some(0), ..Default::default() });
+                d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r, col: c, width: 2000 + c as u32 * 500, ..Default::default() }), space_after: Some(0), ..Default::default() });
             }
         }
         let png = {
@@ -174,10 +174,14 @@ pub(crate) mod tests {
             let mut qp = q.props.clone();
             let who = |d: &TextDoc, r: Option<officina_text::model::RevId>| r.and_then(|r| d.revisions.get(r)).map(|r| r.author.to_string());
             assert_eq!(who(a, pp.rev.take()), who(b, qp.rev.take()), "inserted break before {i}");
-            // Table and list ids are renumbered.
+            // Table and list ids are renumbered; a cell's look may move
+            // between the cell and its table (ODF has no table styles), so
+            // tests/tables.rs compares cells as drawn instead.
             if let (Some(x), Some(y)) = (&mut pp.cell, &mut qp.cell) {
                 x.table = 0;
                 y.table = 0;
+                x.look = Default::default();
+                y.look = Default::default();
             }
             if let (Some(Some(x)), Some(Some(y))) = (&mut pp.list, &mut qp.list) {
                 x.id = 0;

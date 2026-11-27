@@ -69,6 +69,10 @@ pub enum TextOp {
     SetList { id: u32, def: Option<crate::model::ListDef> },
     /// Sets line numbering and hyphenation.
     SetSettings { settings: crate::model::Settings },
+    /// Sets table `id`'s look (None: single rules everywhere).
+    SetTable { id: u32, look: Option<crate::model::TableLook> },
+    /// Sets the table style `name` (None: takes it out).
+    SetTableStyle { name: std::sync::Arc<str>, style: Option<crate::model::TableStyle> },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -162,7 +166,7 @@ impl TextOp {
             TextOp::Remove { at, n } => Edit { first: at as usize, last: (at + n) as usize, delta: n as isize },
             TextOp::Insert { at, ref blocks } => Edit { first: at as usize, last: at as usize, delta: -(blocks.len() as isize) },
             // Every page may change (the paginator resets on a new geometry).
-            TextOp::SetPage { .. } | TextOp::SetMargins { .. } | TextOp::SetList { .. } | TextOp::SetSettings { .. } => Edit { first: 0, last: 0, delta: 0 },
+            TextOp::SetPage { .. } | TextOp::SetMargins { .. } | TextOp::SetList { .. } | TextOp::SetSettings { .. } | TextOp::SetTable { .. } | TextOp::SetTableStyle { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
             TextOp::SetNote { .. } | TextOp::SetShape { .. } | TextOp::SetStyle { .. } => return None,
             // Ids move; nothing looks different.
@@ -452,6 +456,30 @@ impl TextOp {
                 TextOp::SetList { id, def: old }
             }
             TextOp::SetSettings { settings } => TextOp::SetSettings { settings: std::mem::replace(&mut d.settings, settings) },
+            TextOp::SetTable { id, look } => {
+                let old = match look {
+                    Some(x) => {
+                        if !d.tables.contains_key(&id) && d.tables.len() >= crate::model::MAX_TABLES {
+                            return TextOp::Nop;
+                        }
+                        d.tables.insert(id, x.bounded())
+                    }
+                    None => d.tables.remove(&id),
+                };
+                TextOp::SetTable { id, look: old }
+            }
+            TextOp::SetTableStyle { name, style } => {
+                let old = match style {
+                    Some(x) => {
+                        if !d.styles.tables.contains_key(&name) && d.styles.tables.len() >= crate::model::MAX_TABLE_STYLES {
+                            return TextOp::Nop;
+                        }
+                        d.styles.tables.insert(name.clone(), x)
+                    }
+                    None => d.styles.tables.remove(&name),
+                };
+                TextOp::SetTableStyle { name, style: old }
+            }
             TextOp::SetMargins { header, footer, first_page, even_pages } => TextOp::SetMargins {
                 header: std::mem::replace(&mut d.header, header),
                 footer: std::mem::replace(&mut d.footer, footer),

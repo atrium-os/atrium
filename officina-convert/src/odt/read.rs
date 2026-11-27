@@ -19,8 +19,8 @@
 //! formatting before from our `officina:old-style`, else plain) are read.
 //!
 //! Reported, not carried: notes inside notes or headers, annotations there,
-//! sections and columns, frames anchored to the page (kept in line), merged
-//! cells, nested tables (their text kept), fields other than page numbers (their
+//! sections and columns, frames anchored to the page (kept in line), tables
+//! nested more than one deep (their text kept), fields other than page numbers (their
 //! text kept), drawings and charts, embedded objects.
 
 use officina_text::model::PageSetup;
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -344,6 +344,27 @@ fn hyphenation_of(s: &El) -> Option<bool> {
     s.child("style:text-properties").and_then(|t| t.attr("fo:hyphenate")).map(|v| v == "true")
 }
 
+/// A cell style's look: its borders (all round or per side), background,
+/// vertical alignment and padding.
+fn odf_cell_look(p: &El) -> CellLook {
+    let all = p.attr("fo:border").map(odf_border);
+    let side = |name: &str| p.attr(name).map(odf_border).or(all).or(Some(None));
+    let pad_all = p.attr("fo:padding").and_then(length);
+    let pad = |name: &str| p.attr(name).and_then(length).or(pad_all).map(|v| v.clamp(0, MAX_CELL_PAD as i64) as u16);
+    let (pt, pb, ps, pe) = (pad("fo:padding-top"), pad("fo:padding-bottom"), pad("fo:padding-left"), pad("fo:padding-right"));
+    let any_pad = pt.is_some() || pb.is_some() || ps.is_some() || pe.is_some();
+    CellLook {
+        borders: CellBorders { top: side("fo:border-top"), bottom: side("fo:border-bottom"), start: side("fo:border-left"), end: side("fo:border-right") },
+        shading: Some(p.attr("fo:background-color").and_then(|c| if c == "transparent" { None } else { color(Some(c)) })),
+        valign: match p.attr("style:vertical-align") {
+            Some("middle") => VAlign::Center,
+            Some("bottom") => VAlign::Bottom,
+            _ => VAlign::Top,
+        },
+        pad: any_pad.then(|| CellPad { top: pt.unwrap_or(0), bottom: pb.unwrap_or(0), start: ps.unwrap_or(0), end: pe.unwrap_or(0) }),
+    }
+}
+
 /// An `fo:border` value: width, style and colour in any order; `none` is none.
 fn odf_border(v: &str) -> Option<Border> {
     let mut b = Border { space: 0, ..Border::default() };
@@ -547,6 +568,12 @@ struct Reader<'a> {
     list_defs: HashMap<String, ListDef>,
     /// Column widths by column style name.
     columns: HashMap<String, u32>,
+    /// Table cell, row and table styles' looks.
+    cell_styles: HashMap<String, CellLook>,
+    /// The span of the cell last started at each grid column.
+    span_above: HashMap<usize, usize>,
+    row_styles: HashMap<String, RowLook>,
+    table_styles: HashMap<String, (officina_text::model::HAlign, i32)>,
     /// Graphic styles: parent and graphic properties, by name.
     graphic: HashMap<String, (Option<String>, Vec<(String, String)>)>,
     /// Columns of section styles by name.
@@ -832,6 +859,30 @@ impl<'a> Reader<'a> {
                         Some("section") => {
                             if let Some(c) = s.child("style:section-properties").and_then(|p| p.child("style:columns")) {
                                 self.sec_styles.insert(name.to_string(), odf_columns(c));
+                            }
+                        }
+                        Some("table-cell") => {
+                            if let Some(p) = s.child("style:table-cell-properties") {
+                                self.cell_styles.insert(name.to_string(), odf_cell_look(p));
+                            }
+                        }
+                        Some("table-row") => {
+                            if let Some(p) = s.child("style:table-row-properties") {
+                                let exact = p.attr("style:row-height").and_then(length);
+                                let min = p.attr("style:min-row-height").and_then(length);
+                                let height = exact.or(min).map_or(0, |v| v.clamp(0, u16::MAX as i64) as u16);
+                                self.row_styles.insert(name.to_string(), RowLook { header: false, cant_split: p.attr("fo:keep-together") == Some("always"), height, exact: exact.is_some() });
+                            }
+                        }
+                        Some("table") => {
+                            if let Some(p) = s.child("style:table-properties") {
+                                let align = match p.attr("table:align") {
+                                    Some("center") => officina_text::model::HAlign::Center,
+                                    Some("right") => officina_text::model::HAlign::End,
+                                    _ => officina_text::model::HAlign::Start,
+                                };
+                                let indent = p.attr("fo:margin-left").and_then(length).map_or(0, |v| v.clamp(-31_680, 31_680) as i32);
+                                self.table_styles.insert(name.to_string(), (align, indent));
                             }
                         }
                         Some("table-column") => {
@@ -1891,6 +1942,11 @@ impl<'a> Reader<'a> {
     }
 
     fn table(&mut self, t: &El) {
+        self.table_in(t, 0)
+    }
+
+    /// A table at a depth (1: in a cell, its cells' tables kept as text).
+    fn table_in(&mut self, t: &El, depth: usize) {
         let mut widths: Vec<u32> = Vec::new();
         for c in t.els().flat_map(|x| if x.name == "table:table-columns" { x.els().collect::<Vec<_>>() } else { vec![x] }) {
             if c.name != "table:table-column" {
@@ -1906,35 +1962,67 @@ impl<'a> Reader<'a> {
         }
         let table = self.next_table;
         self.next_table += 1;
-        let mut rows: Vec<&El> = Vec::new();
+        // Cells draw their own rules in ODF: the table adds none.
+        let (align, indent) = t.attr("table:style-name").and_then(|n| self.table_styles.get(n)).copied().unwrap_or_default();
+        self.doc.tables.insert(table, TableLook { borders: Some(TableBorders::default()), align, indent, look: 0, ..TableLook::default() });
+        let mut rows: Vec<(&El, bool)> = Vec::new();
         for x in t.els() {
             match x.name.as_str() {
-                "table:table-row" => rows.push(x),
-                "table:table-header-rows" | "table:table-rows" | "table:table-row-group" => rows.extend(x.children("table:table-row")),
+                "table:table-row" => rows.push((x, false)),
+                "table:table-header-rows" => rows.extend(x.children("table:table-row").map(|r| (r, true))),
+                "table:table-rows" | "table:table-row-group" => rows.extend(x.children("table:table-row").map(|r| (r, false))),
                 _ => {}
             }
         }
-        for (r, tr) in rows.into_iter().enumerate() {
+        // Grid columns a cell merged down covers, and for how many more rows.
+        let mut down: HashMap<usize, usize> = HashMap::new();
+        for (r, (tr, header)) in rows.into_iter().enumerate() {
             let mut col = 0usize;
             let mut c = 0u16;
+            let mut row_look = tr.attr("table:style-name").and_then(|n| self.row_styles.get(n)).copied().unwrap_or_default();
+            row_look.header = header;
+            // Covered cells that only fill out the span of the cell before.
+            let mut skip = 0usize;
             for tc in tr.els() {
-                if tc.name == "table:covered-table-cell" {
-                    col += 1;
+                let covered = tc.name == "table:covered-table-cell";
+                if !covered && tc.name != "table:table-cell" {
                     continue;
                 }
-                if tc.name != "table:table-cell" {
+                if covered && skip > 0 {
+                    skip -= 1;
                     continue;
                 }
                 let span = tc.attr("table:number-columns-spanned").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 63);
-                if span > 1 || tc.attr("table:number-rows-spanned").is_some_and(|v| v != "1") {
-                    self.rep.note(Kind::Approximate, "merged cells (kept as one wide cell)");
+                // A covered cell under a cell merged down is a cell of its
+                // own, merged up; one beside a cell merged across is part of
+                // that cell.
+                let merged_up = covered && down.get(&col).is_some_and(|n| *n > 0);
+                if covered && !merged_up {
+                    col += 1;
+                    continue;
+                }
+                if merged_up {
+                    if let Some(n) = down.get_mut(&col) {
+                        *n -= 1;
+                    }
+                }
+                let rows_down = tc.attr("table:number-rows-spanned").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 4096);
+                if rows_down > 1 {
+                    down.insert(col, rows_down - 1);
+                }
+                // A cell merged up spans what the cell above it did.
+                let span = if merged_up { self.span_above.get(&col).copied().unwrap_or(1) } else { span };
+                if !merged_up {
+                    self.span_above.insert(col, span);
                 }
                 let width = (col..col + span).map(|g| widths.get(g).copied().unwrap_or(1440)).sum::<u32>().clamp(1, MAX_OBJECT_TWIPS);
+                let look = tc.attr("table:style-name").and_then(|n| self.cell_styles.get(n)).copied().unwrap_or(CellLook { borders: CellBorders { top: Some(None), bottom: Some(None), start: Some(None), end: Some(None) }, ..CellLook::default() });
                 col += span;
-                let cell = CellRef { table, row: r as u32, col: c, width };
+                skip = span - 1;
+                let cell = CellRef { table, row: r as u32, col: c, width, look, row_look, merged_up, span: span as u8, ..Default::default() };
                 c = c.saturating_add(1);
                 let before = self.doc.blocks.len();
-                self.cell_content(tc, cell, 0);
+                self.cell_content(tc, cell, depth);
                 if self.doc.blocks.len() == before {
                     let k = self.doc.push_para("", 0, vec![]);
                     self.doc.blocks.update(k, |b| {
@@ -1953,8 +2041,24 @@ impl<'a> Reader<'a> {
             match x.name.as_str() {
                 "text:p" | "text:h" => self.para(x, Some(cell), None),
                 "text:list" => self.list(x, 0, None, None, Some(cell)),
+                "table:table" if depth == 0 => {
+                    // A table in a cell: its paragraphs are in the outer
+                    // cell and in their own cell of the inner table.
+                    let before = self.doc.blocks.len();
+                    let spans = std::mem::take(&mut self.span_above);
+                    self.table_in(x, 1);
+                    self.span_above = spans;
+                    for k in before..self.doc.blocks.len() {
+                        self.doc.blocks.update(k, |b| {
+                            if let Some(q) = b.as_para_mut() {
+                                q.props.inner = q.props.cell;
+                                q.props.cell = Some(cell);
+                            }
+                        });
+                    }
+                }
                 "table:table" if depth < 8 => {
-                    self.rep.note(Kind::Approximate, "nested tables (their text kept in the cell)");
+                    self.rep.note(Kind::Approximate, "tables three deep (their text kept in the cell)");
                     for row in x.els().filter(|r| r.name == "table:table-row") {
                         for inner in row.children("table:table-cell") {
                             self.cell_content(inner, cell, depth + 1);
@@ -2198,7 +2302,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), list_defs: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), list_defs: HashMap::new(), columns: HashMap::new(), cell_styles: HashMap::new(), span_above: HashMap::new(), row_styles: HashMap::new(), table_styles: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {

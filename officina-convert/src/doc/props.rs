@@ -559,6 +559,33 @@ pub struct Tap {
     /// Per cell: merged into the one before; merged down (continues).
     pub merged: Vec<bool>,
     pub vmerge: Vec<u8>,
+    /// Per cell: its borders as `w:tcBorders` children, background, and
+    /// vertical alignment (0 top, 1 centre, 2 bottom).
+    pub borders: Vec<String>,
+    pub shading: Vec<Option<u32>>,
+    pub valign: Vec<u8>,
+    /// The table's borders as `w:tblBorders` children.
+    pub table_borders: Option<String>,
+    pub header: bool,
+    pub cant_split: bool,
+    /// Twips; negative is exact.
+    pub height: i16,
+    /// 0 left, 1 centre, 2 right.
+    pub jc: u8,
+}
+
+/// Borders from a run of Brc (`size` bytes each) named in order.
+/// Without `nil`, a side with none is left out (the table's shows).
+fn brcs_xml(arg: &[u8], size: usize, names: &[&str], nil: bool) -> String {
+    let mut s = String::new();
+    for (i, name) in names.iter().enumerate() {
+        match arg.get(i * size..i * size + size).and_then(|b| brc_xml(name, b)) {
+            Some(x) => s += &x,
+            None if nil && arg.len() >= (i + 1) * size => s += &format!(r#"<w:{name} w:val="nil"/>"#),
+            None => {}
+        }
+    }
+    s
 }
 
 impl Tap {
@@ -576,10 +603,17 @@ impl Tap {
                     let tcs = &a[1 + 2 * (n + 1)..];
                     t.merged = vec![false; n];
                     t.vmerge = vec![0; n];
+                    t.borders = vec![String::new(); n];
+                    t.shading = vec![None; n];
+                    t.valign = vec![0; n];
                     for i in 0..n {
                         let Some(tc) = tcs.get(i * 20..i * 20 + 2) else { break };
                         let f = u16::from_le_bytes([tc[0], tc[1]]);
                         t.merged[i] = f & 0x0002 != 0;
+                        t.valign[i] = ((f >> 7) & 3).min(2) as u8;
+                        if let Some(brc) = tcs.get(i * 20 + 4..i * 20 + 20) {
+                            t.borders[i] = brcs_xml(brc, 4, &["top", "left", "bottom", "right"], false);
+                        }
                         t.vmerge[i] = match (f & 0x0020 != 0, f & 0x0040 != 0) {
                             (true, true) => 3,
                             (true, false) => 1,
@@ -587,6 +621,29 @@ impl Tap {
                         };
                     }
                 }
+                // Table borders (Brc80 then Brc): top, left, bottom, right,
+                // inside rules.
+                0xD605 => t.table_borders = Some(brcs_xml(s.arg, 4, &["top", "left", "bottom", "right", "insideH", "insideV"], true)),
+                0xD613 => t.table_borders = Some(brcs_xml(s.arg, 8, &["top", "left", "bottom", "right", "insideH", "insideV"], true)),
+                // Cells' backgrounds: a Shd each (foreground, background, pattern).
+                0xD612 => {
+                    for (i, shd) in s.arg.chunks_exact(10).enumerate().take(64) {
+                        if t.shading.len() <= i {
+                            t.shading.resize(i + 1, None);
+                        }
+                        t.shading[i] = colorref(&shd[4..8]);
+                    }
+                }
+                0xD62C => {
+                    let (a, b, v) = (s.u8() as usize, *s.arg.get(1).unwrap_or(&0) as usize, *s.arg.get(2).unwrap_or(&0));
+                    for i in a..b.min(t.valign.len()) {
+                        t.valign[i] = v.min(2);
+                    }
+                }
+                0x3404 => t.header = s.u8() != 0,
+                0x3403 | 0x3644 => t.cant_split = s.u8() != 0,
+                0x9407 => t.height = i16::from_le_bytes([*s.arg.first().unwrap_or(&0), *s.arg.get(1).unwrap_or(&0)]),
+                0x5400 | 0x548A => t.jc = (s.u8()).min(2),
                 0xD62B => {
                     let (i, v) = (s.u8() as usize, *s.arg.get(1).unwrap_or(&0));
                     if let Some(m) = t.vmerge.get_mut(i) {

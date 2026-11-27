@@ -15,8 +15,8 @@
 //! marks, `w:trackRevisions`): one revision per author; deleted text is read
 //! inline and made tombstones afterwards.
 //!
-//! Reported, not carried: floating pictures (kept in line), merged cells, nested
-//! tables (their text kept), notes inside notes or headers, comments without a
+//! Reported, not carried: floating pictures (kept in line), tables nested more
+//! than one deep (their text kept), notes inside notes or headers, comments without a
 //! range, tracked changes in notes and headers (insertions kept, deletions
 //! dropped), deleted table rows, paragraph property changes (kept as made), fields other than
 //! page numbers (their shown result kept), text boxes, charts, equations, embedded
@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use officina_text::fields;
 use officina_text::paginate::PAGE_BREAK;
-use officina_text::model::{Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{CellBorders, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, HAlign as TableAlign, LOOK_HEADER, LOOK_TOTAL, LOOK_FIRST_COLUMN, LOOK_LAST_COLUMN, LOOK_BANDED_ROWS, LOOK_BANDED_COLUMNS, MAX_TABLE_STYLES, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -305,6 +305,101 @@ fn border(e: &El) -> Option<Border> {
     Some(Border { style, width, color: color(e.attr("w:color")), space })
 }
 
+/// A `w:tblBorders` (or a style's): sides by their start/end or left/right
+/// names, and the inside rules.
+fn table_borders(e: &El) -> TableBorders {
+    let side = |a: &str, b: &str| e.child(a).or_else(|| e.child(b)).and_then(border);
+    TableBorders { top: side("w:top", "w:top"), bottom: side("w:bottom", "w:bottom"), start: side("w:start", "w:left"), end: side("w:end", "w:right"), inside_h: side("w:insideH", "w:insideH"), inside_v: side("w:insideV", "w:insideV") }
+}
+
+/// A cell's own borders (`w:tcBorders`): a side named `nil` is none.
+fn cell_borders(e: &El) -> CellBorders {
+    let side = |a: &str, b: &str| e.child(a).or_else(|| e.child(b)).map(border);
+    CellBorders { top: side("w:top", "w:top"), bottom: side("w:bottom", "w:bottom"), start: side("w:start", "w:left"), end: side("w:end", "w:right") }
+}
+
+/// Cell margins (`w:tblCellMar`, `w:tcMar`) over `base`, twips.
+fn cell_margins(e: &El, base: CellPad) -> CellPad {
+    let side = |a: &str, b: &str, d: u16| e.child(a).or_else(|| e.child(b)).filter(|x| x.attr("w:type").is_none_or(|t| t == "dxa")).and_then(|x| num(x.attr("w:w"))).map_or(d, |v| v.clamp(0, MAX_CELL_PAD as i64) as u16);
+    CellPad { top: side("w:top", "w:top", base.top), bottom: side("w:bottom", "w:bottom", base.bottom), start: side("w:start", "w:left", base.start), end: side("w:end", "w:right", base.end) }
+}
+
+/// Word's cell margins when a table names none.
+const WORD_PAD: CellPad = CellPad { top: 0, bottom: 0, start: 108, end: 108 };
+
+/// `w:tblLook`'s parts as `LOOK_*` bits: from its attributes, or the
+/// older hex value.
+fn table_look(e: &El) -> u8 {
+    let bit = |name: &str, mask: u16| -> Option<bool> { e.attr(name).map(|v| v == "1" || v == "true").or_else(|| e.attr("w:val").and_then(|v| u16::from_str_radix(v, 16).ok()).map(|v| v & mask != 0)) };
+    let mut look = 0;
+    if bit("w:firstRow", 0x20).unwrap_or(true) {
+        look |= LOOK_HEADER;
+    }
+    if bit("w:lastRow", 0x40).unwrap_or(false) {
+        look |= LOOK_TOTAL;
+    }
+    if bit("w:firstColumn", 0x80).unwrap_or(true) {
+        look |= LOOK_FIRST_COLUMN;
+    }
+    if bit("w:lastColumn", 0x100).unwrap_or(false) {
+        look |= LOOK_LAST_COLUMN;
+    }
+    if !bit("w:noHBand", 0x200).unwrap_or(false) {
+        look |= LOOK_BANDED_ROWS;
+    }
+    if !bit("w:noVBand", 0x400).unwrap_or(true) {
+        look |= LOOK_BANDED_COLUMNS;
+    }
+    look
+}
+
+/// A table style (`w:style w:type="table"`) over its parent's look.
+fn table_style(s: &El, base: Option<&TableStyle>) -> TableStyle {
+    let mut t = base.cloned().unwrap_or_default();
+    if let Some(b) = s.child("w:tblPr").and_then(|p| p.child("w:tblBorders")) {
+        t.borders = table_borders(b);
+    }
+    if let Some(c) = s.child("w:tcPr").and_then(|p| p.child("w:shd")).and_then(shading) {
+        t.shading = Some(c);
+    }
+    for x in s.children("w:tblStylePr") {
+        let region = match x.attr("w:type") {
+            Some("firstRow") => &mut t.header,
+            Some("lastRow") => &mut t.total,
+            Some("firstCol") => &mut t.first_col,
+            Some("lastCol") => &mut t.last_col,
+            Some("band1Horz") => {
+                t.band_row = x.child("w:tcPr").and_then(|p| p.child("w:shd")).and_then(shading).or(t.band_row);
+                continue;
+            }
+            Some("band1Vert") => {
+                t.band_col = x.child("w:tcPr").and_then(|p| p.child("w:shd")).and_then(shading).or(t.band_col);
+                continue;
+            }
+            _ => continue,
+        };
+        let under = x.attr("w:type") != Some("lastRow");
+        if let Some(c) = x.child("w:tcPr").and_then(|p| p.child("w:shd")).and_then(shading) {
+            region.shading = Some(c);
+        }
+        if let Some(r) = x.child("w:rPr") {
+            if let Some(b) = r.child("w:b") {
+                region.bold = on(b);
+            }
+            if let Some(c) = r.child("w:color").and_then(|c| color(c.attr("w:val"))) {
+                region.color = Some(c);
+            }
+        }
+        if let Some(b) = x.child("w:tcPr").and_then(|p| p.child("w:tcBorders")) {
+            let rule = b.child(if under { "w:bottom" } else { "w:top" }).and_then(border);
+            if rule.is_some() {
+                region.rule = rule;
+            }
+        }
+    }
+    t
+}
+
 /// A `w:shd`'s colour: the fill, or a solid pattern's colour.
 fn shading(e: &El) -> Option<u32> {
     match val(e) {
@@ -495,6 +590,8 @@ struct Reader<'a> {
     rels: HashMap<String, (String, String, bool)>,
     images: HashMap<String, u32>,
     next_table: u32,
+    /// Table styles' names by style id.
+    table_styles: HashMap<String, Arc<str>>,
     pictures: u64,
     /// The settings turn on separate even-page headers and footers.
     even_odd: bool,
@@ -675,11 +772,18 @@ impl<'a> Reader<'a> {
             })
         };
         let mut list: Vec<(&El, String, StyleKind)> = Vec::new();
+        let mut table_els: Vec<(String, Arc<str>, &El)> = Vec::new();
         for s in e.children("w:style") {
             let kind = match s.attr("w:type") {
                 Some("paragraph") => StyleKind::Para,
                 Some("character") => StyleKind::Char,
-                Some("table") | Some("numbering") => continue,
+                Some("table") => {
+                    if let Some(id) = s.attr("w:styleId") {
+                        let name = s.child("w:name").and_then(val).unwrap_or(id);
+                        table_els.push((id.to_string(), Arc::<str>::from(&name[..name.len().min(255)]), s));
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             let Some(id) = s.attr("w:styleId") else { continue };
@@ -723,6 +827,27 @@ impl<'a> Reader<'a> {
                 st.parent = parent.or(if st.kind == StyleKind::Para { Some(0) } else { None });
             }
             st.next = next.or(st.next);
+        }
+        // Table styles, each over its parent (a chain at most 8 deep).
+        for (id, name, _) in table_els.iter().take(MAX_TABLE_STYLES) {
+            self.table_styles.insert(id.clone(), name.clone());
+        }
+        let by_id: HashMap<&str, &El> = table_els.iter().map(|(id, _, el)| (id.as_str(), *el)).collect();
+        for (id, name, el) in table_els.iter().take(MAX_TABLE_STYLES) {
+            let mut chain = vec![*el];
+            let mut cur = *el;
+            while chain.len() < 8 {
+                let Some(parent) = cur.child("w:basedOn").and_then(val).filter(|p| *p != id.as_str()).and_then(|p| by_id.get(p)) else { break };
+                chain.push(parent);
+                cur = parent;
+            }
+            let mut t: Option<TableStyle> = None;
+            for x in chain.iter().rev() {
+                t = Some(table_style(x, t.as_ref()));
+            }
+            if let Some(t) = t {
+                self.doc.styles.tables.insert(name.clone(), t);
+            }
         }
         // A parent chain that loops is cut.
         for i in 0..self.doc.styles.styles.len() {
@@ -1623,32 +1748,52 @@ impl<'a> Reader<'a> {
     }
 
     fn table(&mut self, t: &El, depth: usize, field: &mut FieldState) {
-        if depth > 0 {
-            // A table in a cell: its text, a paragraph per cell paragraph.
-            self.rep.note(Kind::Approximate, "nested tables (their text kept in the cell)");
-        }
         let grid: Vec<u32> = t.child("w:tblGrid").map(|g| g.children("w:gridCol").map(|c| num(c.attr("w:w")).unwrap_or(1440).clamp(1, MAX_OBJECT_TWIPS as i64) as u32).collect()).unwrap_or_default();
         let table = self.next_table;
         self.next_table += 1;
+        let tbl = t.child("w:tblPr");
+        let look = self.table_look_of(tbl);
         let mut rows = Vec::new();
         wrapped(t, "w:tr", &mut rows, 0);
+        // Only the rows at the top repeat as headers (Word ignores the
+        // mark on a row after one without it).
+        let mut leading = true;
         for (r, tr) in rows.into_iter().enumerate() {
             let mut col = 0usize;
             let mut cells = Vec::new();
             wrapped(tr, "w:tc", &mut cells, 0);
+            let trpr = tr.child("w:trPr");
+            let row_look = RowLook {
+                header: leading && trpr.and_then(|p| p.child("w:tblHeader")).is_some_and(on),
+                cant_split: trpr.and_then(|p| p.child("w:cantSplit")).is_some_and(on),
+                height: trpr.and_then(|p| p.child("w:trHeight")).and_then(|h| num(val(h))).map_or(0, |v| v.clamp(0, u16::MAX as i64) as u16),
+                exact: trpr.and_then(|p| p.child("w:trHeight")).and_then(|h| h.attr("w:hRule")) == Some("exact"),
+            };
+            leading = row_look.header;
             for (c, tc) in cells.into_iter().enumerate() {
                 let pr = tc.child("w:tcPr");
                 let span = pr.and_then(|p| p.child("w:gridSpan")).and_then(|g| num(val(g))).unwrap_or(1).clamp(1, 63) as usize;
-                if span > 1 {
-                    self.rep.note(Kind::Approximate, "merged cells (kept as one wide cell)");
-                }
-                if pr.and_then(|p| p.child("w:vMerge")).is_some() {
-                    self.rep.note(Kind::Approximate, "cells merged down (each row keeps its own cell)");
-                }
+                let merged_up = pr.and_then(|p| p.child("w:vMerge")).is_some_and(|v| val(v).is_none_or(|x| x == "continue"));
                 let width = (col..col + span).map(|g| grid.get(g).copied().unwrap_or(0)).sum::<u32>();
                 let width = if width == 0 { pr.and_then(|p| p.child("w:tcW")).filter(|w| w.attr("w:type") == Some("dxa")).and_then(|w| num(w.attr("w:w"))).unwrap_or(2000).clamp(1, MAX_OBJECT_TWIPS as i64) as u32 } else { width.min(MAX_OBJECT_TWIPS) };
                 col += span;
-                let cell = CellRef { table, row: r as u32, col: c.min(u16::MAX as usize) as u16, width };
+                let mut cell = CellRef { table, row: r as u32, col: c.min(u16::MAX as usize) as u16, width, row_look, merged_up, span: span as u8, ..Default::default() };
+                if let Some(pr) = pr {
+                    if let Some(b) = pr.child("w:tcBorders") {
+                        cell.look.borders = cell_borders(b);
+                    }
+                    if let Some(sh) = pr.child("w:shd") {
+                        cell.look.shading = Some(shading(sh));
+                    }
+                    cell.look.valign = match pr.child("w:vAlign").and_then(val) {
+                        Some("center") => VAlign::Center,
+                        Some("bottom") => VAlign::Bottom,
+                        _ => VAlign::Top,
+                    };
+                    if let Some(m) = pr.child("w:tcMar") {
+                        cell.look.pad = Some(cell_margins(m, look.pad.unwrap_or(WORD_PAD)));
+                    }
+                }
                 let before = self.doc.blocks.len();
                 self.cell_content(tc, cell, depth, field);
                 if self.doc.blocks.len() == before {
@@ -1664,13 +1809,89 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A table's own look from its `w:tblPr`: its style (or Word's plain
+    /// table, with no rules, when it names none the file has), borders,
+    /// shading, cell margins, place and parts.
+    fn table_look_of(&mut self, tbl: Option<&El>) -> TableLook {
+        let mut look = TableLook { pad: Some(WORD_PAD), ..TableLook::default() };
+        let Some(p) = tbl else {
+            look.borders = Some(TableBorders::default());
+            self.doc.tables.insert(self.next_table - 1, look.clone());
+            return look;
+        };
+        look.style = p.child("w:tblStyle").and_then(val).and_then(|id| self.table_styles.get(id).cloned());
+        let style = look.style.as_ref().and_then(|n| self.doc.styles.tables.get(n));
+        look.borders = match p.child("w:tblBorders") {
+            Some(b) => {
+                // Over the style's sides: a side the table names (even as
+                // nil) is its own.
+                let base = style.map(|s| s.borders).unwrap_or_default();
+                let side = |a: &str, alt: &str, under: Option<Border>| match b.child(a).or_else(|| b.child(alt)) {
+                    Some(x) => border(x),
+                    None => under,
+                };
+                Some(TableBorders { top: side("w:top", "w:top", base.top), bottom: side("w:bottom", "w:bottom", base.bottom), start: side("w:start", "w:left", base.start), end: side("w:end", "w:right", base.end), inside_h: side("w:insideH", "w:insideH", base.inside_h), inside_v: side("w:insideV", "w:insideV", base.inside_v) })
+            }
+            None if style.is_none() => Some(TableBorders::default()),
+            None => None,
+        };
+        look.shading = p.child("w:shd").and_then(shading);
+        if let Some(m) = p.child("w:tblCellMar") {
+            look.pad = Some(cell_margins(m, WORD_PAD));
+        }
+        look.align = match p.child("w:jc").and_then(val) {
+            Some("center") => TableAlign::Center,
+            Some("right") | Some("end") => TableAlign::End,
+            _ => TableAlign::Start,
+        };
+        look.indent = p.child("w:tblInd").filter(|x| x.attr("w:type").is_none_or(|t| t == "dxa")).and_then(|x| num(x.attr("w:w"))).map_or(0, |v| v.clamp(-31_680, 31_680) as i32);
+        look.autofit = p.child("w:tblLayout").and_then(|x| x.attr("w:type")) != Some("fixed");
+        if let Some(l) = p.child("w:tblLook") {
+            look.look = table_look(l);
+        }
+        self.doc.tables.insert(self.next_table - 1, look.clone());
+        look
+    }
+
     fn cell_content(&mut self, tc: &El, cell: CellRef, depth: usize, field: &mut FieldState) {
-        for x in tc.els() {
+        let els: Vec<&El> = tc.els().collect();
+        for (i, x) in els.iter().copied().enumerate() {
             match x.name.as_str() {
+                // The paragraph Word must end a cell with after a table in
+                // it isn't text of the cell when it holds none (after empty
+                // ones there, the last of them).
+                "w:p" if depth == 0 && i + 1 == els.len() && els[..i].iter().rposition(|e| e.name == "w:tbl").is_some_and(|t| els[t + 1..i].iter().all(|e| matches!(e.name.as_str(), "w:p" | "w:bookmarkStart" | "w:bookmarkEnd"))) => {
+                    let before = self.doc.blocks.len();
+                    self.para(x, Some(cell), field);
+                    let blank = |d: &TextDoc, k: usize| d.para(k).is_some_and(|p| p.text.is_empty() && p.props.section.is_none() && p.props.inner.is_none() && p.props.cell == Some(cell));
+                    let mut k = before;
+                    while k > 0 && blank(&self.doc, k - 1) {
+                        k -= 1;
+                    }
+                    let after_table = k > 0 && self.doc.para(k - 1).is_some_and(|p| p.props.inner.is_some() && p.props.cell.is_some_and(|c| (c.table, c.row, c.col) == (cell.table, cell.row, cell.col)));
+                    if self.doc.blocks.len() == before + 1 && blank(&self.doc, before) && after_table {
+                        self.doc.blocks.remove(before);
+                    }
+                }
                 "w:p" => {
                     self.para(x, Some(cell), field);
                 }
+                "w:tbl" if depth == 0 => {
+                    // A table in a cell: its paragraphs are in the outer
+                    // cell and in their own cell of the inner table.
+                    let before = self.doc.blocks.len();
+                    self.table(x, 1, field);
+                    for k in before..self.doc.blocks.len() {
+                        self.doc.blocks.update(k, |b| {
+                            if let Some(q) = b.as_para_mut() {
+                                q.props.inner = q.props.cell;
+                                q.props.cell = Some(cell);
+                            }
+                        });
+                    }
+                }
                 "w:tbl" if depth < 8 => {
+                    // Deeper tables: their text, a paragraph per cell paragraph.
                     let mut rows = Vec::new();
                     wrapped(x, "w:tr", &mut rows, 0);
                     for tr in rows {
@@ -1680,7 +1901,7 @@ impl<'a> Reader<'a> {
                             self.cell_content(inner, cell, depth + 1, field);
                         }
                     }
-                    self.rep.note(Kind::Approximate, "nested tables (their text kept in the cell)");
+                    self.rep.note(Kind::Approximate, "tables three deep (their text kept in the cell)");
                 }
                 "w:sdt" => {
                     if let Some(c) = x.child("w:sdtContent") {
@@ -1995,7 +2216,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new(), drop: None };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, table_styles: HashMap::new(), pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new(), drop: None };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };

@@ -19,7 +19,7 @@ fn table_first() -> TextDoc {
     for r in 0..2u32 {
         for c in 0..2u16 {
             let k = d.push_para(&format!("cell {r}{c}"), 0, vec![]);
-            d.blocks.update(k, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 1, row: r, col: c, width: 2400 }));
+            d.blocks.update(k, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 1, row: r, col: c, width: 2400, ..Default::default() }));
         }
     }
     d.push_para("After the table.", 0, vec![]);

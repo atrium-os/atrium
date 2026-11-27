@@ -31,7 +31,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, MAX_BORDER_WIDTH, MAX_BORDER_SPACE, ListDef, ListLevel, NumFormat, MAX_LEVEL_TEXT, MAX_LIST_START, MAX_LIST_DEFS, LineNumbering, LineRestart, Settings, Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, RegionLook, MAX_TABLES, MAX_TABLE_STYLES, MAX_CELL_PAD, MAX_TWIPS_TABLE, MAX_CELLS, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, MAX_BORDER_WIDTH, MAX_BORDER_SPACE, ListDef, ListLevel, NumFormat, MAX_LEVEL_TEXT, MAX_LIST_START, MAX_LIST_DEFS, LineNumbering, LineRestart, Settings, Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -52,6 +52,9 @@ pub const SHAPE: u16 = 13;
 pub const LISTS: u16 = 14;
 /// Line numbers and hyphenation.
 pub const SETTINGS: u16 = 15;
+/// Tables' own looks, and table styles.
+pub const TABLES: u16 = 16;
+pub const TABLE_STYLES: u16 = 17;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -552,10 +555,271 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     for v in [p.line_numbers, p.hyphenate].into_iter().flatten() {
         w.u8(v as u8);
     }
+    if more & 64 != 0 {
+        if let Some(c) = &p.cell {
+            encode_cell_extras(w, c);
+        }
+    }
+    if more & 128 != 0 {
+        if let Some(c) = &p.inner {
+            w.var(c.table as u64);
+            w.var(c.row as u64);
+            w.var(c.col as u64);
+            w.var(c.width as u64);
+            encode_cell_extras(w, c);
+        }
+    }
 }
 
 fn box_mask(p: &ParaProps) -> u8 {
-    p.borders.is_some() as u8 | (p.shading.is_some() as u8) << 1 | (p.drop_cap.is_some() as u8) << 2 | (p.list_start.is_some() as u8) << 3 | (p.line_numbers.is_some() as u8) << 4 | (p.hyphenate.is_some() as u8) << 5
+    let cell_extras = p.cell.is_some_and(|c| !c.look.is_default() || c.row_look != RowLook::default() || c.merged_up || c.span != 1);
+    p.borders.is_some() as u8 | (p.shading.is_some() as u8) << 1 | (p.drop_cap.is_some() as u8) << 2 | (p.list_start.is_some() as u8) << 3 | (p.line_numbers.is_some() as u8) << 4 | (p.hyphenate.is_some() as u8) << 5 | (cell_extras as u8) << 6 | ((p.cell.is_some() && p.inner.is_some()) as u8) << 7
+}
+
+/// `0`, or `1` then a border.
+fn encode_opt_border(w: &mut Writer, b: Option<Border>) {
+    match b {
+        None => w.u8(0),
+        Some(x) => {
+            w.u8(1);
+            encode_border(w, &x);
+        }
+    }
+}
+
+fn decode_opt_border(r: &mut Reader) -> Result<Option<Border>, WireError> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(decode_border(r)?)),
+        _ => Err(WireError::Invalid("border")),
+    }
+}
+
+fn encode_opt_color(w: &mut Writer, c: Option<u32>) {
+    match c {
+        None => w.u8(0),
+        Some(c) => {
+            w.u8(1);
+            w.var(c as u64 & 0xff_ffff);
+        }
+    }
+}
+
+fn encode_pad(w: &mut Writer, p: CellPad) {
+    let p = p.bounded();
+    for v in [p.top, p.bottom, p.start, p.end] {
+        w.var(v as u64);
+    }
+}
+
+fn decode_pad(r: &mut Reader) -> Result<CellPad, WireError> {
+    let mut v = [0u16; 4];
+    for x in v.iter_mut() {
+        *x = r.len("cell padding", MAX_CELL_PAD as u64)? as u16;
+    }
+    Ok(CellPad { top: v[0], bottom: v[1], start: v[2], end: v[3] })
+}
+
+/// A cell's own look, its row's, merged up and its span.
+fn encode_cell_extras(w: &mut Writer, c: &CellRef) {
+    let b = c.look.borders;
+    for side in [b.top, b.bottom, b.start, b.end] {
+        match side {
+            None => w.u8(0),
+            Some(None) => w.u8(1),
+            Some(Some(x)) => {
+                w.u8(2);
+                encode_border(w, &x);
+            }
+        }
+    }
+    match c.look.shading {
+        None => w.u8(0),
+        Some(None) => w.u8(1),
+        Some(Some(x)) => {
+            w.u8(2);
+            w.var(x as u64 & 0xff_ffff);
+        }
+    }
+    w.u8(match c.look.valign {
+        VAlign::Top => 0,
+        VAlign::Center => 1,
+        VAlign::Bottom => 2,
+    });
+    match c.look.pad {
+        None => w.u8(0),
+        Some(p) => {
+            w.u8(1);
+            encode_pad(w, p);
+        }
+    }
+    let rl = c.row_look;
+    w.u8(rl.header as u8 | (rl.cant_split as u8) << 1 | (rl.exact as u8) << 2 | (c.merged_up as u8) << 3);
+    w.var(rl.height as u64);
+    w.u8(c.span.clamp(1, MAX_CELLS as u8));
+}
+
+fn decode_cell_extras(r: &mut Reader, c: &mut CellRef) -> Result<(), WireError> {
+    let mut sides = [None; 4];
+    for x in sides.iter_mut() {
+        *x = match r.u8()? {
+            0 => None,
+            1 => Some(None),
+            2 => Some(Some(decode_border(r)?)),
+            _ => return Err(WireError::Invalid("cell border")),
+        };
+    }
+    let [top, bottom, start, end] = sides;
+    let shading = match r.u8()? {
+        0 => None,
+        1 => Some(None),
+        2 => Some(Some(r.len("colour", 0xff_ffff)? as u32)),
+        _ => return Err(WireError::Invalid("cell shading")),
+    };
+    let valign = match r.u8()? {
+        0 => VAlign::Top,
+        1 => VAlign::Center,
+        2 => VAlign::Bottom,
+        _ => return Err(WireError::Invalid("cell alignment")),
+    };
+    let pad = match r.u8()? {
+        0 => None,
+        1 => Some(decode_pad(r)?),
+        _ => return Err(WireError::Invalid("cell padding")),
+    };
+    let bits = r.u8()?;
+    if bits > 15 {
+        return Err(WireError::Invalid("row flags"));
+    }
+    let height = r.len("row height", u16::MAX as u64)? as u16;
+    let span = r.u8()?;
+    if span == 0 || span as usize > MAX_CELLS {
+        return Err(WireError::Invalid("cell span"));
+    }
+    c.look = CellLook { borders: CellBorders { top, bottom, start, end }, shading, valign, pad };
+    c.row_look = RowLook { header: bits & 1 != 0, cant_split: bits & 2 != 0, height, exact: bits & 4 != 0 };
+    c.merged_up = bits & 8 != 0;
+    c.span = span;
+    Ok(())
+}
+
+/// A table's own look.
+pub fn encode_table(w: &mut Writer, t: &TableLook) {
+    match &t.style {
+        None => w.u8(0),
+        Some(n) => {
+            w.u8(1);
+            w.str(n);
+        }
+    }
+    match &t.borders {
+        None => w.u8(0),
+        Some(b) => {
+            w.u8(1);
+            for x in b.sides() {
+                encode_opt_border(w, x);
+            }
+        }
+    }
+    encode_opt_color(w, t.shading);
+    match t.pad {
+        None => w.u8(0),
+        Some(p) => {
+            w.u8(1);
+            encode_pad(w, p);
+        }
+    }
+    w.u8(match t.align {
+        HAlign::Start | HAlign::Offset => 0,
+        HAlign::Center => 1,
+        HAlign::End => 2,
+    });
+    w.ivar(t.indent.clamp(-MAX_TWIPS_TABLE, MAX_TWIPS_TABLE) as i64);
+    w.u8(t.look & 63);
+    w.u8(t.autofit as u8);
+}
+
+pub fn decode_table(r: &mut Reader) -> Result<TableLook, WireError> {
+    let style = match r.u8()? {
+        0 => None,
+        1 => Some(r.str("table style", 256)?.into()),
+        _ => return Err(WireError::Invalid("table style")),
+    };
+    let borders = match r.u8()? {
+        0 => None,
+        1 => {
+            let mut v = [None; 6];
+            for x in v.iter_mut() {
+                *x = decode_opt_border(r)?;
+            }
+            let [top, bottom, start, end, inside_h, inside_v] = v;
+            Some(TableBorders { top, bottom, start, end, inside_h, inside_v })
+        }
+        _ => return Err(WireError::Invalid("table borders")),
+    };
+    let shading = decode_color(r)?;
+    let pad = match r.u8()? {
+        0 => None,
+        1 => Some(decode_pad(r)?),
+        _ => return Err(WireError::Invalid("table padding")),
+    };
+    let align = match r.u8()? {
+        0 => HAlign::Start,
+        1 => HAlign::Center,
+        2 => HAlign::End,
+        _ => return Err(WireError::Invalid("table alignment")),
+    };
+    let indent = r.ivar()?;
+    if indent.abs() > MAX_TWIPS_TABLE as i64 {
+        return Err(WireError::Invalid("table indent"));
+    }
+    let look = r.u8()?;
+    let autofit = r.u8()?;
+    if look > 63 || autofit > 1 {
+        return Err(WireError::Invalid("table flags"));
+    }
+    Ok(TableLook { style, borders, shading, pad, align, indent: indent as i32, look, autofit: autofit == 1 })
+}
+
+fn encode_region(w: &mut Writer, x: &RegionLook) {
+    encode_opt_color(w, x.shading);
+    w.u8(x.bold as u8);
+    encode_opt_color(w, x.color);
+    encode_opt_border(w, x.rule);
+}
+
+fn decode_region(r: &mut Reader) -> Result<RegionLook, WireError> {
+    let shading = decode_color(r)?;
+    let bold = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(WireError::Invalid("bold")),
+    };
+    Ok(RegionLook { shading, bold, color: decode_color(r)?, rule: decode_opt_border(r)? })
+}
+
+/// A table style.
+pub fn encode_table_style(w: &mut Writer, t: &TableStyle) {
+    for x in t.borders.sides() {
+        encode_opt_border(w, x);
+    }
+    encode_opt_color(w, t.shading);
+    for x in [&t.header, &t.total, &t.first_col, &t.last_col] {
+        encode_region(w, x);
+    }
+    encode_opt_color(w, t.band_row);
+    encode_opt_color(w, t.band_col);
+}
+
+pub fn decode_table_style(r: &mut Reader) -> Result<TableStyle, WireError> {
+    let mut v = [None; 6];
+    for x in v.iter_mut() {
+        *x = decode_opt_border(r)?;
+    }
+    let [top, bottom, start, end, inside_h, inside_v] = v;
+    let shading = decode_color(r)?;
+    let (header, total, first_col, last_col) = (decode_region(r)?, decode_region(r)?, decode_region(r)?, decode_region(r)?);
+    Ok(TableStyle { borders: TableBorders { top, bottom, start, end, inside_h, inside_v }, shading, header, total, first_col, last_col, band_row: decode_color(r)?, band_col: decode_color(r)? })
 }
 
 fn encode_border(w: &mut Writer, b: &Border) {
@@ -709,7 +973,7 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let more = if ext & 32 != 0 { r.u8()? } else { 0 };
-    if more >> 6 != 0 || (ext & 32 != 0 && more == 0) {
+    if ext & 32 != 0 && more == 0 {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -782,7 +1046,7 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
         if !(1..=MAX_OBJECT_TWIPS as u64).contains(&width) {
             return Err(WireError::Invalid("cell width"));
         }
-        p.cell = Some(CellRef { table, row, col, width: width as u32 });
+        p.cell = Some(CellRef { table, row, col, width: width as u32, ..CellRef::default() });
     }
     if on(14) {
         p.rev = Some(r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId);
@@ -888,6 +1152,25 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     }
     if more & 32 != 0 {
         p.hyphenate = Some(flag(r)?);
+    }
+    if more & 64 != 0 {
+        let Some(c) = p.cell.as_mut() else { return Err(WireError::Invalid("cell look outside a table")) };
+        decode_cell_extras(r, c)?;
+    }
+    if more & 128 != 0 {
+        if p.cell.is_none() {
+            return Err(WireError::Invalid("inner table outside a table"));
+        }
+        let table = r.len("table", u32::MAX as u64)? as u32;
+        let row = r.len("row", u32::MAX as u64)? as u32;
+        let col = r.len("column", u16::MAX as u64)? as u16;
+        let width = r.var()?;
+        if !(1..=MAX_OBJECT_TWIPS as u64).contains(&width) {
+            return Err(WireError::Invalid("cell width"));
+        }
+        let mut c = CellRef { table, row, col, width: width as u32, ..CellRef::default() };
+        decode_cell_extras(r, &mut c)?;
+        p.inner = Some(c);
     }
     Ok(p)
 }
@@ -1439,6 +1722,28 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             w.u8(20);
             encode_settings(&mut w, settings);
         }
+        TextOp::SetTable { id, look } => {
+            w.u8(21);
+            w.var(*id as u64);
+            match look {
+                None => w.u8(0),
+                Some(t) => {
+                    w.u8(1);
+                    encode_table(&mut w, t);
+                }
+            }
+        }
+        TextOp::SetTableStyle { name, style } => {
+            w.u8(22);
+            w.str(name);
+            match style {
+                None => w.u8(0),
+                Some(t) => {
+                    w.u8(1);
+                    encode_table_style(&mut w, t);
+                }
+            }
+        }
         TextOp::SetConflict { id, alt } => {
             w.u8(14);
             w.var(*id as u64);
@@ -1732,6 +2037,24 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
             TextOp::SetList { id, def }
         }
         20 => TextOp::SetSettings { settings: decode_settings(&mut r)? },
+        21 => {
+            let id = r.len("table", u32::MAX as u64)? as u32;
+            let look = match r.u8()? {
+                0 => None,
+                1 => Some(decode_table(&mut r)?),
+                _ => return Err(WireError::Invalid("table")),
+            };
+            TextOp::SetTable { id, look }
+        }
+        22 => {
+            let name: Arc<str> = r.str("table style", 256)?.into();
+            let style = match r.u8()? {
+                0 => None,
+                1 => Some(decode_table_style(&mut r)?),
+                _ => return Err(WireError::Invalid("table style")),
+            };
+            TextOp::SetTableStyle { name, style }
+        }
         _ => return Err(WireError::Invalid("op")),
     };
     if !r.is_empty() {
@@ -1903,6 +2226,24 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         encode_settings(&mut w, &doc.settings);
         c.add(SETTINGS, &w.into_bytes())?;
     }
+    if !doc.tables.is_empty() {
+        let mut w = Writer::new();
+        w.var(doc.tables.len().min(MAX_TABLES) as u64);
+        for (id, t) in doc.tables.iter().take(MAX_TABLES) {
+            w.var(*id as u64);
+            encode_table(&mut w, t);
+        }
+        c.add(TABLES, &w.into_bytes())?;
+    }
+    if !doc.styles.tables.is_empty() {
+        let mut w = Writer::new();
+        w.var(doc.styles.tables.len().min(MAX_TABLE_STYLES) as u64);
+        for (name, t) in doc.styles.tables.iter().take(MAX_TABLE_STYLES) {
+            w.str(name);
+            encode_table_style(&mut w, t);
+        }
+        c.add(TABLE_STYLES, &w.into_bytes())?;
+    }
 
     if !checkpoints.is_empty() {
         let mut w = Writer::new();
@@ -2011,6 +2352,32 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
         doc.settings = decode_settings(&mut r)?;
         if !r.is_empty() {
             return Err(LoadError::Bad("SETTINGS chunk"));
+        }
+    }
+    if c.entries().iter().any(|e| e.kind == TABLES) {
+        let mut r = Reader::new(one(TABLES, "TABLES chunk")?);
+        let n = r.count("tables", MAX_TABLES as u64, 8)?;
+        for _ in 0..n {
+            let id = r.len("table", u32::MAX as u64)? as u32;
+            if doc.tables.insert(id, decode_table(&mut r)?).is_some() {
+                return Err(LoadError::Bad("table defined twice"));
+            }
+        }
+        if !r.is_empty() {
+            return Err(LoadError::Bad("TABLES chunk"));
+        }
+    }
+    if c.entries().iter().any(|e| e.kind == TABLE_STYLES) {
+        let mut r = Reader::new(one(TABLE_STYLES, "TABLE_STYLES chunk")?);
+        let n = r.count("table styles", MAX_TABLE_STYLES as u64, 16)?;
+        for _ in 0..n {
+            let name: Arc<str> = r.str("table style", 256)?.into();
+            if doc.styles.tables.insert(name, decode_table_style(&mut r)?).is_some() {
+                return Err(LoadError::Bad("table style defined twice"));
+            }
+        }
+        if !r.is_empty() {
+            return Err(LoadError::Bad("TABLE_STYLES chunk"));
         }
     }
 
@@ -2246,7 +2613,7 @@ mod tests {
             d.push_para(&format!("Paragraph {i} with bold and a link; naïve ✓"), 0, vec![(0, 0), (14, bold), (18, 0), (27, link), (31, 0)]);
         }
         d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), list: Some(Some(ListRef { id: 3, kind: ListKind::Numbered, level: 2 })), ..Default::default() });
-        d.blocks.update(4, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 2, row: 7, col: 1, width: 2000 }));
+        d.blocks.update(4, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 2, row: 7, col: 1, width: 2000, ..Default::default() }));
         d.blocks.update(9, |b| b.as_para_mut().unwrap().props.section = Some(Section { start: SectionStart::Continuous, columns: 3, gap: 400, rule: true, page: None }));
         d.blocks.update(10, |b| b.as_para_mut().unwrap().props.section = Some(Section { page: Some(PageSetup { width: 16838, height: 11906, ..PageSetup::default() }), ..Section::default() }));
         d.page.margin_start = 1000;
@@ -2341,6 +2708,54 @@ mod tests {
         let mut w = Writer::new();
         encode_border(&mut w, &Border { width: 0, ..b });
         assert!(decode_border(&mut Reader::new(&w.into_bytes())).is_err());
+    }
+
+    #[test]
+    fn cell_looks_tables_and_table_styles_round_trip() {
+        use crate::model::{Border, CellBorders, CellLook, CellPad, CellRef, RegionLook, RowLook, TableBorders, TableLook, TableStyle, VAlign, LOOK_TOTAL};
+        let mut d = TextDoc::new();
+        let b = Border { color: Some(0x00aa00), width: 8, ..Default::default() };
+        let cell = CellRef {
+            table: 3,
+            row: 1,
+            col: 2,
+            width: 2400,
+            look: CellLook { borders: CellBorders { top: Some(Some(b)), bottom: Some(None), ..Default::default() }, shading: Some(Some(0xabcdef)), valign: VAlign::Bottom, pad: Some(CellPad { top: 10, bottom: 20, start: 30, end: 40 }) },
+            row_look: RowLook { header: true, cant_split: true, height: 720, exact: true },
+            merged_up: true,
+            span: 3,
+        };
+        d.blocks.update(0, |x| x.as_para_mut().unwrap().props.cell = Some(cell));
+        let plain = d.push_para("plain cell", 0, vec![]);
+        d.blocks.update(plain, |x| x.as_para_mut().unwrap().props.cell = Some(CellRef { table: 3, row: 2, col: 0, width: 900, ..Default::default() }));
+        let look = TableLook { style: Some("Mine".into()), borders: Some(TableBorders { inside_v: Some(b), ..Default::default() }), shading: Some(0xfefefe), pad: Some(CellPad::default()), align: crate::model::HAlign::Center, indent: -144, look: LOOK_TOTAL, autofit: true };
+        d.tables.insert(3, look.clone());
+        let style = TableStyle { borders: TableBorders::grid(), header: RegionLook { shading: Some(1), bold: true, color: Some(2), rule: Some(b) }, band_row: Some(3), ..Default::default() };
+        d.styles.tables.insert("Mine".into(), style.clone());
+        let r = load(&save_to_vec(&d, &[])).unwrap().doc;
+        assert_eq!(r.para(0).unwrap().props.cell, Some(cell));
+        assert_eq!(r.para(plain).unwrap().props, d.para(plain).unwrap().props);
+        assert_eq!(r.tables.get(&3), Some(&look));
+        assert_eq!(r.styles.tables.get("Mine"), Some(&style));
+        for op in [TextOp::SetTable { id: 3, look: Some(look) }, TextOp::SetTable { id: 4, look: None }, TextOp::SetTableStyle { name: "Mine".into(), style: Some(style) }, TextOp::SetTableStyle { name: "X".into(), style: None }] {
+            assert_eq!(decode_op(&encode_op(&op), 1, 1).unwrap(), op);
+        }
+        let mut w = Writer::new();
+        let mut p = ParaProps { cell: Some(cell), ..Default::default() };
+        encode_props(&mut w, &p);
+        let mut bytes = w.into_bytes();
+        assert_eq!(decode_props(&mut Reader::new(&bytes)).unwrap(), p);
+        bytes.truncate(bytes.len() - 1);
+        assert!(decode_props(&mut Reader::new(&bytes)).is_err(), "cut short");
+        // A table inside the cell, and one that isn't in a cell is refused.
+        p.inner = Some(CellRef { table: 9, row: 0, col: 1, width: 700, span: 2, ..Default::default() });
+        let mut w = Writer::new();
+        encode_props(&mut w, &p);
+        assert_eq!(decode_props(&mut Reader::new(&w.into_bytes())).unwrap(), p);
+        p.cell = None;
+        let mut w = Writer::new();
+        encode_props(&mut w, &p);
+        assert_eq!(decode_props(&mut Reader::new(&w.into_bytes())).unwrap().inner, None, "no inner cell without an outer one");
     }
 
     #[test]

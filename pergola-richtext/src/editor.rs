@@ -15,7 +15,7 @@ use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Border, ParaBorders, DropCap, ListDef, ListLevel, LineNumbering, LineSpacing, ParaFormat, Settings, TabStop, TabAlign, Leader, MAX_TABS, LIST_INDENT, Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{builtin_table_styles, CellPad, TableLook, VAlign, Border, ParaBorders, DropCap, ListDef, ListLevel, LineNumbering, LineSpacing, ParaFormat, Settings, TabStop, TabAlign, Leader, MAX_TABS, LIST_INDENT, Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::PAGE_BREAK;
 use officina_text::model::{RevId, Revision};
@@ -1974,8 +1974,9 @@ impl Editor {
             let mut props = p.props.clone();
             let st = match style {
                 Some(s) => {
-                    // A new style clears direct paragraph formatting.
-                    props = ParaProps::default();
+                    // A new style clears direct paragraph formatting (the
+                    // paragraph stays in its list, cell and section).
+                    props = ParaProps { list: props.list, cell: props.cell, inner: props.inner, rev: props.rev, toc: props.toc, section: props.section, ..ParaProps::default() };
                     s
                 }
                 None => p.style,
@@ -2359,10 +2360,15 @@ impl Editor {
         (cells, k)
     }
 
+    /// An empty cell like block `like`'s (its look; its row's look but
+    /// not as a header unless `like`'s row is one and `same_row`).
     fn empty_cell(&mut self, like: usize, row: u32, col: u16, width: u32) -> Block {
         let (style, mut props) = self.doc.para(like).map(|p| (p.style, p.props.clone())).unwrap_or_default();
-        let table = props.cell.map_or(0, |c| c.table);
-        props.cell = Some(CellRef { table, row, col, width: width.max(1) });
+        let old = props.cell.unwrap_or_default();
+        let same_row = old.row == row;
+        let row_look = officina_text::model::RowLook { header: old.row_look.header && same_row, ..old.row_look };
+        props.cell = Some(CellRef { table: old.table, row, col, width: width.max(1), look: old.look, row_look, ..Default::default() });
+        props.inner = None;
         props.list = None;
         let id = self.doc.new_id();
         Block::Para(Para { id, text: String::new(), runs: vec![(0, 0)], style, props })
@@ -2382,7 +2388,7 @@ impl Editor {
         for r in 0..rows {
             for c in 0..cols {
                 let id = self.doc.new_id();
-                let props = ParaProps { cell: Some(CellRef { table, row: r as u32, col: c as u16, width }), space_after: Some(0), ..Default::default() };
+                let props = ParaProps { cell: Some(CellRef { table, row: r as u32, col: c as u16, width, ..Default::default() }), space_after: Some(0), ..Default::default() };
                 blocks.push(Block::Para(Para { id, text: String::new(), runs: vec![(0, 0)], style: 0, props }));
             }
         }
@@ -2416,6 +2422,11 @@ impl Editor {
     /// Adds a column right of the caret's: in every row the cell at the
     /// caret's place splits its width with a new empty cell after it.
     pub fn insert_column_right(&mut self) -> bool {
+        self.insert_column(true)
+    }
+
+    /// A column after (`right`) or before the caret's.
+    fn insert_column(&mut self, right: bool) -> bool {
         let b = self.caret.block;
         if self.doc.cell(b).is_none() {
             return false;
@@ -2441,9 +2452,10 @@ impl Editor {
                 }
             }
             let blk = self.empty_cell(cell.start, cc.row, col, (cc.width - half).max(1));
-            ops.push(TextOp::Insert { at: cell.end as u32, blocks: vec![blk] });
+            let at = if right { cell.end } else { cell.start };
+            ops.push(TextOp::Insert { at: at as u32, blocks: vec![blk] });
             if row.contains(&b) {
-                caret = Some(cell.end);
+                caret = Some(at);
             } else if caret.is_some() {
                 // A row above: its new cell comes before the caret's.
                 shift += 1;
@@ -2452,7 +2464,7 @@ impl Editor {
         if ops.is_empty() {
             return false;
         }
-        self.apply("Insert Column", ops, Kind::Other);
+        self.apply(if right { "Insert Column Right" } else { "Insert Column Left" }, ops, Kind::Other);
         if let Some(c) = caret {
             self.set_caret(Pos::new(c + shift, 0), false);
         }
@@ -2548,6 +2560,693 @@ impl Editor {
         }
     }
 
+    // ---- table tools ----
+
+    /// The selected cells of the caret's table as a block of rows and
+    /// cells: each row's blocks, and from each the cells in the columns
+    /// (by place in the row) the selection's ends are in.
+    fn cell_rect(&self) -> Option<Vec<(std::ops::Range<usize>, Vec<std::ops::Range<usize>>)>> {
+        let (a, b) = self.selection();
+        self.doc.cell(a.block)?;
+        let rows = self.table_rows(a.block);
+        let t = self.table_range(a.block);
+        let b = if t.contains(&b.block) { b.block } else { a.block };
+        let place = |k: usize| -> Option<(usize, usize)> {
+            let r = rows.iter().position(|r| r.contains(&k))?;
+            let cells = cells_in(&self.doc, rows[r].clone());
+            Some((r, cells.iter().position(|c| c.contains(&k)).unwrap_or(0)))
+        };
+        let ((r0, c0), (r1, c1)) = (place(a.block)?, place(b)?);
+        let (r0, r1, c0, c1) = (r0.min(r1), r0.max(r1), c0.min(c1), c0.max(c1));
+        Some(
+            rows[r0..=r1]
+                .iter()
+                .map(|r| {
+                    let cells = cells_in(&self.doc, r.clone());
+                    let hi = c1.min(cells.len().saturating_sub(1));
+                    (r.clone(), cells.get(c0.min(hi)..=hi).map(|c| c.to_vec()).unwrap_or_default())
+                })
+                .collect(),
+        )
+    }
+
+    /// SetPara ops giving blocks' cells a change.
+    fn retag(&self, blocks: impl IntoIterator<Item = usize>, f: impl Fn(&mut CellRef)) -> Vec<TextOp> {
+        let mut ops = Vec::new();
+        for k in blocks {
+            let Some(p) = self.doc.para(k) else { continue };
+            let Some(mut c) = p.props.cell else { continue };
+            f(&mut c);
+            if Some(c) != p.props.cell {
+                let mut props = p.props.clone();
+                props.cell = Some(c);
+                ops.push(TextOp::SetPara { block: k as u32, style: p.style, props });
+            }
+        }
+        ops
+    }
+
+    /// Changes the selected cells.
+    fn change_cells(&mut self, label: &str, f: impl Fn(&mut CellRef)) -> bool {
+        let Some(rect) = self.cell_rect() else { return false };
+        let ops = self.retag(rect.iter().flat_map(|r| r.1.iter().flat_map(|c| c.clone())), f);
+        let rev = self.revision;
+        self.apply(label, ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// Changes the selected rows (every cell in them).
+    fn change_rows(&mut self, label: &str, f: impl Fn(&mut CellRef)) -> bool {
+        let Some(rect) = self.cell_rect() else { return false };
+        let ops = self.retag(rect.iter().flat_map(|r| r.0.clone()), f);
+        let rev = self.revision;
+        self.apply(label, ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// Shading of the selected cells (`None`: no colour).
+    pub fn set_cell_shading(&mut self, color: Option<u32>) -> bool {
+        self.change_cells("Shading", move |c| c.look.shading = Some(color))
+    }
+
+    /// Where the text sits down the selected cells.
+    pub fn set_cell_valign(&mut self, v: VAlign) -> bool {
+        self.change_cells("Cell Alignment", move |c| c.look.valign = v)
+    }
+
+    /// The selected cells' padding (`None`: the table's).
+    pub fn set_cell_pad(&mut self, pad: Option<CellPad>) -> bool {
+        self.change_cells("Cell Margins", move |c| c.look.pad = pad.map(CellPad::bounded))
+    }
+
+    /// Rules on edges of the selected block of cells: `b` (`None`: no rule).
+    pub fn set_cell_borders(&mut self, edges: CellEdges, b: Option<Border>) -> bool {
+        let Some(rect) = self.cell_rect() else { return false };
+        let n = rect.len();
+        let mut ops = Vec::new();
+        for (ri, (_, cells)) in rect.iter().enumerate() {
+            let m = cells.len();
+            for (ci, cell) in cells.iter().enumerate() {
+                let (top, bottom, start, end) = (ri == 0, ri + 1 == n, ci == 0, ci + 1 == m);
+                let [t, bo, s, e] = match edges {
+                    CellEdges::All | CellEdges::None => [true; 4],
+                    CellEdges::Outside => [top, bottom, start, end],
+                    CellEdges::Inside => [!top, !bottom, !start, !end],
+                    CellEdges::Top => [top, false, false, false],
+                    CellEdges::Bottom => [false, bottom, false, false],
+                    CellEdges::Start => [false, false, start, false],
+                    CellEdges::End => [false, false, false, end],
+                    CellEdges::InsideH => [!top, !bottom, false, false],
+                    CellEdges::InsideV => [false, false, !start, !end],
+                };
+                let side = if edges == CellEdges::None { None } else { b };
+                ops.extend(self.retag(cell.clone(), |c| {
+                    let x = &mut c.look.borders;
+                    for (on, v) in [(t, &mut x.top), (bo, &mut x.bottom), (s, &mut x.start), (e, &mut x.end)] {
+                        if on {
+                            *v = Some(side);
+                        }
+                    }
+                }));
+            }
+        }
+        let rev = self.revision;
+        self.apply("Borders", ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// The selected rows repeat at the top of each page (the table's first
+    /// rows only do).
+    pub fn set_header_rows(&mut self, on: bool) -> bool {
+        self.change_rows("Repeat Header Rows", move |c| c.row_look.header = on)
+    }
+
+    /// The selected rows break across pages or not.
+    pub fn set_cant_split(&mut self, on: bool) -> bool {
+        self.change_rows("Row Can't Break", move |c| c.row_look.cant_split = on)
+    }
+
+    /// The selected rows' height in twips (0: as the text needs), at
+    /// least or exactly.
+    pub fn set_row_height(&mut self, height: u32, exact: bool) -> bool {
+        let h = height.min(MAX_OBJECT_TWIPS).min(u16::MAX as u32) as u16;
+        self.change_rows("Row Height", move |c| {
+            c.row_look.height = h;
+            c.row_look.exact = exact && h > 0;
+        })
+    }
+
+    /// Adds a row of empty cells above the caret's row.
+    pub fn insert_row_above(&mut self) -> bool {
+        let b = self.caret.block;
+        let Some(c) = self.doc.cell(b) else { return false };
+        let row = self.doc.row_range(b);
+        let fresh = self.table_rows(b).iter().filter_map(|r| self.doc.cell(r.start)).map(|x| x.row).max().unwrap_or(0).wrapping_add(1);
+        let (cells, _) = self.cells_of(b);
+        let mut blocks = Vec::new();
+        for (r, _, _) in &cells {
+            let cc = self.doc.cell(r.start).unwrap_or(c);
+            let mut blk = self.empty_cell(r.start, fresh, cc.col, cc.width);
+            // A row above a header row is one too.
+            if let Some(p) = blk.as_para_mut() {
+                if let Some(x) = p.props.cell.as_mut() {
+                    x.row_look.header = cc.row_look.header;
+                }
+            }
+            blocks.push(blk);
+        }
+        self.apply("Insert Row", vec![TextOp::Insert { at: row.start as u32, blocks }], Kind::Other);
+        self.set_caret(Pos::new(row.start, 0), false);
+        true
+    }
+
+    /// Adds a column left of the caret's.
+    pub fn insert_column_left(&mut self) -> bool {
+        self.insert_column(false)
+    }
+
+    /// Removes the caret's whole table.
+    pub fn delete_table(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let t = self.table_range(b);
+        let mut ops = vec![TextOp::Remove { at: t.start as u32, n: t.len() as u32 }];
+        if t.len() == self.blocks() {
+            let id = self.doc.new_id();
+            ops.push(TextOp::Insert { at: 0, blocks: vec![Block::Para(Para::new(id, "", 0))] });
+        }
+        self.apply("Delete Table", ops, Kind::Other);
+        let at = t.start.min(self.blocks() - 1);
+        self.set_caret(Pos::new(at, 0), false);
+        true
+    }
+
+    /// Merge Cells: the selected cells of a row become one (as wide as
+    /// they were together, their text in it); selected cells down a
+    /// column become one, the ones below merged up into the top one and
+    /// their text moved into it.
+    pub fn merge_cells(&mut self) -> bool {
+        let Some(rect) = self.cell_rect() else { return false };
+        let rev = self.revision;
+        if rect.iter().any(|r| r.1.len() > 1) {
+            let mut ops = Vec::new();
+            let mut gone = Vec::new();
+            for (_, cells) in &rect {
+                let Some(first) = cells.first().and_then(|c| self.doc.cell(c.start)) else { continue };
+                if cells.len() < 2 {
+                    continue;
+                }
+                let width = cells.iter().filter_map(|c| self.doc.cell(c.start)).map(|c| c.width).sum::<u32>().min(MAX_OBJECT_TWIPS);
+                let span = cells.iter().filter_map(|c| self.doc.cell(c.start)).map(|c| c.span.max(1) as u32).sum::<u32>().min(MAX_CELLS as u32) as u8;
+                let all = cells.first().unwrap().start..cells.last().unwrap().end;
+                ops.extend(self.retag(all, |c| {
+                    *c = CellRef { width, span, ..first };
+                }));
+                // Cells that held nothing add no empty paragraph.
+                for c in &cells[1..] {
+                    if c.len() == 1 && self.doc.para(c.start).is_some_and(|p| p.text.is_empty()) {
+                        gone.push(c.start);
+                    }
+                }
+            }
+            gone.sort_unstable();
+            for k in gone.into_iter().rev() {
+                ops.push(TextOp::Remove { at: k as u32, n: 1 });
+            }
+            self.apply("Merge Cells", ops, Kind::Other);
+        }
+        // Down: in the (now single) cells of the rows, top to bottom.
+        let rect = if self.revision != rev { self.cell_rect_at(rect.len()) } else { Some(rect) };
+        if let Some(rect) = rect.filter(|r| r.len() > 1) {
+            let top = rect[0].1.first().cloned();
+            if let Some(top) = top {
+                let Some(head) = self.doc.cell(top.start) else { return self.revision != rev };
+                let mut ops = Vec::new();
+                let mut moved = Vec::new();
+                for (_, cells) in rect[1..].iter().rev() {
+                    let Some(x) = cells.first() else { continue };
+                    let Some(xc) = self.doc.cell(x.start) else { continue };
+                    let mut keep: Vec<Block> = Vec::new();
+                    for k in x.clone() {
+                        if let Some(p) = self.doc.para(k).filter(|p| !p.text.is_empty() || x.len() > 1) {
+                            let mut q = p.clone();
+                            q.props.cell = Some(head);
+                            keep.push(Block::Para(q));
+                        }
+                    }
+                    moved.splice(0..0, keep);
+                    let mut blk = self.empty_cell(x.start, xc.row, xc.col, head.width);
+                    if let Some(c) = blk.as_para_mut().and_then(|p| p.props.cell.as_mut()) {
+                        c.merged_up = true;
+                        c.span = head.span;
+                    }
+                    ops.push(TextOp::Remove { at: x.start as u32, n: x.len() as u32 });
+                    ops.push(TextOp::Insert { at: x.start as u32, blocks: vec![blk] });
+                }
+                if !moved.is_empty() {
+                    ops.push(TextOp::Insert { at: top.end as u32, blocks: moved });
+                }
+                self.apply("Merge Cells", ops, Kind::Other);
+                self.set_caret(Pos::new(top.start, 0), false);
+            }
+        }
+        self.revision != rev
+    }
+
+    /// The cell block after a merge across: from the caret's row, `rows`
+    /// rows down, the caret's cell in each.
+    fn cell_rect_at(&mut self, rows: usize) -> Option<Vec<(std::ops::Range<usize>, Vec<std::ops::Range<usize>>)>> {
+        let (a, _) = self.selection();
+        let b = a.block.min(self.blocks() - 1);
+        self.doc.cell(b)?;
+        let all = self.table_rows(b);
+        let r0 = all.iter().position(|r| r.contains(&b))?;
+        let ci = cells_in(&self.doc, all[r0].clone()).iter().position(|c| c.contains(&b)).unwrap_or(0);
+        Some(all[r0..(r0 + rows).min(all.len())].iter().map(|r| {
+            let cells = cells_in(&self.doc, r.clone());
+            (r.clone(), cells.get(ci.min(cells.len().saturating_sub(1))).cloned().into_iter().collect())
+        }).collect())
+    }
+
+    /// Split Cell: a cell merged down comes apart into its rows' cells
+    /// again; any other splits across into two, half as wide each.
+    pub fn split_cell(&mut self) -> bool {
+        let b = self.caret.block;
+        let Some(c) = self.doc.cell(b) else { return false };
+        let rows = self.table_rows(b);
+        let Some(r0) = rows.iter().position(|r| r.contains(&b)) else { return false };
+        let ci = cells_in(&self.doc, rows[r0].clone()).iter().position(|x| x.contains(&b)).unwrap_or(0);
+        // The run of cells merged up under this one.
+        let mut below = Vec::new();
+        for r in &rows[r0 + 1..] {
+            let cells = cells_in(&self.doc, r.clone());
+            match cells.get(ci) {
+                Some(x) if self.doc.cell(x.start).is_some_and(|d| d.merged_up) => below.push(x.clone()),
+                _ => break,
+            }
+        }
+        if !c.merged_up && !below.is_empty() {
+            let ops = self.retag(below.into_iter().flatten(), |d| d.merged_up = false);
+            self.apply("Split Cell", ops, Kind::Other);
+            return true;
+        }
+        let (cells, k) = self.cells_of(b);
+        if cells.len() >= MAX_CELLS {
+            return false;
+        }
+        let cell = cells[k].0.clone();
+        let col = rows[r0].clone().filter_map(|x| self.doc.cell(x)).map(|x| x.col).max().unwrap_or(0).wrapping_add(1);
+        let half = (c.width / 2).max(1);
+        let left_span = (c.span / 2).max(1);
+        let mut ops = self.retag(cell.clone(), |d| {
+            d.width = half;
+            d.span = left_span;
+        });
+        let mut blk = self.empty_cell(cell.start, c.row, col, (c.width - half).max(1));
+        if let Some(d) = blk.as_para_mut().and_then(|p| p.props.cell.as_mut()) {
+            d.span = c.span.saturating_sub(left_span).max(1);
+            d.merged_up = c.merged_up;
+        }
+        ops.push(TextOp::Insert { at: cell.end as u32, blocks: vec![blk] });
+        self.apply("Split Cell", ops, Kind::Other);
+        true
+    }
+
+    /// The caret's table's own look (the default when it has none).
+    pub fn table_look_at_caret(&self) -> Option<TableLook> {
+        let c = self.doc.cell(self.caret.block)?;
+        Some(self.doc.tables.get(&c.table).cloned().unwrap_or_default())
+    }
+
+    /// Changes the caret's table's look.
+    fn change_table(&mut self, label: &str, f: impl FnOnce(&mut TableLook)) -> bool {
+        let Some(c) = self.doc.cell(self.caret.block) else { return false };
+        let mut look = self.doc.tables.get(&c.table).cloned().unwrap_or_default();
+        let old = look.clone();
+        f(&mut look);
+        if look == old && self.doc.tables.contains_key(&c.table) {
+            return false;
+        }
+        self.apply(label, vec![TextOp::SetTable { id: c.table, look: Some(look.bounded()) }], Kind::Other);
+        true
+    }
+
+    /// A table style from the gallery ([`builtin_table_styles`]) or the
+    /// document's own, for the caret's table; its own borders give way to
+    /// the style's. `None`: no style (plain rules all round).
+    pub fn set_table_style(&mut self, name: Option<&str>) -> bool {
+        let Some(c) = self.doc.cell(self.caret.block) else { return false };
+        let mut ops = Vec::new();
+        let name: Option<std::sync::Arc<str>> = match name {
+            Some(n) if self.doc.styles.tables.contains_key(n) => Some(n.into()),
+            Some(n) => {
+                let Some((_, st)) = builtin_table_styles().into_iter().find(|s| s.0 == n) else { return false };
+                ops.push(TextOp::SetTableStyle { name: n.into(), style: Some(st) });
+                Some(n.into())
+            }
+            None => None,
+        };
+        let mut look = self.doc.tables.get(&c.table).cloned().unwrap_or_default();
+        look.style = name;
+        look.borders = None;
+        ops.push(TextOp::SetTable { id: c.table, look: Some(look) });
+        self.apply("Table Style", ops, Kind::Other);
+        true
+    }
+
+    /// Which parts of its style the caret's table shows (`LOOK_*` bits).
+    pub fn set_table_look_bits(&mut self, bits: u8) -> bool {
+        self.change_table("Table Style Options", |t| t.look = bits & 63)
+    }
+
+    /// Where the caret's table sits across the column.
+    pub fn set_table_align(&mut self, align: HAlign) -> bool {
+        self.change_table("Table Alignment", |t| {
+            t.align = align;
+            t.indent = 0;
+        })
+    }
+
+    /// The rows to work on: the selected block's, or (one cell selected)
+    /// the whole table's.
+    fn rows_for_sizing(&self) -> Vec<(std::ops::Range<usize>, Vec<std::ops::Range<usize>>)> {
+        match self.cell_rect() {
+            Some(r) if r.len() > 1 || r.iter().any(|x| x.1.len() > 1) => r,
+            Some(_) => self.table_rows(self.caret.block).into_iter().map(|r| (r.clone(), cells_in(&self.doc, r))).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Distribute Columns: the cells of each selected row (or the table)
+    /// share their width evenly.
+    pub fn distribute_columns(&mut self) -> bool {
+        let mut ops = Vec::new();
+        for (_, cells) in self.rows_for_sizing() {
+            let total: u32 = cells.iter().filter_map(|c| self.doc.cell(c.start)).map(|c| c.width).sum();
+            let n = cells.len().max(1) as u32;
+            for c in &cells {
+                ops.extend(self.retag(c.clone(), |d| d.width = (total / n).max(1)));
+            }
+        }
+        let rev = self.revision;
+        self.apply("Distribute Columns", ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// The laid-out height in twips of the row starting at block `b`.
+    fn row_height_shown(&self, b: usize) -> Option<u32> {
+        for pg in self.pages.pages() {
+            if let Some(s) = pg.slices.iter().find(|s| s.block == b) {
+                let cell = pg.cells.iter().find(|c| !c.inner && c.x <= s.x && s.x < c.x + c.w && c.y <= s.y && s.y < c.y + c.h)?;
+                return Some((cell.h * 20 / officina_text::LU).clamp(0, u16::MAX as i64) as u32);
+            }
+        }
+        None
+    }
+
+    /// Distribute Rows: the selected rows (or the table's) all as high as
+    /// the tallest of them.
+    pub fn distribute_rows(&mut self) -> bool {
+        let rows = self.rows_for_sizing();
+        let h = rows.iter().filter_map(|r| self.row_height_shown(r.0.start)).max().unwrap_or(0).min(u16::MAX as u32) as u16;
+        if h == 0 {
+            return false;
+        }
+        let ops = self.retag(rows.into_iter().flat_map(|r| r.0), |c| {
+            c.row_look.height = h;
+            c.row_look.exact = false;
+        });
+        let rev = self.revision;
+        self.apply("Distribute Rows", ops, Kind::Other);
+        self.revision != rev
+    }
+
+    /// AutoFit Window: each row as wide as the column, its cells in
+    /// proportion.
+    pub fn autofit_window(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let col = (self.pages.col_width(b) * 20 / officina_text::LU).clamp(1, MAX_OBJECT_TWIPS as i64) as u64;
+        let mut ops = Vec::new();
+        for row in self.table_rows(b) {
+            let cells = cells_in(&self.doc, row);
+            let total: u64 = cells.iter().filter_map(|c| self.doc.cell(c.start)).map(|c| c.width as u64).sum::<u64>().max(1);
+            for c in &cells {
+                ops.extend(self.retag(c.clone(), |d| d.width = ((d.width as u64 * col / total) as u32).max(1)));
+            }
+        }
+        let c = self.doc.cell(b).unwrap_or_default();
+        let mut look = self.doc.tables.get(&c.table).cloned().unwrap_or_default();
+        look.autofit = false;
+        look.align = HAlign::Start;
+        look.indent = 0;
+        ops.push(TextOp::SetTable { id: c.table, look: Some(look) });
+        self.apply("AutoFit Window", ops, Kind::Other);
+        true
+    }
+
+    /// AutoFit Contents: each column as wide as its widest text (and the
+    /// cells' padding), the table no wider than the column.
+    pub fn autofit_contents(&mut self) -> bool {
+        let b = self.caret.block;
+        let Some(c) = self.doc.cell(b) else { return false };
+        let col = (self.pages.col_width(b) * 20 / officina_text::LU).clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
+        let rows = self.table_rows(b);
+        // The widest line of each column (by place in the row), in twips.
+        let mut want: Vec<u32> = Vec::new();
+        for row in &rows {
+            for (i, cell) in cells_in(&self.doc, row.clone()).into_iter().enumerate() {
+                let pad = self.doc.cell_pad(cell.start);
+                let mut w = 0i64;
+                for k in cell {
+                    if let Some(p) = self.doc.para(k) {
+                        let l = self.cache.get(&self.doc, p, officina_text::twips(MAX_OBJECT_TWIPS as i64), &*self.fonts);
+                        w = w.max(l.lines.iter().map(|x| x.x.max(0) + x.width).max().unwrap_or(0));
+                    }
+                }
+                let tw = (w * 20 / officina_text::LU) as u32 + pad.start as u32 + pad.end as u32 + 20;
+                if want.len() <= i {
+                    want.resize(i + 1, 0);
+                }
+                want[i] = want[i].max(tw.max(360));
+            }
+        }
+        let total: u64 = want.iter().map(|&w| w as u64).sum::<u64>().max(1);
+        if total > col as u64 {
+            for w in &mut want {
+                *w = ((*w as u64 * col as u64 / total) as u32).max(1);
+            }
+        }
+        let mut ops = Vec::new();
+        for row in rows {
+            let cells = cells_in(&self.doc, row);
+            let one = cells.len() == want.len();
+            for (i, cell) in cells.into_iter().enumerate() {
+                // Rows with cells merged across keep their widths.
+                if one {
+                    let w = want[i];
+                    ops.extend(self.retag(cell, |d| d.width = w));
+                }
+            }
+        }
+        let mut look = self.doc.tables.get(&c.table).cloned().unwrap_or_default();
+        look.autofit = true;
+        ops.push(TextOp::SetTable { id: c.table, look: Some(look) });
+        self.apply("AutoFit Contents", ops, Kind::Other);
+        true
+    }
+
+    /// Sort: the table's rows under its header rows by the text of their
+    /// cell in the caret's column (as numbers when all are), up or down.
+    /// A table with cells merged down isn't sorted.
+    pub fn sort_rows(&mut self, descending: bool) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let t = self.table_range(b);
+        if t.clone().any(|k| self.doc.cell(k).is_some_and(|c| c.merged_up)) {
+            return false;
+        }
+        let (_, ci) = self.cells_of(b);
+        let rows: Vec<_> = self.table_rows(b).into_iter().skip_while(|r| self.doc.cell(r.start).is_some_and(|c| c.row_look.header)).collect();
+        if rows.len() < 2 {
+            return false;
+        }
+        let key = |r: &std::ops::Range<usize>| -> String {
+            let cells = cells_in(&self.doc, r.clone());
+            cells.get(ci).map(|c| c.clone().filter_map(|k| self.doc.para(k)).map(|p| p.text.trim().to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+        };
+        let keys: Vec<String> = rows.iter().map(key).collect();
+        let nums: Option<Vec<f64>> = keys.iter().map(|k| k.replace(',', "").parse::<f64>().ok()).collect();
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        match &nums {
+            Some(n) => order.sort_by(|&a, &b| n[a].total_cmp(&n[b])),
+            None => order.sort_by_key(|&i| keys[i].to_lowercase()),
+        }
+        if descending {
+            order.reverse();
+        }
+        if order.iter().enumerate().all(|(i, &j)| i == j) {
+            return false;
+        }
+        let first_row = self.doc.cell(rows[0].start).map_or(0, |c| c.row);
+        let mut blocks = Vec::new();
+        for (n, &i) in order.iter().enumerate() {
+            for k in rows[i].clone() {
+                if let Some(Block::Para(p)) = self.doc.blocks.get(k) {
+                    let mut q = p.clone();
+                    if let Some(c) = q.props.cell.as_mut() {
+                        c.row = first_row.wrapping_add(n as u32);
+                    }
+                    blocks.push(Block::Para(q));
+                } else if let Some(x) = self.doc.blocks.get(k) {
+                    blocks.push(x.clone());
+                }
+            }
+        }
+        let start = rows[0].start;
+        let n = rows.last().map_or(start, |r| r.end) - start;
+        self.apply("Sort", vec![TextOp::Remove { at: start as u32, n: n as u32 }, TextOp::Insert { at: start as u32, blocks }], Kind::Other);
+        self.set_caret(Pos::new(start, 0), false);
+        true
+    }
+
+    /// Convert Text to Table: the selected paragraphs become rows, their
+    /// text split at tabs into cells, as many columns as the most tabs.
+    pub fn text_to_table(&mut self) -> bool {
+        let (a, b) = self.selection();
+        let range = a.block..b.block + 1;
+        if range.clone().any(|k| self.doc.cell(k).is_some() || self.doc.para(k).is_none()) {
+            return false;
+        }
+        let paras: Vec<Para> = range.clone().filter_map(|k| self.doc.para(k).cloned()).collect();
+        let cols = paras.iter().map(|p| p.text.split('\t').count()).max().unwrap_or(1).clamp(1, MAX_CELLS);
+        let table = self.doc.blocks.iter().filter_map(|x| x.as_para().and_then(|p| p.props.cell)).map(|c| c.table).max().map_or(1, |t| t.wrapping_add(1).max(1));
+        let width = ((self.pages.col_width(a.block) * 20 / officina_text::LU) as u32 / cols as u32).clamp(1, MAX_OBJECT_TWIPS);
+        let mut blocks = Vec::new();
+        for (r, p) in paras.iter().enumerate() {
+            let mut at = 0;
+            let parts: Vec<&str> = p.text.splitn(cols, '\t').collect();
+            for c in 0..cols {
+                let part = parts.get(c).copied().unwrap_or("");
+                let (text, runs) = if parts.get(c).is_some() { piece(p, at, at + part.len()) } else { (String::new(), vec![(0, p.attr_at(p.text.len() as u32))]) };
+                at += part.len() + 1;
+                let id = self.doc.new_id();
+                let mut props = p.props.clone();
+                props.list = None;
+                props.section = None;
+                props.space_after = Some(0);
+                props.cell = Some(CellRef { table, row: r as u32, col: c as u16, width, ..Default::default() });
+                blocks.push(Block::Para(Para { id, text, runs, style: p.style, props }));
+            }
+        }
+        let mut ops = vec![TextOp::Remove { at: range.start as u32, n: range.len() as u32 }, TextOp::Insert { at: range.start as u32, blocks }];
+        if range.end >= self.blocks() || self.doc.cell(range.end).is_some() {
+            let id = self.doc.new_id();
+            ops.push(TextOp::Insert { at: (range.start + paras.len() * cols) as u32, blocks: vec![Block::Para(Para::new(id, "", 0))] });
+        }
+        // A section that ended with the last paragraph ends after the table.
+        let sect = paras.last().and_then(|p| p.props.section);
+        self.apply("Convert to Table", ops, Kind::Other);
+        if let Some(sec) = sect {
+            let k = range.start + paras.len() * cols;
+            if let Some(p) = self.doc.para(k) {
+                let mut props = p.props.clone();
+                props.section = Some(sec);
+                let op = TextOp::SetPara { block: k as u32, style: p.style, props };
+                self.apply("Convert to Table", vec![op], Kind::Other);
+            }
+        }
+        self.set_caret(Pos::new(range.start, 0), false);
+        true
+    }
+
+    /// Convert Table to Text: each row a paragraph, its cells' text
+    /// between tabs (a cell's paragraphs joined by spaces).
+    pub fn table_to_text(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let t = self.table_range(b);
+        let mut blocks = Vec::new();
+        for row in self.table_rows(b) {
+            let mut text = String::new();
+            let mut runs: Vec<(u32, officina_text::model::AttrId)> = Vec::new();
+            let first = self.doc.para(row.start).cloned();
+            for (i, cell) in cells_in(&self.doc, row).into_iter().enumerate() {
+                if self.doc.cell(cell.start).is_some_and(|c| c.merged_up) {
+                    if i > 0 {
+                        text.push('\t');
+                    }
+                    continue;
+                }
+                for (j, k) in cell.enumerate() {
+                    let Some(p) = self.doc.para(k) else { continue };
+                    if i > 0 && j == 0 {
+                        text.push('\t');
+                    } else if j > 0 {
+                        text.push(' ');
+                    }
+                    let base = text.len() as u32;
+                    for &(s, a) in &p.runs {
+                        runs.push((base + s, a));
+                    }
+                    text.push_str(&p.text);
+                }
+            }
+            if runs.is_empty() {
+                runs.push((0, 0));
+            }
+            runs[0].0 = 0;
+            runs.dedup_by(|x, y| x.0 == y.0 && { y.1 = x.1; true });
+            let id = self.doc.new_id();
+            let (style, mut props) = first.map(|p| (p.style, p.props)).unwrap_or_default();
+            props.cell = None;
+            props.inner = None;
+            props.space_after = None;
+            blocks.push(Block::Para(Para { id, text, runs, style, props }));
+        }
+        self.apply("Convert to Text", vec![TextOp::Remove { at: t.start as u32, n: t.len() as u32 }, TextOp::Insert { at: t.start as u32, blocks }], Kind::Other);
+        self.set_caret(Pos::new(t.start, 0), false);
+        true
+    }
+
+    /// Formula =SUM(ABOVE): types the sum of the numbers in the cells
+    /// above the caret's, in its column up to the first that isn't one
+    /// (as computed text: it doesn't update).
+    pub fn insert_sum_above(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let rows = self.table_rows(b);
+        let Some(r0) = rows.iter().position(|r| r.contains(&b)) else { return false };
+        let ci = cells_in(&self.doc, rows[r0].clone()).iter().position(|c| c.contains(&b)).unwrap_or(0);
+        let mut sum = 0f64;
+        let mut any = false;
+        for r in rows[..r0].iter().rev() {
+            let cells = cells_in(&self.doc, r.clone());
+            let Some(c) = cells.get(ci) else { break };
+            let text: String = c.clone().filter_map(|k| self.doc.para(k)).map(|p| p.text.trim().to_string()).collect::<Vec<_>>().join("");
+            match text.replace(',', "").trim_start_matches(['$', '€', '£']).parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    sum += v;
+                    any = true;
+                }
+                _ if text.is_empty() && !any => continue,
+                _ => break,
+            }
+        }
+        let s = if sum.fract() == 0.0 && sum.abs() < 1e15 { format!("{}", sum as i64) } else { format!("{sum:.2}") };
+        self.insert(&s)
+    }
+
     /// The caret paragraph's format as shown (its style's under its own).
     pub fn para_format_at_caret(&self) -> ParaFormat {
         self.doc.para(self.caret.block).map(|p| self.doc.styles.para_format(p.style, &p.props).0).unwrap_or_default()
@@ -2608,7 +3307,7 @@ impl Editor {
     /// lists, cells and sections stay.
     pub fn reset_paragraph(&mut self) {
         self.set_paragraphs("Reset Paragraph", None, |p| {
-            *p = ParaProps { list: p.list, list_start: p.list_start, cell: p.cell, rev: p.rev, toc: p.toc, section: p.section, ..Default::default() };
+            *p = ParaProps { list: p.list, list_start: p.list_start, cell: p.cell, inner: p.inner, rev: p.rev, toc: p.toc, section: p.section, ..Default::default() };
         });
     }
 
@@ -2869,7 +3568,7 @@ impl Editor {
         let mut ops = Vec::new();
         for k in a.block..=b.block {
             let Some(p) = self.doc.para(k) else { continue };
-            let props = ParaProps { list: p.props.list, cell: p.props.cell, rev: p.props.rev, toc: p.props.toc, section: p.props.section, ..Default::default() };
+            let props = ParaProps { list: p.props.list, cell: p.props.cell, inner: p.props.inner, rev: p.props.rev, toc: p.props.toc, section: p.props.section, ..Default::default() };
             if props != p.props || style != p.style {
                 ops.push(TextOp::SetPara { block: k as u32, style, props });
             }
@@ -3649,6 +4348,47 @@ fn clear_look(a: &mut CharAttrs) {
 
 fn only_look(a: &CharAttrs) -> CharAttrs {
     CharAttrs { bold: a.bold, italic: a.italic, underline: a.underline, strike: a.strike, size: a.size, color: a.color, highlight: a.highlight, family: a.family.clone(), style: a.style, vert: a.vert, caps: a.caps, hidden: a.hidden, dstrike: a.dstrike, spacing: a.spacing, scale: a.scale, effects: a.effects, ..Default::default() }
+}
+
+/// Edges of a block of cells that Borders sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellEdges {
+    All,
+    None,
+    Outside,
+    Inside,
+    InsideH,
+    InsideV,
+    Top,
+    Bottom,
+    Start,
+    End,
+}
+
+/// The cells of `row`: their blocks.
+fn cells_in(doc: &TextDoc, row: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for k in row {
+        match out.last_mut() {
+            Some(r) if doc.same_cell(r.start, k) => r.end = k + 1,
+            _ => out.push(k..k + 1),
+        }
+    }
+    out
+}
+
+/// Bytes `s..e` of paragraph `p`: its text and runs from there.
+fn piece(p: &Para, s: usize, e: usize) -> (String, Vec<(u32, officina_text::model::AttrId)>) {
+    let e = e.min(p.text.len());
+    let s = s.min(e);
+    let mut runs = vec![(0, p.attr_at(s as u32))];
+    for &(at, a) in &p.runs {
+        let at = at as usize;
+        if at > s && at < e {
+            runs.push(((at - s) as u32, a));
+        }
+    }
+    (p.text.get(s..e).unwrap_or("").to_string(), runs)
 }
 
 #[cfg(test)]
@@ -4602,6 +5342,169 @@ pub(crate) mod tests {
         assert_eq!(e.hit(s.page, s.x + 10, s.y + 10).block, 2);
         let s1 = e.spot(Pos::new(1, 0));
         assert!(s.x > s1.x && s.y == s1.y, "side by side");
+    }
+
+    /// A 3x3 table with "rc" text in each cell, after "before".
+    fn table3(e: &mut Editor) {
+        e.set_caret(Pos::new(0, 6), false);
+        assert!(e.insert_table(3, 3));
+        for k in 1..10 {
+            e.set_caret(Pos::new(k, 0), false);
+            let (r, c) = ((k - 1) / 3, (k - 1) % 3);
+            e.insert(&format!("{r}{c}"));
+        }
+    }
+
+    #[test]
+    fn table_tools_merge_split_and_look() {
+        let mut e = ed(&["before", "after"]);
+        table3(&mut e);
+        let cells = |e: &Editor, k: usize| e.doc.row_cells(e.doc.row_range(k), e.pages.width()).len();
+        // Merge across: 00 and 01 become one cell twice as wide.
+        let w = e.doc.cell(1).unwrap().width;
+        e.set_caret(Pos::new(1, 0), false);
+        e.set_caret(Pos::new(2, 1), true);
+        assert!(e.merge_cells());
+        assert_eq!(cells(&e, 1), 2);
+        assert_eq!(e.doc.cell(1).unwrap().width, 2 * w);
+        assert_eq!(e.doc.cell(1).unwrap().span, 2);
+        assert!(e.doc.same_cell(1, 2), "both texts in the one cell");
+        // Split it again: two cells, half as wide each.
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.split_cell());
+        assert_eq!(cells(&e, 1), 3);
+        while e.undo() {}
+        table3(&mut e);
+        // Merge down the last column of rows 1 and 2: the lower cell is
+        // merged up and its text moves into the upper one.
+        e.set_caret(Pos::new(6, 0), false);
+        e.set_caret(Pos::new(9, 1), true);
+        assert!(e.merge_cells());
+        let t = e.table_range(1);
+        let merged: Vec<usize> = t.clone().filter(|&k| e.doc.cell(k).unwrap().merged_up).collect();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(e.doc.para(merged[0]).unwrap().text, "");
+        assert!(e.doc.same_cell(6, 7) && e.doc.para(7).unwrap().text == "22", "the text moved up: {:?}", texts(&e));
+        assert_eq!(cells(&e, merged[0]), 3, "the row keeps its three cells");
+        // Split Cell takes the merge apart.
+        e.set_caret(Pos::new(6, 0), false);
+        assert!(e.split_cell());
+        assert!(t.clone().all(|k| !e.doc.cell(k).is_some_and(|c| c.merged_up)));
+        // Shading, alignment, borders on a block of cells.
+        e.set_caret(Pos::new(1, 0), false);
+        e.set_caret(Pos::new(5, 0), true);
+        assert!(e.set_cell_shading(Some(0xFFEE00)));
+        assert!(e.set_cell_valign(VAlign::Center));
+        let b = Border { width: 12, ..Border::default() };
+        assert!(e.set_cell_borders(CellEdges::Outside, Some(b)));
+        let c = |e: &Editor, k: usize| e.doc.cell(k).unwrap().look;
+        assert_eq!(c(&e, 1).shading, Some(Some(0xFFEE00)));
+        assert_eq!(c(&e, 3).shading, None, "02 isn't in the block");
+        assert_eq!((c(&e, 1).borders.top, c(&e, 1).borders.start, c(&e, 1).borders.end, c(&e, 1).borders.bottom), (Some(Some(b)), Some(Some(b)), None, None));
+        assert_eq!((c(&e, 5).borders.bottom, c(&e, 5).borders.end, c(&e, 5).borders.top), (Some(Some(b)), Some(Some(b)), None));
+        assert!(e.set_cell_borders(CellEdges::None, None));
+        assert_eq!(c(&e, 4).borders.top, Some(None));
+        // Rows: header, can't split, height.
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.set_header_rows(true));
+        assert!(e.set_row_height(720, true));
+        assert!((1..4).all(|k| e.doc.cell(k).unwrap().row_look == officina_text::model::RowLook { header: true, cant_split: false, height: 720, exact: true }));
+        assert_eq!(e.doc.header_rows(4), Some(1..4), "the rows under it repeat it");
+        // A row above a header row is one too; rows below aren't.
+        assert!(e.insert_row_above());
+        assert!(e.doc.cell(1).unwrap().row_look.header);
+        e.set_caret(Pos::new(7, 0), false);
+        assert!(e.insert_row_below());
+        assert!(!e.doc.cell(10).unwrap().row_look.header);
+        assert!(e.insert_column_left());
+        let k = e.caret.block;
+        assert_eq!(e.doc.para(k).unwrap().text, "", "the caret in the new cell");
+        assert_eq!(cells_in(&e.doc, e.doc.row_range(k)).iter().position(|c| c.contains(&k)), Some(0), "first in its row");
+        assert!(e.table_rows(1).iter().all(|r| cells_in(&e.doc, r.clone()).len() == 4));
+        // Table style from the gallery: it is added to the document once.
+        assert!(e.set_table_style(Some("Blue Table")));
+        assert!(e.doc.styles.tables.contains_key("Blue Table"));
+        let t = e.table_look_at_caret().unwrap();
+        assert_eq!((t.style.as_deref(), t.borders), (Some("Blue Table"), None));
+        assert!(e.set_table_look_bits(officina_text::model::LOOK_HEADER));
+        assert!(e.set_table_align(HAlign::Center));
+        assert_eq!(e.table_look_at_caret().unwrap().align, HAlign::Center);
+        assert!(!e.set_table_style(Some("No Such Style")));
+        // Delete Table, and undo brings it all back.
+        assert!(e.delete_table());
+        assert_eq!(texts(&e), ["before", "after"]);
+        assert!(e.undo());
+        assert!(e.doc.cell(1).is_some(), "undo brings the table back");
+        while e.undo() {}
+        assert_eq!(texts(&e), ["before", "after"]);
+    }
+
+    #[test]
+    fn table_tools_sizing_sorting_and_converting() {
+        let mut e = ed(&["before", "after"]);
+        table3(&mut e);
+        while !e.paginate(Duration::from_secs(1)) {}
+        // Distribute: a narrow first cell, then even again.
+        e.set_caret(Pos::new(1, 0), false);
+        let w = e.doc.cell(1).unwrap().width;
+        let ops = e.retag(1..2, |c| c.width = 400);
+        e.apply("t", ops, Kind::Other);
+        assert!(e.distribute_columns());
+        let total = 400 + 2 * w;
+        assert!((1..4).all(|k| e.doc.cell(k).unwrap().width == total / 3));
+        // Window: the rows fill the column.
+        assert!(e.autofit_window());
+        let col = (e.pages.col_width(1) * 20 / officina_text::LU) as u32;
+        let sum: u32 = (1..4).map(|k| e.doc.cell(k).unwrap().width).sum();
+        assert!(sum.abs_diff(col) <= 3, "{sum} vs {col}");
+        // Contents: short texts make narrow columns.
+        assert!(e.autofit_contents());
+        let sum: u32 = (1..4).map(|k| e.doc.cell(k).unwrap().width).sum();
+        assert!(sum < col / 2, "{sum} of {col}");
+        assert!(e.table_look_at_caret().unwrap().autofit);
+        // Rows as tall as the tallest.
+        e.set_caret(Pos::new(4, 2), false);
+        e.key(Key::Enter, NO, "", 0);
+        e.insert("more");
+        while !e.paginate(Duration::from_secs(1)) {}
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.distribute_rows());
+        let h = e.doc.cell(1).unwrap().row_look.height;
+        assert!(h > 0 && e.table_rows(1).iter().all(|r| e.doc.cell(r.start).unwrap().row_look.height == h));
+        while e.undo() {}
+        // Sort by the first column, down: rows 20, 10, 00.
+        table3(&mut e);
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.sort_rows(true));
+        let firsts: Vec<String> = e.table_rows(1).iter().map(|r| e.doc.para(r.start).unwrap().text.clone()).collect();
+        assert_eq!(firsts, ["20", "10", "00"]);
+        // Header rows stay put.
+        assert!(e.set_header_rows(true));
+        assert!(e.sort_rows(false));
+        let firsts: Vec<String> = e.table_rows(1).iter().map(|r| e.doc.para(r.start).unwrap().text.clone()).collect();
+        assert_eq!(firsts, ["20", "00", "10"]);
+        // SUM(ABOVE) under numbers.
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.set_header_rows(false));
+        let last = e.table_rows(1).last().unwrap().start;
+        e.set_caret(Pos::new(last, 0), false);
+        assert!(e.insert_row_below());
+        let b = e.table_rows(1).last().unwrap().start;
+        e.set_caret(Pos::new(b, 0), false);
+        assert!(e.insert_sum_above());
+        assert_eq!(e.doc.para(b).unwrap().text, "30", "20 + 0 + 10");
+        // Table to text and back.
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.table_to_text());
+        assert_eq!(texts(&e)[1], "20\t21\t22");
+        let n = e.blocks();
+        e.set_caret(Pos::new(1, 0), false);
+        e.set_caret(Pos::new(3, 0), true);
+        assert!(e.text_to_table());
+        assert_eq!(e.blocks(), n - 3 + 9);
+        assert_eq!(e.doc.para(2).unwrap().text, "21");
+        assert_eq!(e.doc.cell(2).unwrap().col, 1);
+        assert_eq!(cells_in(&e.doc, e.doc.row_range(1)).len(), 3);
     }
 
     #[test]

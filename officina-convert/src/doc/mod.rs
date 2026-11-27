@@ -427,9 +427,33 @@ impl Table {
         if rows.is_empty() {
             return;
         }
-        out.push_str("<w:tbl><w:tblPr/>");
+        // The first row's table borders and place stand for the table's.
+        let first = &rows[0].1;
+        out.push_str("<w:tbl><w:tblPr>");
+        match first.jc {
+            1 => out.push_str(r#"<w:jc w:val="center"/>"#),
+            2 => out.push_str(r#"<w:jc w:val="right"/>"#),
+            _ => {}
+        }
+        if let Some(b) = &first.table_borders {
+            out.push_str(&format!("<w:tblBorders>{b}</w:tblBorders>"));
+        }
+        out.push_str("</w:tblPr>");
         for (cells, tap) in rows {
             out.push_str("<w:tr>");
+            let mut trpr = String::new();
+            if tap.cant_split {
+                trpr += "<w:cantSplit/>";
+            }
+            if tap.height != 0 {
+                trpr += &format!(r#"<w:trHeight w:val="{}"{}/>"#, tap.height.unsigned_abs(), if tap.height < 0 { r#" w:hRule="exact""# } else { "" });
+            }
+            if tap.header {
+                trpr += "<w:tblHeader/>";
+            }
+            if !trpr.is_empty() {
+                out.push_str(&format!("<w:trPr>{trpr}</w:trPr>"));
+            }
             let mut i = 0;
             while i < cells.len() {
                 let mut span = 1;
@@ -447,6 +471,17 @@ impl Table {
                 match tap.vmerge.get(i) {
                     Some(3) => out.push_str(r#"<w:vMerge w:val="restart"/>"#),
                     Some(1) => out.push_str("<w:vMerge/>"),
+                    _ => {}
+                }
+                if let Some(b) = tap.borders.get(i).filter(|b| !b.is_empty()) {
+                    out.push_str(&format!("<w:tcBorders>{b}</w:tcBorders>"));
+                }
+                if let Some(Some(c)) = tap.shading.get(i) {
+                    out.push_str(&format!(r#"<w:shd w:val="clear" w:color="auto" w:fill="{c:06X}"/>"#));
+                }
+                match tap.valign.get(i) {
+                    Some(1) => out.push_str(r#"<w:vAlign w:val="center"/>"#),
+                    Some(2) => out.push_str(r#"<w:vAlign w:val="bottom"/>"#),
                     _ => {}
                 }
                 out.push_str("</w:tcPr>");

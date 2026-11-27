@@ -1036,6 +1036,9 @@ pub struct ParaProps {
     pub line_numbers: Option<bool>,
     /// `false`: the paragraph's words are never hyphenated.
     pub hyphenate: Option<bool>,
+    /// Its cell in a table inside the cell `cell` (one level deep: a table
+    /// further in is read into this one).
+    pub inner: Option<CellRef>,
 }
 
 impl ParaProps {
@@ -1067,6 +1070,7 @@ impl ParaProps {
             list_start: self.list_start.or(under.list_start),
             line_numbers: self.line_numbers.or(under.line_numbers),
             hyphenate: self.hyphenate.or(under.hyphenate),
+            inner: self.inner.or(under.inner),
         }
     }
 }
@@ -1165,6 +1169,235 @@ pub struct CellRef {
     pub col: u16,
     /// The cell's width, twips (scaled down when a row is wider than the column).
     pub width: u32,
+    /// The cell's own look (over its table's).
+    pub look: CellLook,
+    /// Its row's (each cell of a row carries the same).
+    pub row_look: RowLook,
+    /// It continues the cell above it (merged down): its text, if any, is
+    /// drawn with that cell's, and no rule runs between them.
+    pub merged_up: bool,
+    /// Grid columns it spans (merged across), for the writers' grid.
+    pub span: u8,
+}
+
+impl Default for CellRef {
+    fn default() -> Self {
+        CellRef { table: 0, row: 0, col: 0, width: 1440, look: CellLook::default(), row_look: RowLook::default(), merged_up: false, span: 1 }
+    }
+}
+
+/// Where a cell's text sits down it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+/// Space inside a cell's border, twips (each within `MAX_CELL_PAD`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CellPad {
+    pub top: u16,
+    pub bottom: u16,
+    pub start: u16,
+    pub end: u16,
+}
+
+pub const MAX_CELL_PAD: u16 = 1440;
+
+impl CellPad {
+    pub fn bounded(self) -> CellPad {
+        let b = |v: u16| v.min(MAX_CELL_PAD);
+        CellPad { top: b(self.top), bottom: b(self.bottom), start: b(self.start), end: b(self.end) }
+    }
+}
+
+impl Default for CellPad {
+    fn default() -> Self {
+        CellPad { top: CELL_PAD as u16, bottom: CELL_PAD as u16, start: CELL_PAD as u16, end: CELL_PAD as u16 }
+    }
+}
+
+/// A cell's own borders: `None` takes the table's side, `Some(None)` has
+/// none there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CellBorders {
+    pub top: Option<Option<Border>>,
+    pub bottom: Option<Option<Border>>,
+    pub start: Option<Option<Border>>,
+    pub end: Option<Option<Border>>,
+}
+
+impl CellBorders {
+    pub fn is_empty(&self) -> bool {
+        *self == CellBorders::default()
+    }
+}
+
+/// A cell's own look; what it leaves unset comes from its table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CellLook {
+    pub borders: CellBorders,
+    /// Background (`Some(None)`: none, over the table's).
+    pub shading: Option<Option<u32>>,
+    pub valign: VAlign,
+    pub pad: Option<CellPad>,
+}
+
+impl CellLook {
+    pub fn is_default(&self) -> bool {
+        *self == CellLook::default()
+    }
+}
+
+/// A row's look: repeated at the top of each page as a header, kept on one
+/// page, and its height (twips; 0 is as its text needs, else at least
+/// that, or exactly with `exact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RowLook {
+    pub header: bool,
+    pub cant_split: bool,
+    pub height: u16,
+    pub exact: bool,
+}
+
+/// Borders of a whole table: its four sides and the rules between rows
+/// and between columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TableBorders {
+    pub top: Option<Border>,
+    pub bottom: Option<Border>,
+    pub start: Option<Border>,
+    pub end: Option<Border>,
+    pub inside_h: Option<Border>,
+    pub inside_v: Option<Border>,
+}
+
+impl TableBorders {
+    /// Single half-point rules everywhere (Word's Table Grid).
+    pub fn grid() -> TableBorders {
+        let b = Some(Border::default());
+        TableBorders { top: b, bottom: b, start: b, end: b, inside_h: b, inside_v: b }
+    }
+    pub fn sides(&self) -> [Option<Border>; 6] {
+        [self.top, self.bottom, self.start, self.end, self.inside_h, self.inside_v]
+    }
+}
+
+/// Which parts of a table its style marks out (Word's Table Style Options).
+pub const LOOK_HEADER: u8 = 1;
+pub const LOOK_TOTAL: u8 = 2;
+pub const LOOK_BANDED_ROWS: u8 = 4;
+pub const LOOK_FIRST_COLUMN: u8 = 8;
+pub const LOOK_LAST_COLUMN: u8 = 16;
+pub const LOOK_BANDED_COLUMNS: u8 = 32;
+
+/// A whole table's look: its style, borders (over the style's), cell
+/// padding, place across the column, and how its columns size.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableLook {
+    /// A table style by name (in [`StyleSheet::tables`]).
+    pub style: Option<Arc<str>>,
+    /// Its own borders; `None` takes the style's (or none).
+    pub borders: Option<TableBorders>,
+    pub shading: Option<u32>,
+    pub pad: Option<CellPad>,
+    pub align: HAlign,
+    /// From the column's start edge, twips.
+    pub indent: i32,
+    /// `LOOK_*` bits.
+    pub look: u8,
+    /// Columns size to their contents (else the widths it has).
+    pub autofit: bool,
+}
+
+impl Default for TableLook {
+    fn default() -> Self {
+        TableLook { style: None, borders: None, shading: None, pad: None, align: HAlign::Start, indent: 0, look: LOOK_HEADER | LOOK_BANDED_ROWS | LOOK_FIRST_COLUMN, autofit: false }
+    }
+}
+
+impl TableLook {
+    /// Bounded to what the file format holds.
+    pub fn bounded(mut self) -> TableLook {
+        self.indent = self.indent.clamp(-MAX_TWIPS_TABLE, MAX_TWIPS_TABLE);
+        self.pad = self.pad.map(CellPad::bounded);
+        self.look &= 63;
+        self
+    }
+}
+
+/// The furthest a table is set in or out, twips.
+pub const MAX_TWIPS_TABLE: i32 = 31_680;
+
+/// A part of a table a style gives its own look: a background, its text
+/// bold, its text's colour, and rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RegionLook {
+    pub shading: Option<u32>,
+    pub bold: bool,
+    pub color: Option<u32>,
+    /// A rule under it (the header) or over it (the total row).
+    pub rule: Option<Border>,
+}
+
+/// A table style: its borders and background, and its header row, total
+/// row, first column and banded rows' looks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct TableStyle {
+    pub borders: TableBorders,
+    pub shading: Option<u32>,
+    pub header: RegionLook,
+    pub total: RegionLook,
+    pub first_col: RegionLook,
+    pub last_col: RegionLook,
+    /// Odd rows' and odd columns' backgrounds when banded.
+    pub band_row: Option<u32>,
+    pub band_col: Option<u32>,
+}
+
+/// The table styles the table style gallery offers: a name, then the
+/// style (added to a document when first used).
+pub fn builtin_table_styles() -> Vec<(&'static str, TableStyle)> {
+    let rule = |color: u32, width: u16| Border { color: Some(color), width, space: 0, ..Border::default() };
+    let accent = |name: &'static str, dark: u32, light: u32| {
+        (name, TableStyle {
+            borders: TableBorders { top: Some(rule(dark, 4)), bottom: Some(rule(dark, 4)), start: Some(rule(dark, 4)), end: Some(rule(dark, 4)), inside_h: Some(rule(dark, 4)), inside_v: None },
+            header: RegionLook { shading: Some(dark), bold: true, color: Some(0xFFFFFF), rule: None },
+            total: RegionLook { bold: true, rule: Some(Border { style: BorderStyle::Double, ..rule(dark, 4) }), ..RegionLook::default() },
+            first_col: RegionLook { bold: true, ..RegionLook::default() },
+            band_row: Some(light),
+            ..TableStyle::default()
+        })
+    };
+    vec![
+        ("Table Grid", TableStyle { borders: TableBorders::grid(), ..TableStyle::default() }),
+        ("Plain Table", TableStyle { header: RegionLook { bold: true, rule: Some(rule(0x7F7F7F, 4)), ..RegionLook::default() }, first_col: RegionLook { bold: true, ..RegionLook::default() }, band_row: Some(0xF2F2F2), ..TableStyle::default() }),
+        ("Light List", TableStyle { borders: TableBorders { top: Some(rule(0x000000, 4)), bottom: Some(rule(0x000000, 4)), ..TableBorders::default() }, header: RegionLook { bold: true, rule: Some(rule(0x000000, 4)), ..RegionLook::default() }, total: RegionLook { bold: true, rule: Some(rule(0x000000, 4)), ..RegionLook::default() }, ..TableStyle::default() }),
+        accent("Blue Table", 0x4472C4, 0xD9E2F3),
+        accent("Orange Table", 0xED7D31, 0xFBE4D5),
+        accent("Green Table", 0x70AD47, 0xE2EFD9),
+        accent("Grey Table", 0x7F7F7F, 0xEDEDED),
+    ]
+}
+
+/// Most table styles and tables a document keeps looks for.
+pub const MAX_TABLE_STYLES: usize = 1024;
+pub const MAX_TABLES: usize = 65_536;
+
+/// A cell's look as drawn: its four rules and background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CellPaint {
+    pub top: Option<Border>,
+    pub bottom: Option<Border>,
+    pub start: Option<Border>,
+    pub end: Option<Border>,
+    pub shading: Option<u32>,
+    pub valign: VAlign,
+    /// Its text bold or coloured by the table style.
+    pub bold: bool,
+    pub color: Option<u32>,
 }
 
 /// Space inside a cell's border, twips.
@@ -1423,6 +1656,9 @@ pub struct StyleSheet {
     /// Lists' own definitions by list id; a list without one numbers as
     /// the built-in list of its kind.
     pub lists: std::collections::BTreeMap<u32, ListDef>,
+    /// Table styles by name: the file's own and those picked from the
+    /// gallery.
+    pub tables: std::collections::BTreeMap<Arc<str>, TableStyle>,
 }
 
 impl Default for StyleSheet {
@@ -1441,6 +1677,7 @@ impl Default for StyleSheet {
             ],
             default_char: CharFormat::default(),
             lists: Default::default(),
+            tables: Default::default(),
         }
     }
 }
@@ -1798,6 +2035,9 @@ pub struct TextDoc {
     pub tracking: bool,
     /// Line numbers and hyphenation.
     pub settings: Settings,
+    /// Tables' own looks by table id (a table without one has single rules
+    /// everywhere).
+    pub tables: std::collections::BTreeMap<u32, TableLook>,
     /// What each field shows, as last worked out (derived: not saved, not
     /// part of undo); see [`crate::fields`].
     pub field_values: HashMap<Field, Arc<str>>,
@@ -1839,7 +2079,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, settings: Settings::default(), field_values: HashMap::new(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, settings: Settings::default(), tables: Default::default(), field_values: HashMap::new(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d
@@ -1897,9 +2137,48 @@ impl TextDoc {
         self.para(i)?.props.cell
     }
 
+    /// Block `i`'s cell in the table inside its cell, if any.
+    pub fn inner_cell(&self, i: usize) -> Option<CellRef> {
+        let p = self.para(i)?;
+        p.props.cell.and(p.props.inner)
+    }
+
+    /// Block `i`'s cell at a depth: its table's (false) or the one inside
+    /// its cell (true).
+    pub fn cell_at(&self, i: usize, inner: bool) -> Option<CellRef> {
+        if inner { self.inner_cell(i) } else { self.cell(i) }
+    }
+
     /// Whether blocks `a` and `b` are in the same cell (or both outside tables).
     pub fn same_cell(&self, a: usize, b: usize) -> bool {
-        match (self.cell(a), self.cell(b)) {
+        self.same_cell_at(a, b, false)
+    }
+
+    /// The blocks of the row holding block `i` (empty outside tables).
+    pub fn row_range(&self, i: usize) -> std::ops::Range<usize> {
+        self.row_range_at(i, false)
+    }
+
+    /// The cells of row `row` in a column `col_w` wide (see [`Self::row_cells_at`]).
+    pub fn row_cells(&self, row: std::ops::Range<usize>, col_w: i64) -> Vec<(std::ops::Range<usize>, i64, i64)> {
+        self.row_cells_at(row, col_w, false)
+    }
+
+    pub fn cell_pad(&self, i: usize) -> CellPad {
+        self.cell_pad_at(i, false)
+    }
+
+    pub fn row_place(&self, i: usize) -> (usize, bool) {
+        self.row_place_at(i, false)
+    }
+
+    pub fn row_paints(&self, row: std::ops::Range<usize>, n_cells: usize) -> Vec<CellPaint> {
+        self.row_paints_at(row, n_cells, false)
+    }
+
+    /// Whether blocks `a` and `b` are in the same cell (or both outside tables).
+    pub fn same_cell_at(&self, a: usize, b: usize, inner: bool) -> bool {
+        match (self.cell_at(a, inner), self.cell_at(b, inner)) {
             (None, None) => true,
             (Some(x), Some(y)) => (x.table, x.row, x.col) == (y.table, y.row, y.col),
             _ => false,
@@ -1907,9 +2186,9 @@ impl TextDoc {
     }
 
     /// The blocks of the row holding block `i` (empty outside tables).
-    pub fn row_range(&self, i: usize) -> std::ops::Range<usize> {
-        let Some(c) = self.cell(i) else { return i..i };
-        let same = |k: usize| self.cell(k).is_some_and(|d| (d.table, d.row) == (c.table, c.row));
+    pub fn row_range_at(&self, i: usize, inner: bool) -> std::ops::Range<usize> {
+        let Some(c) = self.cell_at(i, inner) else { return i..i };
+        let same = |k: usize| self.cell_at(k, inner).is_some_and(|d| (d.table, d.row) == (c.table, c.row));
         let mut a = i;
         while a > 0 && i - a < MAX_ROW_BLOCKS && same(a - 1) {
             a -= 1;
@@ -1923,20 +2202,27 @@ impl TextDoc {
 
     /// The cells of row `row`: their blocks, x and width in layout units, in
     /// a column `col_w` wide (widths scaled down to fit it).
-    pub fn row_cells(&self, row: std::ops::Range<usize>, col_w: i64) -> Vec<(std::ops::Range<usize>, i64, i64)> {
+    pub fn row_cells_at(&self, row: std::ops::Range<usize>, col_w: i64, inner: bool) -> Vec<(std::ops::Range<usize>, i64, i64)> {
         let mut cells: Vec<(std::ops::Range<usize>, i64)> = Vec::new();
         for k in row {
-            let w = self.cell(k).map_or(1, |c| c.width.clamp(1, 31680)) as i64;
+            let w = self.cell_at(k, inner).map_or(1, |c| c.width.clamp(1, 31680)) as i64;
             let n = cells.len();
             match cells.last_mut() {
                 // Past the most cells a row has, the rest join the last.
-                Some((r, _)) if n >= MAX_CELLS || self.same_cell(r.start, k) => r.end = k + 1,
+                Some((r, _)) if n >= MAX_CELLS || self.same_cell_at(r.start, k, inner) => r.end = k + 1,
                 _ => cells.push((k..k + 1, crate::twips(w))),
             }
         }
         let total: i64 = cells.iter().map(|c| c.1).sum::<i64>().max(1);
         let scale = |w: i64| if total > col_w { (w * col_w / total).max(crate::LU) } else { w };
-        let mut x = 0;
+        // The table's place across the column.
+        let room = (col_w - total).max(0);
+        let look = cells.first().and_then(|c| self.cell_at(c.0.start, inner)).and_then(|c| self.tables.get(&c.table));
+        let mut x = match look.map(|t| t.align) {
+            Some(HAlign::Center) => room / 2,
+            Some(HAlign::End) => room,
+            _ => look.map_or(0, |t| crate::twips(t.indent as i64).clamp(-col_w, room)),
+        };
         cells
             .into_iter()
             .map(|(r, w)| {
@@ -1949,16 +2235,167 @@ impl TextDoc {
     }
 
     /// Where block `i` sits across a column `col_w` wide: its x and the width
-    /// its text is laid out in (a cell's, inside the padding, or the column).
+    /// its text is laid out in (a cell's, inside the padding, or the column;
+    /// in a table inside a cell, its cell there).
     pub fn block_box(&self, i: usize, col_w: i64) -> (i64, i64) {
-        if self.cell(i).is_none() {
-            return (0, col_w);
+        let Some((x, w)) = self.cell_box_at(i, col_w, false) else { return (0, col_w) };
+        match self.cell_box_at(i, w, true) {
+            Some((x2, w2)) => (x + x2, w2),
+            None => (x, w),
         }
-        let pad = crate::twips(CELL_PAD as i64);
-        self.row_cells(self.row_range(i), col_w)
-            .into_iter()
-            .find(|c| c.0.contains(&i))
-            .map_or((0, col_w), |(_, x, w)| (x + pad, (w - 2 * pad).max(crate::LU)))
+    }
+
+    /// The text box of block `i`'s cell at a depth, in a width `col_w`.
+    fn cell_box_at(&self, i: usize, col_w: i64, inner: bool) -> Option<(i64, i64)> {
+        self.cell_at(i, inner)?;
+        let pad = self.cell_pad_at(i, inner);
+        let (ps, pe) = (crate::twips(pad.start as i64), crate::twips(pad.end as i64));
+        let row = self.row_range_at(i, inner);
+        self.row_cells_at(row, col_w, inner).into_iter().find(|c| c.0.contains(&i)).map(|(_, x, w)| (x + ps, (w - ps - pe).max(crate::LU)))
+    }
+
+    /// The padding of the cell block `i` is in: its own, its table's, or
+    /// the default.
+    pub fn cell_pad_at(&self, i: usize, inner: bool) -> CellPad {
+        let Some(c) = self.cell_at(i, inner) else { return CellPad::default() };
+        c.look.pad.or_else(|| self.tables.get(&c.table).and_then(|t| t.pad)).unwrap_or_default()
+    }
+
+    /// The table style `t` names, if the document has it.
+    pub fn table_style(&self, t: &TableLook) -> Option<&TableStyle> {
+        t.style.as_ref().and_then(|n| self.styles.tables.get(n))
+    }
+
+    /// Where the row of block `i` sits in its table: its index among the
+    /// table's rows (counted back at most `MAX_ROW_BLOCKS` blocks), and
+    /// whether it is the last.
+    pub fn row_place_at(&self, i: usize, inner: bool) -> (usize, bool) {
+        let Some(c) = self.cell_at(i, inner) else { return (0, false) };
+        let row = self.row_range_at(i, inner);
+        let mut k = row.start;
+        let mut index = 0;
+        let mut last_row = c.row;
+        while k > 0 && row.start - k < MAX_ROW_BLOCKS {
+            match self.cell_at(k - 1, inner) {
+                Some(d) if d.table == c.table => {
+                    if d.row != last_row {
+                        index += 1;
+                        last_row = d.row;
+                    }
+                    k -= 1;
+                }
+                _ => break,
+            }
+        }
+        let last = !self.cell_at(row.end, inner).is_some_and(|d| d.table == c.table);
+        (index, last)
+    }
+
+    /// The blocks of the header rows at the top of block `i`'s table, when
+    /// `i` is in a later row (they repeat at the top of each page).
+    pub fn header_rows(&self, i: usize) -> Option<std::ops::Range<usize>> {
+        let c = self.cell(i)?;
+        if c.row_look.header {
+            return None;
+        }
+        // Back to the table's first block.
+        let mut start = self.row_range(i).start;
+        let mut rows = 0;
+        while start > 0 && rows < MAX_ROW_BLOCKS {
+            match self.cell(start - 1) {
+                Some(d) if d.table == c.table => {
+                    start = self.row_range(start - 1).start;
+                    rows += 1;
+                }
+                _ => break,
+            }
+        }
+        let mut end = start;
+        while self.cell(end).is_some_and(|d| d.table == c.table && d.row_look.header) && end < i {
+            end = self.row_range(end).end;
+        }
+        (end > start).then_some(start..end)
+    }
+
+    /// How each cell of the row of blocks `row` is drawn, in order: its
+    /// rules and background from its own look over its table's style
+    /// regions, its table's borders and the style's.
+    pub fn row_paints_at(&self, row: std::ops::Range<usize>, n_cells: usize, inner: bool) -> Vec<CellPaint> {
+        let Some(first) = self.cell_at(row.start, inner) else { return Vec::new() };
+        let look = self.tables.get(&first.table).cloned().unwrap_or_default();
+        let style = self.table_style(&look).cloned();
+        let borders = look.borders.or(style.as_ref().map(|s| s.borders)).unwrap_or_else(TableBorders::grid);
+        let (index, last) = self.row_place_at(row.start, inner);
+        // Header rows: those marked, or the first when the style marks it.
+        let header = first.row_look.header || (index == 0 && look.look & LOOK_HEADER != 0 && style.is_some());
+        let total = last && index > 0 && look.look & LOOK_TOTAL != 0 && style.is_some();
+        let banded_row = look.look & LOOK_BANDED_ROWS != 0 && (index + usize::from(look.look & LOOK_HEADER == 0)) % 2 == 1;
+        let mut cells: Vec<CellRef> = Vec::new();
+        for k in row {
+            let Some(c) = self.cell_at(k, inner) else { continue };
+            if cells.last().is_none_or(|d| (d.row, d.col) != (c.row, c.col)) && cells.len() < MAX_CELLS {
+                cells.push(c);
+            }
+        }
+        let n = n_cells.max(cells.len()).max(1);
+        cells
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                let mut p = CellPaint {
+                    top: if index == 0 { borders.top } else { borders.inside_h },
+                    bottom: if last { borders.bottom } else { borders.inside_h },
+                    start: if j == 0 { borders.start } else { borders.inside_v },
+                    end: if j + 1 == n { borders.end } else { borders.inside_v },
+                    shading: look.shading.or(style.as_ref().and_then(|s| s.shading)),
+                    valign: c.look.valign,
+                    bold: false,
+                    color: None,
+                };
+                if let Some(s) = &style {
+                    if banded_row && !header && !total {
+                        p.shading = s.band_row.or(p.shading);
+                    }
+                    if look.look & LOOK_BANDED_COLUMNS != 0 && j % 2 == 0 && !header {
+                        p.shading = s.band_col.or(p.shading);
+                    }
+                    let mut region = |r: &RegionLook, under: bool| {
+                        p.shading = r.shading.or(p.shading);
+                        p.bold |= r.bold;
+                        p.color = r.color.or(p.color);
+                        if let Some(rule) = r.rule {
+                            if under {
+                                p.bottom = Some(rule);
+                            } else {
+                                p.top = Some(rule);
+                            }
+                        }
+                    };
+                    if j == 0 && look.look & LOOK_FIRST_COLUMN != 0 {
+                        region(&s.first_col, true);
+                    }
+                    if j + 1 == n && look.look & LOOK_LAST_COLUMN != 0 {
+                        region(&s.last_col, true);
+                    }
+                    if header {
+                        region(&s.header, true);
+                    }
+                    if total {
+                        region(&s.total, false);
+                    }
+                }
+                let b = c.look.borders;
+                p.top = b.top.unwrap_or(p.top);
+                p.bottom = b.bottom.unwrap_or(p.bottom);
+                p.start = b.start.unwrap_or(p.start);
+                p.end = b.end.unwrap_or(p.end);
+                p.shading = c.look.shading.unwrap_or(p.shading);
+                if c.merged_up {
+                    p.top = None;
+                }
+                p
+            })
+            .collect()
     }
 
     /// Appends a paragraph (building documents in code and in converters).

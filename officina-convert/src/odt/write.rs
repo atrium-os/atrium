@@ -171,7 +171,9 @@ fn odf_border(b: &Border) -> String {
         BorderStyle::Dotted => "dotted",
         BorderStyle::Dashed => "dashed",
     };
-    format!("{}pt {style} #{:06x}", b.width as f64 / 8.0, b.color.unwrap_or(0) & 0xff_ffff)
+    // ODF has no "thick" style: a solid rule as thick as it draws.
+    let width = if b.style == BorderStyle::Thick { b.width.max(12) } else { b.width };
+    format!("{}pt {style} #{:06x}", width as f64 / 8.0, b.color.unwrap_or(0) & 0xff_ffff)
 }
 
 /// Hyphenation is a text property in ODF: a paragraph's own setting goes
@@ -1014,58 +1016,173 @@ impl Out<'_> {
     }
 
     fn table(&mut self, b: usize, out: &mut String) -> usize {
+        self.table_at(b, self.doc.blocks.len(), false, out)
+    }
+
+    /// The table at a depth (`inner`: the one in a cell, ending by
+    /// `limit`) starting at block `b`; returns the block after it.
+    fn table_at(&mut self, b: usize, limit: usize, inner: bool, out: &mut String) -> usize {
         let doc = self.doc;
-        let t = doc.cell(b).map(|c| c.table);
+        let t = doc.cell_at(b, inner).map(|c| c.table);
         let mut end = b;
-        while end < doc.blocks.len() && doc.cell(end).map(|c| c.table) == t {
+        while end < limit && doc.cell_at(end, inner).map(|c| c.table) == t {
             end += 1;
         }
         self.tables += 1;
         let name = format!("Table{}", self.tables);
-        let first = cells_of(doc, doc.row_range(b));
-        let widths: Vec<u32> = first.iter().map(|c| doc.cell(c.start).map_or(1440, |x| x.width)).collect();
-        let total: u32 = widths.iter().sum();
-        let _ = write!(self.auto, r#"<style:style style:name="{name}" style:family="table"><style:table-properties style:width="{}" table:align="left"/></style:style>"#, pt(total as i64));
-        for (i, w) in widths.iter().enumerate() {
-            let _ = write!(self.auto, r#"<style:style style:name="{name}.C{i}" style:family="table-column"><style:table-column-properties style:column-width="{}"/></style:style>"#, pt(*w as i64));
-        }
-        let cell_style = format!("{name}.A1");
-        let _ = write!(self.auto, r#"<style:style style:name="{cell_style}" style:family="table-cell"><style:table-cell-properties fo:padding="4pt" fo:border="0.5pt solid #8c9199"/></style:style>"#);
-        let _ = write!(out, r#"<table:table table:name="{name}" table:style-name="{name}">"#);
-        for i in 0..widths.len() {
-            let _ = write!(out, r#"<table:table-column table:style-name="{name}.C{i}"/>"#);
-        }
+        // Rows: each cell's blocks, its edges across (twips), and how it is
+        // drawn (ODF has no table styles: each cell carries its look).
+        let mut rows: Vec<(Vec<(std::ops::Range<usize>, u32, u32, officina_text::model::CellPaint)>, officina_text::model::RowLook)> = Vec::new();
         let mut k = b;
         while k < end {
-            let row = doc.row_range(k);
+            let row = doc.row_range_at(k, inner);
             let row = k..row.end.max(k + 1).min(end);
-            out.push_str("<table:table-row>");
-            for cell in cells_of(doc, row.clone()) {
-                let _ = write!(out, r#"<table:table-cell table:style-name="{cell_style}" office:value-type="string">"#);
+            let cells = cells_of(doc, row.clone(), inner);
+            let paints = doc.row_paints_at(row.clone(), cells.len(), inner);
+            let mut x = 0u32;
+            let v = cells
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let w = doc.cell_at(c.start, inner).map_or(1440, |x| x.width);
+                    let r = (c, x, x + w, paints.get(i).copied().unwrap_or_default());
+                    x += w;
+                    r
+                })
+                .collect();
+            rows.push((v, doc.cell_at(k, inner).map(|c| c.row_look).unwrap_or_default()));
+            k = row.end;
+        }
+        let mut edges: Vec<u32> = rows.iter().flat_map(|r| r.0.iter().flat_map(|c| [c.1, c.2])).collect();
+        edges.sort_unstable();
+        edges.dedup_by(|a, b| a.abs_diff(*b) <= 20);
+        edges.truncate(64);
+        let col_of = |x: u32| edges.iter().position(|e| e.abs_diff(x) <= 20).unwrap_or(edges.len().saturating_sub(1));
+        let total = edges.last().copied().unwrap_or(1440);
+        let look = t.and_then(|t| doc.tables.get(&t)).cloned().unwrap_or_default();
+        let align = match look.align {
+            officina_text::model::HAlign::Center => "center",
+            officina_text::model::HAlign::End => "right",
+            _ if look.indent != 0 => "margins",
+            _ => "left",
+        };
+        let margin = if look.indent != 0 { format!(r#" fo:margin-left="{}""#, pt(look.indent as i64)) } else { String::new() };
+        let _ = write!(self.auto, r#"<style:style style:name="{name}" style:family="table"><style:table-properties style:width="{}" table:align="{align}"{margin}/></style:style>"#, pt(total as i64));
+        for (i, w) in edges.windows(2).enumerate() {
+            let _ = write!(self.auto, r#"<style:style style:name="{name}.C{i}" style:family="table-column"><style:table-column-properties style:column-width="{}"/></style:style>"#, pt((w[1] - w[0]) as i64));
+        }
+        let _ = write!(out, r#"<table:table table:name="{name}" table:style-name="{name}">"#);
+        for i in 0..edges.len().saturating_sub(1) {
+            let _ = write!(out, r#"<table:table-column table:style-name="{name}.C{i}"/>"#);
+        }
+        // One cell style per look, one row style per row look.
+        let mut cell_styles: HashMap<(officina_text::model::CellPaint, Option<officina_text::model::CellPad>), String> = HashMap::new();
+        let mut row_styles: HashMap<officina_text::model::RowLook, String> = HashMap::new();
+        let mut in_header = false;
+        let n_rows = rows.len();
+        for ri in 0..n_rows {
+            let (cells, rl) = &rows[ri];
+            if rl.header && ri == 0 {
+                out.push_str("<table:table-header-rows>");
+                in_header = true;
+            } else if in_header && !rl.header {
+                out.push_str("</table:table-header-rows>");
+                in_header = false;
+            }
+            let plain = officina_text::model::RowLook { header: false, ..*rl };
+            let row_attr = if plain != officina_text::model::RowLook::default() {
+                let n = row_styles.len();
+                let rname = row_styles.entry(plain).or_insert_with(|| {
+                    let rname = format!("{name}.R{n}");
+                    let mut props = String::new();
+                    if plain.height > 0 {
+                        let _ = write!(props, r#" style:{}="{}""#, if plain.exact { "row-height" } else { "min-row-height" }, pt(plain.height as i64));
+                    }
+                    if plain.cant_split {
+                        props += r#" fo:keep-together="always""#;
+                    }
+                    let _ = write!(self.auto, r#"<style:style style:name="{rname}" style:family="table-row"><style:table-row-properties{props}/></style:style>"#);
+                    rname
+                });
+                format!(r#" table:style-name="{rname}""#)
+            } else {
+                String::new()
+            };
+            let _ = write!(out, "<table:table-row{row_attr}>");
+            for (cell, x0, x1, paint) in cells {
+                let c = doc.cell_at(cell.start, inner).unwrap_or_default();
+                let span = col_of(*x1).saturating_sub(col_of(*x0)).max(1);
+                let pad = c.look.pad.or(look.pad);
+                let key = (*paint, pad);
+                let n = cell_styles.len();
+                let auto = &mut self.auto;
+                let cname = cell_styles
+                    .entry(key)
+                    .or_insert_with(|| {
+                        let cname = format!("{name}.A{n}");
+                        let side = |b: Option<officina_text::model::Border>| b.map_or("none".to_string(), |x| odf_border(&x));
+                        let pd = pad.unwrap_or_default();
+                        let bg = paint.shading.map_or("transparent".to_string(), |c| format!("#{c:06x}"));
+                        let va = match paint.valign {
+                            officina_text::model::VAlign::Top => "top",
+                            officina_text::model::VAlign::Center => "middle",
+                            officina_text::model::VAlign::Bottom => "bottom",
+                        };
+                        let _ = write!(auto, r#"<style:style style:name="{cname}" style:family="table-cell"><style:table-cell-properties fo:padding-top="{}" fo:padding-bottom="{}" fo:padding-left="{}" fo:padding-right="{}" fo:border-top="{}" fo:border-bottom="{}" fo:border-left="{}" fo:border-right="{}" fo:background-color="{bg}" style:vertical-align="{va}"/></style:style>"#, pt(pd.top as i64), pt(pd.bottom as i64), pt(pd.start as i64), pt(pd.end as i64), side(paint.top), side(paint.bottom), side(paint.start), side(paint.end));
+                        cname
+                    })
+                    .clone();
+                // Merged down: the first of a run says how many rows it covers.
+                let mut down = 1;
+                while rows.get(ri + down).and_then(|r| r.0.iter().find(|d| d.1.abs_diff(*x0) <= 20)).and_then(|d| doc.cell_at(d.0.start, inner)).is_some_and(|d| d.merged_up) {
+                    down += 1;
+                }
+                let tag = if c.merged_up { "table:covered-table-cell" } else { "table:table-cell" };
+                let mut attrs = format!(r#" table:style-name="{cname}""#);
+                if !c.merged_up {
+                    attrs += r#" office:value-type="string""#;
+                    if span > 1 {
+                        let _ = write!(attrs, r#" table:number-columns-spanned="{span}""#);
+                    }
+                    if down > 1 {
+                        let _ = write!(attrs, r#" table:number-rows-spanned="{down}""#);
+                    }
+                }
+                let _ = write!(out, "<{tag}{attrs}>");
                 let mut x = cell.start;
                 while x < cell.end {
-                    if list_of(doc, x).is_some() {
-                        x = self.list(x, cell.end, out).max(x + 1);
+                    if !inner && doc.inner_cell(x).is_some() {
+                        x = self.table_at(x, cell.end, true, out).max(x + 1);
+                    } else if list_of(doc, x).is_some() {
+                        // A list stops where a table in the cell starts.
+                        let stop = if inner { cell.end } else { (x..cell.end).find(|&j| doc.inner_cell(j).is_some()).unwrap_or(cell.end) };
+                        x = self.list(x, stop, out).max(x + 1);
                     } else {
                         self.para(x, out);
                         x += 1;
                     }
                 }
-                out.push_str("</table:table-cell>");
+                let _ = write!(out, "</{tag}>");
+                // The grid columns it spans past the first are covered.
+                for _ in 1..span {
+                    out.push_str("<table:covered-table-cell/>");
+                }
             }
             out.push_str("</table:table-row>");
-            k = row.end;
+        }
+        if in_header {
+            out.push_str("</table:table-header-rows>");
         }
         out.push_str("</table:table>");
         end
     }
 }
 
-fn cells_of(doc: &TextDoc, row: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+fn cells_of(doc: &TextDoc, row: std::ops::Range<usize>, inner: bool) -> Vec<std::ops::Range<usize>> {
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
     for k in row {
         match out.last_mut() {
-            Some(r) if doc.same_cell(r.start, k) => r.end = k + 1,
+            Some(r) if doc.same_cell_at(r.start, k, inner) => r.end = k + 1,
             _ => out.push(k..k + 1),
         }
     }

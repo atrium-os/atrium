@@ -93,6 +93,13 @@ struct Counts {
     labels: usize,
     line_numbers: usize,
     hyphenation: usize,
+    merged_across: usize,
+    merged_down: usize,
+    nested_cells: usize,
+    header_rows: usize,
+    row_heights: usize,
+    cell_shading: usize,
+    cell_rules: usize,
 }
 
 impl Counts {
@@ -171,6 +178,81 @@ impl Counts {
             c.line_numbers = d.settings.line_numbers.is_some() as usize;
             c.hyphenation = d.settings.hyphenate as usize;
         }
+        {
+            // Tables as drawn: cells merged, header rows, heights, and each
+            // cell's background and rules (a hash of them).
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut k = 0;
+            while k < d.blocks.len() {
+                if d.cell(k).is_none() {
+                    k += 1;
+                    continue;
+                }
+                let row = d.row_range(k);
+                let row = k..row.end.max(k + 1);
+                let mut seen = Vec::new();
+                let mut inner_seen = Vec::new();
+                for b in row.clone() {
+                    let Some(x) = d.cell(b) else { continue };
+                    if let Some(i) = d.inner_cell(b) {
+                        if !inner_seen.contains(&(i.table, i.row, i.col)) {
+                            inner_seen.push((i.table, i.row, i.col));
+                        }
+                    }
+                    if seen.contains(&x.col) {
+                        continue;
+                    }
+                    seen.push(x.col);
+                    c.merged_down += x.merged_up as usize;
+                    c.header_rows += x.row_look.header as usize;
+                    c.row_heights += (x.row_look.height > 0) as usize;
+                }
+                c.nested_cells += inner_seen.len();
+                for p in d.row_paints(row.clone(), 0) {
+                    c.cell_shading += p.shading.is_some() as usize;
+                    // Rule looks: whether each side has one, and its style.
+                    for side in [p.top, p.bottom, p.start, p.end] {
+                        std::hash::Hash::hash(&side.map(|b| (if b.style == officina_text::model::BorderStyle::Thick { officina_text::model::BorderStyle::Single } else { b.style }, b.thickness().min(240) / 10)), &mut h);
+                    }
+                }
+                k = row.end;
+            }
+            c.cell_rules = (std::hash::Hasher::finish(&h) % 1_000_000) as usize;
+            // Merged across: cells over more than one column of the table's
+            // grid (every row's cell edges), as the writers work it out.
+            let mut k = 0;
+            while k < d.blocks.len() {
+                let Some(t) = d.cell(k).map(|x| x.table) else {
+                    k += 1;
+                    continue;
+                };
+                let mut rows: Vec<Vec<(u32, u32)>> = Vec::new();
+                while d.cell(k).is_some_and(|x| x.table == t) {
+                    let row = d.row_range(k);
+                    let row = k..row.end.max(k + 1);
+                    let mut x0 = 0u32;
+                    let mut cols = Vec::new();
+                    let mut last = None;
+                    for b in row.clone() {
+                        let x = d.cell(b).unwrap();
+                        if last == Some(x.col) {
+                            continue;
+                        }
+                        last = Some(x.col);
+                        cols.push((x0, x0 + x.width));
+                        x0 += x.width;
+                    }
+                    rows.push(cols);
+                    k = row.end;
+                }
+                let mut edges: Vec<u32> = rows.iter().flatten().flat_map(|c| [c.0, c.1]).collect();
+                edges.sort_unstable();
+                edges.dedup_by(|a, b| a.abs_diff(*b) <= 20);
+                for (a, b) in rows.iter().flatten() {
+                    c.merged_across += (edges.iter().filter(|e| **e > a + 20 && **e + 20 < *b).count() > 0) as usize;
+                }
+            }
+        }
         c.notes = d.note_numbers().len();
         c.comments = d.live_comments().len();
         c.edits = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.edits().len())).unwrap_or(0);
@@ -208,6 +290,13 @@ impl Counts {
             ("labels", self.labels),
             ("line_numbers", self.line_numbers),
             ("hyphenation", self.hyphenation),
+            ("merged_across", self.merged_across),
+            ("merged_down", self.merged_down),
+            ("nested_cells", self.nested_cells),
+            ("header_rows", self.header_rows),
+            ("row_heights", self.row_heights),
+            ("cell_shading", self.cell_shading),
+            ("cell_rules", self.cell_rules),
             ("caps", self.caps),
             ("hidden", self.hidden),
             ("dstrike", self.dstrike),
