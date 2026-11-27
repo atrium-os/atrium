@@ -750,6 +750,38 @@ measurement.
 - **Kernel hardening:** `vmm` stays out of ATRIUM kernels (kernel-hardening.md); Solum
   machines do not need it.
 
+### 8.1 Emulators and VMMs inside Atrium
+
+Asked by Shankar: can Atrium run an emulator while Solum is running? Yes, in three cases:
+
+1. **Pure software emulators** (an emulator interpreting or translating another CPU:
+   Vaahana in full-emulation mode, console and retro emulators, QEMU TCG). These are
+   ordinary user-space programs in an app jail and need nothing from Solum. They run at
+   the same speed as on bare metal, since they never touch virtualisation hardware. A JIT
+   needs the same writable-then-executable memory grant it needs today (W^X policy).
+2. **Accelerated emulators and VMMs** (Vaahana or QEMU with hardware acceleration,
+   bhyve, the Linux lane). Under Solum, main does not see VT-x or EL2 (§4.8 hides them), so
+   these can't use `vmm.ko` or a KVM-style device directly. Solum instead offers a
+   **guest-domain API**, shaped like KVM's: create a guest domain, give it memory from the
+   emulator process's own pages (donated, so the process and the guest can't both write
+   them unless shared), run a vCPU, and get each exit back to the process. The guest is a
+   **sibling domain of main**, not a guest of a guest, so there is only one level of
+   virtualisation and CPU-bound guest code runs at near-native speed. The emulator
+   process stays the device model, jailed as bhyve is (§3.3), and `jaild` grants the guest
+   API only to bundles whose manifest asks for it. Vaahana, bhyve's user space or any other
+   VMM needs a small **Solum backend**, the way Cloud Hypervisor and OpenVMM have one per
+   platform. The cost: an exit that needs the device model goes guest, then Solum, then
+   main's kernel, then the process, so two world switches more than under KVM on bare
+   metal. I/O-heavy guests should use virtio with event suppression; CPU-bound guests
+   don't notice.
+3. **Emulating a machine that itself runs a hypervisor** (developing Solum inside an
+   Atrium that runs on Solum, or any guest that needs VMX or EL2). That needs nested
+   virtualisation, which Solum does not offer (§4.8). Either the emulator implements VMX
+   or EL2 in software (slow, functional only), or that work runs on a machine booted
+   without Solum (§4.7). Solum development itself is done that way.
+
+On machines without Solum, accelerated emulators use `vmm.ko` (bhyve) as today.
+
 ## 9. Performance gates
 
 Main domain under Solum against the same kernel and binaries on bare metal, at least 3
@@ -897,6 +929,9 @@ in the S2a gate.
 7f. **Access, debugging and power** (§5.7): Solum reached only through `solumd`, `solumctl`
    and Curia; GDB stub in debug builds only; main owns energy policy, Solum owns resume,
    reset and CPU bring-up; no hibernate under Solum. *Recommend yes; new.*
+7g. **Emulators under Solum** (§8.1): software emulators unchanged; accelerated ones use
+   a KVM-shaped guest-domain API with a Solum backend in each VMM; no nested
+   virtualisation. *Recommend yes; new.*
 7e. **Driver-model weak spots** (§5.6): explicit move sequence in dispensatord, generation
    bump on every move, main's config writes checked, main keeps ACPI with Solum owning
    the resume path (new step S2a). *Recommend yes; this one is new since the acceptance.*
