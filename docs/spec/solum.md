@@ -162,10 +162,11 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
   main domain's vCPU there, then returns. This is the only scheduling Solum does: a
   per-CPU priority run queue with a budget per domain so a looping driver domain cannot
   starve the main one (it is stopped and restarted, §6.1).
-- amd64: no external-interrupt exiting for the main domain, so Solum takes the CPU back
-  for driver domains and watchdogs with the **VMX preemption timer** (armed only while a
-  driver domain has pending work or a watchdog is due) and with **NMIs** it sends itself
-  (NMI exiting on). Posted interrupts where the CPU has them. MSR and I/O bitmaps pass
+- amd64: Solum takes the CPU back for driver domains and watchdogs with the **VMX
+  preemption timer** (armed only while a driver domain has pending work or a watchdog is
+  due) and with **NMIs** it sends itself (NMI exiting on). Interrupt delivery is in §4.4:
+  external-interrupt exiting has to be on whenever other domains own devices, and
+  posted interrupts are what keep main's device interrupts exit-free. MSR and I/O bitmaps pass
   everything except virtualisation control, IOMMU and a few MSRs; VMX hidden in CPUID.
   **The interrupt-command register is not passed through**: with a direct x2APIC, main could
   IPI, INIT or NMI a CPU while it runs the vault or a driver domain. Main's ICR writes go
@@ -188,10 +189,33 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
 
 ### 4.4 Interrupts
 
-Every interrupt source belongs to the domain that owns the device. Passthrough devices'
-MSI/MSI-X go through IOMMU interrupt remapping straight to the owning vCPU (posted on
-amd64, direct injection via GICv4 where present, list registers otherwise). Solum refuses
-to pass a device through on a machine without interrupt remapping.
+Every interrupt source belongs to the domain that owns the device. Solum refuses to pass
+a device through on a machine without interrupt remapping.
+
+How an interrupt reaches its owner depends on the hardware, and this decides whether
+interrupt-heavy I/O is near native:
+
+- **amd64 with posted interrupts** (APICv plus VT-d posted interrupts; AVIC on AMD):
+  interrupt remapping posts each device interrupt to its owning vCPU's descriptor. Main's
+  device interrupts arrive with no exit. External-interrupt exiting is on, but only Solum's
+  own vectors and posted-interrupt notifications for vCPUs that aren't running reach it.
+- **amd64 without posted interrupts** (for example Coffee Lake parts such as the R9700
+  box's Xeon E-2288G and the i9-9900K): with external-interrupt exiting off, every
+  physical interrupt on a CPU running main would go straight to main's IDT, including the
+  ones that belong to a driver domain, so it has to be on. **Every device interrupt then
+  exits** and Solum re-injects it into its owner. That costs roughly an exit and an entry
+  per interrupt. Interrupt moderation in the NIC and NVMe drivers keeps the rate down,
+  and §9's interrupt-latency and NVMe gates are measured on such a machine as well as on
+  one with posted interrupts. A machine without posted interrupts and without driver
+  domains (everything in main) can keep external-interrupt exiting off.
+- **arm64 with GICv4.1**: LPIs (MSIs) go straight to the owning vPE, with no exit.
+- **arm64 without GICv4.1**: Solum takes physical IRQs at EL2 (`HCR_EL2.IMO`) and injects
+  them through list registers, with an exit per interrupt, as on amd64 without posted
+  interrupts. On a machine where only main owns devices, `IMO` can stay clear while main
+  runs.
+
+So **near-native interrupt rates need posted interrupts or GICv4.1**. Without them Solum
+still works, with a measured cost per interrupt (§9).
 
 ### 4.5 Hypercalls
 
@@ -770,7 +794,13 @@ Asked by Shankar: can Atrium run an emulator while Solum is running? Yes, in thr
    process stays the device model, jailed as bhyve is (§3.3), and `jaild` grants the guest
    API only to bundles whose manifest asks for it. Vaahana, bhyve's user space or any other
    VMM needs a small **Solum backend**, the way Cloud Hypervisor and OpenVMM have one per
-   platform. The cost: an exit that needs the device model goes guest, then Solum, then
+   platform. Vaahana's wishes for the API, to be designed in S1: memory regions mapped
+   from the VMM's own pages, with 4 KiB write-protect and dirty tracking; a run call that
+   returns a KVM-style exit record (MMIO and port I/O with data, system-register or MSR
+   access, HLT/WFI, shutdown); batched register get and set; MSI injection and an
+   interrupt-window exit; an eventfd-like doorbell for queue kicks; guest debug
+   (single-step, hardware breakpoints); and a blocking wait for the next exit.
+   The cost: an exit that needs the device model goes guest, then Solum, then
    main's kernel, then the process, so two world switches more than under KVM on bare
    metal. I/O-heavy guests should use virtio with event suppression; CPU-bound guests
    don't notice.
@@ -794,7 +824,9 @@ runs per arm, exits counted by a positive-controlled counter:
 - Wired network on a passthrough NIC: throughput and RTT within run-to-run noise.
 - frescod on the R9700: p50 and p99 frame time on the noisy-neighbour and Navigator scroll
   runs, and GPU submit latency, within noise.
-- Interrupt latency on passthrough devices: < 5 µs added at p99.
+- Interrupt latency on passthrough devices: < 5 µs added at p99, measured on a machine with
+  posted interrupts and on one without (§4.4); the second also reports the cost per
+  interrupt at the NIC's and NVMe's real interrupt rates.
 - Exits per second in steady state: near zero; a steady stream is a bug.
 - Energy: idle package power and wake-ups per second within noise of bare metal; S3 entry
   and exit within 10 % (§5.7).
@@ -828,7 +860,12 @@ interrupt-emulation costs exist only in Solum and are first measured in S1 and S
 Test platforms: **Vaahana**, Atrium's own emulator, instead of QEMU (Shankar,
 2026-11-27), for everything functional: nested VMX and EL2, the IOMMU, ACPI sleep, the
 TPM and the debug stub. What Solum needs from it is listed in
-`docs/reviews/2026-11-27-solum-vaahana-requests.md`, ordered by build step. Numbers come
+`docs/reviews/2026-11-27-solum-vaahana-requests.md`, ordered by build step. Vaahana's answer
+(`docs/reviews/2026-11-27-solum-vaahana-gap-list.md`): nested virtualisation is passed
+down to the host, not emulated. amd64 work runs on Vaahana's x86 KVM machine on the
+Hostkey box (i9-9900K; no APICv, posted interrupts or IPIv, so it exercises §4.4's exit
+path), and arm64 work through HVF's EL2 on the M4 Max (nVHE support still to be probed).
+Nothing in the list is fully there yet; Vaahana's own order of work is in that file. Numbers come
 from the R9700 box, natively over PXE (x86_64-port §5). Until Vaahana has a feature a step
 needs, that step's functional check runs on the R9700 box (Linux KVM nested VMX) or under
 QEMU TCG, and the check script says which one it used.
@@ -891,7 +928,9 @@ MSI-only interrupts, filtered config calls, and an IOMMU required without Solum 
 item 4); D-states split between Solum and main; reset and power-off through Solum with
 MOR set by the vault; CF8/CFC and read-only ECAM for owned functions (§5.6 item 3); DSDT
 not trimmed (§5.5 item 1); reserved manifest fields rejected and two-consumer seals for
-lockstep (safety study). A fourth pass on §5.7 is folded in as well: Intel PT, SPE and
+lockstep (safety study). Vaahana's gap list surfaced one more correction: external-interrupt
+exiting must be on when driver domains exist, so near-native interrupt rates need
+posted interrupts or GICv4.1 (§4.4). A fourth pass on §5.7 is folded in as well: Intel PT, SPE and
 TRBE trapped, debug images signed only with a development key, a physical UART or an
 isolated BMC for the stub, admin-only counters, INIT/SIPI exits, and driver-domain wake
 in the S2a gate.
