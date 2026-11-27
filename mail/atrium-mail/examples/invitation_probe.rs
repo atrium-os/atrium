@@ -983,14 +983,19 @@ fn weekly_move(e: &Engine) {
         let at = weekly.find("END:VCALENDAR").unwrap();
         format!("{}{moved}END:VCALENDAR\n", &weekly[..at])
     };
+    // Each control checks Send and then undoes it, keeping the original RSVP
+    // unanswered for the next organizer update.
+    let check_target_still_answerable = || {
+        let op = e.send_invitation_reply(target, blob(target), &reply).unwrap();
+        assert!(e.undo_send(op).unwrap().is_some());
+        assert!(e.store.outbox().unwrap().is_empty());
+    };
     // The same move restated by the weekly invitation pauses nothing.
     put(4, &bundle("SEQUENCE:4", "20261209T15", "Studio B"), true);
-    e.send_invitation_reply(target, blob(target), &reply).unwrap();
-    submit(e, 3, Some(AFTER_CUTOFF));
+    check_target_still_answerable();
     // An unverified bundle is not evidence either way.
     put(5, &bundle("SEQUENCE:9", "20261230T10", "Studio D"), false);
-    e.send_invitation_reply(target, blob(target), &reply).unwrap();
-    submit(e, 3, Some(AFTER_CUTOFF));
+    check_target_still_answerable();
     let moved = put(6, &bundle("SEQUENCE:5", "20261223T11", "Studio C"), true);
     let paused = e.send_invitation_reply(target, blob(target), &reply);
     assert!(
