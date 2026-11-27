@@ -231,16 +231,31 @@ pub enum Report<'a> {
     OpenBeside(&'a str),
 }
 
-/// An address an engine may report: plain HTTPS, bounded, printable.
+/// An address an engine may report: plain HTTPS or your own server's
+/// local address in its one spelling (background-apps.md §4.5), bounded,
+/// printable. navigatord decides which of them a page may reach.
 fn reportable(url: &str) -> bool {
-    url.len() <= URL_MAX && url.starts_with("https://") && url.bytes().all(|b| b.is_ascii_graphic())
+    url.len() <= URL_MAX && url.bytes().all(|b| b.is_ascii_graphic())
+        && (url.starts_with("https://") || local_spelling(url))
+}
+
+/// `url` is a local address exactly as navigator-control spells it.
+fn local_spelling(url: &str) -> bool {
+    navigator_control::local::parse(url).is_some_and(|l| l.url() == url)
+}
+
+/// `origin` is a local origin (`http://localhost:PORT` and the like) as
+/// navigator-control spells it.
+fn local_origin(origin: &str) -> bool {
+    navigator_control::local::parse(origin).is_some_and(|l| l.origin.spell() == origin)
 }
 
 impl Report<'_> {
     fn valid(&self) -> bool {
         match self {
-            Self::Started { origin } => origin.len() <= 255 && origin.strip_prefix("https://").is_some_and(|host|
-                !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))),
+            Self::Started { origin } => origin.len() <= 255 && (origin.strip_prefix("https://").is_some_and(|host|
+                !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')))
+                || local_origin(origin)),
             Self::Title(text) => text.len() <= 256 && !text.chars().any(char::is_control),
             Self::Resize { width, height } => (1..=16384).contains(width) && (1..=16384).contains(height),
             Self::Ended(_) | Self::MediaReady | Self::PickFile => true,
@@ -401,6 +416,27 @@ mod tests {
                     ended = matches!(report, Ended(_));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn your_own_servers_page_reports_its_local_origin_and_addresses() {
+        let mut state = Lifecycle::default();
+        assert!(state.receive(&Report::Started { origin: "http://localhost:9000" }.encode().unwrap()).is_some());
+        for ok in ["http://localhost:9000/second", "http://127.0.0.1:8080/", "http://[::1]:3000/a?b=1"] {
+            assert_eq!(state.receive(&Report::Navigate(ok).encode().unwrap()), Some(Report::Navigate(ok)), "{ok}");
+        }
+        for bad in ["http://localhost:9000", "http://localhost:09000/", "http://127.0.0.2:9000/", "http://localhost./",
+                    "http://a.localhost:9000/", "http://example.com:9000/", "http://localhost:9000/#f"] {
+            assert!(Report::Navigate(bad).encode().is_none(), "{bad}");
+            assert!(state.receive(&postcard::to_stdvec(&Report::Navigate(bad)).unwrap()).is_none(), "{bad}");
+        }
+        for origin in ["http://127.0.0.1:9000", "http://[::1]:9000"] {
+            assert!(Report::Started { origin }.encode().is_some(), "{origin}");
+        }
+        for bad in ["http://localhost:9000/", "http://localhost", "http://example.com:9000", "http://127.0.0.2:9000"] {
+            assert!(Report::Started { origin: bad }.encode().is_none(), "{bad}");
+            assert!(Lifecycle::default().receive(&postcard::to_stdvec(&Report::Started { origin: bad }).unwrap()).is_none(), "{bad}");
         }
     }
 

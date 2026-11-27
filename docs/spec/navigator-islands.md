@@ -2543,8 +2543,9 @@ Same flag as I6.1.
   link, a GET form, `location`) reaches `EditorPage::
   request_navigation_start`, which reports it as `Report::Navigate(url)`
   (`navigator_live_propose`) and never follows it. Limen checks the report
-  on both sides (`web_island::reportable`: plain HTTPS, printable, at most
-  2,048 bytes; reports now frame up to 2,304 bytes) and takes it only
+  on both sides (`web_island::reportable`: plain HTTPS, or your own server's
+  local address in navigator-control's spelling (background-apps.md §4.5),
+  printable, at most 2,048 bytes; reports now frame up to 2,304 bytes) and takes it only
   while the page runs. A POST, a frame's document, or a jump within the
   same document is refused, loudly, as in I6.1.
 - **navigatord** (`live_page::navigation`) takes one plain HTTPS address in

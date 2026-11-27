@@ -590,6 +590,7 @@ dependencies = [
  "fresco-protocol",
  "libc",
  "lyra-protocol",
+ "navigator-control",
  "portcullis-ipc",
  "portcullis-peer",
  "portcullis-policy",

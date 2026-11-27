@@ -754,6 +754,7 @@ dependencies = [
  "fresco-protocol",
  "libc",
  "lyra-protocol",
+ "navigator-control",
  "portcullis-ipc",
  "portcullis-peer",
  "portcullis-policy",
@@ -869,6 +870,7 @@ dependencies = [
 name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "navigator-control",
  "nuntius",

@@ -1069,6 +1069,7 @@ dependencies = [
  "fresco-protocol",
  "libc",
  "lyra-protocol",
+ "navigator-control",
  "portcullis-ipc",
  "portcullis-peer",
  "portcullis-policy",
@@ -1344,6 +1345,7 @@ name = "officina-grid"
 version = "0.1.0"
 dependencies = [
  "officina-core",
+ "officina-shapes",
  "regex",
 ]
 

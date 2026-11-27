@@ -62,7 +62,15 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
 #endif
     auto doc = nav->active_document();
     auto parsed = URL::Parser::basic_parse(location);
-    if (!parsed.has_value() || parsed->scheme() != "https"sv) return Error::from_string_literal("invalid document origin");
+#ifdef ATRIUM_I6_PAGE
+    // A live page may be your own server's http page (background-apps.md
+    // §4.5): navigator_live_page delivers http only for a local address
+    // navigatord checked.
+    bool scheme_ok = parsed.has_value() && (parsed->scheme() == "https"sv || parsed->scheme() == "http"sv);
+#else
+    bool scheme_ok = parsed.has_value() && parsed->scheme() == "https"sv;
+#endif
+    if (!scheme_ok) return Error::from_string_literal("invalid document origin");
     auto& url = *parsed;
     doc->set_url(url);
     doc->set_origin(url.origin());

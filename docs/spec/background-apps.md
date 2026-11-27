@@ -704,5 +704,23 @@ not yet checked in a VM.
   type_and_body_even_split_and_is_checked` (navigator-fetch),
   `your_own_servers_page_is_offered_live_only_once_navigatord_named_its_app`
   (navigator-ui).
-- Not checked yet: the engine build with these patches and a live run of
-  a local page on the Mac VM.
+- **Mac run (2026-11-27).** The I6 page engine built with these patches
+  on the Mac, and a local page ran live in the Mac VM (arm64 Tessera,
+  an overlay of `navigator-signin-base`, main's navigatord, navigator-ui,
+  fetchd, portcullisd and limend, `NAVIGATORD_LIVE_PAGES=1`):
+  `localhost:9000/live` typed in the window, the prompt "Its scripts run
+  in a jail of their own and reach only Photo Server on this computer"
+  with no "Always for this site", Run live, and the page reads
+  `live get=ok post=saved{"n":1} other-port=refused web=refused visits=1`;
+  Stop and Run live again: `visits=2`. Photo Server saw only port-9000
+  requests (`GET /live`, `GET /api/get`, `POST /api/save`); navigatord
+  refused `localhost:9090` and `example.com` before anything was sent.
+  Two fixes were needed: the engine painted only https documents
+  (`SignInFixture.h` refused http with a silent exit 4; it now takes http
+  for `ATRIUM_I6_PAGE`, and each exit says why), and limen's web-island
+  reports refused a local origin in `Started` and local addresses in
+  `Navigate`/`UrlChanged`/`OpenBeside`/`Submit`; they now take your own
+  server's addresses in navigator-control's one spelling. Not checked:
+  the trail's name keeps the title the engine reports at its start (the
+  script sets it later), and a same-origin link from a live local page.
+  Evidence: `~/atrium-vm/evidence/navigator-b7-20261127/` on the Mac.

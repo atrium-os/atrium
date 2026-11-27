@@ -147,7 +147,10 @@ int main(int argc, char** argv)
     static u8 page_url[8192];
     size_t page_url_length = 0;
     auto body_length = navigator_live_page(page_url, sizeof(page_url), &page_url_length, document_body.data(), document_body.size());
-    if (!body_length || body_length > document_body.size() || document_body.try_resize(body_length).is_error()) return 4;
+    if (!body_length || body_length > document_body.size() || document_body.try_resize(body_length).is_error()) {
+        warnln("live page: no page from navigatord");
+        return 4;
+    }
     // The page's localStorage is its site's store in navigatord, asked for
     // only now that the page (and so the site) is delivered.
     static Navigator::LiveStorage live_storage;
@@ -155,12 +158,17 @@ int main(int argc, char** argv)
     StringView location { page_url, page_url_length };
     client->page().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
     auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);
-    if (result.is_error()) return 4;
+    if (result.is_error()) {
+        warnln("live page: {} not painted: {}", location, result.error());
+        return 4;
+    }
     auto document = client->page().local_traversable()->active_document();
     auto origin = document->origin().serialize();
     auto title = document->title().to_well_formed_utf8();
-    if (!navigator_counter_started(scene, origin.bytes().data(), origin.byte_count(), title.bytes().data(), title.byte_count()))
+    if (!navigator_counter_started(scene, origin.bytes().data(), origin.byte_count(), title.bytes().data(), title.byte_count())) {
+        warnln("live page: navigatord refused the start of {}", origin);
         return 4;
+    }
     client->island_scene = scene;
     // A live page takes the keyboard (I6.4).
     navigator_live_keys(scene);

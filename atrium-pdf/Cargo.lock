@@ -720,6 +720,7 @@ dependencies = [
  "fresco-protocol",
  "libc",
  "lyra-protocol",
+ "navigator-control",
  "portcullis-ipc",
  "portcullis-peer",
  "portcullis-policy",
@@ -793,6 +794,16 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "navigator-control"
+version = "0.1.0"
+dependencies = [
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

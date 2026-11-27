@@ -29,6 +29,8 @@ libc            = "0.2"
 atrium-listen   = { path = "../atrium-listen" }
 # choragusd's attribution wire (embedded players play as their parent).
 lyra-protocol   = { path = "../lyra-protocol" }
+# The one parser for your own server's addresses (background-apps.md §4.4).
+navigator-control = { path = "../navigator-control" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 
