@@ -5,7 +5,8 @@
 # is viewed. forum-wm runs (a whole desktop).
 #
 # Checks: while viewed the seat shows the desktop with frescod's indicator
-# on its strip (the viewed colour, the viewer's address, a Disconnect);
+# on its strip (the viewed colour, the viewer's address, a Disconnect),
+# over the lock screen too;
 # the seat's typing still reaches the desktop; a click on the indicator's
 # Disconnect ends the session; then the indicator is gone.
 #
@@ -14,7 +15,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin fenestra-live 7
+gate_begin fenestra-live 8
 FEN_WM=1
 . "$ROOT/scripts/lib/fenestra-vm.sh"
 G=/tmp/fendesk
@@ -38,6 +39,12 @@ get "$G/seat-viewed.png" "$W/seat-viewed.png"
 g "printf 'KEY 38 1\nKEY 38 0\nKEY 40 1\nKEY 40 0\n' | nc -N -U $G/input.sock"
 sleep 5
 g "cp $G/screen.png $G/after-keys.png"
+# The seat locks (the lock file ostiarius writes): the indicator stays.
+g "echo root >$G/session-locked"
+sleep 5
+g "cp $G/screen-seat.png $G/seat-locked.png; rm -f $G/session-locked"
+get "$G/seat-locked.png" "$W/seat-locked.png"
+sleep 5
 # The indicator's Disconnect: the blue pill in the strip's right half (the
 # composed colour, sRGB of the chrome's linear one).
 B=$(python3 -I - "$W/seat-viewed.png" <<'EOF2'
@@ -58,7 +65,7 @@ g "cp $G/screen-seat.png $G/seat-after.png"
 wait $VP
 for f in before-keys after-keys seat-after; do get "$G/$f.png" "$W/$f.png"; done
 g "cat $G/fenestrad.log" >"$W/fenestrad.log" 2>&1
-g "grep -E 'viewed|inject' $G/frescod.log" >"$W/frescod.log" 2>&1
+g "grep -E 'viewed|inject|screen (un)?locked' $G/frescod.log" >"$W/frescod.log" 2>&1
 tail -5 "$W/view.log"
 cat "$W/frescod.log"
 
@@ -71,10 +78,11 @@ d = list(im.crop((0, 0, w, min(h, 22))).getdata())
 print(sum(1 for p in d if abs(p[0] - 237) <= 2 and abs(p[1] - 108) <= 2 and abs(p[2] - 124) <= 2))
 EOF2
 }
-RV=$(red "$W/seat-viewed.png"); RA=$(red "$W/seat-after.png")
+RV=$(red "$W/seat-viewed.png"); RA=$(red "$W/seat-after.png"); RL=$(red "$W/seat-locked.png")
 check "the seat keeps the desktop, at its size" 1280x720 "$(python3 -I -c 'import sys; from PIL import Image; w, h = Image.open(sys.argv[1]).size; print(f"{w}x{h}")' "$W/seat-viewed.png")"
 check "the indicator is on the seat's strip while viewed" yes "$([ "${RV:-0}" -gt 300 ] && echo yes || echo "no ($RV px)")"
 check "it names where the viewer came from" yes "$(grep -q 'viewed: live seat, indicator on' "$W/frescod.log" && grep -qF 'viewed: viewers 1, latest from 10.0.2.2' "$W/frescod.log" && echo yes || echo no)"
+check "and over the lock screen" yes "$([ "${RL:-0}" -gt 300 ] && grep -q 'screen locked' "$W/frescod.log" && echo yes || echo "no ($RL px)")"
 check "typing at a live seat reaches the session" yes "$(cmp -s "$W/after-keys.png" "$W/before-keys.png" && echo no || echo yes)"
 check "Disconnect on the indicator ended the session" "yes gone" "$([ -n "$B" ] && grep -q 'Disconnect pressed on the live indicator' "$W/frescod.log" && grep -q 'disconnected at the host' "$W/fenestrad.log" && echo yes || echo "no (button at '$B')") $(g "pgrep -x fenestra-session >/dev/null" && echo running || echo gone)"
 check "then the indicator is gone" "yes 0" "$(grep -q 'indicator off' "$W/frescod.log" && echo yes || echo no) $RA"

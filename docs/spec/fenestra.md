@@ -1821,7 +1821,10 @@ in its chrome at the strip's right end on every monitor, over anything else ther
 direct mode gets a chrome frame for it too): "viewed from ADDR" (or "by N viewers, ...") on a red
 no app's chrome uses, and a Disconnect beside it. A press on that Disconnect is frescod's own
 (`socket_server::CHROME_PRESS`, before any window sees it) and ends every session as the viewed
-screen's does; the indicator goes when no session is on. `scripts/fenestra-live-vm.sh` 7/7 (headless
+screen's does; the indicator goes when no session is on. Direct scanout (a span's fullscreen window) is off while it
+shows, and it draws over the lock screen too (the strip is frescod's chrome there as well). The press
+is taken whatever its source, so a viewer may click it too: that is the viewer's own way out and is
+meant, not a seat-only control to tighten. `scripts/fenestra-live-vm.sh` 8/8 (headless
 seat, forum-wm): the indicator on the seat's strip, the seat's typing reaching the session,
 Disconnect from the indicator. Headless frescod stands in for a seat
 with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture saved as

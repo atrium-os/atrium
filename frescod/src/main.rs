@@ -807,7 +807,10 @@ fn main() -> std::io::Result<()> {
         let spanned = |h: &heads::Head<'_>| span.as_ref().is_some_and(|s| s.is_member(h.identity));
         /* A span's members take the window straight when nothing covers
          * it; the desktop is composed only if some head still shows it. */
-        last_direct = match span.as_ref().map(|s| span::direct(s, &comp, split.as_deref(), &heads, strip_until.is_some())) {
+        /* Never while viewed: the viewed screen or a live seat's
+         * indicator (frescod's chrome) must reach every monitor. */
+        let chrome_up = strip_until.is_some() || viewed::active() || viewed::live_label().is_some();
+        last_direct = match span.as_ref().map(|s| span::direct(s, &comp, split.as_deref(), &heads, chrome_up)) {
             Some(Ok(d)) => {
                 if direct_said != Some("") {
                     eprintln!("frescod: span: direct scanout");
@@ -1161,7 +1164,7 @@ fn present_span(
 ) -> std::io::Result<()> {
     let mut up = Vec::with_capacity(group.len());
     for &k in group {
-        up.push(match direct.filter(|_| !viewed::active()) {
+        up.push(match direct.filter(|_| !viewed::active() && viewed::live_label().is_none()) {
             Some(d) => upload_direct(&mut heads[k], d, deadline_ns, enc)?,
             None => upload_head(&mut heads[k], None, desktop, desktop_w, deadline_ns, enc)?,
         });
