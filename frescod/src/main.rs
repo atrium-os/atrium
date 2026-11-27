@@ -643,7 +643,14 @@ fn main() -> std::io::Result<()> {
             /* While viewed nothing reads the desktop's frame for a monitor
              * (upload_head shows the viewed screen, direct scanout is off),
              * so its size is the viewer's alone. */
-            let want = viewer_output.filter(|_| viewed::active() && !viewed::live());
+            /* Ending keeps the viewer's output until the seat is locked
+             * (poll above), so nothing re-lays out to the seat before. */
+            let want = match viewed::phase() {
+                _ if viewed::live() => None,
+                viewed::Phase::Off => None,
+                viewed::Phase::Viewed => viewer_output,
+                viewed::Phase::Ending => desk_remote,
+            };
             if want != desk_remote || (desk_reapply && want.is_some()) {
                 desk_reapply = false;
                 let (w, h) = want.map_or((dw, dh), |(w, h, _)| (w, h));
