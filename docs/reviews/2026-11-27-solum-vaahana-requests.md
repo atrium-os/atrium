@@ -81,6 +81,19 @@ of these numbers will be quoted as product performance.
 24. **A host-side API** (a socket or a script hook) to send an NMI, press the power or
     sleep button, and read guest-physical memory, for check scripts.
 
+## 4a. Running Vaahana on Atrium under Solum
+
+25. **A Solum backend for Vaahana's acceleration mode.** Under Solum, Atrium doesn't see
+    VT-x or EL2, so an accelerated Vaahana running inside Atrium has to use Solum's
+    guest-domain API instead (solum.md §8.1). That API is shaped like KVM's: create a
+    guest, give it memory from Vaahana's own pages, run a vCPU, and get each exit back.
+    The guest runs as a sibling of Atrium, with one level of virtualisation. Vaahana keeps
+    its device models in its own (jailed) process. We'd like Vaahana to have a backend
+    for this API next to its other accelerators, so the same Vaahana runs accelerated on a
+    bare machine and inside Atrium on Solum. Its pure-emulation mode needs nothing from
+    Solum. The API's exact calls will be specified with Solum's S1 step, and we'd welcome
+    Vaahana's input on its shape.
+
 ## 5. How we'll use it
 
 Each Solum step has a gate in `docs/spec/solum.md` §10, and the checks will run on
@@ -93,3 +106,5 @@ Questions for the Vaahana project:
 - Does Vaahana run on the Mac (arm64), on Linux (amd64), or both, and does it accelerate
   through HVF or KVM, or is everything emulated?
 - Is nested virtualisation (item 1 or 13) emulated in software, or passed down to the host?
+- Would a Solum accelerator backend (item 25) fit Vaahana's accelerator interface, and what
+  would you need from the guest-domain API?
