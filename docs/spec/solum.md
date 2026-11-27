@@ -175,15 +175,39 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
   of service, which §11 accepts. An IPI with SMI delivery mode raises an SMI on any CPU,
   which is one more reason the SMI port filter is best effort and SMM isolation is what
   bounds SMM (§5.6 item 4).
+  Passing the ICR through is safe only with these rules:
+  - **Every physical CPU is under VMX before main runs, always.** Solum starts every CPU in
+    the machine, including those the MADT marks disabled or online-capable and SMT
+    siblings left unused, before main's first instruction. It never executes VMXOFF.
+    Offline CPUs are parked in a VMX-root HLT loop (INIT is latched there and SIPI
+    ignored). On resume from S3, Solum brings every AP back under VMX before main runs.
+    A SIPI to a CPU outside VMX would start main's code in host mode, with full control
+    of the machine; these rules make that impossible.
+  - **The service CPUs' own LAPIC is virtual to main.** On open CPUs the x2APIC MSRs
+    (0x800–0x8FF) are passed through. On service CPUs main gets a different MSR bitmap: its
+    writes to TPR, SVR, EOI, the LVT entries (LINT0/1, timer, error), TSC_DEADLINE and
+    SELF_IPI go to a virtual APIC (APICv's virtual-APIC page where the CPU has it, trapped
+    and emulated otherwise). Otherwise main could raise TPR or clear the SVR enable bit and
+    stop every interrupt reaching Solum or a driver domain there, or EOI a vector a driver
+    domain is handling. This is the only amd64 place where main's APIC accesses exit, and
+    only for main's threads on the service CPUs.
 - arm64: nVHE, the main domain at EL1 with direct access to its own GIC redistributors and
   CPU interface. The **distributor (GICD) and the ITS are trapped and emulated** by Solum for
   the routing and enable state of interrupts that belong to other domains, so main cannot
   reroute or mask a driver domain's SPIs or LPIs; main's own interrupts go straight through
   the emulation's fast path. SGIs (`ICC_SGI1R_EL1`, main's IPI path) are **not** trapped:
   service CPUs run with `HCR_EL2.IMO` set, so an SGI that main sends to one is taken at EL2
-  by Solum. The **redistributor frames of the service CPUs** are trapped (stage-2), so main
-  cannot disable the PPIs and SGIs Solum relies on there (its EL2 timer); main's own CPUs'
-  redistributors stay direct. Stage-2 faults on those pages, HVC, and SMC (checked against a
+  by Solum, and main's EL1 `ICC_*` accesses there go to the virtual `ICV_*` interface, so
+  main can't touch the service CPUs' physical CPU interface. **Redistributors:** every CPU's
+  `RD_base` frame is trapped (stage-2), on open CPUs too, because it holds `PROPBASER` and
+  `PENDBASER`, and on many GICs one LPI property table is shared by all redistributors
+  (`CommonLPIAff`). Solum programs every redistributor's `PROPBASER` and `PENDBASER` with
+  tables in Solum's memory before main runs, so main can neither disable nor reprioritise a
+  driver domain's LPIs nor point the tables at memory it controls. Without an ITS,
+  `GICR_SETLPIR`/`CLRLPIR` also sit in `RD_base` and are covered by the same trap. `RD_base`
+  is touched at boot and power transitions, not in the I/O path. Open CPUs' `SGI_base`
+  frames stay direct; the service CPUs' `SGI_base` frames are trapped too, so main can't
+  disable the PPIs and SGIs Solum relies on there (its EL2 timer). Stage-2 faults on those pages, HVC, and SMC (checked against a
   PSCI allowlist and forwarded) are the traps.
 - So "no device emulation" holds, but Solum does emulate parts of the **interrupt
   controller** (GICD and ITS on arm64, and the service CPUs' redistributor frames). Those emulations
@@ -216,6 +240,31 @@ NVMe, NIC and GPU interrupts land on open CPUs and never exit. The cost is confi
 the service CPUs, where main's threads see an exit per interrupt; Laminar can be told to
 keep interrupt-heavy and latency-critical threads off them. The same mechanism gives the
 safety profile its reserved cores (safety study §3.2).
+
+Rules on the service CPUs:
+
+- **Vault calls run to completion.** A vault call is bounded in length and runs with
+  external interrupts held; main's IPIs to that CPU stay pending until it returns. So main
+  cannot single-step the vault with a stream of IPIs and probe the caches and predictors
+  in between (the SGX-Step pattern).
+- **Core scheduling.** "One SMT pair" means that while the vault or a driver domain runs on
+  one sibling, Solum pulls the other sibling out of main (an IPI and an exit per vault
+  call) and keeps it idle until the call returns. Solum flushes on entry **and** on exit
+  (IBPB, L1D flush, VERW on MDS-affected CPUs such as the i9-9900K). Neither the i9-9900K
+  nor the E-2288G has cache allocation (CAT), so the last-level cache stays shared with
+  main, and the vault's crypto has to be constant-time. All of it is counted in §9.
+- **Vectors are doorbells, not messages.** An IPI from main can carry a driver domain's
+  vector or Solum's own, and look exactly like the real one. So every cross-CPU request
+  inside Solum carries its meaning in a Solum-owned mailbox, and the vector only says
+  "look". Driver domains tolerate spurious interrupts. An NMI is checked the same way: a
+  mailbox entry means it's Solum's, otherwise it's re-injected into main.
+- **NMIs into Solum** use their own IST stack, are safe when nested, and are rate-limited,
+  so an NMI storm from main is a slowdown on that CPU and nothing more.
+- **arm64 Group 0:** service CPUs set `HCR_EL2.FMO` along with `IMO`, and `ICC_SGI0R_EL1`
+  and `ICC_ASGI1R_EL1` are trapped (`ICH_HCR_EL2`), so a Group-0 SGI from main can't arrive
+  as an FIQ in the vault's EL1.
+- **Steal time:** Solum reports the time a service CPU spent on other domains to main as
+  steal time, so Laminar's accounting stays right.
 
 Where the hardware has them, posted interrupts (APICv with VT-d posted interrupts, AVIC)
 and GICv4.1 direct injection remove even the service CPUs' exits for main's interrupts,
