@@ -8,6 +8,7 @@
 #   ssh ... 'sh vcpu-trace.sh' | tee trace.log
 set -u
 kldstat -q -m vmm || kldload vmm || { echo "FAILED: kldload vmm"; exit 1; }
+kldstat -q -m dtraceall || kldload dtraceall || { echo "FAILED: kldload dtraceall"; exit 1; }
 bhyvectl --vm=t --destroy 2>/dev/null
 bhyvectl --vm=t --create || { echo "FAILED: create"; exit 1; }
 # Fast switch rate so little is buffered when the host stops.
