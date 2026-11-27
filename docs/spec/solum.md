@@ -359,6 +359,47 @@ replay their scenes (fresco-recovery.md §3). What it costs: one hop per scene u
 per pixel. Gate it on the §9 frame-time numbers; until then the GPU stays in the main
 domain.
 
+### 5.5 The driver model in the main domain
+
+FreeBSD's driver model (newbus probe and attach, `bus_space` for registers, `busdma` for
+DMA, the interrupt framework, `PNP_INFO` and devmatch) stays as it is. device-assignment.md
+§3.2 rates it strong, and Atrium's kmods already use it. Routing every driver through
+Solum hypercalls would turn passthrough into exits and break the near-native goal, and
+it would give nothing a domain or a driver process doesn't already give. Solum fits into
+the model as one more bus and one more `busdma` mode, and a non-Solum boot uses the model
+untouched.
+
+What changes, all of it additive:
+
+1. **Main sees only what it owns.** Solum gives main an ACPI (or device tree) and PCI view
+   with the devices of other domains removed: their functions read as absent in config
+   space, and their ACPI and DMAR/IORT entries are trimmed. newbus never probes a device
+   main doesn't own, so no driver needs to know about Solum.
+2. **`solumbus`:** a newbus bus driver that enumerates main's links from the manifest
+   (one child per link, with the protocol class as its PNP id). Link class drivers attach
+   with ordinary probe and attach. The frame link becomes an `ifnet`; the others hand an
+   fd to the user-space service (lyrad, tactusd, Vinculum, Capsa) through dispensatord, as
+   device nodes are handed today.
+3. **`busdma` on Solum:** passthrough devices keep using `busdma` unchanged. Under Solum the
+   IOMMU backend runs in static-domain mode (§5.3 item 8): a load is an identity mapping
+   that is already there, with no hypercall. Only donation, sealing and module freezing
+   change mappings, and those are Solum's calls, not drivers'.
+4. **User-space PCI drivers** (driver processes, study §6.1): FreeBSD has none today
+   (device-assignment.md §3.2). Add one small kernel interface, `devassign`, used only by
+   dispensatord. It detaches a device's kernel driver (`devctl detach`), maps the BARs into
+   one jailed process (without config-space mirrors or the MSI-X table), asks Solum for an
+   IOMMU domain over that process's pinned pages, and delivers interrupts as kevents. It
+   is the PCI counterpart of `ugen` and `hidraw`, and on a non-Solum boot it can use
+   FreeBSD's own IOMMU (`dmar`, `smmu`) instead.
+5. **Moving a device** between main and a domain is detach in main (`devctl detach`, then
+   Solum's move with the §5.3 reset), then attach in the domain. Main's newbus sees a
+   removal, as for a hot-unplug.
+6. **Driver domains** (`ATRIUM-DD`) run the same FreeBSD drivers with the same model,
+   plus a link back end. No driver code is written twice.
+
+Two gaps that device-assignment.md already lists, late binding and unstable unit numbers,
+are unrelated to Solum and stay with that spec.
+
 ## 6. Crash protection
 
 ### 6.1 Driver domains
@@ -636,5 +677,7 @@ as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after dev
 7b. **Cameras are a frame-stream link, opened only through a grant** (§5.1). *Recommend
    yes.*
 7c. **No safety variant now; keep Solum compatible with one** (§11a and the study).
-   *Recommend yes.*
+   **Accepted by Shankar 2026-11-27** ("keep it compatible, but don't build it").
+7d. **Keep FreeBSD's driver model;** add `solumbus`, static-domain `busdma`, a filtered
+   device view for main, and `devassign` for user-space PCI drivers (§5.5). *Recommend yes.*
 8. **Name: Solum** (Latin: ground, floor, the base the atrium stands on). *Recommend yes.*
