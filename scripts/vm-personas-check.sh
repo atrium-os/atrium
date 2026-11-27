@@ -5,6 +5,9 @@
 #
 #   ARCH=amd64 sh scripts/cloud-vm.sh up
 #   sh scripts/vm-personas-check.sh
+#   REQUIRE_SEALED_WORK=1 NO_UI=1 ARCH=arm64 VM_SSH_PORT="${port:?set the disposable guest port}" sh scripts/vm-personas-check.sh
+# The sealed run needs a disposable guest with alice and bob's Arcas unlocked,
+# atrium-volumes serving their Tessera homes, and /root/sealed/tessera-keyload.
 #
 # The app is home_probe (portcullisd's example): it reports its uid, a run
 # counter kept in its overlay and the jail's kern.hostuuid.
@@ -30,6 +33,10 @@
 #     frescod's own chrome tests (chip in the strip, 3 pt frame) run in
 #     the VM too.
 set -u
+case ${REQUIRE_SEALED_WORK:-0} in
+    0|1) ;;
+    *) echo "REQUIRE_SEALED_WORK must be 0 or 1" >&2; exit 2 ;;
+esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ARCH=${ARCH:-amd64}   # ARCH=arm64: the arm64 cloud VM (~/atrium-vm)
 set -- env
@@ -57,9 +64,9 @@ echo "=== install"
 B=/var/tmp/personas
 V "pkill -x portcullisd; sleep 1; rm -rf $B; mkdir -p $B"
 for b in release/portcullisd release/portcullis release/opifex release/examples/home_probe release/examples/download_probe; do
-    scp -q $K -P 2222 "$TGT/$TARGET/$b" root@localhost:$B/ || exit 1
+    scp -q $K -P "$VM_SSH_PORT" "$TGT/$TARGET/$b" root@localhost:$B/ || exit 1
 done
-scp -q $K -P 2222 "$ROOT/crypta/target/$TARGET/release/atrium-cryptad" root@localhost:$B/ || exit 1
+scp -q $K -P "$VM_SSH_PORT" "$ROOT/crypta/target/$TARGET/release/atrium-cryptad" root@localhost:$B/ || exit 1
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 PROBE=org.test.personaprobe
 FM=org.test.personafm
@@ -187,11 +194,11 @@ if [ -z "${NO_UI:-}" ]; then
 echo "=== the launch question"
 OUT=${OUT:-$ROOT/scratch/personas}; mkdir -p "$OUT"
 for b in frescod/target/$TARGET/release/frescod forum-dock/target/$TARGET/release/forum-dock forum-dock/target/$TARGET/release/examples/sample_app; do
-    scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { bad "copy $b"; echo "personas: $fails failed"; exit 1; }
+    scp -q $K -P "$VM_SSH_PORT" "$ROOT/$b" root@localhost:$B/ || { bad "copy $b"; echo "personas: $fails failed"; exit 1; }
 done
 # The text faces frescod looks for (the dialog's Plex Sans and the icons).
 V "mkdir -p /usr/local/share/fonts/ibm-plex"
-scp -q $K -P 2222 "$ROOT/fonts/ibm-plex/IBMPlexSans.ttf" "$ROOT/fonts/phosphor/Phosphor.ttf" root@localhost:/usr/local/share/fonts/ibm-plex/
+scp -q $K -P "$VM_SSH_PORT" "$ROOT/fonts/ibm-plex/IBMPlexSans.ttf" "$ROOT/fonts/phosphor/Phosphor.ttf" root@localhost:/usr/local/share/fonts/ibm-plex/
 FS=/atrium/sockets/fresco/fresco.sock
 V "mkdir -p /atrium/sockets/fresco"
 V "pkill -x frescod; sleep 1; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$B/screen FRESCOD_SOCK=$FS FRESCOD_WM_SOCK=$B/wm.sock \
@@ -210,7 +217,7 @@ asked() { # user log: start forum-dock launch --ask; wait for its question (or i
 ended() { i=0; while [ $i -lt 90 ] && ! V "grep -Eq 'exited|not opened|launch of' $B/$1 2>/dev/null"; do sleep 2; i=$((i+2)); done; }
 asked alice q1.log
 check "alice is asked, Work preselected" "yes" "$(V "grep -q 'persona question for $PROBE: \[personal, work\], work preselected' $B/q1.log" && echo yes)"
-V "cp $B/screen.png $B/q1.png 2>/dev/null || cp $B/screen $B/q1.png 2>/dev/null"; scp -q $K -P 2222 root@localhost:$B/q1.png "$OUT/question.png" 2>/dev/null && echo "  screenshot $OUT/question.png"
+V "cp $B/screen.png $B/q1.png 2>/dev/null || cp $B/screen $B/q1.png 2>/dev/null"; scp -q $K -P "$VM_SSH_PORT" root@localhost:$B/q1.png "$OUT/question.png" 2>/dev/null && echo "  screenshot $OUT/question.png"
 inj "KEY 0x28 1" "KEY 0x28 0"; ended q1.log
 check "Enter: opened in Work" "yes" "$(V "grep -q 'in persona work' $B/q1.log && grep -q 'exited (code Some(0))' $B/q1.log" && echo yes)"
 check "Work's third run" "3" "$(V "cat /home/alice/.atrium/persona-apps/work/$PROBE/var/probe-runs")"
@@ -249,7 +256,7 @@ sleep 3; chmod 666 $PSOCK; printf 'acme up persona\\n' > /var/run/atrium/vpn-sta
 su -m alice -c 'portcullis personas $PROBE' >/dev/null 2>&1
 EOS
 check "portcullisd publishes Work's VPN" "alice work acme" "$(V "cat /var/run/atrium/persona-vpn" | grep '^alice ')"
-shot() { V "cp $B/screen.png $B/s.png 2>/dev/null || cp $B/screen $B/s.png"; scp -q $K -P 2222 root@localhost:$B/s.png "$OUT/$1.png" 2>/dev/null && echo "  screenshot $OUT/$1.png"; }
+shot() { V "cp $B/screen.png $B/s.png 2>/dev/null || cp $B/screen $B/s.png"; scp -q $K -P "$VM_SSH_PORT" root@localhost:$B/s.png "$OUT/$1.png" 2>/dev/null && echo "  screenshot $OUT/$1.png"; }
 px() { python3 -c "from PIL import Image; im=Image.open('$OUT/$1.png').convert('RGB'); print('%02x%02x%02x' % im.getpixel(($2,$3)))"; }
 V "daemon -f -o $B/win-w.log su -m alice -c 'portcullis launch --no-prompt --persona work $WIN'"
 i=0; while [ $i -lt 90 ] && ! V "grep -q 'up (pid' $B/win-w.log"; do sleep 2; i=$((i+2)); done
@@ -276,7 +283,7 @@ fi
 
 if [ -n "${FT:-}" ]; then
 echo "=== frescod's chrome tests"
-scp -q $K -P 2222 "$FT" root@localhost:$B/frescod-tests && R=$(V "$B/frescod-tests chrome:: 2>&1 | grep 'test result'")
+scp -q $K -P "$VM_SSH_PORT" "$FT" root@localhost:$B/frescod-tests && R=$(V "$B/frescod-tests chrome:: 2>&1 | grep 'test result'")
 case "$R" in *" 0 failed"*) ok "chrome: $R" ;; *) bad "chrome tests: $R" ;; esac
 fi
 
@@ -303,10 +310,38 @@ EOS
 i=0; while [ $i -lt 30 ] && ! V "grep -q \"alice's personal: \" $B/cryptad.log"; do sleep 1; i=$((i+1)); done
 check "portcullisd names alice's Personal folder to cryptad" "/home/alice/.atrium/apps/.crypta" "$(V "grep \"alice's personal: \" $B/cryptad.log | tail -1 | sed 's/.* in //'")"
 check "…root's, 0700" "root 700" "$(V "stat -f '%Su %Lp' /home/alice/.atrium/apps/.crypta")"
+if [ "${REQUIRE_SEALED_WORK:-0}" = 1 ]; then
+    # Personal may be published before Work, including while Work is being
+    # provisioned. Wait through portcullisd's 60 s store retry.
+    i=0
+    while [ "$i" -lt 75 ] && ! V "grep -q \"alice's work: \" $B/cryptad.log"; do sleep 1; i=$((i+1)); done
+fi
 SEALED=$(V "grep -q \"alice's work: \" $B/cryptad.log && echo yes || echo no")
 if [ "$SEALED" = yes ]; then
     OWN=work; DIR=/home/alice/.atrium/persona-apps/work/.crypta
-    ok "Work's app data is sealed: its folder is named too"
+    check "portcullisd names Work's VPN folder to cryptad" "$DIR" "$(V "grep \"alice's work: \" $B/cryptad.log | tail -1 | sed 's/.* in //'")"
+    check "Work's VPN folder is root's, 0700" "root 700" "$(V "stat -f '%Su %Lp' $DIR")"
+    if [ "${REQUIRE_SEALED_WORK:-0}" = 1 ]; then
+        open_group() {
+            info=$(V "/root/sealed/tessera-keyload group-info $1") || return 1
+            printf '%s\n' "$info" |
+                awk '$NF == "open" {
+                    for (i = 1; i < NF; i++)
+                        if ($i == "group" && $(i+1) ~ /^[1-9][0-9]*$/) print $(i+1)
+                }'
+        }
+        work_group=$(open_group "${DIR%/.crypta}")
+        profile_group=$(open_group "$DIR")
+        if [ -n "$work_group" ] && [ "$work_group" = "$profile_group" ]; then
+            ok "Work's VPN folder is in Work's open key group ($work_group)"
+        else
+            bad "expected Work and .crypta in the same open key group, got [$work_group] and [$profile_group]"
+        fi
+    fi
+elif [ "${REQUIRE_SEALED_WORK:-0}" = 1 ]; then
+    bad "sealed Work required: portcullisd did not publish alice's Work folder"
+    echo "personas: $fails failed"
+    exit 1
 else
     # Plain app data (this VM's opt-out): no Work folder, so no Work profile.
     check "Work's app data is plain: cryptad has no Work folder" "error why=no-persona-store" "$(V "$CTL create-gp name=${MK}w host=${MK}-gw.acme.example owner=alice/work" | tail -1)"
@@ -315,6 +350,7 @@ else
 fi
 check "a profile for alice's $OWN" "ok" "$(V "$CTL create-gp name=$MK host=$MK-gw.acme.example owner=alice/$OWN" | tail -1)"
 check "…kept in $OWN's folder, 0600" "600" "$(V "stat -f %Lp $DIR/$MK.profile")"
+check "…the stored profile contains its synthetic gateway" "yes" "$(V "grep -Fq 'host=$MK-gw.acme.example ' $DIR/$MK.profile && echo yes")"
 check "…not in cryptad's own folder" "" "$(V "grep -rl $MK $CDB 2>/dev/null; ls $CDB")"
 check "…persona-scoped, its owner listed" "owner=alice/$OWN scoped=1" "$(V "$CTL list" | grep "name=$MK " | grep -o 'owner=[^ ]*\|scoped=[01]' | tr '\n' ' ' | sed 's/ $//')"
 check "…it can't be made machine-wide" "error why=persona-profile" "$(V "$CTL set name=$MK scoped=0" | tail -1)"

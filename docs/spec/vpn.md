@@ -403,8 +403,52 @@ boot, before login.
     `tessera-personas-vm.sh` passed with 0 failed (87 checks). That
     includes the four VPN checks of §5. Evidence:
     `~/atrium-vm/evidence/vpn-at-rest-20261125/`.
-  - Not yet run: the personas check's sealed (Work) branch. It needs a
-    guest whose homes are on sealed Tessera, and the dev VM's are on UFS.
+  - The saved Mac `vm-personas-check.log` in that directory is a separate UFS
+    run (43 failures). The 49-check plain pass above was on cloud amd64.
+
+**Sealed Work verification staged (2026-11-27).** The Mail A5 fixture
+provides a recipe for the remaining service check. Its arm64 run verified a
+Tessera `/home`, an unlocked synthetic person, and Work's app data in an
+open key group managed by the real arcad and atrium-volumes. See
+`scripts/mail-at-rest-vm-check.sh` and
+`~/atrium-vm/evidence/tessera/latch-no-clear-2026-11-25/`
+(`a5-run1/gate.log`, 46 checks). Its cleanup unmounted the homes and the
+disposable disks were removed. The dev VM's UFS homes and the earlier
+manually keyed Stoa image are insufficient for this check. Current
+`ensure_app_data` requires both atrium-volumes' encrypted reply and the
+kernel's open group.
+
+1. On an approved disposable arm64 guest, reproduce A5's Tessera home
+   mount, matching kmod and service setup for the personas gate's synthetic
+   `alice` and `bob`. Unlock their test Arcas as in A5 and install
+   `/root/sealed/tessera-keyload`. From the Mac run
+   `REQUIRE_SEALED_WORK=1 NO_UI=1 ARCH=arm64 VM_SSH_PORT="${port:?set the disposable guest port}" sh scripts/vm-personas-check.sh`
+   with the FreeBSD C cross-toolchain. All uploads use the selected port.
+   Capture the guest kernel, binaries and complete gate log. Require zero
+   failures, the published Work path, root:0700, and the same nonzero open
+   group on the Work apps directory and its `.crypta`. The synthetic gateway
+   must be in the 0600 profile, outside the machine store, listed as
+   `owner=alice/work scoped=1`. Both state files must be root:_frescod 0640.
+   The gate sends `persona-forget` directly and checks that the machine
+   profile survives. The separate 87-check run above covers raw-device
+   erasure. The sealed service run is pending.
+2. Host-built arm64 FreeBSD 16 executables from `e29285651` are staged
+   under `~/atrium-vm/evidence/vpn-work-20261127/` with `SHA256`. The
+   navigatord test binary contains all 87 source test names. Copy the
+   directory by scp to a fresh private directory on guest-local disk and run
+   `sh run-navigatord-tests.sh` there. It checks the hashes, saves the
+   unfiltered inventory and bounded serial run, and compares every passing
+   name with the inventory. Keep the kernel line, inventory and results.
+   The November 24 FreeBSD result (28/28 in
+   `vpn-passkey-keycloak-20261124/guest-host-tests.log`) predates the
+   resource-path restriction in `06b776a09`. The new executable has only
+   been cross-built and inspected so far.
+3. For Okta or Entra, use an authorized test tenant or a scripted fixture
+   for that provider's sign-in flow, with a synthetic account and profile.
+   Record the provider and binding, window completion, gateway acceptance,
+   single token redemption, and a successful in-tunnel request. Keycloak's
+   registration and sign-in evidence is in §14. Keep credentials, assertions
+   and tokens out of the evidence.
 
 ### 7.2 CLASS_VPN (new Aqueduct class 19)
 
