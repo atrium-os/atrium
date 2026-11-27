@@ -1522,13 +1522,42 @@ impl Default for LineNumbering {
     }
 }
 
-/// The document's settings for line numbers and hyphenation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// The document's settings: line numbers, hyphenation, and the look of
+/// every page (its colour, a border round it, a watermark behind the text).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Settings {
     pub line_numbers: Option<LineNumbering>,
     /// Words are hyphenated at line ends.
     pub hyphenate: bool,
+    /// The sheet's colour (RGB) behind everything.
+    pub page_color: Option<u32>,
+    pub page_borders: Option<PageBorders>,
+    pub watermark: Option<Watermark>,
 }
+
+/// Rules round the page: each side's, `space` points from the text (or,
+/// `from_page`, from the sheet's edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PageBorders {
+    pub top: Option<Border>,
+    pub bottom: Option<Border>,
+    pub start: Option<Border>,
+    pub end: Option<Border>,
+    pub from_page: bool,
+}
+
+/// Words or a picture drawn faintly behind the text of every page.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Watermark {
+    /// Words across the page, as large as fit: on the diagonal or level.
+    Text { text: Arc<str>, font: Option<Arc<str>>, color: u32, diagonal: bool },
+    /// A picture from the document's images, centred, its width a share of
+    /// the content box's (percent), washed out (faint) or as it is.
+    Picture { image: u32, scale: u16, washout: bool },
+}
+
+/// Longest watermark text, bytes.
+pub const MAX_WATERMARK_TEXT: usize = 256;
 
 /// A paragraph's place in a list: which list (items of one list number on
 /// from each other, across paragraphs between), its kind, and its level (0–8).
@@ -1933,17 +1962,50 @@ impl HeaderFooter {
 }
 
 /// A header's or footer's paragraphs with each table row made one line, its
-/// cells apart by tabs (headers lay out no tables; a cell a paragraph would
+/// cells apart by tabs that stop where the cells are, each as its cell's
+/// text is aligned (headers lay out no tables; a cell a paragraph would
 /// stack a three-column row three lines high).
 pub fn rows_as_lines(paras: Vec<Para>) -> Vec<Para> {
+    // A cell's text sits this far in from its edges (Word's default).
+    const PAD: i32 = 108;
+    let stop = |x: i32, w: i32, align: Option<Align>| match align {
+        Some(Align::Center) => TabStop { pos: x + w / 2, align: TabAlign::Center, leader: Leader::None },
+        Some(Align::End) => TabStop { pos: (x + w - PAD).max(x), align: TabAlign::End, leader: Leader::None },
+        _ => TabStop { pos: x + PAD.min(w / 2), align: TabAlign::Start, leader: Leader::None },
+    };
     let mut out: Vec<Para> = Vec::with_capacity(paras.len());
     let mut last: Option<CellRef> = None;
+    // Where the current cell starts across its row, twips.
+    let mut x = 0i32;
     for mut p in paras {
         let cell = p.props.cell.take();
         match (cell, last, out.last_mut()) {
             (Some(c), Some(l), Some(q)) if (c.table, c.row) == (l.table, l.row) => {
-                let gap = if c.col != l.col { '\t' } else { ' ' };
+                if c.col != l.col {
+                    x = x.saturating_add(l.width.min(MAX_OBJECT_TWIPS) as i32);
+                }
                 if !p.text.is_empty() {
+                    if c.col != l.col && q.props.tabs.is_none() {
+                        // The row's first cell, as it was aligned.
+                        let first = q.props.align;
+                        q.props.align = None;
+                        q.props.tabs = Some(Vec::new());
+                        if matches!(first, Some(Align::Center | Align::End)) {
+                            q.text.insert(0, '\t');
+                            for r in q.runs.iter_mut().skip(1) {
+                                r.0 += 1;
+                            }
+                            if let Some(t) = q.props.tabs.as_mut() {
+                                t.push(stop(0, l.width.min(MAX_OBJECT_TWIPS) as i32, first));
+                            }
+                        }
+                    }
+                    let gap = if c.col != l.col { '\t' } else { ' ' };
+                    if gap == '\t' {
+                        if let Some(t) = q.props.tabs.as_mut().filter(|t| t.len() < MAX_TABS) {
+                            t.push(stop(x, c.width.min(MAX_OBJECT_TWIPS) as i32, p.props.align));
+                        }
+                    }
                     let base = q.text.len() as u32 + 1;
                     let a = q.runs.last().map_or(0, |r| r.1);
                     q.text.push(gap);
@@ -1953,7 +2015,10 @@ pub fn rows_as_lines(paras: Vec<Para>) -> Vec<Para> {
                     q.normalize();
                 }
             }
-            _ => out.push(p),
+            _ => {
+                x = 0;
+                out.push(p);
+            }
         }
         last = cell;
     }

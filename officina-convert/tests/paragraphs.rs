@@ -29,7 +29,7 @@ pub fn paragraphs_doc() -> TextDoc {
     def.levels[0] = ListLevel { format: NumFormat::UpperRoman, text: "%1)".into(), start: 1, indent: 720, hang: 360 };
     def.levels[1] = ListLevel { format: NumFormat::LowerLetter, text: "%1.%2".into(), start: 1, indent: 1440, hang: 540 };
     d.styles.lists.insert(3, def);
-    d.settings = Settings { hyphenate: true, line_numbers: Some(LineNumbering { start: 1, count_by: 5, distance: 360, restart: LineRestart::Continuous }) };
+    d.settings = Settings { hyphenate: true, line_numbers: Some(LineNumbering { start: 1, count_by: 5, distance: 360, restart: LineRestart::Continuous }), ..Default::default() };
     d
 }
 

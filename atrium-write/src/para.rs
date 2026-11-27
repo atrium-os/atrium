@@ -17,6 +17,7 @@ use pergola_richtext::{Editor, RichTextView};
 
 use crate::app::{Cmd, Write, FIND_H, MARGIN_H, SHAPE_COLORS, TOOLBAR_H};
 use crate::table::{table_cmd, TableCmd};
+use crate::page_look::{look_cmd, LookCmd};
 
 /// The ruler's height, over the pages while it is shown.
 pub const RULER_H: f32 = 24.0;
@@ -30,6 +31,8 @@ pub enum ParaKind {
     Lists,
     /// Table Tools (crate::table).
     Table,
+    /// Page Background (crate::page_look).
+    Page,
 }
 
 /// The paragraph bars' state: which is open, the border look new sides
@@ -65,12 +68,15 @@ pub struct ParaMenus {
     pub cell_valign: Mutable<MenuState>,
     pub cell_edges: Mutable<MenuState>,
     pub table_align: Mutable<MenuState>,
+    pub page_color: Mutable<MenuState>,
+    pub watermark: Mutable<MenuState>,
+    pub mark_color: Mutable<MenuState>,
 }
 
 impl Default for ParaMenus {
     fn default() -> Self {
         let m = || Mutable::new(MenuState::default());
-        ParaMenus { spacing: m(), border_style: m(), border_color: m(), shading: m(), drop: m(), tab_align: m(), tab_leader: m(), level_format: m(), table_style: m(), cell_shade: m(), cell_valign: m(), cell_edges: m(), table_align: m() }
+        ParaMenus { spacing: m(), border_style: m(), border_color: m(), shading: m(), drop: m(), tab_align: m(), tab_leader: m(), level_format: m(), table_style: m(), cell_shade: m(), cell_valign: m(), cell_edges: m(), table_align: m(), page_color: m(), watermark: m(), mark_color: m() }
     }
 }
 
@@ -149,6 +155,8 @@ pub enum ParaCmd {
     RulerTab(Option<i32>, Option<i32>),
     /// A Table Tools command.
     Table(TableCmd),
+    /// A Page Background command.
+    Look(LookCmd),
 }
 
 pub const INDENT_STEP: i32 = 360;
@@ -347,6 +355,7 @@ pub fn para_cmd(e: &mut Editor, bar: &Mutable<ParaBar>, ruler: &Mutable<bool>, c
             None => e.clear_tab(from),
         },
         ParaCmd::Table(tc) => table_cmd(e, &b, tc),
+        ParaCmd::Look(lc) => look_cmd(e, &b, lc),
     }
     let changed = b != bar.get_cloned();
     if changed {
@@ -392,7 +401,7 @@ impl Write {
             let mut e = ed.borrow_mut();
             let item = e.list_of(e.caret.block);
             let n = e.numbering().item(e.caret.block).map(|x| x.1);
-            (e.para_format_at_caret(), e.doc.settings, item, n)
+            (e.para_format_at_caret(), e.doc.settings.clone(), item, n)
         };
         let bar = self.para.get_cloned();
         let lbl = |ctx: &mut Ctx, x: f32, y: f32, wd: f32, text: &str| ctx.add(Node::Text { rect: Rect::new(x, y + 6.0, wd, 20.0), content: text.into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
@@ -534,6 +543,7 @@ impl Write {
                 }
             }
             ParaKind::Table => self.table_rows(ctx, w),
+            ParaKind::Page => self.page_look_rows(ctx, w),
         }
         Button::secondary("Close").at(w - 76.0, ry).width(64.0).on_click(push(ParaCmd::Close)).render(ctx);
         ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
@@ -675,7 +685,7 @@ mod tests {
         assert!(!w.para_open());
         run(&w, at("Hyphenation"));
         run(&w, at("Line Numbers"));
-        let s = w.doc.borrow().ed.borrow().doc.settings;
+        let s = w.doc.borrow().ed.borrow().doc.settings.clone();
         assert!(s.hyphenate && s.line_numbers.is_some());
     }
 

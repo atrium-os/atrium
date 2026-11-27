@@ -140,6 +140,12 @@ impl<W: Write> Pdf<W> {
                 Item::Rect { x, y, w, h, color } => {
                     page.c.extend([Op::FillRgb(rgb(color)), Op::Rect(pt(x), ph - pt(y + h), pt(w), pt(h)), Op::Fill]);
                 }
+                Item::Veil { x, y, w, h, color, alpha } => {
+                    let a = page.alpha(alpha, 255);
+                    page.c.push(Op::Save);
+                    page.c.extend(a);
+                    page.c.extend([Op::FillRgb(rgb(color)), Op::Rect(pt(x), ph - pt(y + h), pt(w), pt(h)), Op::Fill, Op::Restore]);
+                }
                 Item::Image { image, x, y, w, h } => match self.picture(page, image as u64, || doc_image(image))? {
                     Some(n) => page.c.extend([Op::Save, Op::Transform([pt(w), 0.0, 0.0, pt(h), pt(x), ph - pt(y + h)]), Op::XObject(n), Op::Restore]),
                     None => page.c.extend([Op::FillRgb([0.85, 0.86, 0.88]), Op::Rect(pt(x), ph - pt(y + h), pt(w), pt(h)), Op::Fill]),

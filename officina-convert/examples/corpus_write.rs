@@ -314,8 +314,9 @@ impl Counts {
 /// Each paragraph's visible text (tracked deletions left out), empty ones
 /// dropped: our writers add an empty paragraph where Word needs one.
 fn texts(d: &TextDoc) -> Vec<String> {
-    // A page break inside a paragraph counts as the end of one (ODF splits there).
-    d.visible_text().into_iter().flat_map(|t| t.split('\u{000C}').map(|x| x.replace('\u{FFFC}', "")).collect::<Vec<_>>()).filter(|t| !t.trim().is_empty()).collect()
+    // A page break inside a paragraph counts as the end of one (ODF splits
+    // there), and a column break as a line break (ODF keeps one there).
+    d.visible_text().into_iter().flat_map(|t| t.split('\u{000C}').map(|x| x.replace('\u{FFFC}', "").replace('\u{000B}', "\u{2028}")).collect::<Vec<_>>()).filter(|t| !t.trim().is_empty()).collect()
 }
 
 /// "same", or what differs: the text first, then each count that moved.

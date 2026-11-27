@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::layout::{object_height, size_lu, vert_shift, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
 use crate::lists::Numbering;
-use crate::model::{Border, BorderStyle, LineRestart, ArrowEnd, Dash, PathCmd, Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use crate::model::{Watermark, Border, BorderStyle, LineRestart, ArrowEnd, Dash, PathCmd, Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
 use crate::paginate::{Page, NOTE_HANG, NOTE_RULE_SPACE};
 use crate::twips;
 
@@ -48,6 +48,9 @@ pub enum Item {
     Glyphs(GlyphRun),
     /// A picture from the document's images, its top-left corner and size.
     Image { image: u32, x: i64, y: i64, w: i64, h: i64 },
+    /// A see-through fill over what is under it (a washed-out watermark):
+    /// `alpha` of 255 is opaque.
+    Veil { x: i64, y: i64, w: i64, h: i64, color: u32, alpha: u8 },
     /// An area that is a link.
     Link { x: i64, y: i64, w: i64, h: i64, uri: String },
     /// Text under comments (the last one listed is the innermost): the screen
@@ -315,6 +318,8 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
     let (mx, my) = (twips(g.margin_start as i64), twips(g.margin_top as i64));
     let (pw, ph) = (twips(g.width as i64), twips(g.height as i64));
 
+    page_look(&mut out, doc, fonts, g, pw, ph);
+
     // Cells' backgrounds, under everything on the page.
     for c in &page.cells {
         if let Some(color) = c.paint.shading {
@@ -577,6 +582,88 @@ fn rule(out: &mut Vec<Item>, b: &Border, x: i64, y: i64, len: i64, t: i64, flat:
         }
     }
 }
+
+/// The page's colour, its border and its watermark: under everything else.
+fn page_look(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, g: &crate::model::PageSetup, pw: i64, ph: i64) {
+    let st = &doc.settings;
+    if let Some(color) = st.page_color {
+        out.push(Item::Rect { x: 0, y: 0, w: pw, h: ph, color });
+    }
+    // The content box, in page units.
+    let (cx0, cy0) = (twips(g.margin_start as i64), twips(g.margin_top as i64));
+    let (cx1, cy1) = (pw - twips(g.margin_end as i64), ph - twips(g.margin_bottom as i64));
+    if let Some(w) = &st.watermark {
+        let (cw, ch) = ((cx1 - cx0).max(crate::LU), (cy1 - cy0).max(crate::LU));
+        let (mx, my) = ((cx0 + cx1) / 2, (cy0 + cy1) / 2);
+        match w {
+            Watermark::Picture { image, scale, washout } => {
+                if let Some(d) = doc.images.get(*image) {
+                    let ww = cw * (*scale).clamp(1, 500) as i64 / 100;
+                    let hh = if d.width > 0 { ww * d.height as i64 / d.width as i64 } else { ww };
+                    let (x, y) = (mx - ww / 2, my - hh / 2);
+                    out.push(Item::Image { image: *image, x, y, w: ww, h: hh });
+                    if *washout {
+                        out.push(Item::Veil { x, y, w: ww, h: hh, color: 0xFFFFFF, alpha: WASHOUT });
+                    }
+                }
+            }
+            Watermark::Text { text, font, color, diagonal } => {
+                let mut fmt = CharFormat { size: 144, color: *color, ..Default::default() };
+                if let Some(f) = font {
+                    fmt.family = f.clone();
+                }
+                let w0: i64 = fonts.shape(text, &fmt).iter().map(|g| g.adv).sum();
+                if w0 > 0 {
+                    // As large as fits along the line it takes, at most 300 pt.
+                    let along = if *diagonal { ((cw as f64).hypot(ch as f64) * 0.7) as i64 } else { cw * 9 / 10 };
+                    let size = (fmt.size as i64 * along / w0).clamp(8, 600);
+                    fmt.size = size as u16;
+                    let w1: i64 = fonts.shape(text, &fmt).iter().map(|g| g.adv).sum();
+                    let first = out.len();
+                    let s = size_lu(&fmt);
+                    runs(out, fonts, text, &fmt, mx - w1 / 2, my + s * 7 / 20);
+                    if *diagonal {
+                        // Turned about the content box's centre, rising to the right.
+                        let (a, b) = (std::f64::consts::FRAC_1_SQRT_2, -std::f64::consts::FRAC_1_SQRT_2);
+                        for it in &mut out[first..] {
+                            if let Item::Glyphs(r) = it {
+                                let (u, v) = ((r.x - mx) as f64, (r.y - my) as f64);
+                                r.x = mx + (a * u - b * v) as i64;
+                                r.y = my + (b * u + a * v) as i64;
+                                r.turn = Some([a, b, -b, a]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(pb) = &st.page_borders {
+        let th = |b: &Border| twips(b.thickness() as i64).max(RULE);
+        let sp = |b: &Option<Border>| b.map_or(0, |b| twips(b.space as i64 * 20));
+        let (x0, y0, x1, y1) = if pb.from_page {
+            (sp(&pb.start), sp(&pb.top), pw - sp(&pb.end), ph - sp(&pb.bottom))
+        } else {
+            (cx0 - sp(&pb.start), cy0 - sp(&pb.top), cx1 + sp(&pb.end), cy1 + sp(&pb.bottom))
+        };
+        let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(pw), y1.min(ph));
+        if let Some(b) = &pb.top {
+            rule(out, b, x0, y0 - th(b), x1 - x0, th(b), true);
+        }
+        if let Some(b) = &pb.bottom {
+            rule(out, b, x0, y1, x1 - x0, th(b), true);
+        }
+        if let Some(b) = &pb.start {
+            rule(out, b, x0 - th(b), y0 - pb.top.as_ref().map_or(0, th), y1 - y0 + pb.top.as_ref().map_or(0, th) + pb.bottom.as_ref().map_or(0, th), th(b), false);
+        }
+        if let Some(b) = &pb.end {
+            rule(out, b, x1, y0 - pb.top.as_ref().map_or(0, th), y1 - y0 + pb.top.as_ref().map_or(0, th) + pb.bottom.as_ref().map_or(0, th), th(b), false);
+        }
+    }
+}
+
+/// How much of a washed-out watermark picture shows through its veil (of 255).
+const WASHOUT: u8 = 179;
 
 /// A dropped capital, on the baseline of its last line, when slice
 /// `lines` holds that line (`top`: the slice's first line's top).
@@ -866,6 +953,45 @@ mod tests {
     use crate::model::{CharAttrs, HeaderFooter, ImageData, ObjectRef};
     use crate::paginate::Paginator;
 
+    /// The page's colour first, under everything; its border round the
+    /// text; a diagonal watermark turned about the middle; a washed-out
+    /// picture veiled.
+    #[test]
+    fn page_colour_border_and_watermarks() {
+        use crate::model::{PageBorders, Watermark};
+        let mut d = TextDoc::new();
+        d.push_para("Text", 0, vec![(0, 0)]);
+        d.settings.page_color = Some(0xFFF2CC);
+        let b = Border { width: 8, space: 4, color: Some(0x2F5496), ..Default::default() };
+        d.settings.page_borders = Some(PageBorders { top: Some(b), bottom: Some(b), start: Some(b), end: Some(b), from_page: false });
+        d.settings.watermark = Some(Watermark::Text { text: "DRAFT".into(), font: None, color: 0xC0C0C0, diagonal: true });
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "1");
+        let (pw, ph) = (twips(d.page.width as i64), twips(d.page.height as i64));
+        assert_eq!(items[0], Item::Rect { x: 0, y: 0, w: pw, h: ph, color: 0xFFF2CC });
+        let mark = items.iter().find_map(|i| if let Item::Glyphs(r) = i { (r.text == "DRAFT").then_some(r) } else { None }).expect("the watermark");
+        assert!(mark.turn.is_some_and(|t| t[1] < 0.0) && mark.color == 0xC0C0C0 && mark.size > size_lu(&CharFormat::default()) * 4, "{mark:?}");
+        // The border: four rules just outside the text, in its colour.
+        let rules: Vec<&Item> = items.iter().filter(|i| matches!(i, Item::Rect { color: 0x2F5496, .. })).collect();
+        assert_eq!(rules.len(), 4);
+        let mx = twips(d.page.margin_start as i64);
+        assert!(rules.iter().any(|r| matches!(r, Item::Rect { x, .. } if *x < mx - twips(80) && *x > mx - twips(200))), "{rules:?}");
+        // The text comes after them all.
+        let text_at = items.iter().position(|i| matches!(i, Item::Glyphs(r) if r.text == "Text")).unwrap();
+        assert!(items.iter().position(|i| matches!(i, Item::Rect { color: 0x2F5496, .. })).unwrap() < text_at);
+        // A picture, washed out.
+        let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![0u8; 4]), width: 20, height: 10 });
+        d.settings.watermark = Some(Watermark::Picture { image: img, scale: 50, washout: true });
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "1");
+        let cw = p.width();
+        let (iw, ih) = items.iter().find_map(|i| if let Item::Image { w, h, .. } = i { Some((*w, *h)) } else { None }).unwrap();
+        assert_eq!((iw, ih), (cw / 2, cw / 4));
+        assert!(items.iter().any(|i| matches!(i, Item::Veil { color: 0xFFFFFF, w, .. } if *w == iw)));
+    }
+
     #[test]
     fn a_page_paints_text_rules_pictures_links_and_footer() {
         let mut d = TextDoc::new();
@@ -1128,6 +1254,17 @@ mod tests {
         let v = rows_as_lines(vec![mk("Title", None), mk("A", cell(0, 0)), mk("B", cell(0, 1)), mk("b2", cell(0, 1)), mk("C", cell(1, 0)), mk("", cell(1, 1)), mk("D", cell(1, 2))]);
         assert_eq!(v.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["Title", "A\tB b2", "C\tD"]);
         assert!(v.iter().all(|p| p.props.cell.is_none() && p.runs.iter().all(|r| r.0 as usize <= p.text.len())));
+        // The tabs stop at the cells: D's past the empty cell.
+        let at = |p: &Para| p.props.tabs.clone().unwrap_or_default().iter().map(|t| t.pos).collect::<Vec<_>>();
+        assert_eq!((at(&v[1]), at(&v[2])), (vec![1108], vec![2108]));
+        // A centred title cell and a right-aligned date keep their places.
+        let al = |t: &str, c, a| Para { props: crate::model::ParaProps { cell: c, align: Some(a), ..Default::default() }, ..Para::new(0, t, 0) };
+        let v = rows_as_lines(vec![al("Logo", cell(0, 0), Align::Start), al("Title", cell(0, 1), Align::Center), al("Date", cell(0, 2), Align::End)]);
+        let tabs = v[0].props.tabs.clone().unwrap();
+        assert_eq!(v[0].text, "Logo\tTitle\tDate");
+        assert_eq!(tabs.iter().map(|t| (t.pos, t.align)).collect::<Vec<_>>(), [(1500, crate::model::TabAlign::Center), (2892, crate::model::TabAlign::End)]);
+        let v = rows_as_lines(vec![al("Mid", cell(0, 0), Align::Center), al("End", cell(0, 1), Align::End)]);
+        assert_eq!((v[0].text.as_str(), v[0].props.align, v[0].props.tabs.as_ref().map(|t| t[0].pos)), ("\tMid\tEnd", None, Some(500)));
     }
 
     #[test]

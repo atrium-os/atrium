@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::paginate::PAGE_BREAK;
+use officina_text::paginate::{COLUMN_BREAK, PAGE_BREAK};
 use officina_text::model::{CellBorders, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, HAlign as TableAlign, LOOK_HEADER, LOOK_TOTAL, LOOK_FIRST_COLUMN, LOOK_LAST_COLUMN, LOOK_BANDED_ROWS, LOOK_BANDED_COLUMNS, MAX_TABLE_STYLES, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
@@ -708,6 +708,11 @@ fn wrapped<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
     }
 }
 
+/// Whether a VML element is Word's watermark (by the names Word gives it).
+fn is_watermark(e: &El) -> bool {
+    e.name == "v:shape" && [e.attr("id"), e.attr("o:spid")].into_iter().flatten().any(|n| n.contains("PowerPlusWaterMarkObject") || n.contains("WordPictureWatermark"))
+}
+
 fn all_of<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
     for x in e.els() {
         if out.len() >= 64 || depth > 64 {
@@ -917,6 +922,10 @@ impl<'a> Reader<'a> {
     fn vml(&mut self, pict: &El, field: &FieldState) -> Option<ObjectRef> {
         const SHAPES: [&str; 7] = ["v:shape", "v:rect", "v:roundrect", "v:oval", "v:line", "v:image", "v:group"];
         let sh = pict.els().find(|e| SHAPES.contains(&e.name.as_str()))?;
+        if is_watermark(sh) {
+            // Read as the document's (see `watermark_in`).
+            return None;
+        }
         if sh.name == "v:group" {
             // A group: its first shape, as big as the group.
             self.rep.note(Kind::Approximate, "grouped VML shapes (the first kept)");
@@ -1502,6 +1511,8 @@ impl<'a> Reader<'a> {
                             "w:br" | "w:cr" => {
                                 if k.attr("w:type") == Some("page") {
                                     p.push(&PAGE_BREAK.to_string(), &a);
+                                } else if k.attr("w:type") == Some("column") {
+                                    p.push(&COLUMN_BREAK.to_string(), &a);
                                 } else {
                                     p.push("\u{2028}", &a);
                                 }
@@ -2047,6 +2058,12 @@ impl<'a> Reader<'a> {
     fn box_blocks(&mut self, b: &El, field: &mut FieldState, depth: usize) {
         for x in b.els() {
             match x.name.as_str() {
+                // A paragraph that only holds the watermark takes no line.
+                "w:p" if field.in_margin && x.find("w:t").is_none() && {
+                    let mut v = Vec::new();
+                    all_of(x, "w:pict", &mut v, 0);
+                    !v.is_empty() && v.iter().all(|p| p.els().any(is_watermark))
+                } => {}
                 "w:p" => {
                     self.para(x, None, field);
                 }
@@ -2288,6 +2305,12 @@ impl<'a> Reader<'a> {
 
     fn section(&mut self, s: &El) {
         self.doc.page = page_setup(s);
+        // Word sets page borders per section; the last section's are the
+        // document's.
+        self.doc.settings.page_borders = s.child("w:pgBorders").map(|b| {
+            let side = |a: &str, c: &str| b.child(a).or_else(|| b.child(c)).and_then(border);
+            officina_text::model::PageBorders { top: side("w:top", "w:top"), bottom: side("w:bottom", "w:bottom"), start: side("w:left", "w:start"), end: side("w:right", "w:end"), from_page: b.attr("w:offsetFrom") == Some("page") }
+        }).filter(|b| b.top.is_some() || b.bottom.is_some() || b.start.is_some() || b.end.is_some());
         // Other kinds count only where the document turns them on; turned
         // on, a kind without a part of its own is blank.
         let title = s.child("w:titlePg").is_some_and(on);
@@ -2314,6 +2337,46 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Word's watermark: a VML shape in a header named for it, words on a
+    /// text path or a picture. The first one found is the document's.
+    fn watermark_in(&mut self, e: &El, target: &str) {
+        use officina_text::model::{Watermark, MAX_WATERMARK_TEXT};
+        if self.doc.settings.watermark.is_some() {
+            return;
+        }
+        let mut picts = Vec::new();
+        all_of(e, "w:pict", &mut picts, 0);
+        let Some(sh) = picts.iter().find_map(|p| p.els().find(|x| is_watermark(x))) else { return };
+        let style = vml_style(sh.attr("style").unwrap_or(""));
+        let g = &self.doc.page;
+        let content = (g.width - g.margin_start - g.margin_end).max(1440) as i64;
+        if let Some(tp) = sh.child("v:textpath") {
+            let text: String = tp.attr("string").unwrap_or("").chars().filter(|c| !c.is_control()).collect();
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            let font = vml_style(tp.attr("style").unwrap_or("")).get("font-family").map(|f| f.trim_matches(|c| c == '"' || c == '\'' || c == ' ').to_string()).filter(|f| !f.is_empty() && f.len() <= MAX_WATERMARK_TEXT).map(|f| f.into());
+            let rot = style.get("rotation").and_then(|r| r.trim_end_matches("fd").parse::<f64>().ok()).unwrap_or(0.0);
+            // Turned off the level (Word's diagonal is 315°).
+            let off = rot.rem_euclid(180.0);
+            let diagonal = off > 1.0 && off < 179.0;
+            let color = sh.attr("fillcolor").and_then(vml_color).unwrap_or(0xC0C0C0);
+            let text: String = text[..text.floor_char_boundary(MAX_WATERMARK_TEXT)].to_string();
+            self.doc.settings.watermark = Some(Watermark::Text { text: text.into(), font, color, diagonal });
+        } else if let Some(d) = sh.child("v:imagedata") {
+            let Some(rid) = d.attr("r:id").or_else(|| d.attr("o:relid")) else { return };
+            let main = std::mem::replace(&mut self.rels, rels(self.archive, target).unwrap_or_default());
+            let image = self.image_by_rel(rid);
+            self.rels = main;
+            let Some(image) = image else { return };
+            let w = style.get("width").and_then(|v| vml_len(v)).unwrap_or(content);
+            let scale = (w * 100 / content).clamp(1, 500) as u16;
+            let washout = d.attr("gain").is_some() || d.attr("blacklevel").is_some();
+            self.doc.settings.watermark = Some(Watermark::Picture { image, scale, washout });
+        }
+    }
+
     /// Where the header (or footer) of a kind (0 default, 1 first page, 2
     /// even pages) goes.
     fn margin_slot(&mut self, kind: usize, header: bool) -> &mut Option<HeaderFooter> {
@@ -2328,6 +2391,7 @@ impl<'a> Reader<'a> {
     /// A header or footer part as one line of text, page fields as `{page}`.
     fn margin_text(&mut self, target: &str) -> Option<HeaderFooter> {
         let e = part(self.archive, target).ok().flatten()?;
+        self.watermark_in(&e, target);
         let mut field = FieldState { in_margin: true, ..Default::default() };
         let mut text = String::new();
         let mut align = Align::Start;
@@ -2350,7 +2414,12 @@ impl<'a> Reader<'a> {
         if e.find("w:tbl").is_some() {
             self.rep.note(Kind::Approximate, "tables in headers and footers (their cells one under another)");
         }
-        (!text.is_empty() || e.find("w:drawing").is_some()).then(|| HeaderFooter { text: text.chars().take(1000).collect(), align, paras: Vec::new() })
+        let shapes = {
+            let mut v = Vec::new();
+            all_of(&e, "w:pict", &mut v, 0);
+            v.iter().any(|p| !p.els().any(is_watermark))
+        };
+        (!text.is_empty() || e.find("w:drawing").is_some() || shapes).then(|| HeaderFooter { text: text.chars().take(1000).collect(), align, paras: Vec::new() })
     }
 }
 
@@ -2655,6 +2724,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
         r.doc.settings.hyphenate = st.as_ref().is_some_and(|s| s.child("w:autoHyphenation").is_some_and(on));
     }
     r.doc.styles.lists = r.numbering.defs.iter().map(|(k, v)| (*k, v.clone())).collect();
+    r.doc.settings.page_color = doc_xml.child("w:background").and_then(|b| color(b.attr("w:color"))).filter(|&c| c != 0xFFFFFF);
     // Line numbers: Word sets them per section; the first section's here.
     if let Some(n) = doc_xml.child("w:body").and_then(|b| b.find("w:lnNumType")) {
         let restart = match n.attr("w:restart") {

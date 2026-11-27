@@ -372,6 +372,9 @@ impl RichTextView {
                         Item::Rect { x, y, w, h, color } => {
                             ctx.add(Node::Rect { rect: Rect::new(q(ox + x as f64 * g.k), q(oy + y as f64 * g.k), (w as f64 * g.k).max(1.0) as f32, (h as f64 * g.k).max(1.0) as f32), fill: rgb(color), radius: 0.0 });
                         }
+                        Item::Veil { x, y, w, h, color, alpha } => {
+                            ctx.add(Node::Rect { rect: Rect::new(q(ox + x as f64 * g.k), q(oy + y as f64 * g.k), (w as f64 * g.k).max(1.0) as f32, (h as f64 * g.k).max(1.0) as f32), fill: rgb(color).with_alpha(alpha as f32 / 255.0), radius: 0.0 });
+                        }
                         Item::Glyphs(r) => {
                             if let Some(face) = faces.and_then(|fs| fs.get(r.face as usize)) {
                                 let run: Vec<PGlyph> = r.glyphs.iter().map(|gl| PGlyph { id: gl.id, dx: (gl.x as f64 * g.k) as f32, dy: (gl.dy as f64 * g.k) as f32 }).collect();

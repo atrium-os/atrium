@@ -427,6 +427,10 @@ impl Out {
                         flush(&mut text, &mut body);
                         let _ = write!(body, r#"<w:r>{props}<w:br w:type="page"/></w:r>"#);
                     }
+                    '\u{000B}' => {
+                        flush(&mut text, &mut body);
+                        let _ = write!(body, r#"<w:r>{props}<w:br w:type="column"/></w:r>"#);
+                    }
                     OBJECT_CHAR if attrs.field.is_some() => {
                         flush(&mut text, &mut body);
                         let f = attrs.field.expect("checked");
@@ -1039,6 +1043,37 @@ pub(crate) fn is_svg(b: &[u8]) -> bool {
     head.contains("<svg") && !head.contains("<html")
 }
 
+const VML_NS: &str = r#"xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w10="urn:schemas-microsoft-com:office:word""#;
+
+/// The watermark as Word writes it: a paragraph holding a VML shape behind
+/// the text, centred on the margins, named so Word's Watermark finds it.
+fn watermark_para(doc: &TextDoc, o: &mut Out, x: &mut String, n: u32) {
+    use officina_text::model::Watermark;
+    let g = &doc.page;
+    let content = (g.width - g.margin_start - g.margin_end).max(1440) as i64;
+    let place = "position:absolute;margin-left:0;margin-top:0;mso-position-horizontal:center;mso-position-horizontal-relative:margin;mso-position-vertical:center;mso-position-vertical-relative:margin";
+    let shape = match &doc.settings.watermark {
+        Some(Watermark::Text { text, font, color, diagonal }) => {
+            // Word sizes the words to the shape: as wide as the margins.
+            let w = content as f64 / 20.0;
+            let h = w / (text.chars().count().max(1) as f64 * 0.55).max(1.0);
+            let rot = if *diagonal { ";rotation:315" } else { "" };
+            let font = font.as_deref().map(|f| format!("font-family:&quot;{}&quot;;", esc(f))).unwrap_or_default();
+            format!(r##"<v:shapetype id="_x0000_t136" coordsize="21600,21600" o:spt="136" adj="10800" path="m@7,l@8,m@5,21600l@6,21600e"><v:path textpathok="t" o:connecttype="custom"/><v:textpath on="t" fitshape="t"/></v:shapetype><v:shape id="PowerPlusWaterMarkObject{n}" o:spid="_x0000_s{}" type="#_x0000_t136" style="{place};width:{w:.1}pt;height:{h:.1}pt{rot};z-index:-251657216" o:allowincell="f" fillcolor="#{color:06X}" stroked="f"><v:fill opacity=".5"/><v:textpath style="{font}font-size:1pt" string="{}"/><w10:wrap anchorx="margin" anchory="margin"/></v:shape>"##, 2048 + n, esc(text))
+        }
+        Some(Watermark::Picture { image, scale, washout }) => {
+            let Some(d) = doc.images.get(*image) else { return };
+            let Some(rid) = o.image(doc, *image) else { return };
+            let w = content as f64 * *scale as f64 / 100.0 / 20.0;
+            let h = if d.width > 0 { w * d.height as f64 / d.width as f64 } else { w };
+            let wash = if *washout { r#" gain="19661f" blacklevel="22938f""# } else { "" };
+            format!(r##"<v:shape id="WordPictureWatermark{n}" o:spid="_x0000_s{}" type="#_x0000_t75" style="{place};width:{w:.1}pt;height:{h:.1}pt;z-index:-251656192" o:allowincell="f"><v:imagedata r:id="{rid}" o:title=""{wash}/><w10:wrap anchorx="margin" anchory="margin"/></v:shape>"##, 2048 + n)
+        }
+        None => return,
+    };
+    let _ = write!(x, r#"<w:p><w:r><w:pict>{shape}</w:pict></w:r></w:p>"#);
+}
+
 /// A header or footer part's `{page}` and `{pages}` as page fields in the
 /// run's own format.
 fn page_fields(x: &str) -> String {
@@ -1371,22 +1406,35 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             // A first or even kind with none: a blank part, so the default
             // one doesn't show there.
             let empty = HeaderFooter::line("", Align::Start);
+            // The watermark rides in every header, so a document with one
+            // has a header.
+            let mark = k == 0 && doc.settings.watermark.is_some();
             let hf = match hf {
                 Some(h) => h,
-                None if ty != "default" => &empty,
+                None if ty != "default" || mark => &empty,
                 None => continue,
             };
             n += 1;
             let name = format!("{kind}{n}.xml");
             let r = o.rel(kind, name.clone(), false);
             let _ = write!(sect, r#"<w:{kind}Reference w:type="{ty}" r:id="{r}"/>"#);
-            if hf.paras.is_empty() {
+            if hf.paras.is_empty() && !mark {
                 parts.push((format!("word/{name}"), margin_part(hf, tag)));
                 continue;
             }
             // Its own paragraphs, with their pictures beside the part.
             let mut ho = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), restarts: Vec::new(), styles: ids.clone(), pic: 10_000 * n, notes: HashMap::new(), media_stem: if k == 0 { "hdr_image" } else { "ftr_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
-            let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} {W_NS} {DRAW_NS}>"#);
+            let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} {W_NS} {DRAW_NS} {VML_NS}>"#);
+            if mark {
+                watermark_para(doc, &mut ho, &mut x, n);
+            }
+            if hf.paras.is_empty() {
+                // One line of text: the plain part's paragraph.
+                let plain = margin_part(hf, tag);
+                if let (Some(a), Some(b)) = (plain.find("<w:p>"), plain.rfind("</w:p>")) {
+                    x += &plain[a..b + 6];
+                }
+            }
             for p in &hf.paras {
                 let mut q = p.clone();
                 q.props.list = None;
@@ -1430,6 +1478,20 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         }
         // The first page's own header: the first section's first page.
         let title = if doc.first_page.is_some() && std::ptr::eq(x, &secs[0].1) { "<w:titlePg/>" } else { "" };
+        // pgBorders goes after pgMar, before lnNumType.
+        if let Some(b) = &doc.settings.page_borders {
+            let mut v = format!(r#"<w:pgBorders w:offsetFrom="{}">"#, if b.from_page { "page" } else { "text" });
+            for (name, side) in [("top", &b.top), ("left", &b.start), ("bottom", &b.bottom), ("right", &b.end)] {
+                if let Some(s) = side {
+                    v += &border_xml(name, s);
+                }
+            }
+            v += "</w:pgBorders>";
+            geo = match geo.find("<w:lnNumType") {
+                Some(i) => format!("{}{v}{}", &geo[..i], &geo[i..]),
+                None => geo + &v,
+            };
+        }
         format!("<w:sectPr>{sect}{ty}{geo}{cols}{title}</w:sectPr>")
     };
     if secs.len() > 1 {
@@ -1445,16 +1507,18 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         body = filled;
     }
     let sect = sect_pr(&secs[secs.len() - 1].1);
-    let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS} {DRAW_NS}><w:body>{body}{sect}</w:body></w:document>"#);
+    let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS} {DRAW_NS}>{background}<w:body>{body}{sect}</w:body></w:document>"#, background = doc.settings.page_color.map(|c| format!(r#"<w:background w:color="{c:06X}"/>"#)).unwrap_or_default());
 
     // Settings: tracking on, even pages' own headers.
-    if doc.tracking || doc.even_pages.is_some() || doc.settings.hyphenate {
+    if doc.tracking || doc.even_pages.is_some() || doc.settings.hyphenate || doc.settings.page_color.is_some() {
         let even = if doc.even_pages.is_some() { "<w:evenAndOddHeaders/>" } else { "" };
         let track = if doc.tracking { "<w:trackRevisions/>" } else { "" };
         let hyph = if doc.settings.hyphenate { "<w:autoHyphenation/>" } else { "" };
+        // Word shows the page colour only with this.
+        let bg = if doc.settings.page_color.is_some() { "<w:displayBackgroundShape/>" } else { "" };
         o.rel("settings", "settings.xml".into(), false);
-        // Schema order: trackRevisions, autoHyphenation, evenAndOddHeaders.
-        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}>{track}{hyph}{even}</w:settings>"#)));
+        // Schema order: displayBackgroundShape, trackRevisions, autoHyphenation, evenAndOddHeaders.
+        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}>{bg}{track}{hyph}{even}</w:settings>"#)));
     }
     let styles_xml = styles_part(doc, &ids, &mut o.lists, o.restarts.len());
     let mut z = ZipWriter::new(out);

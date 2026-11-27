@@ -847,7 +847,7 @@ impl Paginator {
                     cur = Checkpoint::at(b2, 0);
                 }
                 Stop::Section(b2) | Stop::Break(b2) => return finish(f, bottom, rules, Some(Checkpoint::at(b2, 0)), cache),
-                Stop::Full(next) => return finish(f, bottom, rules, Some(next), cache),
+                Stop::Full(next) | Stop::Page(next) => return finish(f, bottom, rules, Some(next), cache),
                 Stop::End(line) => {
                     // The text has ended: endnotes, if any, follow it.
                     let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur, blank: false };
@@ -1067,14 +1067,20 @@ impl Paginator {
                 }
                 yy += l.lines[li].height;
                 li += 1;
-                // A page break inside the paragraph (U+000C ends its line):
-                // the rest starts the next column.
-                if li < total && doc.para(b).is_some_and(|p| l.lines[li - 1].end > 0 && p.text.as_bytes().get(l.lines[li - 1].end as usize - 1) == Some(&PAGE_BREAK_BYTE)) {
-                    if let Some(c) = &wrap {
+                // A page or column break ends its line: what follows starts
+                // the next page or column.
+                let brk = doc.para(b).and_then(|p| match l.lines[li - 1].end {
+                    0 => None,
+                    e => break_kind(p.text.as_bytes().get(e as usize - 1).copied()),
+                });
+                if let Some(page) = brk {
+                    if let Some(c) = wrap.as_ref().filter(|_| li < total) {
                         f.carry = Some((b, c.clone()));
                     }
                     f.slices.push(Slice { block: b, lines: l0..li, y: y0, x, w, wrap });
-                    return (Stop::Full(Checkpoint { block: b, line: li, wrap: hash }), yy);
+                    let next = if li < total { Checkpoint { block: b, line: li, wrap: hash } } else { Checkpoint::at(b + 1, 0) };
+                    let y_end = if li == total { yy + l.space_after } else { yy };
+                    return (if page { Stop::Page(next) } else { Stop::Full(next) }, y_end);
                 }
             }
             if li == total {
@@ -1129,7 +1135,19 @@ impl Paginator {
 
 /// A page break inside a paragraph (Word's `w:br w:type="page"`).
 pub const PAGE_BREAK: char = '\u{000C}';
-const PAGE_BREAK_BYTE: u8 = 0x0C;
+/// A column break inside a paragraph (Word's `w:br w:type="column"`); in a
+/// section of one column it starts the next page.
+pub const COLUMN_BREAK: char = '\u{000B}';
+
+/// What the byte ending a line breaks: `Some(true)` the page, `Some(false)`
+/// the column.
+fn break_kind(b: Option<u8>) -> Option<bool> {
+    match b {
+        Some(0x0C) => Some(true),
+        Some(0x0B) => Some(false),
+        _ => None,
+    }
+}
 
 /// What a page holds so far.
 #[derive(Clone, Default)]
@@ -1151,6 +1169,8 @@ struct Fill {
 enum Stop {
     /// Full: the next column (or page) starts here.
     Full(Checkpoint),
+    /// A page break: the next page starts here, whatever columns are left.
+    Page(Checkpoint),
     /// Block `b` starts a section.
     Section(usize),
     /// Block `b` has a page break before it.
@@ -1213,6 +1233,33 @@ mod tests {
         });
         let (p, _) = all(&d);
         assert_eq!(shape(&p), vec![vec![(0, 0..1)], vec![(0, 1..2)]]);
+    }
+
+    /// A break that ends a paragraph moves the next paragraph on; a column
+    /// break moves to the next column, a page break past the columns left.
+    #[test]
+    fn column_and_page_breaks() {
+        let mut d = doc_with(&[1, 1, 1, 1], 10);
+        let set = |d: &mut TextDoc, b: usize, t: String| d.blocks.update(b, |x| x.as_para_mut().unwrap().text = t);
+        set(&mut d, 0, format!("one{PAGE_BREAK}"));
+        let (p, _) = all(&d);
+        assert_eq!(shape(&p), vec![vec![(0, 0..1)], vec![(1, 0..1), (2, 0..1), (3, 0..1)]], "a break ending a paragraph");
+        // One column: a column break starts the next page.
+        set(&mut d, 0, format!("one{COLUMN_BREAK}two"));
+        let (p, _) = all(&d);
+        assert_eq!(shape(&p), vec![vec![(0, 0..1)], vec![(0, 1..2), (1, 0..1), (2, 0..1), (3, 0..1)]]);
+        // Two columns: the column break goes to column two of the same page.
+        set_section(&mut d, 0, sec(2, SectionStart::NextPage));
+        let (p, _) = all(&d);
+        assert_eq!(p.pages().len(), 1);
+        let xs: Vec<i64> = p.pages()[0].slices.iter().map(|s| s.x).collect();
+        assert!(xs[0] == 0 && xs[1..].iter().all(|&x| x > 0), "{xs:?}");
+        // A page break skips column two.
+        set(&mut d, 1, format!("two{PAGE_BREAK}"));
+        set(&mut d, 0, "one".into());
+        let (p, _) = all(&d);
+        assert_eq!(shape(&p), vec![vec![(0, 0..1), (1, 0..1)], vec![(2, 0..3), (3, 0..3)]], "blocks 2 and 3 wrap in the narrow column");
+        assert!(p.pages()[0].slices.iter().all(|s| s.x == 0) && p.pages()[1].slices[0].x == 0);
     }
 
     #[test]

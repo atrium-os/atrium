@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, PageBorders, MAX_BORDER_SPACE, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El, Node};
@@ -488,6 +488,14 @@ fn master_setup(st: &El, master: &El, base: PageSetup) -> (PageSetup, Option<Sec
         if let Some(c) = pp.child("style:columns") {
             cols = Some(odf_columns(c));
         }
+        // A page border sits inside the margins, the text its padding further in.
+        if let Some(b) = page_borders(pp) {
+            let inset = |x: &Option<Border>, pad: &str| x.map_or(0, |x| x.thickness() as i64 + pp.attr(pad).or_else(|| pp.attr("fo:padding")).and_then(length).unwrap_or(0));
+            g.margin_top = (g.margin_top as i64 + inset(&b.top, "fo:padding-top")).clamp(0, 63360) as i32;
+            g.margin_bottom = (g.margin_bottom as i64 + inset(&b.bottom, "fo:padding-bottom")).clamp(0, 63360) as i32;
+            g.margin_start = (g.margin_start as i64 + inset(&b.start, "fo:padding-left")).clamp(0, 63360) as i32;
+            g.margin_end = (g.margin_end as i64 + inset(&b.end, "fo:padding-right")).clamp(0, 63360) as i32;
+        }
         // ODF puts the header and footer inside the margins; their heights add to them.
         // With dynamic spacing (LibreOffice's import of Word files) the spacing lies
         // inside the minimum height rather than after it.
@@ -505,6 +513,24 @@ fn master_setup(st: &El, master: &El, base: PageSetup) -> (PageSetup, Option<Sec
         }
     }
     (out, cols)
+}
+
+/// A page layout's borders, `space` the padding between them and the text.
+fn page_borders(pp: &El) -> Option<PageBorders> {
+    let side = |k: &str, pad: &str| {
+        let mut b = pp.attr(k).or_else(|| pp.attr("fo:border")).and_then(odf_border)?;
+        let p = pp.attr(pad).or_else(|| pp.attr("fo:padding")).and_then(length).unwrap_or(0);
+        b.space = (p / 20).clamp(0, MAX_BORDER_SPACE as i64) as u16;
+        Some(b)
+    };
+    let b = PageBorders { top: side("fo:border-top", "fo:padding-top"), bottom: side("fo:border-bottom", "fo:padding-bottom"), start: side("fo:border-left", "fo:padding-left"), end: side("fo:border-right", "fo:padding-right"), from_page: false };
+    (b.top.is_some() || b.bottom.is_some() || b.start.is_some() || b.end.is_some()).then_some(b)
+}
+
+/// A master page's layout properties.
+fn layout_props<'a>(st: &'a El, master: &El) -> Option<&'a El> {
+    let n = master.attr("style:page-layout-name")?;
+    st.child("office:automatic-styles")?.children("style:page-layout").find(|l| l.attr("style:name") == Some(n))?.child("style:page-layout-properties")
 }
 
 /// A `style:columns`: count, gap and the line between. Columns of their own
@@ -2202,6 +2228,10 @@ impl<'a> Reader<'a> {
             first_master.as_ref().and_then(|n| all.iter().find(|x| x.attr("style:name") == Some(n.as_str())).copied()).or_else(|| all.iter().find(|x| x.attr("style:name") == Some("Standard")).copied()).or(all.first().copied())
         });
         let Some(master) = master else { return };
+        if let Some(pp) = layout_props(st, master) {
+            self.doc.settings.page_color = pp.attr("fo:background-color").and_then(|c| color(Some(c))).filter(|&c| c != 0xFFFFFF);
+            self.doc.settings.page_borders = page_borders(pp);
+        }
         let base = self.doc.page;
         let (g, cols) = master_setup(st, master, base);
         self.doc.page = g;

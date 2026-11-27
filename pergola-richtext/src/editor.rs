@@ -17,7 +17,7 @@ use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
 use officina_text::model::{builtin_table_styles, CellPad, TableLook, VAlign, Border, ParaBorders, DropCap, ListDef, ListLevel, LineNumbering, LineSpacing, ParaFormat, Settings, TabStop, TabAlign, Leader, MAX_TABS, LIST_INDENT, Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
-use officina_text::paginate::PAGE_BREAK;
+use officina_text::paginate::{COLUMN_BREAK, PAGE_BREAK};
 use officina_text::model::{RevId, Revision};
 use officina_text::track::{Change, ChangeKind, Edit, Resolve};
 use officina_text::paginate::Paginator;
@@ -991,8 +991,14 @@ impl Editor {
         self.insert_text(&PAGE_BREAK.to_string(), true)
     }
 
-    fn insert_text(&mut self, s: &str, page_break: bool) -> bool {
-        let s: String = s.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|&c| (!c.is_control() || c == '\n' || c == '\t' || (page_break && c == PAGE_BREAK)) && c != OBJECT_CHAR).collect();
+    /// A column break at the caret (Ctrl+Shift+Enter): the text after it
+    /// starts the next column, or the next page in a section of one column.
+    pub fn column_break(&mut self) -> bool {
+        self.insert_text(&COLUMN_BREAK.to_string(), true)
+    }
+
+    fn insert_text(&mut self, s: &str, breaks: bool) -> bool {
+        let s: String = s.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|&c| (!c.is_control() || c == '\n' || c == '\t' || (breaks && (c == PAGE_BREAK || c == COLUMN_BREAK))) && c != OBJECT_CHAR).collect();
         if s.is_empty() {
             return false;
         }
@@ -3417,14 +3423,63 @@ impl Editor {
         }
     }
 
+    /// The sheet's colour (None: white).
+    pub fn set_page_color(&mut self, color: Option<u32>) {
+        let mut s = self.doc.settings.clone();
+        s.page_color = color.map(|c| c & 0xff_ffff).filter(|&c| c != 0xFFFFFF);
+        self.apply_page_look("Page Color", s);
+    }
+
+    /// Rules round every page (None: no border).
+    pub fn set_page_borders(&mut self, borders: Option<officina_text::model::PageBorders>) {
+        let mut s = self.doc.settings.clone();
+        s.page_borders = borders.filter(|b| b.top.is_some() || b.bottom.is_some() || b.start.is_some() || b.end.is_some());
+        self.apply_page_look("Page Borders", s);
+    }
+
+    /// Words behind the text of every page (empty words: no watermark).
+    pub fn set_text_watermark(&mut self, text: &str, color: u32, diagonal: bool) {
+        use officina_text::model::{Watermark, MAX_WATERMARK_TEXT};
+        let t: String = text.chars().filter(|c| !c.is_control()).collect();
+        let t = t.trim();
+        let mut s = self.doc.settings.clone();
+        s.watermark = (!t.is_empty()).then(|| Watermark::Text { text: t[..t.floor_char_boundary(MAX_WATERMARK_TEXT)].into(), font: None, color: color & 0xff_ffff, diagonal });
+        self.apply_page_look("Watermark", s);
+    }
+
+    /// A picture behind the text of every page, `scale` percent of the
+    /// text's width, washed out or not.
+    pub fn set_picture_watermark(&mut self, img: ImageData, scale: u16, washout: bool) -> bool {
+        if img.width == 0 || img.height == 0 || img.bytes.is_empty() {
+            return false;
+        }
+        let image = self.doc.images.add(img);
+        let mut s = self.doc.settings.clone();
+        s.watermark = Some(officina_text::model::Watermark::Picture { image, scale: scale.clamp(10, 500), washout });
+        self.apply_page_look("Watermark", s);
+        true
+    }
+
+    pub fn remove_watermark(&mut self) {
+        let mut s = self.doc.settings.clone();
+        s.watermark = None;
+        self.apply_page_look("Remove Watermark", s);
+    }
+
+    fn apply_page_look(&mut self, label: &str, settings: Settings) {
+        if settings != self.doc.settings {
+            self.apply(label, vec![TextOp::SetSettings { settings }], Kind::Other);
+        }
+    }
+
     pub fn toggle_line_numbers(&mut self) {
-        let mut s = self.doc.settings;
+        let mut s = self.doc.settings.clone();
         s.line_numbers = if s.line_numbers.is_some() { None } else { Some(LineNumbering::default()) };
         self.set_settings(s);
     }
 
     pub fn toggle_hyphenation(&mut self) {
-        let mut s = self.doc.settings;
+        let mut s = self.doc.settings.clone();
         s.hyphenate = !s.hyphenate;
         self.set_settings(s);
     }
@@ -4256,6 +4311,7 @@ impl Editor {
             Key::Tab if !cmd && (self.caret.at == 0 || self.selection().0.block != self.selection().1.block) && self.list_of(self.caret.block).is_some() => edited(self.list_level(if m.shift { -1 } else { 1 })),
             Key::Tab if !cmd && m.shift => Outcome::Ignored,
             Key::Tab if !cmd => edited(self.insert("\t")),
+            Key::Enter if cmd && m.shift => edited(self.column_break()),
             Key::Enter if cmd => edited(self.page_break()),
             Key::Enter if m.shift => edited(self.insert("\u{2028}")),
             Key::F(3) if m.shift => edited(self.cycle_case()),
@@ -5690,7 +5746,9 @@ pub(crate) mod tests {
         e.anchor = e.caret;
         e.key(Key::Enter, CTRL, "", 0);
         assert_eq!(texts(&e), ["Source\u{000C} target"]);
-        assert!(!e.insert("\u{000C}"));
+        assert!(!e.insert("\u{000C}") && !e.insert("\u{000B}"));
+        e.key(Key::Enter, CTRL_SHIFT, "", 0);
+        assert_eq!(texts(&e), ["Source\u{000C}\u{000B} target"], "Ctrl+Shift+Enter: a column break");
         assert_eq!(e.pages.pages().len() >= 1, true);
     }
 

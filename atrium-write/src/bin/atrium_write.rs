@@ -51,6 +51,7 @@ enum Asking {
     Merge,
     SaveAs,
     Picture,
+    Watermark,
     ExportPdf,
 }
 
@@ -572,6 +573,7 @@ fn main() {
                 Cmd::CompareWith => want_picker = Some(Asking::Compare),
                 Cmd::MergeWith => want_picker = Some(Asking::Merge),
                 Cmd::InsertPicture => want_picker = Some(Asking::Picture),
+                Cmd::WatermarkPicture => want_picker = Some(Asking::Watermark),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::ExportPdf => want_picker = Some(Asking::ExportPdf),
                 Cmd::Print => want_print = true,
@@ -637,6 +639,7 @@ fn main() {
                         Asking::Compare => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with an earlier version", stem_of(&name)), name: String::new(), origin: String::new() },
                         Asking::Merge => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Merge a reviewed copy into “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
                         Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into(), name: String::new(), origin: String::new() },
+                        Asking::Watermark => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Choose a picture for behind the text".into(), name: String::new(), origin: String::new() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
                         Asking::ExportPdf => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to put “{}.pdf”", stem_of(&name)), name: String::new(), origin: String::new() },
                     };
@@ -688,6 +691,12 @@ fn main() {
                             match read_all(&mut File::from(fd)).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
                                 Ok(older) => run.write.compare_with(&older, &name),
                                 Err(e) => run.set_status(e),
+                            }
+                        }
+                        (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Watermark) => {
+                            let r = read_all(&mut File::from(fd)).map_err(|e| e.to_string()).and_then(|b| run.write.watermark_picture(b));
+                            if let Err(e) = r {
+                                run.set_status(format!("Couldn't use “{name}” as a watermark: {e}"));
                             }
                         }
                         (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Picture) => {

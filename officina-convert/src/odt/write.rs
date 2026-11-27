@@ -693,7 +693,9 @@ impl Out<'_> {
                     out.push_str("<text:tab/>");
                     start = false;
                 }
-                '\u{2028}' | '\n' => {
+                // ODF breaks columns only before a paragraph: a column break
+                // inside one is kept as a line break.
+                '\u{2028}' | '\n' | '\u{000B}' => {
                     flush(&mut spaces, out, start);
                     out.push_str("<text:line-break/>");
                     start = true;
@@ -1387,7 +1389,26 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 let _ = write!(hf_styles, "<style:{tag}/>");
             }
         }
-        format!(r#"<style:page-layout style:name="{name}"><style:page-layout-properties fo:page-width="{}" fo:page-height="{}" fo:margin-top="{}" fo:margin-bottom="{}" fo:margin-left="{}" fo:margin-right="{}" style:print-orientation="{}"/>{hf_styles}</style:page-layout>"#, pt(g.width as i64), pt(g.height as i64), pt(margins.0 as i64), pt(margins.1 as i64), pt(g.margin_start as i64), pt(g.margin_end as i64), if g.width > g.height { "landscape" } else { "portrait" })
+        // The page's look: its colour, and borders inside the margins with
+        // the text their padding further in (so the text stays put).
+        let mut look = String::new();
+        let mut side_margins = (g.margin_start, g.margin_end);
+        if let Some(c) = doc.settings.page_color {
+            let _ = write!(look, r##" fo:background-color="#{c:06x}""##);
+        }
+        if let Some(b) = &doc.settings.page_borders {
+            for (side, x, m) in [("top", &b.top, &mut margins.0), ("bottom", &b.bottom, &mut margins.1), ("left", &b.start, &mut side_margins.0), ("right", &b.end, &mut side_margins.1)] {
+                let Some(x) = x else { continue };
+                let th = x.thickness();
+                // From the page: the border `space` from the edge, so the
+                // text is the rest of the margin further in.
+                let want = if b.from_page { (*m - x.space as i32 * 20 - th).max(0) } else { x.space as i32 * 20 };
+                let pad = want.min((*m - th).max(0));
+                *m = (*m - pad - th).max(0);
+                let _ = write!(look, r#" fo:border-{side}="{}" fo:padding-{side}="{}""#, odf_border(x), pt(pad as i64));
+            }
+        }
+        format!(r#"<style:page-layout style:name="{name}"><style:page-layout-properties fo:page-width="{}" fo:page-height="{}" fo:margin-top="{}" fo:margin-bottom="{}" fo:margin-left="{}" fo:margin-right="{}" style:print-orientation="{}"{look}/>{hf_styles}</style:page-layout>"#, pt(g.width as i64), pt(g.height as i64), pt(margins.0 as i64), pt(margins.1 as i64), pt(side_margins.0 as i64), pt(side_margins.1 as i64), if g.width > g.height { "landscape" } else { "portrait" })
     };
     let mut layout = page_layout("pm1", &doc.page);
     let mut mp_styles = String::new();

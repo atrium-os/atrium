@@ -46,7 +46,7 @@ pub const TOOLS: [&str; 9] = ["Find and Replace", "Spelling", "Track Changes", "
 pub const LANGS_EA: [(&str, Option<&str>); 5] = [("Asian Text as Document", None), ("Chinese (Simplified)", Some("zh-Hans")), ("Chinese (Traditional)", Some("zh-Hant")), ("Japanese", Some("ja")), ("Korean", Some("ko"))];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 40] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…", "Table Tools…"];
+pub const INSERT: [&str; 41] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…", "Table Tools…", "Page Background…"];
 
 /// The shapes the shape bar draws: (label, preset; "textBox", "line" and
 /// "arrow" are the editor's own).
@@ -56,10 +56,10 @@ pub const SHAPES: [(&str, &str); 12] = [("Rectangle", "rect"), ("Rounded", "roun
 pub const SHAPE_COLORS: [(&str, u32); 9] = [("Blue", 0x4472C4), ("Dark Blue", 0x2F528F), ("Orange", 0xED7D31), ("Green", 0x70AD47), ("Red", 0xC00000), ("Yellow", 0xFFC000), ("Grey", 0xA5A5A5), ("Black", 0x000000), ("White", 0xFFFFFF)];
 
 /// The Format menu, in order (its commands are [`FORMAT_CMDS`]).
-pub const FORMAT: [&str; 25] = ["Font…", "Grow Font", "Shrink Font", "Strikethrough", "Double Strikethrough", "Superscript", "Subscript", "Small Caps", "All Caps", "Hidden", "Clear Formatting", "Sentence case.", "lowercase", "UPPERCASE", "Capitalize Each Word", "tOGGLE cASE", "Format Painter", "Page Break", "Paragraph…", "Borders and Shading…", "Tabs…", "Bullets and Numbering…", "Line Numbers", "Hyphenation", "Ruler"];
+pub const FORMAT: [&str; 26] = ["Font…", "Grow Font", "Shrink Font", "Strikethrough", "Double Strikethrough", "Superscript", "Subscript", "Small Caps", "All Caps", "Hidden", "Clear Formatting", "Sentence case.", "lowercase", "UPPERCASE", "Capitalize Each Word", "tOGGLE cASE", "Format Painter", "Page Break", "Column Break", "Paragraph…", "Borders and Shading…", "Tabs…", "Bullets and Numbering…", "Line Numbers", "Hyphenation", "Ruler"];
 
 /// What each Format menu item does.
-pub const FORMAT_CMDS: [Cmd; 25] = [Cmd::FontOpen, Cmd::Grow(true), Cmd::Grow(false), Cmd::Toggle(Toggle::Strike), Cmd::Toggle(Toggle::DoubleStrike), Cmd::Toggle(Toggle::Superscript), Cmd::Toggle(Toggle::Subscript), Cmd::Toggle(Toggle::SmallCaps), Cmd::Toggle(Toggle::AllCaps), Cmd::Toggle(Toggle::Hidden), Cmd::ClearFormatting, Cmd::Case(Case::Sentence), Cmd::Case(Case::Lower), Cmd::Case(Case::Upper), Cmd::Case(Case::Title), Cmd::Case(Case::Toggle), Cmd::FormatPainter, Cmd::PageBreak, Cmd::Para(ParaCmd::Open(ParaKind::Paragraph)), Cmd::Para(ParaCmd::Open(ParaKind::Borders)), Cmd::Para(ParaCmd::Open(ParaKind::Tabs)), Cmd::Para(ParaCmd::Open(ParaKind::Lists)), Cmd::Para(ParaCmd::LineNumbers), Cmd::Para(ParaCmd::Hyphenation), Cmd::Para(ParaCmd::Ruler)];
+pub const FORMAT_CMDS: [Cmd; 26] = [Cmd::FontOpen, Cmd::Grow(true), Cmd::Grow(false), Cmd::Toggle(Toggle::Strike), Cmd::Toggle(Toggle::DoubleStrike), Cmd::Toggle(Toggle::Superscript), Cmd::Toggle(Toggle::Subscript), Cmd::Toggle(Toggle::SmallCaps), Cmd::Toggle(Toggle::AllCaps), Cmd::Toggle(Toggle::Hidden), Cmd::ClearFormatting, Cmd::Case(Case::Sentence), Cmd::Case(Case::Lower), Cmd::Case(Case::Upper), Cmd::Case(Case::Title), Cmd::Case(Case::Toggle), Cmd::FormatPainter, Cmd::PageBreak, Cmd::ColumnBreak, Cmd::Para(ParaCmd::Open(ParaKind::Paragraph)), Cmd::Para(ParaCmd::Open(ParaKind::Borders)), Cmd::Para(ParaCmd::Open(ParaKind::Tabs)), Cmd::Para(ParaCmd::Open(ParaKind::Lists)), Cmd::Para(ParaCmd::LineNumbers), Cmd::Para(ParaCmd::Hyphenation), Cmd::Para(ParaCmd::Ruler)];
 
 /// The Font… bar's sizes, points (Word's list).
 pub const FONT_SIZES: [u16; 16] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
@@ -109,6 +109,8 @@ pub enum Cmd {
     FormatPainter,
     /// A page break at the caret (Ctrl+Enter).
     PageBreak,
+    /// A column break at the caret (Ctrl+Shift+Enter).
+    ColumnBreak,
     /// The Format menu's item at this place in [`FORMAT`].
     Format(usize),
     /// Format ▸ Font… (Ctrl+D): the Font bar over the selection.
@@ -189,6 +191,8 @@ pub enum Cmd {
     List(ListKind),
     PageNumbers,
     InsertPicture,
+    /// Page Background ▸ Picture…: a picture to put behind every page.
+    WatermarkPicture,
     Table,
     RowBelow,
     ColumnRight,
@@ -312,6 +316,9 @@ fn font_cmd(e: &mut Editor, open: &Mutable<bool>, c: Cmd) -> Option<bool> {
         Cmd::PageBreak => {
             e.page_break();
         }
+        Cmd::ColumnBreak => {
+            e.column_break();
+        }
         Cmd::FontFamily(i) => e.set_family(i.checked_sub(1).map(|k| std::sync::Arc::<str>::from(STYLE_FONTS[k.min(STYLE_FONTS.len() - 1)]))),
         Cmd::FontSize(i) => e.set_size(FONT_SIZES[i.min(FONT_SIZES.len() - 1)] * 2),
         Cmd::FontColor(i) => e.set_color(i.checked_sub(1).map(|k| SHAPE_COLORS[k.min(SHAPE_COLORS.len() - 1)].1)),
@@ -374,7 +381,7 @@ pub const PAGE_CMDS: [PageCmd; 6] = [PageCmd::Portrait, PageCmd::Landscape, Page
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::SectionBreak(SectionStart::OddPage), Cmd::SectionBreak(SectionStart::EvenPage), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen, Cmd::Para(ParaCmd::Open(ParaKind::Table))][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::SectionBreak(SectionStart::OddPage), Cmd::SectionBreak(SectionStart::EvenPage), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen, Cmd::Para(ParaCmd::Open(ParaKind::Table)), Cmd::Para(ParaCmd::Open(ParaKind::Page))][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -1697,6 +1704,22 @@ impl Write {
         out
     }
 
+    /// Puts a picture from its encoded bytes behind every page, washed out.
+    pub fn watermark_picture(&self, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > officina_convert::pictures::MAX_INPUT {
+            return Err("it is over 16 MB".into());
+        }
+        let (w, h) = officina_text::picture::decoder()
+            .ok_or("pictures can't be read here")?
+            .size(&bytes)
+            .ok_or("not a picture this app can show")?;
+        let d = self.doc.borrow();
+        d.ed.borrow_mut().set_picture_watermark(officina_text::model::ImageData { bytes: bytes.into(), width: w, height: h }, 100, true);
+        drop(d);
+        self.sync();
+        Ok(())
+    }
+
     /// Places a picture from its encoded bytes at the caret.
     pub fn insert_picture(&self, bytes: Vec<u8>) -> Result<(), String> {
         if bytes.len() > officina_convert::pictures::MAX_INPUT {
@@ -1790,7 +1813,7 @@ impl View for Write {
             let items: Vec<MenuItem> = FORMAT.iter().enumerate().map(|(i, l)| {
                 let m = MenuItem::new(*l);
                 match i {
-                    1 | 3 | 10 | 11 | 16 | 18 | 22 => m.separated(),
+                    1 | 3 | 10 | 11 | 16 | 19 | 23 => m.separated(),
                     _ => m,
                 }
                 .checked(match i {
@@ -1802,9 +1825,9 @@ impl View for Write {
                     8 => cf.caps == officina_text::model::Caps::All,
                     9 => cf.hidden,
                     16 => painting,
-                    22 => line_numbers,
-                    23 => hyphenate,
-                    24 => ruler,
+                    23 => line_numbers,
+                    24 => hyphenate,
+                    25 => ruler,
                     _ => false,
                 })
             }).collect();
@@ -3060,6 +3083,8 @@ mod tests {
         ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
         run(Cmd::Format(17));
         assert!(ed.borrow().doc.para(1).unwrap().text.starts_with('\u{000C}'));
+        run(Cmd::Format(18));
+        assert!(ed.borrow().doc.para(1).unwrap().text.starts_with("\u{000C}\u{000B}"), "a column break after it");
     }
 
     #[test]

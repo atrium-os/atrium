@@ -31,7 +31,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, RegionLook, MAX_TABLES, MAX_TABLE_STYLES, MAX_CELL_PAD, MAX_TWIPS_TABLE, MAX_CELLS, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, MAX_BORDER_WIDTH, MAX_BORDER_SPACE, ListDef, ListLevel, NumFormat, MAX_LEVEL_TEXT, MAX_LIST_START, MAX_LIST_DEFS, LineNumbering, LineRestart, Settings, Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, RegionLook, MAX_TABLES, MAX_TABLE_STYLES, MAX_CELL_PAD, MAX_TWIPS_TABLE, MAX_CELLS, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, MAX_BORDER_WIDTH, MAX_BORDER_SPACE, ListDef, ListLevel, NumFormat, MAX_LEVEL_TEXT, MAX_LIST_START, MAX_LIST_DEFS, LineNumbering, LineRestart, Settings, PageBorders, Watermark, MAX_WATERMARK_TEXT, Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -933,7 +933,43 @@ pub fn encode_settings(w: &mut Writer, s: &Settings) {
             });
         }
     }
+    // The page's look; a file from before it ends here.
+    w.u8(s.page_color.is_some() as u8 | (s.page_borders.is_some() as u8) << 1 | (s.watermark.is_some() as u8) << 2);
+    if let Some(c) = s.page_color {
+        w.var(c as u64 & 0xff_ffff);
+    }
+    if let Some(b) = &s.page_borders {
+        w.u8(b.from_page as u8);
+        for x in [b.top, b.bottom, b.start, b.end] {
+            match x {
+                None => w.u8(0),
+                Some(x) => {
+                    w.u8(1);
+                    encode_border(w, &x);
+                }
+            }
+        }
+    }
+    match &s.watermark {
+        None => {}
+        Some(Watermark::Text { text, font, color, diagonal }) => {
+            w.u8(0);
+            w.str(&text[..text.floor_char_boundary(MAX_WATERMARK_TEXT)]);
+            w.str(font.as_deref().map_or("", |f| &f[..f.floor_char_boundary(MAX_WATERMARK_TEXT)]));
+            w.var(*color as u64 & 0xff_ffff);
+            w.u8(*diagonal as u8);
+        }
+        Some(Watermark::Picture { image, scale, washout }) => {
+            w.u8(1);
+            w.var(*image as u64);
+            w.var((*scale).min(MAX_WATERMARK_SCALE) as u64);
+            w.u8(*washout as u8);
+        }
+    }
 }
+
+/// Largest picture watermark, percent of the content box's width.
+const MAX_WATERMARK_SCALE: u16 = 500;
 
 pub fn decode_settings(r: &mut Reader) -> Result<Settings, WireError> {
     let hyphenate = match r.u8()? {
@@ -960,7 +996,54 @@ pub fn decode_settings(r: &mut Reader) -> Result<Settings, WireError> {
         }
         _ => return Err(WireError::Invalid("line numbers")),
     };
-    Ok(Settings { line_numbers, hyphenate })
+    let mut s = Settings { line_numbers, hyphenate, ..Settings::default() };
+    if r.is_empty() {
+        return Ok(s);
+    }
+    let m = r.u8()?;
+    if m > 7 {
+        return Err(WireError::Invalid("page look"));
+    }
+    let flag = |r: &mut Reader| -> Result<bool, WireError> {
+        match r.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WireError::Invalid("page look flag")),
+        }
+    };
+    if m & 1 != 0 {
+        s.page_color = Some(r.len("page colour", 0xff_ffff)? as u32);
+    }
+    if m & 2 != 0 {
+        let from_page = flag(r)?;
+        let mut side = || -> Result<Option<Border>, WireError> {
+            match r.u8()? {
+                0 => Ok(None),
+                1 => Ok(Some(decode_border(r)?)),
+                _ => Err(WireError::Invalid("page border")),
+            }
+        };
+        let (top, bottom, start, end) = (side()?, side()?, side()?, side()?);
+        s.page_borders = Some(PageBorders { top, bottom, start, end, from_page });
+    }
+    if m & 4 != 0 {
+        s.watermark = Some(match r.u8()? {
+            0 => {
+                let text: Arc<str> = r.str("watermark", MAX_WATERMARK_TEXT as u64)?.into();
+                let font = r.str("watermark font", MAX_WATERMARK_TEXT as u64)?;
+                let font = (!font.is_empty()).then(|| Arc::<str>::from(font));
+                let color = r.len("watermark colour", 0xff_ffff)? as u32;
+                Watermark::Text { text, font, color, diagonal: flag(r)? }
+            }
+            1 => {
+                let image = r.len("watermark picture", u32::MAX as u64)? as u32;
+                let scale = r.len("watermark scale", MAX_WATERMARK_SCALE as u64)? as u16;
+                Watermark::Picture { image, scale, washout: flag(r)? }
+            }
+            _ => return Err(WireError::Invalid("watermark")),
+        });
+    }
+    Ok(s)
 }
 
 /// Twips a length may be (±22 inches).
@@ -2695,14 +2778,22 @@ mod tests {
         let mut def = ListDef::builtin(crate::model::ListKind::Numbered);
         def.levels[2] = ListLevel { format: NumFormat::UpperLetter, text: "(%3)".into(), start: 4, indent: 2000, hang: 300 };
         d.styles.lists.insert(9, def.clone());
-        d.settings = Settings { hyphenate: true, line_numbers: Some(LineNumbering { start: 2, count_by: 5, distance: 300, restart: LineRestart::Continuous }) };
+        d.settings = Settings { hyphenate: true, line_numbers: Some(LineNumbering { start: 2, count_by: 5, distance: 300, restart: LineRestart::Continuous }), ..Default::default() };
+        // Settings from before the page's look still read.
+        let mut w = Writer::new();
+        encode_settings(&mut w, &d.settings);
+        let old = w.into_bytes();
+        assert_eq!(decode_settings(&mut Reader::new(&old[..old.len() - 1])).unwrap(), d.settings);
+        d.settings.page_color = Some(0xFFF2CC);
+        d.settings.page_borders = Some(crate::model::PageBorders { top: Some(b), bottom: Some(b), start: None, end: Some(b), from_page: true });
+        d.settings.watermark = Some(crate::model::Watermark::Text { text: "DRAFT".into(), font: Some("Calibri".into()), color: 0xC0C0C0, diagonal: true });
         let r = load(&save_to_vec(&d, &[])).unwrap().doc;
         assert_eq!(r.para(0).unwrap().props, d.para(0).unwrap().props);
         assert_eq!(r.para(a).unwrap().props, d.para(a).unwrap().props);
         assert_eq!(r.styles.lists.get(&9), Some(&def));
         assert_eq!(r.settings, d.settings);
         // The ops round-trip too, and a bad border is refused.
-        for op in [TextOp::SetList { id: 9, def: Some(def.clone()) }, TextOp::SetList { id: 2, def: None }, TextOp::SetSettings { settings: d.settings }] {
+        for op in [TextOp::SetList { id: 9, def: Some(def.clone()) }, TextOp::SetList { id: 2, def: None }, TextOp::SetSettings { settings: d.settings.clone() }, TextOp::SetSettings { settings: Settings { watermark: Some(crate::model::Watermark::Picture { image: 0, scale: 120, washout: true }), ..Settings::default() } }] {
             assert_eq!(decode_op(&encode_op(&op), 1, 1).unwrap(), op);
         }
         let mut w = Writer::new();

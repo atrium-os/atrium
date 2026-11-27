@@ -83,3 +83,59 @@ fn frames_become_text_boxes() {
     let r = docx::read(&docx::write(&d, Vec::new()).unwrap()).unwrap().0;
     assert_eq!(objects(&r), o);
 }
+
+/// Column and page breaks inside paragraphs read as such and are written
+/// back; ODF has no column break inside a paragraph, so .odt keeps a line
+/// break there.
+#[test]
+fn column_breaks() {
+    let body = r#"<w:p><w:r><w:t>one</w:t><w:br w:type="column"/><w:t>two</w:t><w:br w:type="page"/><w:t>three</w:t></w:r></w:p>"#;
+    let (d, _) = docx::read(&docx_of(body)).unwrap();
+    assert_eq!(d.para(0).unwrap().text, "one\u{000B}two\u{000C}three");
+    let r = docx::read(&docx::write(&d, Vec::new()).unwrap()).unwrap().0;
+    assert_eq!(r.para(0).unwrap().text, "one\u{000B}two\u{000C}three");
+    let r = odt::read(&odt::write(&d, Vec::new()).unwrap()).unwrap().0;
+    let t: Vec<String> = (0..r.blocks.len()).filter_map(|k| r.para(k)).map(|p| p.text.clone()).collect();
+    assert_eq!(t, ["one\u{2028}two", "three"]);
+}
+
+/// The page's colour, its borders and a watermark (words or a picture)
+/// read from Word's places for them and are written back there; a
+/// watermark-only header adds no line.
+#[test]
+fn page_colour_borders_and_watermarks() {
+    use officina_text::model::Watermark;
+    let mut d = TextDoc::new();
+    d.settings.page_color = Some(0xFFF2CC);
+    let b = officina_text::model::Border { width: 12, space: 24, color: Some(0x2F5496), ..Default::default() };
+    d.settings.page_borders = Some(officina_text::model::PageBorders { top: Some(b), bottom: Some(b), start: Some(b), end: None, from_page: true });
+    d.settings.watermark = Some(Watermark::Text { text: "CONFIDENTIAL".into(), font: Some("Calibri".into()), color: 0xC0C0C0, diagonal: true });
+    let r = docx::read(&docx::write(&d, Vec::new()).unwrap()).unwrap().0;
+    assert_eq!(r.settings.page_color, d.settings.page_color);
+    assert_eq!(r.settings.page_borders, d.settings.page_borders);
+    assert_eq!(r.settings.watermark, d.settings.watermark);
+    assert!(r.header.as_ref().is_none_or(|h| h.paras.iter().all(|p| p.text.is_empty()) && h.text.is_empty()), "{:?}", r.header);
+    // A header with text keeps it, under a picture watermark washed out.
+    let img = d.images.add(officina_text::model::ImageData { bytes: std::sync::Arc::from(png()), width: 2, height: 3 });
+    d.settings.watermark = Some(Watermark::Picture { image: img, scale: 50, washout: true });
+    d.header = Some(officina_text::model::HeaderFooter::line("Head", officina_text::model::Align::Center));
+    let r = docx::read(&docx::write(&d, Vec::new()).unwrap()).unwrap().0;
+    let Some(Watermark::Picture { image, scale, washout }) = r.settings.watermark else { panic!("{:?}", r.settings.watermark) };
+    assert_eq!((scale, washout, r.images.get(image).map(|i| i.bytes.len())), (50, true, Some(png().len())));
+    let h = r.header.unwrap();
+    let texts: Vec<&str> = h.paras.iter().map(|p| p.text.as_str()).collect();
+    assert!(h.text == "Head" && (texts.is_empty() || texts == ["Head"]), "{texts:?} {:?}", h.text);
+    // Through .odt: the colour, and the borders from the text (ODF has no
+    // other kind) where the text was; no watermark (ODF has none of its own).
+    let r = odt::read(&odt::write(&d, Vec::new()).unwrap()).unwrap().0;
+    assert_eq!(r.settings.page_color, d.settings.page_color, "odt");
+    let pb = r.settings.page_borders.expect("odt borders");
+    let th = b.thickness();
+    // (A border is at most 31 pt from the text; the text still stays put.)
+    assert_eq!((pb.start.map(|x| x.space as i32), pb.end, pb.from_page), (Some(((d.page.margin_start - 24 * 20 - th) / 20).min(31)), None, false));
+    assert_eq!((r.page.margin_top, r.page.margin_start), (d.page.margin_top, d.page.margin_start), "the text stays put");
+    // From the text, the borders come back as they were.
+    d.settings.page_borders = Some(officina_text::model::PageBorders { from_page: false, ..d.settings.page_borders.unwrap() });
+    let r = odt::read(&odt::write(&d, Vec::new()).unwrap()).unwrap().0;
+    assert_eq!((r.settings.page_borders, r.page), (d.settings.page_borders, d.page));
+}
