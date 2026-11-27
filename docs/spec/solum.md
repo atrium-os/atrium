@@ -480,7 +480,10 @@ more places where the model meets the hypervisor. Each one, and what to do:
      passes only a per-machine allow-list from the manifest's quirk list (WMI, backlight
      and some EC methods will need entries). Where the CPU and firmware offer **SMM
      isolation** (Intel PPAM / STM, AMD SMM Supervisor), Solum requires it on, and the
-     allow-list can be wider. Either way SMM firmware is in the TCB (§11).
+     allow-list can be wider. The allow-list is best effort: on Intel, writes to PCH
+     registers main owns (BIOS_CNTL, TCO, GPIO and GPE routing) can also raise SMIs, so
+     SMM isolation is what actually bounds this. Either way SMM firmware is in the TCB
+     (§11).
    - Power transitions of a domain's device are the owning domain's to request, over a
      small **platform link** to main's ACPI service. They are split: **Solum** performs the
      device's own part (the PMCSR D-state write in the PCI PM capability, which it already
@@ -515,12 +518,14 @@ reach it only through Atrium:
 - **Curia** gets a "Hypervisor" page and the CLI gets **`solumctl`** (Shankar's rule: a
   CLI for everything the GUI does). Both talk to `solumd`.
 - **Reading:** anyone in the session can see Solum's version and measurement, each
-  domain's state, restarts, exit counters by reason, seal timeouts, and the last crash
-  record. These come from a fixed-size ring of fixed-size event records that Solum
+  domain's state and its restarts. Exit counters, seal timeouts, vault call counts and
+  crash records reveal the activity of the vault and other domains, so they are
+  admin-only, and the session view shows them only as coarse totals. These come from a fixed-size ring of fixed-size event records that Solum
   writes read-only to `solumd`; there is no free text.
 - **Acting:** restarting a domain or moving a device, only where the manifest allows it,
   needs the administrator role (Curia's admin authentication, as for other system
-  settings).
+  settings). That role is policy inside main, not a boundary against a compromised main
+  kernel; the boundary is that the manifest allows only these moves.
 - **Never from Atrium:** changing the manifest, reading another domain's memory, changing
   IOMMU or stage-2 tables. A new manifest arrives as a signed Opifex base update and takes
   effect at the next (measured) boot.
@@ -532,8 +537,16 @@ On real hardware:
 
 - A **debug build** of Solum (a different image, so a different measurement: the vault's
   seal does not open and the recovery path applies, §7.2) carries a **GDB remote stub**
-  (the `gdbstub` crate, MIT/Apache-2.0) on a serial port Solum owns (a UART, or the BMC's
-  serial-over-LAN on the R9700 box).
+  (the `gdbstub` crate, MIT/Apache-2.0) on a **physical UART** Solum owns. A BMC's
+  serial-over-LAN (as on the R9700 box) is allowed only when the BMC sits on an isolated
+  management network, since the stub can read all memory, vault included. While a debug
+  build runs, Curia and Forum show a permanent "debug hypervisor" banner.
+- **Debug images can't be swapped in.** Debug Solum is signed only with a development key
+  that release machines' secure boot does not accept. Release Solum ignores
+  `solum.freeze=0`, and `solum.disable=1` boots the kernel without Solum (so without the
+  vault, §7.2), never a debuggable Solum. When the recovery key is asked for, the prompt
+  says why (no Solum, a changed PCR 2 or 3, a debug image, a changed manifest), so a
+  person is not tricked into typing it into a debuggable boot.
 - **Break-in:** a break sequence on that serial port, or the BMC's NMI button, makes
   Solum stop every CPU (NMI or SGI) and enter the stub. From there it can debug Solum
   itself and also any domain from below: the main kernel's vCPUs, registers and memory,
@@ -559,6 +572,8 @@ On real hardware:
 | sleep, reset and power-off registers, FACS writes | sleep, reset, shutdown | no |
 | SMI-raising ports | AML methods that use SMM | no |
 | a few MSRs (virtualisation control, IOMMU, debug) and, on Intel, `CPUID`, `XSETBV` and `GETSEC` (VMX always exits on these) | boot and rare calls | no |
+| trace and profiling hardware: Intel PT (`IA32_RTIT_*` MSRs, allowed only with the VMX "PT uses guest-physical addresses" control, Ice Lake and later, otherwise off); arm64 SPE and TRBE kept under EL2 with `MDCR_EL2` (E2PB, E2TB) | when a tool turns tracing on | no |
+| CPU bring-up on amd64 (INIT/SIPI through the ICR; IPIv does not cover these, so they always exit) | CPU hotplug and boot | no |
 | the preemption timer (amd64) or EL2 timer (arm64) | only while a driver domain has work or a watchdog is due | no |
 
 Not trapped for main: `HLT`, `MWAIT` and `WFI` (idle runs natively), page faults,
@@ -573,7 +588,7 @@ wake-ups of its own.
 |---|---|---|
 | CPU idle (C-states) | main (Laminar) | nothing: `HLT`/`MWAIT`/`WFI` run natively. A driver domain or the vault going idle returns the CPU to main |
 | CPU frequency (P-states: HWP, CPPC, SCMI) | main | passes the controls through; a domain can't change another's frequency except through main, which is only a denial-of-service risk |
-| CPU on and off (hotplug, PSCI `CPU_ON` and `CPU_OFF`) | main | intercepts, so every CPU comes up in Solum first and then enters main; a CPU running another domain is not taken offline under it |
+| CPU on and off (hotplug; PSCI `CPU_ON` and `CPU_OFF` on arm64, INIT/SIPI on amd64) | main | intercepts, so every CPU comes up in Solum first and then enters main; a CPU running another domain is not taken offline under it |
 | device D-states | the owning domain | Solum does the PMCSR write; main runs the platform AML (§5.6 item 4) |
 | s2idle (modern standby) | main | waits until every domain is idle, then lets main idle the package |
 | S3 (suspend to RAM) | main asks | Solum traps the sleep write, quiesces the domains and the vault, owns the waking vector, and re-checks its tables on wake (§5.6 item 4) |
@@ -707,7 +722,7 @@ signed table).
 Not compatible with the freeze, and off on Solum machines: DTrace `fbt` and `kinst`
 probes (they patch kernel text), kernel live patching, and anything else that writes
 code. DTrace `sdt` probes and other providers that do not patch text keep working. Debug
-boots (`solum.freeze=0`) allow `fbt` for development. Kernel data and page tables stay
+boots (`solum.freeze=0`, honoured only by debug Solum images) allow `fbt` for development. Kernel data and page tables stay
 unprotected; HLAT-style protection (§4.8) is later work.
 
 ### 7.4 Solum's own surface
@@ -768,7 +783,7 @@ runs per arm, exits counted by a positive-controlled counter:
 | **S0** | null Solum on amd64: boots from the loader, launches the unchanged kernel on large-block EPT, everything passed through | boots to frescod on the R9700; §9 CPU, NVMe, GPU gates. **Stop rule:** if missed and not fixable, stop lane S |
 | **S1** | memory ownership, hypercalls, domain manifest, the link (arena, kick, epoch, seal, donate) with a test domain that echoes | a main-domain read of another domain's page faults (positive control first); copy vs seal vs donate and kick latency measured, thresholds fixed |
 | **S2** | IOMMU ownership and §5.3 safeguards; main's static superpage IOMMU domain (§5.3 item 8), small domains for the rest; option-ROM and firmware-slot policy | a DMA to another domain's page faults; group, reset and config-filter checks; GPU gates still met |
-| **S2a** | ACPI and sleep under Solum (§5.6 item 4): platform link, AML fault logging and quirks, Solum-owned resume | 100 sleep and wake cycles on the R9700 box, each followed by an isolation recheck |
+| **S2a** | ACPI and sleep under Solum (§5.6 item 4): platform link, AML fault logging and quirks, Solum-owned resume, wake sources in driver domains (`_PRW` and GPE in main, PME in the owning domain) | 100 sleep and wake cycles on the R9700 box, each followed by an isolation recheck; a wake from a USB keyboard on the usb domain's xHCI |
 | **S3** | first driver domain: usb (xHCI) serving Tactus, file and USB-transfer links; restart path (§6.1) | kill the domain mid-copy: the stick remounts, nothing else stops |
 | **S4** | vault with the TPM (§7.2); arcad's vault ring | arca-vm-test.sh passes; vault memory unreadable from root in the main domain; sealing fails without Solum |
 | **S5** | net domain (Aura Wi-Fi), audio domain | crash and restart gates per class |
@@ -843,7 +858,10 @@ MSI-only interrupts, filtered config calls, and an IOMMU required without Solum 
 item 4); D-states split between Solum and main; reset and power-off through Solum with
 MOR set by the vault; CF8/CFC and read-only ECAM for owned functions (§5.6 item 3); DSDT
 not trimmed (§5.5 item 1); reserved manifest fields rejected and two-consumer seals for
-lockstep (safety study).
+lockstep (safety study). A fourth pass on §5.7 is folded in as well: Intel PT, SPE and
+TRBE trapped, debug images signed only with a development key, a physical UART or an
+isolated BMC for the stub, admin-only counters, INIT/SIPI exits, and driver-domain wake
+in the S2a gate.
 
 ## 13. Decisions (all accepted by Shankar 2026-11-27, as recommended)
 
