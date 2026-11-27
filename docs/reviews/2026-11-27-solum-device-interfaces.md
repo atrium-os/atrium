@@ -151,6 +151,9 @@ and each protocol states what is replayed.
     event-index suppression;
   - a data area that records point into by **offset and length**, checked against the
     arena's bounds on every use; neither side ever sends a physical address.
+  - every record is **copied out of the ring once** into private memory before any field
+    is checked or used, so offset and length cannot change between the bounds check and
+    the access (no double fetch).
 - **Notification** is a Solum doorbell hypercall that injects a virtual interrupt into the
   peer's vCPU. With suppression, a busy link costs about one kick per batch. Under load a
   side may poll for a bounded time before re-enabling kicks.
@@ -173,6 +176,20 @@ move data, and each protocol picks per message:
    KiB upwards (an audio period batch, a file read). It is the content-addressed idea from
    Aqueduct (immutable payloads) enforced by the hypervisor rather than checked by
    hashing.
+   For the seal to mean anything:
+   - Every record also carries the link's epoch (§5.1); an arena's pages are not reused
+     under a new epoch until the device that could DMA into them has been reset.
+   - Solum removes the producer's write access **everywhere it has it**: stage-2, and every
+     IOMMU mapping of a device the producer owns, followed by an IOTLB invalidation and
+     its completion wait, before the seal is reported done. Otherwise the producer's
+     device could still DMA into a "sealed" page.
+   - The consumer trusts only seal state that Solum owns (a per-page state in Solum's
+     table, which the consumer reads by hypercall or from a read-only status page Solum
+     writes), never a flag in the producer's ring record.
+   - Release is bounded: a seal carries a deadline set per link in the manifest. If the
+     consumer hasn't released by then, Solum force-unseals the pages back to the producer
+     and revokes the consumer's read mapping first. A consumer that never releases can't
+     starve the producer's arena.
 3. **Donate.** Whole pages move from one domain to the other (Solum changes the owner and
    invalidates the TLB). Use it for large one-way transfers such as firmware images or big
    file reads.
@@ -213,24 +230,32 @@ run there. For a driver we write in Rust (the planned direction, D2), the kernel
 nothing but size. Solum can instead offer a **driver process**: a jailed, unprivileged
 user-space process in the main domain that
 
-- gets the device's BARs mapped into its address space,
+- gets the device's BARs mapped into its address space, except pages that mirror config
+  space or hold the MSI-X table or PBA, which stay with Solum,
 - gets an IOMMU domain of its own, which Solum programs. Its DMA can reach only pages that
-  process has pinned, and the main kernel cannot widen that,
+  process has pinned. That protects the rest of main's memory from the **device and its
+  driver process**; it does nothing against the main kernel, which chose those pages and
+  can change what is behind them,
 - gets the device's interrupts as events on a descriptor, and
 - serves its class protocol over a link, or over a socket.
 
 A crash is a process restart: milliseconds instead of a guest kernel's boot, and no
-memory reserved for a guest. The isolation is weaker than a domain's in one respect: a
-compromised driver process sits on the main kernel's syscall surface, though jailed and
-filtered (jail-sysfil.md). It is stronger in another: no C kernel of any size sits under
-the driver. This is the microkernel answer (the seL4 and Fuchsia lesson) without a
+memory reserved for a guest. **The isolation is clearly weaker than a domain's:** a
+compromised driver process sits on the main kernel's full syscall surface (jailed and
+filtered by jail-sysfil.md, but that is the same surface any app has), so a kernel bug
+reached from it owns the main domain; and the main kernel controls the process's memory.
+What it does give: a device or driver crash costs a process restart, the device's DMA is
+confined, and no C kernel sits under the driver. Use it for crash protection and DMA
+confinement of trusted-enough Rust drivers, not as a security boundary against hostile
+input that a domain should parse. This is the microkernel answer (the seL4 and Fuchsia lesson) without a
 microkernel, and on Atrium it extends what dispensatord already does for USB, HID and
 serial to PCI devices. FreeBSD has no IOMMU-backed DMA for user processes outside bhyve's
 `ppt` (device-assignment.md §3.2); with Solum owning the IOMMU, Solum supplies it.
 
 Plan: driver domains with a FreeBSD kernel for the C drivers we keep (xHCI, HDA, at
 first), and driver processes for Rust drivers as they are written. Both speak the same
-link protocols, so the main domain never knows which one it is talking to.
+link protocols, so the main domain's services need no code for either case. This is an
+engineering convenience, not a security claim: the two give different protection (above).
 
 ### 6.2 Let the hardware be the interface
 

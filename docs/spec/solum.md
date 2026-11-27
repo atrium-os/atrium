@@ -162,11 +162,26 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
   main domain's vCPU there, then returns. This is the only scheduling Solum does: a
   per-CPU priority run queue with a budget per domain so a looping driver domain cannot
   starve the main one (it is stopped and restarted, §6.1).
-- amd64: no external-interrupt exiting for the main domain; posted interrupts where the CPU
-  has them; MSR and I/O bitmaps pass everything except virtualisation control, IOMMU and a
-  few MSRs; VMX hidden in CPUID. arm64: nVHE, the main domain at EL1 with direct access to
-  its GIC redistributors; stage-2 faults, HVC, and SMC (checked against a PSCI allowlist
-  and forwarded) are the only traps.
+- amd64: no external-interrupt exiting for the main domain, so Solum takes the CPU back
+  for driver domains and watchdogs with the **VMX preemption timer** (armed only while a
+  driver domain has pending work or a watchdog is due) and with **NMIs** it sends itself
+  (NMI exiting on). Posted interrupts where the CPU has them. MSR and I/O bitmaps pass
+  everything except virtualisation control, IOMMU and a few MSRs; VMX hidden in CPUID.
+  **The interrupt-command register is not passed through**: with a direct x2APIC, main could
+  IPI, INIT or NMI a CPU while it runs the vault or a driver domain. Main's ICR writes go
+  through APICv's virtual APIC with **IPI virtualisation (IPIv)** where the CPU has it
+  (Sapphire Rapids and later), and exit to Solum otherwise; on CPUs without IPIv that is
+  one exit per IPI, which §9's `cargo build` gate has to absorb (it is measured, not
+  assumed).
+- arm64: nVHE, the main domain at EL1 with direct access to its own GIC redistributors and
+  CPU interface. The **distributor (GICD) and the ITS are trapped and emulated** by Solum for
+  the routing and enable state of interrupts that belong to other domains, so main cannot
+  reroute or mask a driver domain's SPIs or LPIs; main's own interrupts go straight through
+  the emulation's fast path. Stage-2 faults on those pages, HVC, and SMC (checked against a
+  PSCI allowlist and forwarded) are the traps.
+- So "no device emulation" holds, but Solum does emulate parts of the **interrupt
+  controller** (GICD and ITS on arm64, the ICR without IPIv on amd64). Those emulations
+  are small, fixed register sets and are part of Solum's fuzzed surface (§7.4).
 
 ### 4.4 Interrupts
 
@@ -187,7 +202,8 @@ ack, and DMA-map requests limited to their own pages.
 ### 4.6 The domain manifest
 
 Which domains exist, their memory, which PCI functions each owns, which links join
-them, and who may restart whom: one TOML file, signed with the Opifex base key role,
+them, and who may restart whom: one TOML file, signed with the Opifex base key role (which depends on the deferred key
+ceremony: until then, development builds sign with a development key and say so),
 measured by the loader with Solum (tpm-boot.md §5). It is rendered from validated tokens
 like other Atrium policy files. The main domain cannot change it at run time; it can only
 ask for the moves the manifest allows (for example "this USB device may go to the Linux
@@ -238,7 +254,7 @@ emulation paths (no emulated devices).
 | USB host controllers | usb driver domain | Tactus events for HID, Lyra rings for USB audio, file operations for sticks (FAT/exFAT parsed in the domain), HCI for Bluetooth, per-device USB transfers for jailed user-space drivers (CCID) | descriptor and file-system parsing from any plugged device; hot-plug faults |
 | Bluetooth radio | with USB (it is USB) | as above | firmware loader and HCI parsing |
 | HD audio / codecs | audio driver domain (or driver process) | Lyra stream rings and clock | crash-prone codec drivers; audio rates are tiny |
-| cameras (USB UVC, MIPI on arm64 boards) | usb domain or a driver process | a **frame stream**: Lyra-style rings of sealed frame buffers (format, size, stride, timestamp on the shared clock), with control records for mode, exposure and focus | UVC descriptor and payload-header parsing, MJPEG left undecoded for the consumer's jailed decoder; a camera is a privacy device, so the stream opens only through a grant (an app capability plus the indicator in Forum), never by default |
+| cameras (USB UVC, MIPI on arm64 boards) | usb domain or a driver process | a **frame stream**: Lyra-style rings of sealed frame buffers (format, size, stride, timestamp on the shared clock), with control records for mode, exposure and focus | UVC descriptor and payload-header parsing, MJPEG left undecoded for the consumer's jailed decoder; a camera is a privacy device, so the stream opens only through a grant (an app capability plus an indicator drawn by frescod's trusted chrome lane, not by Forum, so no app or shell bug can hide it), never by default |
 | SD / card readers, serial, sensors | driver domains or processes | file operations, byte streams | low rate, rare drivers |
 | TPM | vault | none (main domain asks the vault) | keys (§7.2) |
 | platform (timers, interrupt controller, power) | Solum / main direct | real hardware | performance and simplicity |
@@ -250,7 +266,10 @@ is for the C drivers we keep. A driver rewritten in Rust instead becomes a **dri
 process**: a jailed user-space process in the main domain with the device's BARs mapped,
 an IOMMU domain of its own that Solum programs, and interrupts as events. It restarts at
 process cost and needs no guest kernel (study §6.1). Both kinds serve the same protocols,
-so the main domain cannot tell them apart.
+so main's services need no code for either. Their protection differs: a driver process
+confines its device's DMA and crashes cheaply, but sits on the main kernel's syscall
+surface and in memory the main kernel controls, so it is not a boundary for hostile
+input that a domain should parse (study §6.1).
 
 ### 5.2 Links, not virtio
 
@@ -298,6 +317,27 @@ move:
    never moved.
 6. Firmware the device loads comes from the signed boot set or the owning domain's own
    verified files (tpm-boot.md, gpu-security-model §6), never from another domain.
+7. **No persistence through device firmware.** A domain that owns a device could rewrite
+   its flash (NVMe Firmware Download/Commit, a NIC's EEPROM, a GPU's VBIOS or option ROM),
+   and an option ROM runs in UEFI before Solum on the next boot. So: Solum filters NVMe
+   admin commands on passthrough controllers only where it can (it cannot see a
+   passed-through controller's queues), so the real controls are firmware ones. The loader
+   requires signed option ROMs or turns option ROMs off (Atrium needs none: the console
+   is efifb or the native driver); NVMe firmware slots are locked with the controller's
+   own write-protect where it has one; and the vault's seal includes PCR 2 and 3 (option
+   ROM code and configuration), so a changed option ROM opens nothing. **Left over:** a
+   device whose flash can be rewritten from its own driver and that runs that firmware
+   without UEFI measuring it (NVMe or NIC firmware) can keep a foothold *in the device*,
+   with DMA confined by the IOMMU. That is in the threat model, not solved.
+8. **IOMMU mappings for the main domain are static.** Main's passthrough devices get one
+   IOMMU domain that maps all of main's memory, built at boot with superpages (1 GiB or
+   2 MiB), mirroring main's stage-2. Main's `busdma` then does no hypercall per map, which is
+   what makes the §9 NVMe and NIC gates possible. Solum changes that table only when pages
+   leave main (donation to a domain, a link arena) and then invalidates the IOTLB before
+   handing the pages over. Where the hardware has nested translation (VT-d scalable mode
+   second stage, SMMUv3 stage 1 + stage 2), main may keep its own first-stage tables for
+   in-guest isolation between its devices without exits. Driver domains and driver
+   processes get their own small IOMMU domains.
 
 ### 5.4 The graphics domain (later)
 
@@ -316,8 +356,11 @@ domain.
 
 Solum notices a crash (the domain's kernel panics and calls Solum, a watchdog on its
 budget, or a vCPU stuck in a fault loop), captures its memory to a buffer, resets its
-devices (§5.3 step 5), and restarts it from its boot image. Virtio devices reset and
-renegotiate; the main domain's front ends see a device reset and retry. Effects: Wi-Fi
+devices (§5.3 step 5), and restarts it from its boot image. Every link to it moves to a
+new epoch; each record carries the epoch it was written under, and a record from an old
+epoch is refused. A link's arena is not reused for the new epoch until the device that
+could DMA into it has been reset, so stale DMA from the dead domain cannot land in new
+buffers. The main domain's protocol clients see "epoch changed" and replay. Effects: Wi-Fi
 drops and rejoins, a USB stick remounts, audio glitches; nothing else stops. Three crashes
 in a minute and the domain stays down, and Curia says which device is gone (as for a
 missing daemon today).
@@ -330,13 +373,27 @@ screen goes dark for the restart time.
 ### 6.3 Main domain
 
 On a main-kernel panic or a hard hang (watchdog), Solum freezes the main domain's vCPUs,
-writes its memory (sealed to the vault's dump key, since it holds the persona's data) to a
-dump area on the NVMe disk, resets the passthrough devices, and restarts the main kernel
-from the boot set without going through firmware. Storage and display domains (when they
-exist) stay up, so the dump can be written even when the main kernel's own disk path is
-what failed. This replaces today's "capture with QEMU's `dump-guest-memory` before
-resetting" (AGENTS.md) on real hardware. The vault keeps running, so the persona's unlock
-still needs the passcode after the restart, as at boot.
+resets the passthrough devices, and restarts the main kernel from the boot set without
+going through firmware. The vault keeps running, so each persona's unlock still needs the
+passcode after the restart, as at boot.
+
+**Dumps are off by default.** A main-domain dump holds the keys and data of every unlocked
+persona, so writing one anywhere would break the at-rest rule (AGENTS.md). Two modes:
+
+- **Default:** no memory dump. Solum keeps a small fixed-size crash record (panic string,
+  registers, backtrace frames, Solum's exit log), with no main-domain data pages, in its
+  own memory, and hands it to the restarted kernel.
+- **Debug policy** (set in the signed manifest, for development machines): the dump is
+  encrypted to a **debug key** whose public half is in the manifest and whose private half
+  is never on the machine, then written to a reserved dump partition by a **minimal NVMe
+  write path inside Solum** (one admin queue and one I/O queue on the passthrough
+  controller, after the controller reset, polled, writes only to the dump partition's LBA
+  range). This is the one device driver Solum carries, and it exists only in builds with
+  debug policy. It replaces today's "capture with QEMU's `dump-guest-memory` before
+  resetting" (AGENTS.md) on real hardware.
+
+If the GPU does not reset cleanly (x86_64-port §6), the restarted main domain comes up on
+efifb, not the R9700, until the next full reboot; Curia says so.
 
 ## 7. Security
 
@@ -367,21 +424,52 @@ secrets, never read them" extends to "arcad uses keys, never reads them".
 - **TPM:** on Solum machines the vault is the sole TPM owner (amends tpm-boot.md
   decision 1). Sealing binds PCRs that include Solum's measurement, so a boot without Solum
   cannot open the vault's keys.
-- **Honest limit:** an attacker who owns the main kernel can ask the vault to sign or
-  unwrap while they hold it, as with a TPM. They cannot copy the keys off, keep using them
-  after a clean reboot, or open locked personas.
+- **Anti-hammering in the vault:** passcode checks happen in the vault, rate-limited by
+  the TPM's dictionary-attack counter (tpm-boot.md §4.2), so a main kernel that holds the
+  vault's ring still cannot guess passcodes faster than the lockout allows.
+- **Booting without Solum** (`solum.disable=1`, a CPU swap, Solum removed) cannot open
+  keys sealed to Solum's PCRs. Every persona key is therefore wrapped twice: once by the
+  vault's sealed key, and once by the recovery key that tpm-boot.md §4.2 already requires.
+  A non-Solum boot asks for the recovery key once, then re-wraps for that boot's own
+  (arcad-owned) TPM seal. Setup and Curia say which mode the machine is in.
+- **Honest limits.** An attacker who owns the main kernel:
+  - can ask the vault to sign or unwrap while they hold the machine, as with a TPM;
+  - sees the passcode the next time the person unlocks a persona, because input, Forum
+    and Vestibulum run in the main domain, and can then have the vault unwrap that persona.
+    "Locked personas stay locked" holds only until the next unlock on the compromised
+    boot;
+  - cannot copy the keys off, guess passcodes past the TPM lockout, or keep using the keys
+    after a clean, measured reboot (with item 7 of §5.3's firmware residue as the
+    exception). A trusted input path (a vault-owned keyboard and a secure display region)
+    would close the passcode gap; it is out of scope here.
 
 ### 7.3 Kernel code integrity
 
 After boot the main kernel asks Solum to freeze its text and read-only data in stage-2
-(read-only and executable; everything else non-executable at EL1/ring 0). Module loads go
-through a hypercall that checks the module's signature (Opifex base key role). A kernel
-write bug can then neither patch code nor load an unsigned module. Kernel data and page
-tables stay unprotected; that is a much larger project.
+(read-only and executable; everything else non-executable at EL1/ring 0). A kernel write
+bug can then no longer patch code.
+
+Signed module loads must not make Solum a parser of variable-length data (§4.5), and the
+signature must cover what actually runs, after relocation. So modules are **linked at a
+fixed address** at build time: Opifex's signing step relocates each `.ko` for its slot in a
+reserved module region and signs the final image and its slot. At load time the kernel
+copies the image into the slot's pages and makes one hypercall with the slot number and
+the frame list. Solum hashes those pages (fixed size, page-aligned, no parsing), checks
+the hash against a **signed module table** loaded and measured with Solum at boot (a
+fixed-size array of slot, length and hash records), and only then makes the pages
+executable and read-only. Modules not in the table never become executable. The cost is
+that a module set is fixed per base release, which already matches Opifex's signed base
+updates.
+
+Not compatible with the freeze, and off on Solum machines: DTrace `fbt` and `kinst`
+probes (they patch kernel text), kernel live patching, and anything else that writes
+code. DTrace `sdt` probes and other providers that do not patch text keep working. Debug
+boots (`solum.freeze=0`) allow `fbt` for development. Kernel data and page tables stay
+unprotected; HLAT-style protection (§4.8) is later work.
 
 ### 7.4 Solum's own surface
 
-The hypercall ABI (§4.5) is fuzzed with cargo-fuzz on the handlers built for the host.
+The hypercall ABI (§4.5) is fuzzed with cargo-fuzz on the handlers built for the host. So are the other inputs Solum reads: the firmware tables it parses at boot (ACPI DMAR, IVRS, IORT, MADT, and the device tree on arm64), PCI capability lists, and the interrupt-controller register emulations (§4.3). Each is variable-length firmware or device input, so each parser bounds every count and length before use and refuses rather than guesses.
 Solum has no network, no file system and no parser of variable-length input. A debug
 build logs to a serial port Solum owns; a release build exposes only its version and
 measurement.
@@ -419,8 +507,13 @@ runs per arm, exits counted by a positive-controlled counter:
   runs, and GPU submit latency, within noise.
 - Interrupt latency on passthrough devices: < 5 µs added at p99.
 - Exits per second in steady state: near zero; a steady stream is a bug.
-- Virtio classes (Wi-Fi, USB, audio): line rate of the device, audio latency within one
-  period, input latency < 1 ms added.
+- Link classes (Wi-Fi, USB, audio, cameras): line rate of the device, audio latency within
+  one period, input latency < 1 ms added.
+- Switch costs, measured and counted against the gates above: the side-channel flushes on
+  each switch into a driver domain or the vault (IBPB, L1D flush, VERW where the CPU needs
+  them), the kick round trip, and how often the vault's SMT co-scheduling takes a sibling
+  away from main (§11).
+- IPI cost on CPUs without IPIv (§4.3).
 
 ## 10. Build order
 
@@ -429,13 +522,16 @@ runs per arm, exits counted by a positive-controlled counter:
 | **P0** | prototype the topology on bhyve on the R9700 box (amd64): FreeBSD host, Atrium as a guest with the R9700 and NVMe passed through, Wi-Fi/USB in a second guest over virtio (bhyve has no links) | the §9 numbers for passthrough vs bare metal, and the cost of a hop for the slow classes, measured before Solum code exists. No product code |
 | **S0** | null Solum on amd64: boots from the loader, launches the unchanged kernel on large-block EPT, everything passed through | boots to frescod on the R9700; §9 CPU, NVMe, GPU gates. **Stop rule:** if missed and not fixable, stop lane S |
 | **S1** | memory ownership, hypercalls, domain manifest, the link (arena, kick, epoch, seal, donate) with a test domain that echoes | a main-domain read of another domain's page faults (positive control first); copy vs seal vs donate and kick latency measured, thresholds fixed |
-| **S2** | IOMMU ownership and §5.3 safeguards; FreeBSD `dmar` backend over hypercalls, batched | a DMA to another domain's page faults; group, reset and config-filter checks; GPU gates still met |
+| **S2** | IOMMU ownership and §5.3 safeguards; main's static superpage IOMMU domain (§5.3 item 8), small domains for the rest; option-ROM and firmware-slot policy | a DMA to another domain's page faults; group, reset and config-filter checks; GPU gates still met |
 | **S3** | first driver domain: usb (xHCI) serving Tactus, file and USB-transfer links; restart path (§6.1) | kill the domain mid-copy: the stick remounts, nothing else stops |
 | **S4** | vault with the TPM (§7.2); arcad's vault ring | arca-vm-test.sh passes; vault memory unreadable from root in the main domain; sealing fails without Solum |
 | **S5** | net domain (Aura Wi-Fi), audio domain | crash and restart gates per class |
 | **S6** | kernel text freeze and signed module loads (§7.3); main-domain crash dump and warm restart (§6.3) | a text write from a test kmod faults; a forced panic dumps and restarts |
 | **S7** | arm64 (EL2 nVHE) | S0–S6 gates under QEMU TCG with `virtualization=on`, then on arm64 hardware with EL2 |
 | **S8** | graphics domain (§5.4) | frame-time gates; GPU fault restarts with client replay |
+
+P0's numbers cover passthrough and the virtio hop only; the vault, seal, kick and
+interrupt-emulation costs exist only in Solum and are first measured in S1 and S2.
 
 Test platforms: amd64 on the R9700 box (Linux KVM nested VMX for function, native PXE boot
 for numbers; x86_64-port §5). arm64 under cloud QEMU TCG for function only. The Mac dev VM
@@ -453,10 +549,14 @@ platform yet.
 - **Availability:** a hostile main kernel can starve domains; Solum guarantees
   confidentiality and integrity of other domains, plus the driver-domain budget, not the
   main domain's fairness to them.
-- **Side channels** between the main domain and the vault: flush on switch, no SMT
+- **Side channels** between the main domain and the vault or a driver domain: flushes on
+  each switch (IBPB, L1D, VERW) cost time on every kick, and keeping the vault's SMT
+  sibling idle means Solum **does** preempt main's vCPU on that sibling while the vault
+  runs. That is an exception to §4.3's "never preempts", limited to vault calls, and both
+  costs are counted in §9. No SMT
   sibling sharing while the vault runs; it runs rarely.
 - **Firmware** (SMM, PSP, ME) stays above Solum, as in tpm-boot.md.
-- **Fork changes:** the `dmar`/`smmu` backend, the module-load hypercall, the link driver, the `ATRIUM-DD` config. Small, but ours to carry.
+- **Fork changes:** `dmar`/`smmu` in a static-domain mode for main, the module-load hypercall, the link driver, the `ATRIUM-DD` config. Small, but ours to carry.
 - **Size of the job:** a hypervisor is a security product. It needs its own review thread
   pass and fuzzing before any default boot uses it.
 
@@ -466,6 +566,19 @@ Solum, the vault and the back ends are ours (BSD-2). Likely crates: `x86_64`/`x8
 `aarch64-cpu` (MIT/Apache-2.0), rust-vmm `virtio-queue` and device crates for the Linux lane and the net link
 (Apache-2.0/BSD-3), each through `scripts/licence-audit.py`. bhyve (P0 only) is BSD-2. GPL
 hypervisors are read for design only.
+
+## 12a. Review, 2026-11-27
+
+The code review thread's adversarial pass (15 findings) is folded in: firmware
+persistence and option ROMs (§5.3 item 7, seal to PCR 2/3), seal TOCTOU and bounded
+release (study §5.1–§5.2), the vault's real limits, anti-hammering and the non-Solum boot
+path (§7.2), static superpage IOMMU domains for main (§5.3 item 8), fixed-address signed
+modules and the DTrace `fbt`/`kinst` conflict (§7.3), interrupt-controller emulation, the
+preemption timer and IPIs (§4.3), dumps off by default with a debug-key mode and Solum's
+own NVMe write path (§6.3), switch and side-channel costs in §9, driver processes stated
+as weaker (§5.1, study §6.1), per-record epochs and arena reuse only after device reset
+(§6.1), firmware-table fuzzing (§7.4), the camera indicator in frescod's trusted lane
+(§5.1), the deferred key ceremony (§4.6), and P0's limits (§10).
 
 ## 13. Decisions for Shankar
 
