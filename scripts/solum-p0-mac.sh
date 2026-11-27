@@ -158,7 +158,7 @@ l2)
     vssh 'mkdir -p /root/l2' || gate_abort "ssh"
     sc "$ROOT/scripts/solum-p0/l2-guest.sh" root@"$ip":/root/l2/ || gate_abort "scp script"
     if vssh 'test -f /root/l2/disk.raw'; then ok "L2 disk already staged"
-    elif sc "$xz_img" root@"$ip":/root/l2/disk.raw.xz && vssh 'cd /root/l2 && xz -d disk.raw.xz'; then
+    elif sc "$xz_img" root@"$ip":/root/l2/disk.raw.xz && vssh 'cd /root/l2 && xz -d disk.raw.xz && sync'; then
         ok "L2 disk staged"
     else bad "L2 disk staged"; fi
     if vssh 'sh /root/l2/l2-guest.sh setup'; then ok "u-boot for bhyve and vmm"; else bad "u-boot for bhyve and vmm"; fi

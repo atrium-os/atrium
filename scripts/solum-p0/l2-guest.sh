@@ -16,8 +16,11 @@ die() { echo "FAILED: $*" >&2; exit 1; }
 case "${1:-}" in
 setup)
     kldstat -q -m vmm || kldload vmm || die "kldload vmm"
-    [ -f "$UBOOT" ] || ASSUME_ALWAYS_YES=yes pkg install -y u-boot-bhyve-arm64 || die "pkg u-boot"
+    # -f: after a hard reset of this host, pkg can list the package while its
+    # files are gone (unsynced metadata), so check the file, not the database.
+    [ -f "$UBOOT" ] || ASSUME_ALWAYS_YES=yes pkg install -f -y u-boot-bhyve-arm64 || die "pkg u-boot"
     [ -f "$UBOOT" ] || die "no $UBOOT after install"
+    sync
     echo "ok: setup"
     ;;
 start)
