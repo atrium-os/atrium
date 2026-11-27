@@ -177,7 +177,10 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
   CPU interface. The **distributor (GICD) and the ITS are trapped and emulated** by Solum for
   the routing and enable state of interrupts that belong to other domains, so main cannot
   reroute or mask a driver domain's SPIs or LPIs; main's own interrupts go straight through
-  the emulation's fast path. Stage-2 faults on those pages, HVC, and SMC (checked against a
+  the emulation's fast path. **SGIs (`ICC_SGI1R_EL1`, main's IPI path, the counterpart of
+  the x2APIC ICR) are trapped** through `ICH_HCR_EL2` while any other domain runs on some CPU,
+  so main cannot send an SGI to a CPU running the vault or a driver domain; with only main
+  running, the trap is off. Stage-2 faults on those pages, HVC, and SMC (checked against a
   PSCI allowlist and forwarded) are the traps.
 - So "no device emulation" holds, but Solum does emulate parts of the **interrupt
   controller** (GICD and ITS on arm64, the ICR without IPIv on amd64). Those emulations
@@ -325,16 +328,22 @@ move:
    requires signed option ROMs or turns option ROMs off (Atrium needs none: the console
    is efifb or the native driver); NVMe firmware slots are locked with the controller's
    own write-protect where it has one; and the vault's seal includes PCR 2 and 3 (option
-   ROM code and configuration), so a changed option ROM opens nothing. **Left over:** a
+   ROM code and configuration), so a changed option ROM opens nothing. A legitimate VBIOS
+   or option-ROM update therefore needs the recovery key once (§7.2). **Left over:** a
    device whose flash can be rewritten from its own driver and that runs that firmware
    without UEFI measuring it (NVMe or NIC firmware) can keep a foothold *in the device*,
    with DMA confined by the IOMMU. That is in the threat model, not solved.
 8. **IOMMU mappings for the main domain are static.** Main's passthrough devices get one
    IOMMU domain that maps all of main's memory, built at boot with superpages (1 GiB or
-   2 MiB), mirroring main's stage-2. Main's `busdma` then does no hypercall per map, which is
+   2 MiB), mirroring main's stage-2 **permissions as well as its layout**: frozen kernel
+   text, read-only data and module text slots (§7.3) are read-only or unmapped for main's
+   devices, so a main kernel with a write bug cannot have a disk or NIC DMA over its own
+   frozen code. Solum updates this domain at freeze time and on every module load, in the
+   same step as the stage-2 change. Main's `busdma` then does no hypercall per map, which is
    what makes the §9 NVMe and NIC gates possible. Solum changes that table only when pages
-   leave main (donation to a domain, a link arena) and then invalidates the IOTLB before
-   handing the pages over. Where the hardware has nested translation (VT-d scalable mode
+   leave main or change protection (donation, a link arena, a **seal**: a sealed page leaves
+   main's static domain as well as the producer's device domains) and invalidates the IOTLB,
+   waiting for completion, before reporting the change done. Where the hardware has nested translation (VT-d scalable mode
    second stage, SMMUv3 stage 1 + stage 2), main may keep its own first-stage tables for
    in-guest isolation between its devices without exits. Driver domains and driver
    processes get their own small IOMMU domains.
@@ -430,8 +439,13 @@ secrets, never read them" extends to "arcad uses keys, never reads them".
 - **Booting without Solum** (`solum.disable=1`, a CPU swap, Solum removed) cannot open
   keys sealed to Solum's PCRs. Every persona key is therefore wrapped twice: once by the
   vault's sealed key, and once by the recovery key that tpm-boot.md §4.2 already requires.
-  A non-Solum boot asks for the recovery key once, then re-wraps for that boot's own
-  (arcad-owned) TPM seal. Setup and Curia say which mode the machine is in.
+  **Every** non-Solum boot asks for the recovery key; no arcad-owned seal for a
+  `solum.disable=1` boot is kept on disk (one would let anyone who picks that boot entry
+  open the keys without the vault), and the next Solum boot checks and deletes any such
+  seal it finds. The same recovery path covers a changed PCR 2 or 3 after a GPU VBIOS or
+  other option-ROM update (§5.3 item 7) and a manifest whose debug policy was turned on
+  (§6.3): the manifest is measured, so changing it changes the PCRs. Setup and Curia say
+  which mode the machine is in.
 - **Honest limits.** An attacker who owns the main kernel:
   - can ask the vault to sign or unwrap while they hold the machine, as with a TPM;
   - sees the passcode the next time the person unlocks a persona, because input, Forum
@@ -456,10 +470,15 @@ reserved module region and signs the final image and its slot. At load time the 
 copies the image into the slot's pages and makes one hypercall with the slot number and
 the frame list. Solum hashes those pages (fixed size, page-aligned, no parsing), checks
 the hash against a **signed module table** loaded and measured with Solum at boot (a
-fixed-size array of slot, length and hash records), and only then makes the pages
-executable and read-only. Modules not in the table never become executable. The cost is
-that a module set is fixed per base release, which already matches Opifex's signed base
-updates.
+fixed-size array of slot, text length, rodata length, data length and hash records;
+the hash covers the whole image). Then it freezes the module's text and read-only data
+(read-only, executable for text) and leaves its `.data` and `.bss` pages writable and
+non-executable. Modules not in the table never become executable. The costs: a module set
+is fixed per base release, which already matches Opifex's signed base updates; and each
+module image is tied to one exact kernel build and one load address, so the module region sits
+at a fixed address per build and module addresses are not randomised on Solum machines
+(no KASLR for modules; the same holds for the kernel image if its base is fixed for the
+signed table).
 
 Not compatible with the freeze, and off on Solum machines: DTrace `fbt` and `kinst`
 probes (they patch kernel text), kernel live patching, and anything else that writes

@@ -179,8 +179,9 @@ move data, and each protocol picks per message:
    For the seal to mean anything:
    - Every record also carries the link's epoch (§5.1); an arena's pages are not reused
      under a new epoch until the device that could DMA into them has been reset.
-   - Solum removes the producer's write access **everywhere it has it**: stage-2, and every
-     IOMMU mapping of a device the producer owns, followed by an IOTLB invalidation and
+   - Solum removes write access to the sealed pages **everywhere it exists**: the producer's
+     stage-2, every IOMMU mapping of a device the producer owns, and, when the producer is
+     main, main's static IOMMU domain (solum.md §5.3 item 8), followed by an IOTLB invalidation and
      its completion wait, before the seal is reported done. Otherwise the producer's
      device could still DMA into a "sealed" page.
    - The consumer trusts only seal state that Solum owns (a per-page state in Solum's
