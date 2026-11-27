@@ -1823,7 +1823,7 @@ with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture save
 (the button and pointer on the first) and a spanning window's direct scanout stops; the desktop
 takes the viewer's output there too (renderer and frame at its size, the one remote output
 published), put back over any monitor change while viewed, and gets the monitors' layout back
-only once the seat is locked. It has not run on a real display yet.
+only once the seat is locked: `scripts/fenestra-display-vm.sh` 15/15 on gpusim in the Mac VM (two monitors, one plugged while viewed, screendumps of each), with fenestra-view native on macOS. Real monitors are still to come.
 "By whom" says first what the host itself saw: the address the viewer's connection came from,
 as observed by the session (its QUIC or TCP peer, sent to fenestrad as a `Peer` record, and again
 when a migrated connection's address changes; kind 6, session to fenestrad
