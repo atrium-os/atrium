@@ -59,11 +59,21 @@ cd "$VMDIR"
 if [ -f qemu.pid ] && kill -0 "$(cat qemu.pid)" 2>/dev/null; then echo "VM already running (pid $(cat qemu.pid)); stop it first" >&2; exit 1; fi
 if pgrep -f "file=$VMDIR/vm.qcow2" >/dev/null; then echo "another qemu holds $VMDIR/vm.qcow2; not starting" >&2; exit 1; fi
 
+# SPARROW_ISOTAP names a fresh, private capture in VMDIR for this run.
+diag=""
+if [ -n "${SPARROW_ISOTAP:-}" ]; then
+    [ "$USB" = "0495:1044" ] || { echo "SPARROW_ISOTAP requires USB=0495:1044" >&2; exit 1; }
+    case $SPARROW_ISOTAP in
+        *[!a-zA-Z0-9._-]*|.|..) echo "SPARROW_ISOTAP must be a simple filename" >&2; exit 1 ;;
+    esac
+    diag=",isodebug=on,isotap=$SPARROW_ISOTAP"
+fi
+
 devs=""; n=0
 for d in $USB; do
     case $d in *:*) ;; *) echo "bad USB entry '$d' (want vid:pid)" >&2; exit 1 ;; esac
     n=$((n + 1))
-    devs="$devs -device usb-host,bus=usbhc.0,vendorid=0x${d%%:*},productid=0x${d##*:},isobufs=$ISOBUFS,isobsize=$ISOBSIZE,id=usbdev$n"
+    devs="$devs -device usb-host,bus=usbhc.0,vendorid=0x${d%%:*},productid=0x${d##*:},isobufs=$ISOBUFS,isobsize=$ISOBSIZE,id=usbdev$n$diag"
 done
 
 rm -f qemu.pid serial.sock mon.sock

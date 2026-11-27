@@ -1,7 +1,7 @@
 # Plan: USB audio through qemu's xHCI on the Mac
 
-Status: **step A done** (2026-11-25): qemu's xHCI is not the fault on its own (§7). Step B needs
-the Sparrow and a sudo session. Goal: a USB DAC passed through to the Mac's
+Status: **step A done** (2026-11-25): qemu's xHCI is not the fault on its own (§7). The Phase B host diagnostics are ready (§8). The controller comparison needs
+Shankar, the Sparrow and a sudo session. Goal: a USB DAC passed through to the Mac's
 Atrium VM on qemu's xHCI controller plays exactly what Lyra sends, so the hi-res and bit-perfect
 path ([lyra-hires.md](lyra-hires.md)) can be tested on real DACs.
 
@@ -169,3 +169,45 @@ D (half a day). A and B are measurement only: nothing in the fork changes behavi
 Sparrow's buzz came from the meeting of xHCI and `usb-host`: §3's causes 1 (packet vs microframe
 in `usb-host`'s libusb mapping) and 3 (the UAC2 feedback endpoint), or something high-speed
 specific. Causes 2, 4 and 5 are unlikely now. Phase B measures which, and needs the Sparrow.
+
+## 8. As built: Phase B host diagnostics (2026-11-27)
+
+The QEMU fork's `codex/sparrow-iso-diagnostics` branch adds
+[1868f5e4dd](https://github.com/atrium-os/qemu/commit/1868f5e4ddda48b89057483035b131967a24aeb9)
+on top of `atrium-xhci-isoch` at `49a9ea15ee`. The Mac has a signed
+instrumented binary at `~/src/bsd/scratch/sparrow-phase-b/qemu-system-aarch64`.
+
+- `usb-host,isodebug=on` logs interval counts once per host second for each active
+  isochronous endpoint, plus a final partial interval on ring teardown or exit.
+  The endpoint address includes direction. `received` counts guest packets,
+  `submitted` counts packet descriptors in successful libusb submissions, and
+  `dropped` counts OUT packets that found no buffer. `starts` and `stops` count
+  transitions into and out of an empty in-flight queue. The final drain contributes
+  a stop. `truncated` counts clamped copies and `empty_in` counts guest reads
+  returning zero bytes, including reads before the first feedback completion.
+  Use the Sparrow's endpoint descriptor to identify its feedback address.
+- Adding `isotap=FILE` captures the concatenated raw OUT bytes, in submission
+  order, across the device's isochronous OUT endpoints. The tap snapshots the
+  descriptor-defined lengths from the transfer buffer and writes the snapshot
+  only when libusb accepts the transfer. A write error logs an incomplete
+  capture and disables further tap writes. The file must be new (mode 0600).
+  Synchronous tap writes add host I/O to the measured path.
+- Host validation replayed 2,817,984 consecutive stereo counter frames from
+  the Phase A xHCI emulated-device recording through the patched ring with a
+  mock libusb submitter. All 469,664 OUT packets were submitted. The tap
+  matched the input byte for byte. A separate run forced one no-buffer drop,
+  one oversized packet, two starts/stops and a rejected submit. The 44-byte
+  tap matched the accepted packets, including a short packet. The feedback
+  endpoint returned empty twice and then returned the injected four bytes.
+  The one-second report reset both endpoints' counters. Mac evidence is in
+  `~/src/bsd/scratch/sparrow-phase-b/{fault,replay}.log`.
+
+**Next measurement (Shankar).** With the high-speed Sparrow alone, select the
+instrumented binary with `QEMU=` in `scripts/usb-host-vm.sh`, use
+`USB=0495:1044`, and set `HCD=xhci SPARROW_ISOTAP=sparrow-xhci.raw` for one
+run and `HCD=ehci SPARROW_ISOTAP=sparrow-ehci.raw` for the other.
+Play `SIGNAL=counter` with `scripts/usb-dac-check.sh`. Save each run's
+`qemu-root.out` before starting the next one. Taps land in `VMDIR`; use fresh
+names for repeats. For the comparison with `LYRA_DUMP`, use a test image with
+the dump-producing lyrad. The installed jailed lyrad keeps no dump. Align the
+counter and expand S16 samples to the negotiated Sparrow format (§4).
