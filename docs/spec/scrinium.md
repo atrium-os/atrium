@@ -180,6 +180,22 @@ Scrinium exits.
 
 Hard links, special permissions, filesystem flags and user extended attributes
 require Save As. Replacement preserves ownership, mode and supported access ACLs.
+
+**Ownership (2026-11-27).** Scrinium runs as its own app uid and reaches the
+person's folders through `files-<user>` (§9), so it cannot `fchown` a new inode
+to the person. It stages the replacement with the workbook's group, mode and
+ACLs while it still owns it. Just before the rename, under the publish lock and
+after the last identity check, it asks portcullisd (`WorkbookOwner`, with the
+writable workbook descriptor and the staged one) to give the replacement the
+workbook's owner. portcullisd takes the request only from Scrinium's uid and
+only when the result grants nothing the writable descriptor did not: the
+workbook is open read-write, regular, one link, owned by the session's person;
+the replacement is Scrinium's own, one link, on the same filesystem, with the
+same group and permission bits, and neither has special bits or flags. It sets
+only the uid, keeping the group, and checks the result. A workbook owned by
+anyone else (another person, root, a stale app uid) still requires Save As.
+Code: `scrinium/src/workbook.rs` (`give_back`),
+`portcullis/portcullisd/src/workbook_owner.rs`.
 A directory sync error after rename means publication could have succeeded.
 
 Known limit: the descriptor is on Scrinium's grant mount, so it stops working

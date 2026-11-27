@@ -45,4 +45,5 @@ pub mod system_worker;
 pub mod system_services;
 pub mod volumes_client;
 
+pub mod workbook_owner;
 pub mod workbook_versions;

@@ -530,6 +530,10 @@ pub enum Request {
     /// Issue or check a native bookmark against one held workbook descriptor.
     WorkbookBookmark { expected: Option<WorkbookBookmark> },
 
+    /// Scrinium supplies a writable workbook and its staged replacement;
+    /// the host gives the replacement the workbook's owner (the person).
+    WorkbookOwner,
+
     /// Mail spends a fresh press to open a private invitation session in its persona.
     CalendarInvitation { activation: [u8; 16] },
     CalendarUpdate,
@@ -1249,6 +1253,8 @@ pub enum Response {
     /// Retained generation for the supplied workbook revision, if available.
     WorkbookVersion { generation: Option<u64> },
     WorkbookBookmark { bookmark: Option<WorkbookBookmark> },
+    /// WorkbookOwner → the replacement now belongs to the workbook's owner.
+    WorkbookOwned,
     PendingWorkbooks { books: Vec<PendingWorkbook> },
     /// OpenLocalPort → the app serving the port (its id and name) and the
     /// address the socket that follows is connected to (`ip:port`), which

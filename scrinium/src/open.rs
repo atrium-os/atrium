@@ -128,6 +128,22 @@ pub fn workbook_bookmark(
     }
 }
 
+/// Ask the host to give a staged replacement the workbook's owner.
+pub fn workbook_owner(original: &std::fs::File, staged: &std::fs::File) -> Result<(), String> {
+    let mut socket = connect()?;
+    match round_trip(&mut socket, &Request::WorkbookOwner).map_err(|e| e.to_string())? {
+        Response::ReadyForFds => {}
+        Response::Error { message } => return Err(message),
+        _ => return Err("Unexpected workbook owner reply".into()),
+    }
+    send_fds(&socket, &[original.as_raw_fd(), staged.as_raw_fd()]).map_err(|e| e.to_string())?;
+    match portcullis_ipc::read_response(&mut socket).map_err(|e| e.to_string())? {
+        Response::WorkbookOwned => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected workbook owner reply".into()),
+    }
+}
+
 /// Ask the host to prove retention or return one read-only historical descriptor.
 pub fn workbook_version(
     current: &std::fs::File,

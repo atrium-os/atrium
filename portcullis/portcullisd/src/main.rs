@@ -985,7 +985,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * Catalog is: only the session's file manager, by its installed
          * manifest. OpenFile also takes a descriptor, so it needs the
          * connection itself. */
-        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. }) {
+        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::WorkbookOwner) {
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
             continue;
         }
@@ -1986,6 +1986,26 @@ fn handle_open(
             match portcullisd::workbook_versions::bookmark(&std::fs::File::from(file), expected.as_ref()) {
                 Ok(bookmark) => write_response(writer, &Response::WorkbookBookmark { bookmark }),
                 Err(err) => refuse(writer, format!("Workbook bookmark: {err}")),
+            }
+        }
+        Request::WorkbookOwner => {
+            if caller.as_deref() != Some("org.atrium.scrinium") {
+                return refuse(writer, "Workbook saves are served by Scrinium.".into());
+            }
+            let Some(person) = portcullisd::home::person_uid(owner) else {
+                return refuse(writer, format!("{owner}: no such person"));
+            };
+            if !reader.buffer().is_empty() {
+                return refuse(writer, "protocol violation: data buffered before the descriptors".into());
+            }
+            write_response(writer, &Response::ReadyForFds)?;
+            let fds = portcullis_ipc::recv_fds(reader.get_ref(), 2)?;
+            let Ok([original, staged]): Result<[OwnedFd; 2], _> = fds.try_into() else {
+                return refuse(writer, "expected the workbook and its replacement".into());
+            };
+            match portcullisd::workbook_owner::hand_back(&std::fs::File::from(original), &std::fs::File::from(staged), uid, person) {
+                Ok(()) => write_response(writer, &Response::WorkbookOwned),
+                Err(err) => refuse(writer, format!("Workbook owner: {err}")),
             }
         }
         Request::WorkbookVersion { generation } => {
@@ -4839,7 +4859,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::CalendarInvitation { .. } | Request::CalendarUpdate | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::WorkbookOwner | Request::CalendarInvitation { .. } | Request::CalendarUpdate | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

@@ -177,6 +177,21 @@ pub(crate) fn grant_at(folder: File, name: CString, file: &File, bookmark_scope:
 pub fn commit(token: Token, source: &File) -> io::Result<()> {
     commit_with(token, |out| {
         fingerprint(source, crate::fs::COPY_CHUNK_SIZE, out)
+    }, give_back)
+}
+
+/// Give the staged replacement `out` the workbook's owner. Scrinium runs as
+/// its own app uid, so for the person's own files only the host can do it
+/// (portcullisd `WorkbookOwner`); it checks that the replacement matches the
+/// workbook in group, mode and filesystem first.
+fn give_back(file: &File, out: &File) -> io::Result<()> {
+    let old = file.metadata()?;
+    // SAFETY: fchown on a descriptor we hold; -1 keeps the group.
+    if unsafe { libc::fchown(out.as_raw_fd(), old.uid(), u32::MAX) } == 0 {
+        return Ok(());
+    }
+    crate::open::workbook_owner(file, out).map_err(|err| {
+        io::Error::other(format!("Cannot give the saved workbook back to its owner ({err}). Use Save As."))
     })
 }
 
@@ -266,6 +281,7 @@ pub fn versions(token: Token) -> Result<Versions, String> {
 fn commit_with(
     token: Token,
     write: impl FnOnce(&mut File) -> io::Result<blake3::Hash>,
+    owner: impl Fn(&File, &File) -> io::Result<()>,
 ) -> io::Result<()> {
     let grant = find_grant(token)?;
     let mut grant = grant
@@ -288,15 +304,21 @@ fn commit_with(
                     staged.sync_all()?;
                     prepared = now.clone();
                 }
-                let revision = Revision {
-                    metadata: staged.metadata()?,
-                    digest: Some(digest),
-                };
                 let _serial = PUBLISH.lock().unwrap();
                 check_name(&grant.folder, &grant.name, &grant.file)?;
                 if ctime(&now) != ctime(&grant.file.metadata()?) {
                     continue;
                 }
+                // Last, because after it Scrinium may no longer own the
+                // replacement and so cannot prepare it again.
+                if staged.metadata()?.uid() != now.uid() {
+                    owner(&grant.file, staged)?;
+                    staged.sync_all()?;
+                }
+                let revision = Revision {
+                    metadata: staged.metadata()?,
+                    digest: Some(digest),
+                };
                 if unsafe {
                     libc::renameat(
                         stage,
@@ -341,12 +363,14 @@ fn prepare_replacement(file: &File, old: &Metadata, out: &File) -> io::Result<()
             "Use Save As for a linked workbook or one with special permissions",
         ));
     }
-    let new = out.metadata()?;
-    if (old.uid(), old.gid()) != (new.uid(), new.gid())
-        && unsafe { libc::fchown(out.as_raw_fd(), old.uid(), old.gid()) } != 0
+    // The group first, while Scrinium owns the replacement; the owner is
+    // given back just before publication (`give_back`).
+    // SAFETY: fchown on a descriptor we hold; -1 keeps the owner.
+    if out.metadata()?.gid() != old.gid()
+        && unsafe { libc::fchown(out.as_raw_fd(), u32::MAX, old.gid()) } != 0
     {
         return Err(io::Error::other(
-            "Cannot preserve workbook ownership. Use Save As.",
+            "Cannot preserve the workbook's group. Use Save As.",
         ));
     }
     out.set_permissions(std::fs::Permissions::from_mode(old.mode() & 0o777))?;
@@ -420,7 +444,7 @@ mod tests {
         commit_with(token, |out| {
             out.write_all(bytes)?;
             Ok(blake3::hash(bytes))
-        })
+        }, give_back)
     }
 
     #[test]
@@ -466,6 +490,62 @@ mod tests {
         std::fs::remove_dir_all(dir)
     }
 
+    /// Scrinium's own app uid saves over a workbook the person owns, reached
+    /// through the files group: the replacement goes to the host with the
+    /// workbook's group and mode, and the host's answer is published.
+    /// Needs root to set the scene; the save itself runs unprivileged.
+    #[test]
+    fn save_in_place_hands_the_persons_workbook_back_through_the_host() {
+        const CHILD: &str = "SCRINIUM_TEST_SAVE_AS_APP_UID";
+        const APP: u32 = 64_243;
+        const PERSON: u32 = 64_244;
+        const FILES: u32 = 64_242;
+        if let Some(path) = std::env::var_os(CHILD) {
+            // SAFETY: plain credential calls in a single-threaded child.
+            unsafe {
+                assert_eq!(libc::setgroups(1, &FILES), 0);
+                assert_eq!(libc::setgid(FILES), 0);
+                assert_eq!(libc::setuid(APP), 0);
+            }
+            let path = Path::new(&path);
+            let file = File::options().read(true).write(true).open(path).unwrap();
+            let handle = grant(path, &file).unwrap();
+            let asked = std::cell::Cell::new(0);
+            commit_with(handle, |out| {
+                out.write_all(b"saved by the app")?;
+                Ok(blake3::hash(b"saved by the app"))
+            }, |original, staged| {
+                let (o, s) = (original.metadata()?, staged.metadata()?);
+                assert_eq!((o.uid(), s.uid()), (PERSON, APP));
+                assert_eq!((s.gid(), s.mode() & 0o7777, s.nlink()), (o.gid(), 0o660, 1));
+                asked.set(asked.get() + 1);
+                Ok(())
+            }).unwrap();
+            assert_eq!(asked.get(), 1);
+            std::process::exit(0);
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to make a workbook owned by another uid");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("workbook-owner-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::chown(&dir, Some(PERSON), Some(FILES)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let path = dir.join("Budget.csv");
+        std::fs::write(&path, b"made in a shell").unwrap();
+        std::os::unix::fs::chown(&path, Some(PERSON), Some(FILES)).unwrap();
+        // Group read-write is how the app reaches the person's files.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "workbook::tests::save_in_place_hands_the_persons_workbook_back_through_the_host"])
+            .env(CHILD, &path).status().unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(status.success(), "the app's save failed: {status}");
+        assert_eq!(saved, b"saved by the app");
+    }
+
     #[test]
     fn interrupted_overwrite_keeps_original_and_reopened_grant_saves_twice() {
         const CHILD: &str = "SCRINIUM_TEST_COMMIT_WORKBOOK";
@@ -480,7 +560,7 @@ mod tests {
                 file.write_all(b"incomplete replacement")?;
                 file.sync_all()?;
                 std::process::exit(27);
-            });
+            }, give_back);
             panic!("writer never reached interruption");
         }
         let dir = std::env::temp_dir().join(format!("workbook-commit-{}", std::process::id()));
