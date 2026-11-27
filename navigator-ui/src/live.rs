@@ -1058,6 +1058,9 @@ impl Live {
                         eprintln!("navigator-ui: a live page's print not taken");
                     }
                 }
+                Event::LiveTitle { from, title } => {
+                    if s.live_titled(&from, &title) { eprintln!("navigator-ui: live title={title:?}"); }
+                }
                 Event::LiveUsage { from, stored, max } => {
                     s.live_usage(&from, stored, max);
                 }

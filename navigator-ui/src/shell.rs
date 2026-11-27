@@ -389,10 +389,23 @@ pub enum Region {
 }
 
 /// `https://host[:port]` of a plain HTTPS address.
+/// A page's origin as navigatord spells it: an https site's, or one of
+/// your own servers' (`http://localhost:<port>`, background-apps.md §4.5),
+/// whose spelling must be the one parser's.
 fn origin_of(url: &str) -> Option<&str> {
-    let rest = url.strip_prefix("https://")?;
+    if let Some(rest) = url.strip_prefix("https://") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        return (end > 0).then(|| &url[..8 + end]);
+    }
+    let rest = url.strip_prefix("http://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    (end > 0).then(|| &url[..8 + end])
+    let origin = &url[..7 + end];
+    navigator_control::local::parse(url).is_some_and(|l| l.origin.spell() == origin).then_some(origin)
+}
+
+/// Whether `origin` is one of your own servers': never run live unasked.
+fn local_origin(origin: &str) -> bool {
+    origin.starts_with("http://")
 }
 
 /// A whole page running live (I6.1).
@@ -1044,7 +1057,7 @@ impl Shell {
     /// and nothing runs live yet. navigatord checks the origin and the jar
     /// again before it starts anything.
     pub fn live_remembered(&mut self, url: &str) -> bool {
-        let Some(o) = origin_of(url).map(str::to_string) else { return false };
+        let Some(o) = origin_of(url).filter(|o| !local_origin(o)).map(str::to_string) else { return false };
         self.live_remembered.retain(|x| *x != o);
         self.live_remembered.push(o);
         if self.live_remembered.len() > LIVE_REMEMBERED_MAX { self.live_remembered.remove(0); }
@@ -1119,6 +1132,16 @@ impl Shell {
         let Some(run) = self.live_run.as_mut().filter(|r| r.url == from && r.origin.is_some()) else { return false };
         if max == 0 || stored > max { return false; }
         run.stored = Some((stored, max));
+        true
+    }
+
+    /// The running page set its title: the entry it is on is named by it.
+    /// An empty title keeps the name it had, as an `Opened` without one does.
+    pub fn live_titled(&mut self, from: &str, title: &str) -> bool {
+        let Some(key) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some()).map(|r| r.key) else { return false };
+        if title.is_empty() || title.len() > navigator_control::LIVE_TITLE_MAX || title.chars().any(char::is_control) { return false; }
+        let Some(p) = self.store.page_by_key_mut(key.0, key.1) else { return false };
+        p.title = title.to_string();
         true
     }
 
@@ -2783,6 +2806,20 @@ mod tests {
         assert!(s.answer_pressed(1, 700.0, Some([5; 16])));
         assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: "http://localhost:9000/".into(), press: [5; 16], jar: navigator_control::Jar::Personal, remember: false }));
         assert!(crate::ax::prompt_text(&asked.prompt).contains("reach only Photo Server on this computer"));
+        // Live, a link within the server is an entry that runs live again,
+        // and its own change of address is taken; another port's is not.
+        let home = "http://localhost:9000/";
+        s.live_reported(home, Some("http://localhost:9000".into()), None);
+        assert!(s.live_navigated(home, "http://localhost:9000/go"));
+        s.live = Some(LivePage::Shown("http://localhost:9000/go".into()));
+        assert!(s.live_follow());
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "http://localhost:9000/go".into(), jar: navigator_control::Jar::Personal }));
+        s.live_reported("http://localhost:9000/go", Some("http://localhost:9000".into()), None);
+        assert!(s.live_url_changed("http://localhost:9000/go", "http://localhost:9000/go#2"));
+        assert!(!s.live_url_changed("http://localhost:9000/go", "http://localhost:9090/"));
+        assert!(!s.live_url_changed("http://localhost:9000/go", "http://localhost:09000/x"), "not the parser's spelling");
+        assert!(!s.live_remembered("http://localhost:9000/go"), "never run live unasked");
+        assert!(!s.live_remembered.iter().any(|o| o.starts_with("http://")));
         // A plain http page of the web is never offered.
         let mut w = Shell::new(TrailStore::empty(), 1280.0, 696.0);
         w.store.new_trail(false);
@@ -4065,6 +4102,28 @@ mod tests {
         assert_eq!(s.store.trails.len(), n, "the empty trail closed");
         assert_eq!(s.store.trail().id, id);
         assert!(!s.on_start());
+    }
+
+    #[test]
+    fn a_live_pages_title_names_its_entry_once_its_engine_started() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        let key = s.shown_key().unwrap();
+        s.opened(key, url, "Loading", false, "", false);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert!(s.answer_pressed(1, 600.0, Some([2; 16])), "Run live");
+        assert!(!s.live_titled(url, "Inbox (3)"), "not before the engine started");
+        s.live_reported(url, Some("https://app.example".into()), None);
+        assert!(!s.live_titled("https://other.example/", "Other"), "another page's");
+        assert!(!s.live_titled(url, ""), "an empty title keeps the name");
+        assert!(!s.live_titled(url, "a\nb"));
+        assert!(!s.live_titled(url, &"x".repeat(navigator_control::LIVE_TITLE_MAX + 1)));
+        assert_eq!(s.store.trail().title(), "Loading");
+        assert!(s.live_titled(url, "Inbox (3)"));
+        assert_eq!(s.store.trail().title(), "Inbox (3)", "the rail names the trail by it");
     }
 
     #[test]

@@ -909,6 +909,37 @@ pub trait Tell: Send + Sync + 'static {
     fn usage(&self, _stored: u64, _max: u64) {}
     /// The engine jail's resident memory and its cap (bytes).
     fn memory(&self, _used: u64, _cap: Option<u64>) {}
+    /// The page set its title: what [`Titles`] lets through.
+    fn title(&self, _title: String) {}
+}
+
+/// The page's titles as told to the UI: each new one, but no two within
+/// [`navigator_control::LIVE_TITLE_EVERY_MS`]; one held back is told when
+/// that time is up, so the last title the page set is always told.
+#[derive(Default)]
+pub struct Titles {
+    told: Option<String>,
+    held: Option<String>,
+    at: Option<Instant>,
+}
+
+impl Titles {
+    /// The engine reported `title` at `now`: what to tell now, if anything.
+    pub fn report(&mut self, title: &str, now: Instant) -> Option<String> {
+        if self.told.as_deref() == Some(title) { self.held = None; return None; }
+        self.held = Some(title.to_string());
+        self.due(now)
+    }
+
+    /// A held title whose time is up.
+    pub fn due(&mut self, now: Instant) -> Option<String> {
+        let every = Duration::from_millis(navigator_control::LIVE_TITLE_EVERY_MS);
+        if self.at.is_some_and(|at| now.duration_since(at) < every) { return None; }
+        let title = self.held.take()?;
+        self.at = Some(now);
+        self.told = Some(title.clone());
+        Some(title)
+    }
 }
 
 /// Whether a memory reading is worth telling: the first, a new cap, or a
@@ -1293,6 +1324,7 @@ impl Live {
             let memory_every = Duration::from_millis(navigator_control::LIVE_MEMORY_EVERY_MS);
             let mut memory_asked = Instant::now();
             let mut memory_told = None::<(u64, Option<u64>)>;
+            let mut titles = Titles::default();
             let why = loop {
                 let mut slot = watched.lock().unwrap();
                 let Some(connection) = slot.as_mut() else { return };
@@ -1309,6 +1341,7 @@ impl Live {
                         }
                     }
                 }
+                if let Some(title) = titles.due(Instant::now()) { tell.title(title); }
                 // The page's frames (I6.5): started, moved or ended as its
                 // script reports them, and moved with the page.
                 let now_rect = size.lock().unwrap().1;
@@ -1338,7 +1371,12 @@ impl Live {
                             let rect = { let mut p = size.lock().unwrap(); p.0 = true; p.1 };
                             tell_size(connection, embed, rect);
                         }
-                        Some(Report::Title(_) | Report::Resize { .. } | Report::MediaReady) => {}
+                        // Its title names its trail entry, once it started:
+                        // the Lifecycle bounded it (256 bytes, no controls).
+                        Some(Report::Title(title)) => {
+                            if started { if let Some(t) = titles.report(title, Instant::now()) { tell.title(t); } }
+                        }
+                        Some(Report::Resize { .. } | Report::MediaReady) => {}
                         // The page asked to go somewhere (I6.2): never followed in
                         // the engine. navigatord hands it to the UI, which opens
                         // it as a trail entry: live again if it is this origin's
@@ -1590,6 +1628,24 @@ impl Drop for Live {
 mod tests {
     use super::*;
     use nuntius::{Open};
+
+    #[test]
+    fn a_pages_titles_are_told_at_a_pace_and_the_last_is_never_lost() {
+        let mut t = Titles::default();
+        let at = Instant::now();
+        let ms = |n| at + Duration::from_millis(n);
+        assert_eq!(t.report("Inbox", at).as_deref(), Some("Inbox"));
+        assert_eq!(t.report("Inbox", ms(10)), None, "the same title is not told again");
+        assert_eq!(t.report("Inbox (1)", ms(20)), None, "held: too soon");
+        assert_eq!(t.report("Inbox (2)", ms(30)), None);
+        assert_eq!(t.due(ms(100)), None);
+        assert_eq!(t.due(ms(navigator_control::LIVE_TITLE_EVERY_MS)).as_deref(), Some("Inbox (2)"), "the latest held one");
+        assert_eq!(t.due(ms(5000)), None, "told once");
+        assert_eq!(t.report("Inbox (1)", ms(5001)).as_deref(), Some("Inbox (1)"));
+        assert_eq!(t.report("Inbox", ms(5002)), None);
+        assert_eq!(t.report("Inbox (1)", ms(5003)), None, "back to the told one: nothing held");
+        assert_eq!(t.due(ms(9000)), None);
+    }
 
     #[test]
     fn memory_is_told_first_then_on_a_mebibyte_or_a_new_cap() {

@@ -720,7 +720,24 @@ not yet checked in a VM.
   for `ATRIUM_I6_PAGE`, and each exit says why), and limen's web-island
   reports refused a local origin in `Started` and local addresses in
   `Navigate`/`UrlChanged`/`OpenBeside`/`Submit`; they now take your own
-  server's addresses in navigator-control's one spelling. Not checked:
-  the trail's name keeps the title the engine reports at its start (the
-  script sets it later), and a same-origin link from a live local page.
+  server's addresses in navigator-control's one spelling.
   Evidence: `~/atrium-vm/evidence/navigator-b7-20261127/` on the Mac.
+- **After the Mac run (2026-11-27).** The run left two gaps, both
+  closed on the host and not yet run on the Mac:
+  - *The trail's name.* navigatord dropped the engine's `Title`
+    reports. They are now `Event::LiveTitle { from, title }`, told by
+    `live_page::Titles`: each new title, at most one every
+    `LIVE_TITLE_EVERY_MS` (500), the latest held one told when that time
+    is up. navigator-ui's `live_titled` names the run's entry by it (an
+    empty title keeps the name), so the rail and the saved trail follow
+    what the script set. This holds for every live page, not just local
+    ones.
+  - *A same-origin link.* navigator-ui's `origin_of` knew only https, so
+    a link or `pushState` from a live local page stopped the run instead
+    of running it live again. It now takes your own server's origin in
+    the parser's spelling. `live_remembered` still refuses a local origin.
+  - Host tests: `a_pages_titles_are_told_at_a_pace_and_the_last_is_never_lost`
+    (navigatord), `a_live_pages_title_names_its_entry_once_its_engine_started`,
+    and the local link, address change and never-remembered cases in
+    `your_own_servers_page_is_offered_live_only_once_navigatord_named_its_app`
+    (navigator-ui).

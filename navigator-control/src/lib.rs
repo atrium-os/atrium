@@ -354,6 +354,12 @@ pub enum LinkAction {
 
 /// How often navigatord asks how much memory a live page's engine uses.
 pub const LIVE_MEMORY_EVERY_MS: u64 = 5000;
+/// The least time between two [`Event::LiveTitle`]s for one page: a page
+/// that changes its title faster is told at this pace, its latest title
+/// last.
+pub const LIVE_TITLE_EVERY_MS: u64 = 500;
+/// The longest title an [`Event::LiveTitle`] carries, as the engine's.
+pub const LIVE_TITLE_MAX: usize = 256;
 
 /// navigatord → UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +464,10 @@ pub enum Event {
     /// The live page at `from` changed its own address to `url`, same
     /// origin (`history.pushState`, I6.2): a trail entry, same engine.
     LiveUrlChanged { from: String, url: String },
+    /// The live page at `from` set its title (`document.title`): the trail
+    /// entry it is on is named by it. At most [`LIVE_TITLE_MAX`] bytes, no
+    /// control characters, told at most every [`LIVE_TITLE_EVERY_MS`].
+    LiveTitle { from: String, title: String },
     /// The live page at `from` offered a file (I6.4): a link or form whose
     /// answer is not a page, or a file its script made. navigatord holds
     /// it under `id` (its own, never one the UI sent) until `Save`,

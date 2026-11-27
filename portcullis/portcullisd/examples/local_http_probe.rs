@@ -6,7 +6,8 @@
 //! `Opened` shows it). `/live` is a page for running live (§4.5): its
 //! script GETs `/api/get`, POSTs JSON to `/api/save` (answered with the
 //! body it got), tries port 9090 and the web (both must fail), counts its
-//! visits in localStorage, and puts what happened in its title. Each
+//! visits in localStorage, and puts what happened in its title, then a
+//! link to `/go` (a same-origin link from a live page). Each
 //! request's first line goes to stderr.
 
 use std::io::{Read, Write};
@@ -29,6 +30,9 @@ fn answer(port: u16, req: &str) -> String {
   r.push('visits=' + n);
   document.title = 'live ' + r.join(' ');
   document.body.textContent = document.title;
+  const a = document.createElement('a');
+  a.href = '/go'; a.id = 'go'; a.textContent = 'next page';
+  document.body.append(' ', a);
 })();
 </script></body></html>"#;
             format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
