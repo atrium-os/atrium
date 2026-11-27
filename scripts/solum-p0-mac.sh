@@ -9,6 +9,7 @@
 #   sh scripts/solum-p0-mac.sh seed     # fresh ssh key + nuageinit seed ISO
 #   sh scripts/solum-p0-mac.sh up       # boot, wait for ssh
 #   sh scripts/solum-p0-mac.sh check    # EL2 / vmm.ko / bhyve probes (gate)
+#   sh scripts/solum-p0-mac.sh l2       # nested bhyve guest boots to login (gate)
 #   sh scripts/solum-p0-mac.sh ssh [cmd]
 #   sh scripts/solum-p0-mac.sh down     # ask the guest to stop, wait for it
 #
@@ -116,7 +117,9 @@ up)
         --console "$P0DIR/console.log" < /dev/null > "$P0DIR/vz-launch.log" 2>&1 &
     echo $! > "$P0DIR/vz.pid"
     i=0
-    while [ $i -lt 90 ]; do
+    # First boot of the BASIC-CLOUDINIT image runs firstboot_pkg_upgrade (about
+    # 1.3 GB of base packages) before sshd starts: ~25 min at 1 MB/s.
+    while [ $i -lt "${UP_WAIT_STEPS:-480}" ]; do
         running || { cat "$P0DIR/vz-launch.log"; die "launcher exited"; }
         if guest_ip >/dev/null && vssh true 2>/dev/null; then
             echo "ok: ssh root@$(guest_ip)"; exit 0
@@ -125,20 +128,43 @@ up)
     done
     echo "--- vz-launch.log"; cat "$P0DIR/vz-launch.log"
     echo "--- console.log (tail)"; tail -40 "$P0DIR/console.log" 2>/dev/null
-    die "no ssh after 450 s (leave it up and read console.log, or run down)"
+    die "no ssh after $((${UP_WAIT_STEPS:-480} * 5)) s (leave it up, or run down)"
     ;;
 check)
     . "$ROOT/scripts/lib/gate.sh"
-    gate_begin solum-p0-host 5
+    gate_begin solum-p0-host 6
     probe() { if vssh "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
     probe "guest answers ssh" true
     vssh 'uname -a; sysctl -n hw.model hw.ncpu' 2>&1
     vssh 'dmesg | grep -iE "el2|hyp|vhe|gic" | head -20' 2>&1
+    # A first-boot pkg upgrade installs a new kernel without rebooting; the
+    # old kernel then cannot link the new vmm.ko. Reboot the guest first.
+    probe "running kernel is the installed one" \
+        'b=$(strings /boot/kernel/kernel | grep -m1 -oE "main-n[0-9]+-[0-9a-f]+"); [ -n "$b" ] && uname -v | grep -qF "$b"'
     probe "vmm.ko is in the image" 'test -f /boot/kernel/vmm.ko'
     probe "vmm.ko loads (needs EL2)" 'kldstat -q -m vmm || kldload vmm'
     probe "kernel reports vmm loaded" 'kldstat -q -m vmm'
     probe "bhyve is in base" 'test -x /usr/sbin/bhyve && test -x /usr/sbin/bhyvectl'
     vssh 'dmesg | tail -20' 2>&1
+    gate_end
+    ;;
+l2)
+    . "$ROOT/scripts/lib/gate.sh"
+    gate_begin solum-p0-l2 4
+    xz_img="$P0DIR/$IMG_NAME.xz"
+    [ -f "$xz_img" ] || gate_abort "no $xz_img (run fetch)"
+    ip=$(guest_ip) || gate_abort "P0 host not up"
+    sc() { scp -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile="$P0DIR/known_hosts" "$@"; }
+    vssh 'mkdir -p /root/l2' || gate_abort "ssh"
+    sc "$ROOT/scripts/solum-p0/l2-guest.sh" root@"$ip":/root/l2/ || gate_abort "scp script"
+    if vssh 'test -f /root/l2/disk.raw'; then ok "L2 disk already staged"
+    elif sc "$xz_img" root@"$ip":/root/l2/disk.raw.xz && vssh 'cd /root/l2 && xz -d disk.raw.xz'; then
+        ok "L2 disk staged"
+    else bad "L2 disk staged"; fi
+    if vssh 'sh /root/l2/l2-guest.sh setup'; then ok "u-boot for bhyve and vmm"; else bad "u-boot for bhyve and vmm"; fi
+    if vssh 'sh /root/l2/l2-guest.sh start'; then ok "bhyve started L2"; else bad "bhyve started L2"; fi
+    if vssh 'sh /root/l2/l2-guest.sh wait'; then ok "L2 reached a login prompt"; else bad "L2 reached a login prompt"; fi
+    vssh 'grep -E "FreeBSD [0-9]|CPU|gic|real memory|login:" /root/l2/console.log | head -20' 2>&1
     gate_end
     ;;
 ssh)
