@@ -52,6 +52,10 @@ struct State {
     /// what their key's comment says (their word, not the host's); the
     /// screen's lines for it, none until a viewer connects.
     viewer: Vec<String>,
+    /// A live seat (`FRESCOD_FENESTRA_LIVE=1`) is being viewed: the strip
+    /// shows the indicator, its Disconnects at these desktop rects.
+    live_on: bool,
+    live_hits: Vec<[i32; 4]>,
     /// The seat's pointer on this screen; shown once it moves.
     cursor: (f32, f32),
     cursor_shown: bool,
@@ -75,6 +79,8 @@ const FRESH: State = State {
     scale_milli: 1000,
     who: String::new(),
     viewer: Vec::new(),
+    live_on: false,
+    live_hits: Vec::new(),
     cursor: (0.0, 0.0),
     cursor_shown: false,
     button: None,
@@ -133,6 +139,44 @@ pub fn active() -> bool {
 /// The picture's generation: it changed when this did.
 pub fn gen() -> u64 {
     state().gen
+}
+
+/// A live seat: whether a session is on now (the strip's indicator).
+pub fn set_live(on: bool) {
+    let mut s = state();
+    if s.live_on != on {
+        s.live_on = on;
+        if !on {
+            s.viewer.clear();
+            s.live_hits.clear();
+        }
+        eprintln!("frescod: viewed: live seat, indicator {}", if on { "on" } else { "off" });
+        changed(&mut s);
+    }
+}
+
+/// The live indicator's words while a live seat is viewed, else `None`.
+pub fn live_label() -> Option<String> {
+    let s = state();
+    s.live_on.then(|| s.viewer.first().map_or("viewed remotely".to_string(), |l| format!("viewed {l}")))
+}
+
+/// Where the live indicator's Disconnects are now (chrome.rs drew them).
+pub fn set_live_hits(hits: Vec<[i32; 4]>) {
+    state().live_hits = hits;
+}
+
+/// A press at desktop (`x`, `y`) on a live indicator's Disconnect: taken
+/// (true), and the sessions end as with the viewed screen's.
+pub fn press_live(x: f32, y: f32) -> bool {
+    let mut s = state();
+    let on = s.live_on && s.live_hits.iter().any(|&[x0, y0, x1, y1]| x >= x0 as f32 && x < x1 as f32 && y >= y0 as f32 && y < y1 as f32);
+    if on {
+        eprintln!("frescod: viewed: Disconnect pressed on the live indicator");
+        s.disconnect = true;
+        changed(&mut s);
+    }
+    on
 }
 
 /// Who is viewing (fenestrad's checked [`fenestra_link::Rec::Viewer`]):
@@ -427,6 +471,25 @@ mod tests {
         assert!(fill_for(0, 640, 360, &mut staging), "still covered while locking");
         assert!(poll(true));
         assert!(!fill_for(0, 640, 360, &mut staging));
+        reset();
+    }
+
+    #[test]
+    fn a_live_seat_shows_who_and_takes_disconnect_from_its_pill_only() {
+        reset();
+        assert_eq!(live_label(), None);
+        set_live(true);
+        assert_eq!(live_label().as_deref(), Some("viewed remotely"));
+        set_viewer(1, "192.0.2.4", "k");
+        assert_eq!(live_label().as_deref(), Some("viewed from 192.0.2.4"));
+        set_live_hits(vec![[100, 3, 180, 21]]);
+        assert!(!press_live(99.0, 10.0));
+        assert!(!take_disconnect());
+        assert!(press_live(100.0, 10.0));
+        assert!(take_disconnect());
+        set_live(false);
+        assert_eq!(live_label(), None);
+        assert!(!press_live(100.0, 10.0), "no indicator, nothing to press");
         reset();
     }
 

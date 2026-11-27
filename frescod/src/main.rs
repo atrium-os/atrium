@@ -241,6 +241,7 @@ fn main() -> std::io::Result<()> {
     activation::set_redraw(redraw.clone());
     lock::watch(comp.clone(), redraw.clone());
     viewed::set_redraw(redraw.clone());
+    let _ = socket_server::CHROME_PRESS.set(viewed::press_live);
     route::watch(redraw.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
@@ -622,6 +623,11 @@ fn main() -> std::io::Result<()> {
             }
             if let Some(o) = b.take_output() {
                 viewer_output = o;
+            }
+            /* A live seat keeps the session and shows the indicator. */
+            if viewed::live() && b.viewed() != viewed::live_label().is_some() {
+                viewed::set_live(b.viewed());
+                last_gen = 0;
             }
             if !viewed::live() {
                 let on = b.viewed();
@@ -1282,6 +1288,19 @@ fn end_span<'a>(
 /// Tell the WM side where each monitor sits (`OP_WM_OUTPUTS`).
 /// Each monitor's scale is the one the session set for it, else the
 /// automatic one from its pixel density.
+/// A live seat being viewed (fenestra.md §11.4): the indicator on every
+/// monitor, over whatever else is there.
+fn live_pills(c: &mut crate::pack::WindowFrame, px: chrome::Px) {
+    let hits = match viewed::live_label() {
+        Some(l) => {
+            let outs: Vec<[i32; 4]> = screen::outputs().iter().map(|o| [o.rect.x, o.rect.y, o.rect.w, o.rect.h]).collect();
+            chrome::viewed_pills(c, px, &outs, &l)
+        }
+        None => Vec::new(),
+    };
+    viewed::set_live_hits(hits);
+}
+
 fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head<'_>], scales: &HashMap<u64, u32>, span: Option<&span::Span>) {
     let list = heads
         .iter()
@@ -1466,6 +1485,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     lock::watch(comp.clone(), redraw2.clone());
     route::watch(redraw2.clone());
     viewed::set_redraw(redraw2.clone());
+    let _ = socket_server::CHROME_PRESS.set(viewed::press_live);
     let seat = headless_seat();
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
@@ -1561,6 +1581,10 @@ fn run_headless(png: &str) -> std::io::Result<()> {
                 b.disconnect();
             }
             let blank = seat && !viewed::live();
+            if seat && viewed::live() && b.viewed() != viewed::live_label().is_some() {
+                viewed::set_live(b.viewed());
+                last_gen = 0;
+            }
             if blank {
                 let on = b.viewed();
                 match viewed::phase() {
@@ -1983,15 +2007,18 @@ fn render_one_frame(
         };
         let mut c = chrome::build_with(px, screen_w, focus, origin, note.as_deref(), &rects, &slots, &covers, &hosted, &islands, chip.as_ref().map(|(n, c)| (n.as_str(), *c)));
         chrome::sheet_frames(&mut c, px, &sheets, px.strip());
+        live_pills(&mut c, px);
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         b.send_chrome(&c);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
     } else if let Some(mut c) = chrome::slot_frames(px, &slots, &island_ids.iter().filter_map(|&id| island_at(id, None)).collect::<Vec<_>>())
-        .or_else(|| (!sheets.is_empty()).then(|| crate::pack::WindowFrame { id: chrome::CHROME_ID, pos: (0.0, 0.0), size: (1, 1), ..Default::default() }))
+        .or_else(|| (!sheets.is_empty() || viewed::live_label().is_some()).then(|| crate::pack::WindowFrame { id: chrome::CHROME_ID, pos: (0.0, 0.0), size: (1, 1), ..Default::default() }))
     {
-        /* Direct mode: no strip, but slots and sheets still get their frame. */
+        /* Direct mode: no strip, but slots, sheets and a live seat's
+         * indicator still get their frame. */
         chrome::sheet_frames(&mut c, px, &sheets, 0);
+        live_pills(&mut c, px);
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);

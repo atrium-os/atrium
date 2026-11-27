@@ -1816,7 +1816,14 @@ until it holds) and keeps the viewed screen ("the remote session ended, locking"
 file says the seat is locked; only then does the desktop go back to the seat's monitors, behind the
 lock screen, so nobody at the desk gets the session by waiting the viewer out.
 `FRESCOD_FENESTRA_LIVE=1` is the per-host opt-in to keep the session on the seat while viewed (the
-seat keeps its outputs; the viewer sees the host's layout). Headless frescod stands in for a seat
+seat keeps its outputs; the viewer sees the host's layout). There frescod draws the §11.4 indicator
+in its chrome at the strip's right end on every monitor, over anything else there (a strip-less
+direct mode gets a chrome frame for it too): "viewed from ADDR" (or "by N viewers, ...") on a red
+no app's chrome uses, and a Disconnect beside it. A press on that Disconnect is frescod's own
+(`socket_server::CHROME_PRESS`, before any window sees it) and ends every session as the viewed
+screen's does; the indicator goes when no session is on. `scripts/fenestra-live-vm.sh` 7/7 (headless
+seat, forum-wm): the indicator on the seat's strip, the seat's typing reaching the session,
+Disconnect from the indicator. Headless frescod stands in for a seat
 with `FRESCOD_HEADLESS_SEAT=1` (its outputs are the monitors, their picture saved as
 `PNG-seat.png`): `scripts/fenestra-seat-vm.sh` 14/14 runs it with forum-wm, a viewer at
 1600x900@1.5 and a stub lock socket. On the display path each monitor scans out the viewed screen
@@ -1883,7 +1890,7 @@ back in the host screen's pixels. `--headless --out DIR` is the gates' form. A c
 to the network is tried again until `--run-secs`; input queued while disconnected is dropped.
 
 **Next in R2.** On the display path, the desktop at the viewer's output while viewed (as headless
-does) and a run on a real display; the §11.4 indicator on a live (opt-in) seat.
+does) and a run on a real display.
 
 ## 20. Sources
 

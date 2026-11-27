@@ -212,6 +212,11 @@ pub fn retire_idle_islands(comp: &Mutex<Compositor>, idle: std::time::Duration) 
     next
 }
 
+/// frescod's own controls in the chrome that a press at desktop (x, y)
+/// may hit before anything else (the live seat's Disconnect,
+/// viewed.rs): true takes the press. Set once by the binary that has them.
+pub static CHROME_PRESS: std::sync::OnceLock<fn(f32, f32) -> bool> = std::sync::OnceLock::new();
+
 /// Buttons whose press dismissed pop-ups: their releases are not
 /// delivered either.
 static SWALLOWED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -243,6 +248,10 @@ fn popup_gate(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> bool {
     }
     // Chrome hits carry global coordinates and target 0. A press already
     // routed to the engine must never become Stop while its frame is changing.
+    if button == 1 && target == 0 && CHROME_PRESS.get().is_some_and(|f| f(x, y)) {
+        swallowed.push(button);
+        return true;
+    }
     if button == 1 && target == 0 && !crate::lock::locked() {
         if let Some(id) = island_stop_at(&c, x, y) {
             if let Some((mut stream, _)) = c.windows.get_mut(&id).and_then(|w| w.island_stop.take()) {

@@ -627,6 +627,40 @@ pub fn sheet_frames(c: &mut WindowFrame, px: Px, sheets: &[Sheet], top: i32) {
     c.size = (right.max(1) as u32, bottom.max(1) as u32);
 }
 
+/// The indicator a live seat (`FRESCOD_FENESTRA_LIVE=1`, fenestra.md
+/// §11.4) shows while viewed: at the strip's right end on each monitor
+/// (`outputs`, desktop rects), `label` on the viewed colour and a
+/// Disconnect beside it, over anything else there. Returns the Disconnect
+/// rects, desktop pixels.
+pub fn viewed_pills(c: &mut WindowFrame, px: Px, outputs: &[[i32; 4]], label: &str) -> Vec<[i32; 4]> {
+    let (mut right, mut bottom) = (c.size.0 as i32, c.size.1 as i32);
+    let h = px.strip() - 2 * px.p(3);
+    let mut hits = Vec::new();
+    for &[ox, oy, ow, _] in outputs {
+        let bw = text_width(px, "disconnect") + px.p(4 * PAD);
+        let lw = text_width(px, label) + px.p(4 * PAD);
+        let y = oy + px.p(3);
+        let bx = (ox + ow - px.p(PAD) - bw).max(ox);
+        let lx = (bx - px.p(PAD) - lw).max(ox);
+        let mut pill = rect(lx, y, lw, h, VIEWED_COLOR);
+        pill.radius = h as f32 / 2.0;
+        c.rects.push(pill);
+        text(&mut c.rects, px, label, lx + px.p(2 * PAD), y + (h - line(px)) / 2, lw - px.p(2 * PAD));
+        let mut b = rect(bx, y, bw, h, RING_COLOR);
+        b.radius = h as f32 / 2.0;
+        c.rects.push(b);
+        text(&mut c.rects, px, "disconnect", bx + px.p(2 * PAD), y + (h - line(px)) / 2, bw - px.p(2 * PAD));
+        hits.push([bx, y, bx + bw, y + h]);
+        right = right.max(bx + bw);
+        bottom = bottom.max(y + h);
+    }
+    c.size = (right.max(1) as u32, bottom.max(1) as u32);
+    hits
+}
+
+/// The live indicator's colour: a red no app's chrome uses.
+const VIEWED_COLOR: [f32; 4] = [0.85, 0.15, 0.2, 1.0];
+
 /// The host's own monitors while a viewer has the session (fenestra.md
 /// §11.4, decision 3): `lines` centred on a plain field, a `button` under
 /// them when there is one, and the seat's pointer at `cursor` when it is
