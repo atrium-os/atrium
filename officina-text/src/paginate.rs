@@ -985,6 +985,15 @@ impl Paginator {
                 }
                 yy += l.lines[li].height;
                 li += 1;
+                // A page break inside the paragraph (U+000C ends its line):
+                // the rest starts the next column.
+                if li < total && doc.para(b).is_some_and(|p| l.lines[li - 1].end > 0 && p.text.as_bytes().get(l.lines[li - 1].end as usize - 1) == Some(&PAGE_BREAK_BYTE)) {
+                    if let Some(c) = &wrap {
+                        f.carry = Some((b, c.clone()));
+                    }
+                    f.slices.push(Slice { block: b, lines: l0..li, y: y0, x, w, wrap });
+                    return (Stop::Full(Checkpoint { block: b, line: li, wrap: hash }), yy);
+                }
             }
             if li == total {
                 f.slices.push(Slice { block: b, lines: l0..li, y: y0, x, w, wrap });
@@ -1035,6 +1044,10 @@ impl Paginator {
         }
     }
 }
+
+/// A page break inside a paragraph (Word's `w:br w:type="page"`).
+pub const PAGE_BREAK: char = '\u{000C}';
+const PAGE_BREAK_BYTE: u8 = 0x0C;
 
 /// What a page holds so far.
 #[derive(Clone, Default)]
@@ -1105,6 +1118,19 @@ mod tests {
 
     fn shape(p: &Paginator) -> Vec<Vec<(usize, Range<usize>)>> {
         p.pages().iter().map(|pg| pg.slices.iter().map(|s| (s.block, s.lines.clone())).collect()).collect()
+    }
+
+    /// A page break inside a paragraph: its line ends the page, the rest of
+    /// the paragraph starts the next.
+    #[test]
+    fn a_page_break_inside_a_paragraph_starts_a_page() {
+        let mut d = doc_with(&[2], 10);
+        d.blocks.update(0, |b| {
+            let p = b.as_para_mut().unwrap();
+            p.text = format!("short{PAGE_BREAK}rest");
+        });
+        let (p, _) = all(&d);
+        assert_eq!(shape(&p), vec![vec![(0, 0..1)], vec![(0, 1..2)]]);
     }
 
     #[test]

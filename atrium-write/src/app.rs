@@ -23,7 +23,7 @@ use pergola_richtext::{Checker, Editor, MarginPages};
 use pergola::text_edit::TextEdit;
 use pergola::widgets::{Button, Check, Checkbox, MenuButton, MenuItem, MenuState, ScrollState, Segmented, TextField};
 use pergola::{Color, Mutable, TextStyle};
-use pergola_richtext::editor::Toggle;
+use pergola_richtext::editor::{Case, Toggle};
 use pergola_richtext::RichTextView;
 
 use crate::doc::Doc;
@@ -54,6 +54,27 @@ pub const SHAPES: [(&str, &str); 12] = [("Rectangle", "rect"), ("Rounded", "roun
 /// The shape bar's colours: (name, RGB).
 pub const SHAPE_COLORS: [(&str, u32); 9] = [("Blue", 0x4472C4), ("Dark Blue", 0x2F528F), ("Orange", 0xED7D31), ("Green", 0x70AD47), ("Red", 0xC00000), ("Yellow", 0xFFC000), ("Grey", 0xA5A5A5), ("Black", 0x000000), ("White", 0xFFFFFF)];
 
+/// The Format menu, in order (its commands are [`FORMAT_CMDS`]).
+pub const FORMAT: [&str; 18] = ["Font…", "Grow Font", "Shrink Font", "Strikethrough", "Double Strikethrough", "Superscript", "Subscript", "Small Caps", "All Caps", "Hidden", "Clear Formatting", "Sentence case.", "lowercase", "UPPERCASE", "Capitalize Each Word", "tOGGLE cASE", "Format Painter", "Page Break"];
+
+/// What each Format menu item does.
+pub const FORMAT_CMDS: [Cmd; 18] = [Cmd::FontOpen, Cmd::Grow(true), Cmd::Grow(false), Cmd::Toggle(Toggle::Strike), Cmd::Toggle(Toggle::DoubleStrike), Cmd::Toggle(Toggle::Superscript), Cmd::Toggle(Toggle::Subscript), Cmd::Toggle(Toggle::SmallCaps), Cmd::Toggle(Toggle::AllCaps), Cmd::Toggle(Toggle::Hidden), Cmd::ClearFormatting, Cmd::Case(Case::Sentence), Cmd::Case(Case::Lower), Cmd::Case(Case::Upper), Cmd::Case(Case::Title), Cmd::Case(Case::Toggle), Cmd::FormatPainter, Cmd::PageBreak];
+
+/// The Font… bar's sizes, points (Word's list).
+pub const FONT_SIZES: [u16; 16] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
+
+/// Highlight colours (Word's fifteen): (name, RGB).
+pub const HIGHLIGHTS: [(&str, u32); 15] = [("Yellow", 0xFFFF00), ("Bright Green", 0x00FF00), ("Turquoise", 0x00FFFF), ("Pink", 0xFF00FF), ("Blue", 0x0000FF), ("Red", 0xFF0000), ("Dark Blue", 0x000080), ("Teal", 0x008080), ("Green", 0x008000), ("Violet", 0x800080), ("Dark Red", 0x800000), ("Dark Yellow", 0x808000), ("Grey 50%", 0x808080), ("Grey 25%", 0xC0C0C0), ("Black", 0x000000)];
+
+/// Letter widths the Font… bar offers, percent.
+pub const FONT_WIDTHS: [u16; 8] = [33, 50, 66, 80, 90, 100, 150, 200];
+
+/// Text effects the Font… bar toggles: (label, bit).
+pub const FONT_EFFECTS: [(&str, u8); 4] = [("Outline", officina_text::model::EFFECT_OUTLINE), ("Shadow", officina_text::model::EFFECT_SHADOW), ("Emboss", officina_text::model::EFFECT_EMBOSS), ("Engrave", officina_text::model::EFFECT_ENGRAVE)];
+
+/// Letter spacing's step on the Font… bar, twips (half a point).
+pub const SPACING_STEP: i16 = 10;
+
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
 
@@ -79,6 +100,33 @@ pub enum Cmd {
     Undo,
     Redo,
     Toggle(Toggle),
+    /// Grow Font (true) or Shrink Font.
+    Grow(bool),
+    ClearFormatting,
+    Case(Case),
+    /// Format Painter: the caret's look goes on the next selection made.
+    FormatPainter,
+    /// A page break at the caret (Ctrl+Enter).
+    PageBreak,
+    /// The Format menu's item at this place in [`FORMAT`].
+    Format(usize),
+    /// Format ▸ Font… (Ctrl+D): the Font bar over the selection.
+    FontOpen,
+    FontClose,
+    /// The font: 0 the paragraph's, else [`STYLE_FONTS`].
+    FontFamily(usize),
+    /// [`FONT_SIZES`]'s size at this place.
+    FontSize(usize),
+    /// Colour: 0 automatic, else [`SHAPE_COLORS`].
+    FontColor(usize),
+    /// Highlight: 0 none, else [`HIGHLIGHTS`].
+    FontHighlight(usize),
+    /// Letters a step further apart (true) or closer.
+    FontSpacing(bool),
+    /// [`FONT_WIDTHS`]'s width at this place.
+    FontWidth(usize),
+    /// A text effect's bit, on or off.
+    FontEffect(u8),
     Align(Align),
     /// The selected paragraphs' direction: from their text (`None`), left
     /// to right, right to left.
@@ -243,6 +291,37 @@ pub enum Cmd {
     ShapeAnchor,
     ShapeDone,
     ShapeClose,
+}
+
+/// The character commands of the Format menu and the Font… bar: Some
+/// (whether the text changed) when `c` is one of them.
+fn font_cmd(e: &mut Editor, open: &Mutable<bool>, c: Cmd) -> Option<bool> {
+    let rev = e.revision;
+    match c {
+        Cmd::FontOpen => open.set(true),
+        Cmd::FontClose => open.set(false),
+        Cmd::Grow(up) => e.grow_font(up, false),
+        Cmd::ClearFormatting => e.clear_formatting(),
+        Cmd::Case(k) => {
+            e.change_case(k);
+        }
+        Cmd::FormatPainter => e.pick_format(),
+        Cmd::PageBreak => {
+            e.page_break();
+        }
+        Cmd::FontFamily(i) => e.set_family(i.checked_sub(1).map(|k| std::sync::Arc::<str>::from(STYLE_FONTS[k.min(STYLE_FONTS.len() - 1)]))),
+        Cmd::FontSize(i) => e.set_size(FONT_SIZES[i.min(FONT_SIZES.len() - 1)] * 2),
+        Cmd::FontColor(i) => e.set_color(i.checked_sub(1).map(|k| SHAPE_COLORS[k.min(SHAPE_COLORS.len() - 1)].1)),
+        Cmd::FontHighlight(i) => e.set_highlight(i.checked_sub(1).map(|k| HIGHLIGHTS[k.min(HIGHLIGHTS.len() - 1)].1)),
+        Cmd::FontSpacing(wider) => {
+            let cur = e.format_at_caret().spacing;
+            e.set_spacing(if wider { cur.saturating_add(SPACING_STEP) } else { cur.saturating_sub(SPACING_STEP) });
+        }
+        Cmd::FontWidth(i) => e.set_scale(FONT_WIDTHS[i.min(FONT_WIDTHS.len() - 1)]),
+        Cmd::FontEffect(bit) => e.toggle_effect(bit),
+        _ => return None,
+    }
+    Some(e.revision != rev || matches!(c, Cmd::FontOpen | Cmd::FontClose | Cmd::FormatPainter) || e.typing.is_some())
 }
 
 /// A change to a section's page.
@@ -526,6 +605,14 @@ pub struct Write {
     pub shape: Mutable<ShapeBar>,
     pub shape_text: Mutable<TextEdit>,
     pub fill_menu: Mutable<MenuState>,
+    /// The Format menu and the Font… bar's menus.
+    pub format_menu: Mutable<MenuState>,
+    pub font_open: Mutable<bool>,
+    pub font_family_menu: Mutable<MenuState>,
+    pub font_size_menu: Mutable<MenuState>,
+    pub font_color_menu: Mutable<MenuState>,
+    pub font_highlight_menu: Mutable<MenuState>,
+    pub font_width_menu: Mutable<MenuState>,
     pub line_menu: Mutable<MenuState>,
     pub speller: Rc<RefCell<Speller>>,
     /// Where words added to the dictionary are kept (one per line).
@@ -534,7 +621,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), read_was: Cell::new(false), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), read_was: Cell::new(false), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), format_menu: Mutable::new(MenuState::default()), font_open: Mutable::new(false), font_family_menu: Mutable::new(MenuState::default()), font_size_menu: Mutable::new(MenuState::default()), font_color_menu: Mutable::new(MenuState::default()), font_highlight_menu: Mutable::new(MenuState::default()), font_width_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -580,7 +667,7 @@ impl Write {
             return Rect::new(0.0, 0.0, w, h);
         }
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open || self.font_open.get() { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         let w = if self.pane.get() || self.outline.get() { (w - PANE_W).max(200.0) } else { w };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
@@ -1206,6 +1293,10 @@ impl Write {
         let out: Vec<Cmd> = cmds
             .into_iter()
             .filter(|&c| {
+                let c = match c {
+                    Cmd::Format(i) => FORMAT_CMDS[i.min(FORMAT_CMDS.len() - 1)],
+                    c => c,
+                };
                 let d = self.doc.borrow();
                 let mut e = d.ed.borrow_mut();
                 // The bars share one place under the toolbar.
@@ -1223,6 +1314,29 @@ impl Write {
                 }
                 if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen | Cmd::StyleOpen) {
                     self.margin.set(MarginBar::default());
+                }
+                // The Font… bar takes the same place.
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen | Cmd::StyleOpen | Cmd::MarginOpen) {
+                    self.font_open.set(false);
+                }
+                if c == Cmd::FontOpen {
+                    e.review = false;
+                    self.style_bar.set(StyleBar::default());
+                    self.shape.set(ShapeBar::default());
+                    self.xref.set(XrefBar::default());
+                    self.margin.set(MarginBar::default());
+                    self.find.set(FindBar::default());
+                    self.spell.set(SpellBar::default());
+                    self.note.set(NoteBar::default());
+                    self.comment.set(CommentBar::default());
+                }
+                if let Some(done) = font_cmd(&mut e, &self.font_open, c) {
+                    drop(e);
+                    drop(d);
+                    if done {
+                        self.changed();
+                    }
+                    return false;
                 }
                 match c {
                     Cmd::TrackToggle => {
@@ -1639,13 +1753,39 @@ impl View for Write {
         button(ctx, "Save As…", Cmd::SaveAs, 88.0, 6.0);
         button(ctx, "PDF…", Cmd::ExportPdf, 60.0, 6.0);
         button(ctx, "Print…", Cmd::Print, 64.0, 10.0);
-        button(ctx, "Undo", Cmd::Undo, 60.0, 6.0);
-        button(ctx, "Redo", Cmd::Redo, 60.0, 10.0);
+        button(ctx, "Undo", Cmd::Undo, 52.0, 6.0);
+        button(ctx, "Redo", Cmd::Redo, 52.0, 10.0);
         button(ctx, "B", Cmd::Toggle(Toggle::Bold), 36.0, 4.0);
         button(ctx, "I", Cmd::Toggle(Toggle::Italic), 36.0, 4.0);
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 10.0);
-        button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
-        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 10.0);
+        button(ctx, "• List", Cmd::List(ListKind::Bullet), 58.0, 4.0);
+        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 60.0, 10.0);
+        {
+            // Character formatting beyond B, I and U.
+            let cf = self.doc.borrow().ed.borrow().format_at_caret();
+            let painting = self.doc.borrow().ed.borrow().painter.is_some();
+            let items: Vec<MenuItem> = FORMAT.iter().enumerate().map(|(i, l)| {
+                let m = MenuItem::new(*l);
+                match i {
+                    1 | 3 | 10 | 11 | 16 => m.separated(),
+                    _ => m,
+                }
+                .checked(match i {
+                    3 => cf.strike && !cf.dstrike,
+                    4 => cf.dstrike,
+                    5 => cf.vert == officina_text::model::VertAlign::Super,
+                    6 => cf.vert == officina_text::model::VertAlign::Sub,
+                    7 => cf.caps == officina_text::model::Caps::Small,
+                    8 => cf.caps == officina_text::model::Caps::All,
+                    9 => cf.hidden,
+                    16 => painting,
+                    _ => false,
+                })
+            }).collect();
+            let cmds = self.cmds.clone();
+            MenuButton::new("Format".to_string(), self.format_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Format(i))).at(x, 8.0).width(76.0).render(ctx);
+            x += 84.0;
+        }
         let (style_name, cur_align, para_styles, cur_dir) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
@@ -1662,8 +1802,8 @@ impl View for Write {
             items.push(MenuItem::new("Styles Pane").checked(self.pane.get()));
             items.push(MenuItem::new("Outline Pane").checked(self.outline.get()));
             let cmds = self.cmds.clone();
-            MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(120.0).render(ctx);
-            x += 128.0;
+            MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(112.0).render(ctx);
+            x += 120.0;
         }
         {
             let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
@@ -1701,8 +1841,8 @@ impl View for Write {
                 }),
             }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Insert".to_string(), self.insert_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::insert(i))).at(x, 8.0).width(96.0).render(ctx);
-            x += 100.0;
+            MenuButton::new("Insert".to_string(), self.insert_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::insert(i))).at(x, 8.0).width(90.0).render(ctx);
+            x += 94.0;
         }
         {
             let tracking = self.doc.borrow().ed.borrow().doc.tracking;
@@ -1714,8 +1854,8 @@ impl View for Write {
                 _ => MenuItem::new(*s),
             }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith, Cmd::PasswordOpen, Cmd::Continuous, Cmd::ReadMode][i.min(8)])).at(x, 8.0).width(88.0).render(ctx);
-            x += 104.0;
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith, Cmd::PasswordOpen, Cmd::Continuous, Cmd::ReadMode][i.min(8)])).at(x, 8.0).width(80.0).render(ctx);
+            x += 92.0;
         }
         {
             // Alignment, as a menu (the toolbar has no room for four buttons).
@@ -2028,6 +2168,82 @@ impl View for Write {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + STYLE_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // The Font… bar: the selection's font, size, colours, spacing, width
+        // and effects (Word's Font dialog), applied as each is picked.
+        if self.font_open.get() {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, MARGIN_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let cf = ed.borrow().format_at_caret();
+            let lbl = |ctx: &mut Ctx, x: f32, y: f32, text: &str| ctx.add(Node::Text { rect: Rect::new(x, y + 6.0, 90.0, 20.0), content: text.into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            let ry = y + 8.0;
+            let mut x = 12.0;
+            lbl(ctx, x, ry, "Font");
+            x += 40.0;
+            let fonts: Vec<MenuItem> = std::iter::once(MenuItem::new("Paragraph's")).chain(STYLE_FONTS.iter().map(|f| MenuItem::new(*f).radio(*cf.family == **f))).collect();
+            let cmds = self.cmds.clone();
+            MenuButton::new(fit_text(&cf.family, 130.0, &st(type_size::MD, Weight::Regular, t.text_primary())), self.font_family_menu.clone(), fonts, move |i| cmds.lock().unwrap().push(Cmd::FontFamily(i))).at(x, ry).width(160.0).render(ctx);
+            x += 172.0;
+            lbl(ctx, x, ry, "Size");
+            x += 36.0;
+            let sizes: Vec<MenuItem> = FONT_SIZES.iter().map(|z| MenuItem::new(z.to_string()).radio(cf.size == z * 2)).collect();
+            let cmds = self.cmds.clone();
+            let shown = if cf.size % 2 == 0 { format!("{}", cf.size / 2) } else { format!("{}.5", cf.size / 2) };
+            MenuButton::new(shown, self.font_size_menu.clone(), sizes, move |i| cmds.lock().unwrap().push(Cmd::FontSize(i))).at(x, ry).width(64.0).render(ctx);
+            x += 70.0;
+            for (label, cmd) in [("A+", Cmd::Grow(true)), ("A−", Cmd::Grow(false))] {
+                Button::secondary(label).at(x, ry).width(40.0).on_click(push(cmd)).render(ctx);
+                x += 44.0;
+            }
+            x += 8.0;
+            lbl(ctx, x, ry, "Colour");
+            x += 50.0;
+            let colors: Vec<MenuItem> = std::iter::once(MenuItem::new("Automatic")).chain(SHAPE_COLORS.iter().map(|(n, c)| MenuItem::new(*n).radio(cf.color == *c))).collect();
+            let now = SHAPE_COLORS.iter().find(|(_, c)| *c == cf.color).map_or("Automatic", |(n, _)| n);
+            let cmds = self.cmds.clone();
+            MenuButton::new(now.to_string(), self.font_color_menu.clone(), colors, move |i| cmds.lock().unwrap().push(Cmd::FontColor(i))).at(x, ry).width(110.0).render(ctx);
+            x += 120.0;
+            lbl(ctx, x, ry, "Highlight");
+            x += 66.0;
+            let marks: Vec<MenuItem> = std::iter::once(MenuItem::new("No Colour").radio(cf.highlight.is_none())).chain(HIGHLIGHTS.iter().map(|(n, c)| MenuItem::new(*n).radio(cf.highlight == Some(*c)))).collect();
+            let now = cf.highlight.and_then(|h| HIGHLIGHTS.iter().find(|(_, c)| *c == h)).map_or(if cf.highlight.is_some() { "Other" } else { "No Colour" }, |(n, _)| n);
+            let cmds = self.cmds.clone();
+            MenuButton::new(now.to_string(), self.font_highlight_menu.clone(), marks, move |i| cmds.lock().unwrap().push(Cmd::FontHighlight(i))).at(x, ry).width(120.0).render(ctx);
+            Button::secondary("Close").at(w - 76.0, ry).width(64.0).on_click(push(Cmd::FontClose)).render(ctx);
+            // Second row: the letters' look.
+            let ry = y + FIND_H + 8.0;
+            let mut x = 12.0;
+            let on = |b: bool, l: &str| if b { format!("{l} ✓") } else { l.to_string() };
+            use officina_text::model::{Caps, VertAlign};
+            for (label, cmd, wd) in [(on(cf.strike && !cf.dstrike, "Strike"), Cmd::Toggle(Toggle::Strike), 72.0), (on(cf.dstrike, "Double"), Cmd::Toggle(Toggle::DoubleStrike), 76.0), (on(cf.vert == VertAlign::Super, "x²"), Cmd::Toggle(Toggle::Superscript), 48.0), (on(cf.vert == VertAlign::Sub, "x₂"), Cmd::Toggle(Toggle::Subscript), 48.0), (on(cf.caps == Caps::Small, "Small Caps"), Cmd::Toggle(Toggle::SmallCaps), 100.0), (on(cf.caps == Caps::All, "All Caps"), Cmd::Toggle(Toggle::AllCaps), 88.0), (on(cf.hidden, "Hidden"), Cmd::Toggle(Toggle::Hidden), 76.0)] {
+                Button::secondary(label).at(x, ry).width(wd).on_click(push(cmd)).render(ctx);
+                x += wd + 4.0;
+            }
+            x += 8.0;
+            lbl(ctx, x, ry, &format!("Spacing {:+.1} pt", cf.spacing as f32 / 20.0));
+            x += 104.0;
+            for (label, cmd) in [("−", Cmd::FontSpacing(false)), ("+", Cmd::FontSpacing(true))] {
+                Button::secondary(label).at(x, ry).width(32.0).on_click(push(cmd)).render(ctx);
+                x += 36.0;
+            }
+            x += 8.0;
+            lbl(ctx, x, ry, "Width");
+            x += 44.0;
+            let widths: Vec<MenuItem> = FONT_WIDTHS.iter().map(|p| MenuItem::new(format!("{p}%")).radio(cf.scale == *p)).collect();
+            let cmds = self.cmds.clone();
+            MenuButton::new(format!("{}%", cf.scale), self.font_width_menu.clone(), widths, move |i| cmds.lock().unwrap().push(Cmd::FontWidth(i))).at(x, ry).width(76.0).render(ctx);
+            x += 86.0;
+            for (label, bit) in FONT_EFFECTS {
+                let wd = 80.0;
+                Button::secondary(on(cf.effects & bit != 0, label)).at(x, ry).width(wd).on_click(push(Cmd::FontEffect(bit))).render(ctx);
+                x += wd + 4.0;
+            }
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // The shape bar: on the caret's shape, its words and look; with none,
         // the shapes to draw.
         let sb = self.shape.get_cloned();
@@ -2183,7 +2399,8 @@ impl View for Write {
         // The pages.
         let cmds = self.cmds.clone();
         let cmds2 = self.cmds.clone();
-        RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).on_comment(move |id| cmds2.lock().unwrap().push(Cmd::CommentOpen(id))).emit(ctx);
+        let cmds3 = self.cmds.clone();
+        RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).on_font(move || cmds3.lock().unwrap().push(Cmd::FontOpen)).on_comment(move |id| cmds2.lock().unwrap().push(Cmd::CommentOpen(id))).emit(ctx);
 
         // The styles pane: every style in its own look; a click puts it on.
         if self.pane.get() {
@@ -2750,6 +2967,69 @@ mod tests {
         ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 1), false);
         run(Cmd::LangEa(0));
         assert_eq!(lang(0, 0), None, "back to the document's");
+    }
+
+    #[test]
+    fn format_menu_and_font_bar() {
+        use officina_text::model::{Caps, CharAttrs, EFFECT_SHADOW};
+        let doc = Doc::from_text("f.txt", "Some words here\nNext.".as_bytes()).unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1280.0, 720.0));
+        let ed = w.doc.borrow().ed.clone();
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        let look = |b: usize, at: u32| {
+            let e = ed.borrow();
+            let p = e.doc.para(b).unwrap();
+            e.doc.attrs.get(p.attr_at(at)).clone()
+        };
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(pergola_richtext::Pos::new(0, 0), false);
+            e.set_caret(pergola_richtext::Pos::new(0, 4), true);
+        }
+        // Every Format menu item maps to its command.
+        assert_eq!(FORMAT.len(), FORMAT_CMDS.len());
+        run(Cmd::Format(8));
+        assert_eq!(look(0, 1).caps, Some(Caps::All));
+        run(Cmd::Format(4));
+        assert_eq!(look(0, 1).dstrike, Some(true));
+        run(Cmd::Format(13));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().text, "SOME words here");
+        run(Cmd::Format(10));
+        assert_eq!(look(0, 1), CharAttrs::default(), "Clear Formatting");
+        // The Font… bar, opened by its item (Ctrl+D in the view).
+        run(Cmd::Format(0));
+        assert!(w.font_open.get());
+        assert!(w.pages_rect(1280.0, 720.0).origin.y >= TOOLBAR_H + MARGIN_H - 0.5, "the pages start below the bar");
+        run(Cmd::FontFamily(1));
+        run(Cmd::FontSize(4));
+        run(Cmd::FontColor(5));
+        run(Cmd::FontHighlight(1));
+        run(Cmd::FontSpacing(true));
+        run(Cmd::FontWidth(6));
+        run(Cmd::FontEffect(EFFECT_SHADOW));
+        let a = look(0, 1);
+        assert_eq!((a.family.as_deref(), a.size, a.color, a.highlight, a.spacing, a.scale, a.effects), (Some(STYLE_FONTS[0]), Some(24), Some(SHAPE_COLORS[4].1), Some(HIGHLIGHTS[0].1), Some(SPACING_STEP), Some(150), Some(EFFECT_SHADOW)));
+        assert_eq!(look(0, 6), CharAttrs::default(), "only the selection");
+        // Another bar closes it.
+        run(Cmd::FindOpen);
+        assert!(!w.font_open.get());
+        // Format Painter: picked here, put on the next selection.
+        run(Cmd::Format(16));
+        assert!(ed.borrow().painter.is_some());
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(pergola_richtext::Pos::new(1, 0), false);
+            e.set_caret(pergola_richtext::Pos::new(1, 4), true);
+            assert!(e.paint_format(false));
+        }
+        assert_eq!(look(1, 1).scale, Some(150));
+        // Page Break.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
+        run(Cmd::Format(17));
+        assert!(ed.borrow().doc.para(1).unwrap().text.starts_with('\u{000C}'));
     }
 
     #[test]

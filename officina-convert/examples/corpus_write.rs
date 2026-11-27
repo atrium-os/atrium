@@ -77,6 +77,13 @@ struct Counts {
     coloured: usize,
     font: usize,
     highlight: usize,
+    caps: usize,
+    hidden: usize,
+    dstrike: usize,
+    spaced_letters: usize,
+    scaled: usize,
+    effects: usize,
+    page_breaks: usize,
     styled: usize,
     indented: usize,
     spaced: usize,
@@ -87,18 +94,21 @@ impl Counts {
         let mut c = Counts::default();
         for b in 0..d.blocks.len() {
             let Some(p) = d.para(b) else { continue };
-            if !p.text.trim().is_empty() {
-                c.paras += 1;
-            }
+            // A paragraph with page breaks inside counts as its pieces, as
+            // ODF (which has no such break) splits it.
+            let k = p.text.split('\u{000C}').count();
+            c.paras += p.text.split('\u{000C}').filter(|t| !t.trim().is_empty()).count();
             let pr = &p.props;
-            c.cells += pr.cell.is_some() as usize;
+            c.cells += k * pr.cell.is_some() as usize;
             c.sections += pr.section.is_some() as usize;
-            c.list_items += matches!(pr.list, Some(Some(_))) as usize;
-            c.toc += pr.toc.is_some() as usize;
-            c.tabs += pr.tabs.as_ref().is_some_and(|t| !t.is_empty()) as usize;
-            c.styled += (p.style != 0 && !p.text.trim().is_empty()) as usize;
-            c.indented += (pr.indent_start.unwrap_or(0) != 0 || pr.first_line.unwrap_or(0) != 0) as usize;
-            c.spaced += (pr.space_before.unwrap_or(0) != 0 || pr.space_after.unwrap_or(0) != 0 || pr.line_spacing.is_some()) as usize;
+            c.list_items += k * matches!(pr.list, Some(Some(_))) as usize;
+            c.toc += k * pr.toc.is_some() as usize;
+            c.tabs += k * pr.tabs.as_ref().is_some_and(|t| !t.is_empty()) as usize;
+            c.styled += p.text.split('\u{000C}').filter(|t| p.style != 0 && !t.trim().is_empty()).count();
+            c.indented += k * (pr.indent_start.unwrap_or(0) != 0 || pr.first_line.unwrap_or(0) != 0) as usize;
+            c.spaced += k * (pr.space_before.unwrap_or(0) != 0 || pr.space_after.unwrap_or(0) != 0 || pr.line_spacing.is_some()) as usize;
+            // A page break inside a paragraph, or before one (ODF has only that).
+            c.page_breaks += p.text.matches('\u{000C}').count() + (b > 0 && pr.page_break_before == Some(true)) as usize;
             for (s, e, a) in p.spans() {
                 let n = p.text[s as usize..e as usize].chars().filter(|ch| !ch.is_whitespace()).count();
                 let a = d.attrs.get(a);
@@ -123,6 +133,12 @@ impl Counts {
                     c.coloured += n * a.color.is_some() as usize;
                     c.font += n * a.family.is_some() as usize;
                     c.highlight += n * a.highlight.is_some() as usize;
+                    c.caps += n * a.caps.is_some_and(|x| x != officina_text::model::Caps::Normal) as usize;
+                    c.hidden += n * (a.hidden == Some(true)) as usize;
+                    c.dstrike += n * (a.dstrike == Some(true)) as usize;
+                    c.spaced_letters += n * a.spacing.is_some_and(|x| x != 0) as usize;
+                    c.scaled += n * a.scale.is_some_and(|x| x != 100) as usize;
+                    c.effects += n * a.effects.is_some_and(|x| x != 0) as usize;
                 }
             }
         }
@@ -157,6 +173,13 @@ impl Counts {
             ("coloured", self.coloured),
             ("font", self.font),
             ("highlight", self.highlight),
+            ("caps", self.caps),
+            ("hidden", self.hidden),
+            ("dstrike", self.dstrike),
+            ("spaced_letters", self.spaced_letters),
+            ("scaled", self.scaled),
+            ("effects", self.effects),
+            ("page_breaks", self.page_breaks),
             ("styled", self.styled),
             ("indented", self.indented),
             ("spaced", self.spaced),
@@ -167,7 +190,8 @@ impl Counts {
 /// Each paragraph's visible text (tracked deletions left out), empty ones
 /// dropped: our writers add an empty paragraph where Word needs one.
 fn texts(d: &TextDoc) -> Vec<String> {
-    d.visible_text().into_iter().map(|t| t.replace('\u{FFFC}', "")).filter(|t| !t.trim().is_empty()).collect()
+    // A page break inside a paragraph counts as the end of one (ODF splits there).
+    d.visible_text().into_iter().flat_map(|t| t.split('\u{000C}').map(|x| x.replace('\u{FFFC}', "")).collect::<Vec<_>>()).filter(|t| !t.trim().is_empty()).collect()
 }
 
 /// "same", or what differs: the text first, then each count that moved.

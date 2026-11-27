@@ -547,14 +547,20 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
         }
         let color = f.color;
         if !run.glyphs.is_empty() {
+            effects(out, &mut run, f.effects, size);
             out.push(Item::Glyphs(run));
         }
         let thick = (size / 14).max(crate::LU / 2);
         if f.underline || f.link.is_some() {
             out.push(Item::Rect { x: rx, y: baseline + size * 12 / 100, w: rw, h: thick, color });
         }
-        if f.strike {
+        if f.strike && !f.dstrike {
             out.push(Item::Rect { x: rx, y: baseline - size * 28 / 100, w: rw, h: thick, color });
+        }
+        if f.dstrike {
+            for y in [baseline - size * 33 / 100, baseline - size * 22 / 100] {
+                out.push(Item::Rect { x: rx, y, w: rw, h: (thick * 3 / 4).max(1), color });
+            }
         }
         if let Some(u) = &f.link {
             out.push(Item::Link { x: rx, y: top, w: rw, h: lh, uri: u.to_string() });
@@ -900,5 +906,34 @@ mod tests {
         let small = items.iter().filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None }).find(|r| r.text == "1").unwrap();
         assert!(small.size < crate::pt(11));
         assert!(p.pages()[0].foot_rule.is_some() && p.pages()[0].end_rule.is_some());
+    }
+}
+
+/// Text effects as copies of the run under it: a shadow down and right in
+/// grey; emboss and engrave as light and dark edges; an outline as the
+/// letters' edge in their colour with the inside left white.
+fn effects(out: &mut Vec<Item>, run: &mut GlyphRun, fx: u8, size: i64) {
+    use crate::model::{EFFECT_EMBOSS, EFFECT_ENGRAVE, EFFECT_OUTLINE, EFFECT_SHADOW};
+    if fx == 0 {
+        return;
+    }
+    let d = (size / 20).max(crate::LU / 2);
+    let copy = |out: &mut Vec<Item>, run: &GlyphRun, dx: i64, dy: i64, color: u32| {
+        out.push(Item::Glyphs(GlyphRun { x: run.x + dx, y: run.y + dy, color, text: String::new(), ..run.clone() }));
+    };
+    if fx & EFFECT_SHADOW != 0 {
+        copy(out, run, d, d, 0x9a9a9a);
+    }
+    if fx & (EFFECT_EMBOSS | EFFECT_ENGRAVE) != 0 {
+        let (hi, lo) = if fx & EFFECT_EMBOSS != 0 { (0xffffff, 0x808080) } else { (0x808080, 0xffffff) };
+        copy(out, run, -d / 2, -d / 2, hi);
+        copy(out, run, d / 2, d / 2, lo);
+    }
+    if fx & EFFECT_OUTLINE != 0 {
+        let t = (d / 2).max(1);
+        for (dx, dy) in [(-t, 0), (t, 0), (0, -t), (0, t)] {
+            copy(out, run, dx, dy, run.color);
+        }
+        run.color = 0xffffff;
     }
 }

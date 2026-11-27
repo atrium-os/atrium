@@ -104,7 +104,12 @@ pub struct Chp {
     /// A tracked format change: its author and time (sprmCPropRMark).
     pub prop_rmark: Option<(u16, u32)>,
     pub symbol: Option<(u16, u16)>,
-    pub effects: bool,
+    /// Outline, shadow, emboss, imprint (bits 0 to 3), as set.
+    pub effects: Option<u8>,
+    /// Letter spacing, twips (sprmCDxaSpace).
+    pub spacing: Option<i16>,
+    /// Letter width, percent (sprmCCharScale).
+    pub scale: Option<u16>,
     pub shading: bool,
 }
 
@@ -144,7 +149,24 @@ impl Chp {
                 0x083A => self.small_caps = toggle(&s, base.small_caps),
                 0x083B => self.caps = toggle(&s, base.caps),
                 0x083C => self.vanish = toggle(&s, base.vanish),
-                0x0838 | 0x0839 | 0x0858 | 0x0854 => self.effects = s.u8() == 1 || self.effects,
+                0x0838 | 0x0839 | 0x0858 | 0x0854 => {
+                    let bit = match s.op {
+                        0x0838 => 1,
+                        0x0839 => 2,
+                        0x0858 => 4,
+                        _ => 8,
+                    };
+                    let was = self.effects.or(base.effects).unwrap_or(0);
+                    let on = match s.u8() {
+                        0 => false,
+                        1 => true,
+                        0x81 => base.effects.unwrap_or(0) & bit == 0,
+                        _ => continue,
+                    };
+                    self.effects = Some(if on { was | bit } else { was & !bit });
+                }
+                0x8840 => self.spacing = Some((s.u16() as i16).clamp(-1584, 1584)),
+                0x4852 => self.scale = Some(s.u16().clamp(1, 600)),
                 0x2A3E => self.underline = Some(s.u8() != 0),
                 0x2A42 => {
                     self.color = ico(s.u8());
@@ -188,6 +210,9 @@ impl Chp {
             font: self.font.or(under.font),
             iss: self.iss.or(under.iss),
             istd: self.istd.or(under.istd),
+            effects: self.effects.or(under.effects),
+            spacing: self.spacing.or(under.spacing),
+            scale: self.scale.or(under.scale),
             ..self.clone()
         }
     }
@@ -213,12 +238,20 @@ impl Chp {
         flag(&mut s, "smallCaps", self.small_caps.filter(|&v| v));
         flag(&mut s, "strike", self.strike);
         flag(&mut s, "dstrike", self.dstrike.filter(|&v| v));
-        flag(&mut s, "vanish", self.vanish.filter(|&v| v));
-        if self.effects {
-            s.push_str("<w:outline/>");
+        if let Some(fx) = self.effects {
+            for (bit, name) in [(1, "outline"), (2, "shadow"), (4, "emboss"), (8, "imprint")] {
+                flag(&mut s, name, Some(fx & bit != 0));
+            }
         }
+        flag(&mut s, "vanish", self.vanish.filter(|&v| v));
         if let Some(c) = self.color {
             s.push_str(&format!(r#"<w:color w:val="{c:06X}"/>"#));
+        }
+        if let Some(v) = self.spacing {
+            s.push_str(&format!(r#"<w:spacing w:val="{v}"/>"#));
+        }
+        if let Some(v) = self.scale {
+            s.push_str(&format!(r#"<w:w w:val="{v}"/>"#));
         }
         if let Some(h) = self.hps {
             s.push_str(&format!(r#"<w:sz w:val="{h}"/>"#));

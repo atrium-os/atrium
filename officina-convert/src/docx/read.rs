@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::paginate::PAGE_BREAK;
+use officina_text::model::{Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -167,7 +168,34 @@ fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
             "w:b" => a.bold = Some(on(p)),
             "w:i" => a.italic = Some(on(p)),
             "w:u" => a.underline = Some(on(p)),
-            "w:strike" | "w:dstrike" => a.strike = Some(on(p)),
+            "w:strike" => a.strike = Some(on(p)),
+            "w:dstrike" => a.dstrike = Some(on(p)),
+            // All capitals win over small ones, whichever comes first.
+            "w:caps" => {
+                if on(p) {
+                    a.caps = Some(Caps::All);
+                } else if a.caps != Some(Caps::Small) {
+                    a.caps = Some(Caps::Normal);
+                }
+            }
+            "w:smallCaps" => {
+                if a.caps != Some(Caps::All) {
+                    a.caps = Some(if on(p) { Caps::Small } else { Caps::Normal });
+                }
+            }
+            "w:vanish" => a.hidden = Some(on(p)),
+            "w:spacing" => a.spacing = num(val(p)).map(|v| v.clamp(-(MAX_SPACING as i64), MAX_SPACING as i64) as i16),
+            "w:w" => a.scale = num(val(p)).map(|v| v.clamp(*SCALE_RANGE.start() as i64, *SCALE_RANGE.end() as i64) as u16),
+            "w:outline" | "w:shadow" | "w:emboss" | "w:imprint" => {
+                let bit = match p.name.as_str() {
+                    "w:outline" => EFFECT_OUTLINE,
+                    "w:shadow" => EFFECT_SHADOW,
+                    "w:emboss" => EFFECT_EMBOSS,
+                    _ => EFFECT_ENGRAVE,
+                };
+                let was = a.effects.unwrap_or(0);
+                a.effects = Some(if on(p) { was | bit } else { was & !bit });
+            }
             "w:sz" => a.size = num(val(p)).map(|v| v.clamp(2, 3276) as u16),
             "w:color" => a.color = color(val(p)),
             "w:highlight" => a.highlight = val(p).and_then(highlight),
@@ -181,7 +209,7 @@ fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
                     a.family = Some(Arc::from(&f[..f.len().min(255)]));
                 }
             }
-            "w:bCs" | "w:iCs" | "w:szCs" | "w:noProof" | "w:kern" | "w:rStyle" | "w:spacing" | "w:w" | "w:position" | "w:webHidden" | "w:specVanish" | "w:rtl" | "w:cs" | "w:eastAsianLayout" | "w:effect" | "w:ligatures" | "w:numForm" | "w:numSpacing" | "w:stylisticSets" | "w:cntxtAlts" | "w:snapToGrid" | "w:fitText" => {}
+            "w:bCs" | "w:iCs" | "w:szCs" | "w:noProof" | "w:kern" | "w:rStyle" | "w:position" | "w:webHidden" | "w:specVanish" | "w:rtl" | "w:cs" | "w:eastAsianLayout" | "w:effect" | "w:ligatures" | "w:numForm" | "w:numSpacing" | "w:stylisticSets" | "w:cntxtAlts" | "w:snapToGrid" | "w:fitText" => {}
             "w:lang" => a.lang_ea = p.attr("w:eastAsia").and_then(lang_tag),
             "w:vertAlign" => {
                 a.vert = match val(p) {
@@ -191,9 +219,8 @@ fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
                     _ => None,
                 }
             }
-            "w:caps" | "w:smallCaps" => rep.note(Kind::Approximate, "capitals and small capitals (shown as typed)"),
-            "w:vanish" => rep.note(Kind::Approximate, "hidden text (shown)"),
-            "w:outline" | "w:shadow" | "w:emboss" | "w:imprint" | "w:bdr" | "w:em" => rep.note(Kind::Approximate, "text effects (dropped)"),
+            "w:bdr" => rep.note(Kind::Approximate, "borders round text (dropped)"),
+            "w:em" => rep.note(Kind::Approximate, "emphasis marks (dropped)"),
             _ => {}
         }
     }
@@ -1060,9 +1087,10 @@ impl<'a> Reader<'a> {
                             "w:tab" | "w:ptab" => p.push("\t", &a),
                             "w:br" | "w:cr" => {
                                 if k.attr("w:type") == Some("page") {
-                                    self.rep.note(Kind::Approximate, "page breaks inside a paragraph (a line break)");
+                                    p.push(&PAGE_BREAK.to_string(), &a);
+                                } else {
+                                    p.push("\u{2028}", &a);
                                 }
-                                p.push("\u{2028}", &a);
                             }
                             "w:noBreakHyphen" => p.push("\u{2011}", &a),
                             "w:softHyphen" => p.push("\u{AD}", &a),
@@ -1606,11 +1634,12 @@ impl<'a> Reader<'a> {
     /// The sections read, onto their first paragraphs: settings, and a page
     /// setup of their own where it isn't the document's (the last section's).
     fn place_sections(&mut self) {
-        for (first, mut x, g) in std::mem::take(&mut self.secs) {
+        for (i, (first, mut x, g)) in std::mem::take(&mut self.secs).into_iter().enumerate() {
             let Some(k) = first else { continue };
             x.page = (g != self.doc.page).then_some(g);
-            // The first section: only its columns and page matter.
-            if k > 0 || x.columns > 1 || x.page.is_some() {
+            // The first section starts the document, even where its first
+            // paragraph comes after a table: only its columns and page matter.
+            if (i > 0 && k > 0) || x.columns > 1 || x.page.is_some() {
                 self.doc.blocks.update(k, |b| {
                     if let Some(q) = b.as_para_mut() {
                         q.props.section = Some(x);

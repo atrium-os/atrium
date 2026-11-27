@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -166,7 +166,39 @@ pub(crate) fn text_props(e: &El, fonts: &HashMap<String, String>) -> CharAttrs {
     }
     if let Some(u) = e.attr("style:text-line-through-style") {
         a.strike = Some(u != "none");
+        if let (true, Some(t)) = (u != "none", e.attr("style:text-line-through-type")) {
+            a.dstrike = Some(t == "double");
+        }
     }
+    // Upper case wins over small capitals, as in Word.
+    match (e.attr("fo:text-transform"), e.attr("fo:font-variant")) {
+        (Some("uppercase"), _) => a.caps = Some(Caps::All),
+        (_, Some("small-caps")) => a.caps = Some(Caps::Small),
+        (Some("none"), _) | (_, Some("normal")) => a.caps = Some(Caps::Normal),
+        _ => {}
+    }
+    if let Some(d) = e.attr("text:display") {
+        a.hidden = Some(d == "none");
+    }
+    if let Some(v) = e.attr("fo:letter-spacing") {
+        a.spacing = if v == "normal" { Some(0) } else { length(v).map(|t| t.clamp(-(MAX_SPACING as i64), MAX_SPACING as i64) as i16) };
+    }
+    if let Some(v) = e.attr("style:text-scale").and_then(|v| v.trim_end_matches('%').trim().parse::<f64>().ok()).filter(|v| v.is_finite()) {
+        a.scale = Some((v.round() as i64).clamp(*SCALE_RANGE.start() as i64, *SCALE_RANGE.end() as i64) as u16);
+    }
+    let mut fx = None;
+    let mut set = |bit: u8, v: bool| fx = Some(if v { fx.unwrap_or(0) | bit } else { fx.unwrap_or(0) & !bit });
+    if let Some(v) = e.attr("style:text-outline") {
+        set(EFFECT_OUTLINE, v == "true");
+    }
+    if let Some(v) = e.attr("fo:text-shadow") {
+        set(EFFECT_SHADOW, v != "none");
+    }
+    if let Some(v) = e.attr("style:font-relief") {
+        set(EFFECT_EMBOSS, v == "embossed");
+        set(EFFECT_ENGRAVE, v == "engraved");
+    }
+    a.effects = fx;
     if let Some(z) = e.attr("fo:font-size").filter(|z| !z.ends_with('%')).and_then(length) {
         a.size = Some((z / 10).clamp(2, 3276) as u16);
     }
@@ -1524,7 +1556,10 @@ impl<'a> Reader<'a> {
         let pf = self.doc.styles.para_format(style, &props).0;
         if !pf.tabs.is_empty() {
             let ind = if self.tabs_from_indent { pf.indent_start.max(0) } else { 0 };
-            props.tabs = Some(pf.tabs.iter().map(|t| TabStop { pos: (t.pos + ind).max(0), ..*t }).collect());
+            // With no indent to measure from, the style's stops stand as they are.
+            if ind != 0 || props.tabs.is_some() {
+                props.tabs = Some(pf.tabs.iter().map(|t| TabStop { pos: (t.pos + ind).max(0), ..*t }).collect());
+            }
         }
         if self.in_toc && cell.is_none() && !self.in_note && !p.text.is_empty() {
             let name = self.doc.styles.styles[style as usize].name.to_ascii_lowercase();
@@ -1879,7 +1914,10 @@ impl<'a> Reader<'a> {
         for (k, name) in std::mem::take(&mut self.master_marks) {
             let Some(&g) = self.masters.get(&name) else { continue };
             let usage = self.usages.get(&name).copied().filter(|_| k > 0);
-            if (g == cur && usage.is_none()) || k >= self.doc.blocks.len() {
+            // Our writer names a section's master page `Section_20_Page…`,
+            // so one of those starts a section even on a page like the last.
+            let ours = k > 0 && name.starts_with("Section_20_Page");
+            if (g == cur && usage.is_none() && !ours) || k >= self.doc.blocks.len() {
                 continue;
             }
             cur = g;
@@ -1916,6 +1954,13 @@ impl<'a> Reader<'a> {
         let base = self.doc.page;
         let (g, cols) = master_setup(st, master, base);
         self.doc.page = g;
+        // Our writer gives a first section with a page of its own a master
+        // page `Section_20_Page_n`; the document's page is then `Standard`'s.
+        if first_master.as_deref().is_some_and(|n| n.starts_with("Section_20_Page_")) {
+            if let Some(std_page) = masters.and_then(|m| m.children("style:master-page").find(|x| x.attr("style:name") == Some("Standard"))) {
+                self.doc.page = master_setup(st, std_page, base).0;
+            }
+        }
         if let Some(c) = cols {
             self.page_cols = Section { start: SectionStart::NextPage, ..c };
         }

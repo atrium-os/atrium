@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use crate::model::{Align, BlockId, CharFormat, Leader, LineSpacing, TabAlign, DEFAULT_TAB, ObjectRef, Para, ParaFormat, TextDoc, VertAlign, OBJECT_CHAR};
+use crate::model::{Caps, Align, BlockId, CharFormat, Leader, LineSpacing, TabAlign, DEFAULT_TAB, ObjectRef, Para, ParaFormat, TextDoc, VertAlign, OBJECT_CHAR};
 use crate::{twips, LU};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,21 +536,51 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
             continue;
         }
         let text = &shape_src[s as usize..e as usize];
+        // Capitals drawn for what was typed (same bytes, so clusters hold).
+        let cased: std::borrow::Cow<str> = if f.caps == Caps::Normal { text.into() } else { capitals(text).into() };
+        let text: &str = &cased;
         // Tabs: four spaces' width for now (tab stops come with the ruler).
         let mut g = match (&f.object, f.note) {
-            // A tombstone (tracked deletion) takes no room.
-            _ if f.deleted.is_some() || f.conflict.is_some() => text.char_indices().map(|(i, _)| Glyph { face: OBJECT_FACE, id: 0, adv: 0, dx: 0, dy: 0, cluster: i as u32, fmt: 0 }).collect(),
+            // A tombstone (tracked deletion) and hidden text take no room.
+            _ if f.deleted.is_some() || f.conflict.is_some() || f.hidden => text.char_indices().map(|(i, _)| Glyph { face: OBJECT_FACE, id: 0, adv: 0, dx: 0, dy: 0, cluster: i as u32, fmt: 0 }).collect(),
             (Some(o), _) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
             (None, Some(n)) => shape_with_label(fonts, text, &f, &doc.note_label(n)),
             (None, None) => match f.field {
                 Some(x) => shape_with_label(fonts, text, &f, &doc.field_text(x)),
+                None if f.caps == Caps::Small => {
+                    // Typed lower-case letters as capitals at four fifths the size.
+                    let small = CharFormat { size: ((f.size as u32 * 4 / 5) as u16).max(2), caps: Caps::Normal, ..f.clone() };
+                    let si = formats.iter().position(|x| *x == small).unwrap_or_else(|| {
+                        formats.push(small.clone());
+                        formats.len() - 1
+                    }) as u16;
+                    let typed = &p.text[s as usize..e as usize];
+                    let mut out = Vec::new();
+                    for (a, b, lower) in case_runs(typed) {
+                        let mut g = fonts.shape(&text[a..b], if lower { &small } else { &f });
+                        for x in g.iter_mut() {
+                            x.cluster += a as u32;
+                            x.fmt = if lower { si + 1 } else { 0 };
+                        }
+                        out.extend(g);
+                    }
+                    out
+                }
                 None => fonts.shape(text, &f),
             },
         };
+        // Letter spacing after each cluster, and widths scaled.
+        if f.spacing != 0 || f.scale != 100 {
+            let extra = twips(f.spacing as i64);
+            for x in g.iter_mut().filter(|x| x.face != OBJECT_FACE) {
+                x.adv = (x.adv * f.scale as i64 / 100 + extra).max(0);
+            }
+        }
         let space = if text.contains('\t') { fonts.shape(" ", &f).first().map_or(0, |g| g.adv) } else { 0 };
         for x in g.iter_mut() {
             x.cluster += s;
-            x.fmt = fi;
+            // Small capitals mark their smaller letters' format (one past it).
+            x.fmt = if x.fmt > 0 { x.fmt - 1 } else { fi };
             x.dy += shift;
             if p.text.as_bytes().get(x.cluster as usize) == Some(&b'\t') {
                 x.adv = space * 4;
@@ -909,6 +939,33 @@ mod tests {
         d
     }
 
+    /// Each look's effect on the advances: capitals keep their places,
+    /// small capitals are smaller, hidden text takes no room, spacing and
+    /// width move the pen.
+    #[test]
+    fn letters_take_their_room() {
+        use crate::model::Caps;
+        let width_of = |a: CharAttrs| {
+            let mut d = doc("abcd");
+            let id = d.attrs.intern(a);
+            d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, id)]);
+            let l = layout_para(&d, d.para(0).unwrap(), twips(9360), &FixedFonts);
+            (l.glyphs.iter().map(|g| g.adv).sum::<i64>(), l.glyphs.iter().map(|g| g.id).collect::<Vec<_>>(), l.formats.len())
+        };
+        let (plain, ids, _) = width_of(CharAttrs::default());
+        assert_eq!(ids, "abcd".chars().map(|c| c as u16).collect::<Vec<_>>());
+        let (caps, ids, _) = width_of(CharAttrs { caps: Some(Caps::All), ..Default::default() });
+        assert_eq!((caps, ids), (plain, "ABCD".chars().map(|c| c as u16).collect::<Vec<_>>()));
+        let (small, ids, formats) = width_of(CharAttrs { caps: Some(Caps::Small), ..Default::default() });
+        assert!(small < plain, "small capitals are smaller: {small} vs {plain}");
+        assert_eq!(ids, "ABCD".chars().map(|c| c as u16).collect::<Vec<_>>());
+        assert_eq!(formats, 2, "drawn in a smaller format");
+        assert_eq!(width_of(CharAttrs { hidden: Some(true), ..Default::default() }).0, 0);
+        assert_eq!(width_of(CharAttrs { spacing: Some(20), ..Default::default() }).0, plain + 4 * twips(20));
+        assert_eq!(width_of(CharAttrs { scale: Some(200), ..Default::default() }).0, plain * 2);
+        assert_eq!(capitals("straße ǆ"), "STRAßE Ǆ");
+    }
+
     #[test]
     fn tabs_go_to_their_stops() {
         use crate::model::{Leader, TabAlign, TabStop};
@@ -1130,4 +1187,31 @@ mod tests {
         assert!(!Rc::ptr_eq(&a, &e));
         assert_eq!((c.hits, c.misses), (1, 2));
     }
+}
+
+/// `text` with each letter that has a one-character capital of the same
+/// length as its capital (others, such as ß, as typed).
+pub fn capitals(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let mut u = c.to_uppercase();
+            match (u.next(), u.next()) {
+                (Some(x), None) if x.len_utf8() == c.len_utf8() => x,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Byte ranges of `text` in turn lower-case letters (true) and the rest.
+fn case_runs(text: &str) -> Vec<(usize, usize, bool)> {
+    let mut out: Vec<(usize, usize, bool)> = Vec::new();
+    for (i, c) in text.char_indices() {
+        let lower = c.is_lowercase() && capitals(&c.to_string()) != c.to_string();
+        match out.last_mut() {
+            Some(r) if r.2 == lower => r.1 = i + c.len_utf8(),
+            _ => out.push((i, i + c.len_utf8(), lower)),
+        }
+    }
+    out
 }

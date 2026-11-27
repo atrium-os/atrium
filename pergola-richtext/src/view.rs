@@ -179,6 +179,8 @@ pub struct RichTextView {
     pub zoom: f32,
     key: u64,
     on_find: Option<Rc<dyn Fn()>>,
+    /// Ctrl+D: the app's Font… bar.
+    on_font: Option<Rc<dyn Fn()>>,
     on_comment: Option<Rc<dyn Fn(CommentId)>>,
 }
 
@@ -216,7 +218,7 @@ fn in_edit(e: &Edit, block: usize, start: u32, end: u32) -> bool {
 
 impl RichTextView {
     pub fn new(editor: Rc<RefCell<Editor>>, scroll: Mutable<ScrollState>, rev: Mutable<u64>, rect: Rect) -> Self {
-        RichTextView { editor, scroll, rev, rect, zoom: 1.0, key: 0x7274_6578, on_find: None, on_comment: None }
+        RichTextView { editor, scroll, rev, rect, zoom: 1.0, key: 0x7274_6578, on_find: None, on_font: None, on_comment: None }
     }
     pub fn zoom(mut self, z: f32) -> Self {
         self.zoom = z.clamp(0.25, 5.0);
@@ -227,6 +229,11 @@ impl RichTextView {
         self
     }
     /// Called on Ctrl+F (and Ctrl+H) in the text.
+    pub fn on_font(mut self, f: impl Fn() + 'static) -> Self {
+        self.on_font = Some(Rc::new(f));
+        self
+    }
+
     pub fn on_find(mut self, f: impl Fn() + 'static) -> Self {
         self.on_find = Some(Rc::new(f));
         self
@@ -679,7 +686,7 @@ impl RichTextView {
             more
         });
         {
-            let (ed, sc, rev, find) = (self.editor.clone(), self.scroll.clone(), self.rev.clone(), self.on_find.clone());
+            let (ed, sc, rev, find, font) = (self.editor.clone(), self.scroll.clone(), self.rev.clone(), self.on_find.clone(), self.on_font.clone());
             let g = g.clone();
             ctx.on_key(body, move |ev| {
                 let Event::Key { kind, key, modifiers, chars } = ev else { return };
@@ -714,6 +721,13 @@ impl RichTextView {
                     Outcome::Find => {
                         drop(e);
                         if let Some(f) = &find {
+                            f();
+                        }
+                        return;
+                    }
+                    Outcome::Font => {
+                        drop(e);
+                        if let Some(f) = &font {
                             f();
                         }
                         return;
@@ -806,6 +820,10 @@ impl RichTextView {
                         }
                     }
                     DragPhase::End => {
+                        // Format Painter: the selection just made takes the look.
+                        if e.dragging.is_none() && e.painter.is_some() && e.paint_format(false) {
+                            return rev.set(rev.get().wrapping_add(1));
+                        }
                         let Some(d) = e.dragging.take() else { return };
                         // A press that hardly moved only picks.
                         if d.dx.abs() + d.dy.abs() > officina_text::LU * 2 {
@@ -1076,7 +1094,7 @@ mod tests {
     }
     impl View for Host {
         fn render(&self, ctx: &mut Ctx) {
-            RichTextView { editor: self.v.editor.clone(), scroll: self.v.scroll.clone(), rev: self.v.rev.clone(), rect: self.v.rect, zoom: 1.0, key: 7, on_find: None, on_comment: None }.emit(ctx);
+            RichTextView { editor: self.v.editor.clone(), scroll: self.v.scroll.clone(), rev: self.v.rev.clone(), rect: self.v.rect, zoom: 1.0, key: 7, on_find: None, on_font: None, on_comment: None }.emit(ctx);
         }
     }
 

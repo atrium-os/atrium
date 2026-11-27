@@ -60,6 +60,44 @@ pub struct CharAttrs {
     /// The language of East Asian text (BCP 47, "ja-JP", "zh-TW"): which
     /// forms a Han character takes (Word's `w:lang w:eastAsia`).
     pub lang_ea: Option<Arc<str>>,
+    /// Capitals or small capitals, whatever was typed.
+    pub caps: Option<Caps>,
+    /// Hidden text: shown only while hidden text is shown, never printed.
+    pub hidden: Option<bool>,
+    /// Struck through with two lines.
+    pub dstrike: Option<bool>,
+    /// Extra room after each letter, twips (negative: condensed), within
+    /// [`MAX_SPACING`].
+    pub spacing: Option<i16>,
+    /// Letters' width, percent of their own (100: as designed), within
+    /// [`SCALE_RANGE`].
+    pub scale: Option<u16>,
+    /// Text effects, a mask of [`EFFECT_OUTLINE`], [`EFFECT_SHADOW`],
+    /// [`EFFECT_EMBOSS`] and [`EFFECT_ENGRAVE`].
+    pub effects: Option<u8>,
+}
+
+/// Most letter spacing either way, twips (Word's 1,584: 79.2 pt).
+pub const MAX_SPACING: i16 = 1584;
+/// Letter widths allowed, percent (Word's 1 to 600).
+pub const SCALE_RANGE: std::ops::RangeInclusive<u16> = 1..=600;
+pub const EFFECT_OUTLINE: u8 = 1;
+pub const EFFECT_SHADOW: u8 = 2;
+pub const EFFECT_EMBOSS: u8 = 4;
+pub const EFFECT_ENGRAVE: u8 = 8;
+/// Every effect bit.
+pub const EFFECTS: u8 = 15;
+
+/// How letters are cased when drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Caps {
+    /// As typed.
+    #[default]
+    Normal,
+    /// Every letter a capital.
+    All,
+    /// Lower-case letters as smaller capitals.
+    Small,
 }
 
 /// A value shown in the text and worked out after pagination: a reference
@@ -655,6 +693,12 @@ impl CharAttrs {
             conflict: self.conflict.or(under.conflict),
             field: self.field.or(under.field),
             lang_ea: self.lang_ea.clone().or_else(|| under.lang_ea.clone()),
+            caps: self.caps.or(under.caps),
+            hidden: self.hidden.or(under.hidden),
+            dstrike: self.dstrike.or(under.dstrike),
+            spacing: self.spacing.or(under.spacing),
+            scale: self.scale.or(under.scale),
+            effects: self.effects.or(under.effects),
         }
     }
 }
@@ -684,11 +728,19 @@ pub struct CharFormat {
     pub field: Option<Field>,
     /// See [`CharAttrs::lang_ea`].
     pub lang_ea: Option<Arc<str>>,
+    pub caps: Caps,
+    pub hidden: bool,
+    pub dstrike: bool,
+    /// Twips after each letter.
+    pub spacing: i16,
+    /// Percent.
+    pub scale: u16,
+    pub effects: u8,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None, lang_ea: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None, lang_ea: None, caps: Caps::Normal, hidden: false, dstrike: false, spacing: 0, scale: 100, effects: 0 }
     }
 }
 
@@ -708,6 +760,24 @@ impl CharFormat {
         }
         if let Some(v) = a.strike {
             self.strike = v;
+        }
+        if let Some(v) = a.caps {
+            self.caps = v;
+        }
+        if let Some(v) = a.hidden {
+            self.hidden = v;
+        }
+        if let Some(v) = a.dstrike {
+            self.dstrike = v;
+        }
+        if let Some(v) = a.spacing {
+            self.spacing = v.clamp(-MAX_SPACING, MAX_SPACING);
+        }
+        if let Some(v) = a.scale {
+            self.scale = v.clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+        }
+        if let Some(v) = a.effects {
+            self.effects = v & EFFECTS;
         }
         if let Some(v) = a.size {
             self.size = v.clamp(2, 3276);

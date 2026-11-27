@@ -5837,7 +5837,7 @@ Tests:
 - Pergola `a_menu_with_a_most_height_scrolls_inside_the_window`: 200 items under a 240 px most height draw fewer than 20 and keep within it. The arrows reach item 29 and the wheel the last.
 - Sheets `escape_closes_a_typed_bar_as_its_cancel_does`: Themes…, Format Chart…, Quick Analysis… and Solver… close on Escape, and Escape with nothing open does nothing.
 
-### 16.169 Write finishing plan (proposed 2026-11-27)
+### 16.169 Write finishing plan (accepted 2026-11-27)
 
 After Sheets (§16.162–§16.168), Write gets a fixed plan of seven rounds, the same way: each round is one push and one report, and the plan ends with a close-out. It starts from a real-document sweep, so the order follows what real files lose.
 
@@ -5900,6 +5900,30 @@ What the readers keep only approximately or drop, by files (of 2,532):
 **Out of scope:** master documents (§17 D17: they import as one document), document signing (waits on Sigillum), online and cloud features, co-authoring, VBA (kept inert, as now), Word 95 and older, dictation and translation, SmartArt editing (drawn from its saved picture), and input-method scripts (wait on the IME work).
 
 Then Slides gets its own plan the same way, starting with a sweep of `.pptx`, `.odp` and `.ppt` and the presenting frame gaps on the Mac VM (84–99 ms worst, §16.38).
+
+### 16.170 Round 1 as built (2026-11-27): characters, page breaks, and the sweep's round-trip fixes
+
+Round 1 of the seven in §16.169.
+
+**What the sweep found, fixed.** The sweep (`officina-convert/examples/corpus_write.rs`) now finds 2,477 of 2,532 files the same through `.docx` (was 2,164) and 2,378 through `.odt` (was 1,999). The fixes, each with a test in `officina-convert/tests/sweep_roundtrip.rs`:
+
+- A document that starts with a table no longer gains a section: the `.docx` reader put the document's only section on the first block after the table, so the writer then wrote a break there.
+- The `.odt` reader starts a section only at our own `Section_20_Page…` masters after the first block, so a next-page section on the same page as the one before survives, and a first section with its own page leaves `doc.page` as the Standard master.
+- A style's tab stops stay in the style through `.odt`, rather than being copied onto each paragraph.
+- Lists inside table cells survive `.odt`.
+- A note mark keeps its run's size and font through `.docx`.
+
+What is left is mostly by design: `.odt` has no continuous one-column section (58), the `.odt` reader drops list items' direct indents on purpose (62), and `.docx` keeps 25 tab, 17 section, 8 margin and 7 table-of-contents differences, which go to rounds 2 and 5.
+
+**Letters.** `CharAttrs` and `CharFormat` gained `caps` (`Caps::All` or `Caps::Small`), `hidden`, `dstrike`, `spacing` (twips, within ±`MAX_SPACING`), `scale` (percent, `SCALE_RANGE` 1–600) and `effects` (bits `EFFECT_OUTLINE`, `EFFECT_SHADOW`, `EFFECT_EMBOSS`, `EFFECT_ENGRAVE`). The native file carries them behind ext-mask bit 7, a sub-mask byte then each value, and the decoder refuses anything out of range. Layout shapes all-capitals with `capitals()` (the same byte length per character, so clusters still index the text), shapes the lower-case runs of small capitals at 4/5 size as capitals, gives hidden text no room, and changes advances for spacing and scale. Paint draws two lines for double strikethrough and the effects as offset copies of the glyph run. `.docx` reads and writes `w:caps`, `w:smallCaps`, `w:vanish`, `w:dstrike`, `w:spacing`, `w:w`, `w:outline`, `w:shadow`, `w:emboss` and `w:imprint`, with `rPr` now in schema order; `.odt` uses `fo:text-transform`, `fo:font-variant`, `text:display`, `style:text-line-through-type`, `fo:letter-spacing`, `style:text-scale`, `style:text-outline`, `fo:text-shadow` and `style:font-relief`; `.doc` reads the effect, spacing and scale sprms. Borders round text and emphasis marks are read as Fidelity Report notes.
+
+**Page breaks inside a paragraph** are U+000C (`officina_text::paginate::PAGE_BREAK`): a forced line end in layout, and the end of the column in pagination. `.docx` writes `<w:br w:type="page"/>`; ODF has no such break, so the `.odt` writer splits the paragraph and the later pieces start a page.
+
+**The UI.** A Format menu on the toolbar after the lists (bold to hidden, superscript and subscript, capitals, case, Clear Formatting, Format Painter, Page Break, Font…). Font… opens a two-row bar over the page with family, size, colour, highlight, spacing, width and effects. Format Painter copies the look at the caret and paints it on the next selection; double-click keeps it on. Change Case cycles sentence, lower, upper, title and toggle. Word's keys: Ctrl+Shift+> and <, Ctrl+] and [, Ctrl+=, Ctrl+Shift+=, Ctrl+Space, Ctrl+D (Font…), Ctrl+Shift+D, A, K, H, C and V, Ctrl+Enter, Shift+F3.
+
+**Checks.** Unit tests in officina-text (81), officina-convert (68 plus 19 integration files, including `tests/letters.rs` through `.docx`, `.odt` and native), pergola-richtext (40) and atrium-write (29) pass. LibreOffice opened the `.docx` and `.odt` from `examples/letters_lo.rs write` with every look in place, and its saved copies read back the same with `letters_lo read`.
+
+**Not yet:** hidden text is always hidden (no "show hidden" view with a dotted underline yet), and word-only underline (Ctrl+Shift+W) has no model field. Both go to round 7.
 
 ## 17. Decisions (accepted 2026-11-14)
 

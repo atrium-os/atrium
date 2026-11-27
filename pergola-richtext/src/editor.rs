@@ -15,8 +15,9 @@ use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
+use officina_text::paginate::PAGE_BREAK;
 use officina_text::model::{RevId, Revision};
 use officina_text::track::{Change, ChangeKind, Edit, Resolve};
 use officina_text::paginate::Paginator;
@@ -65,6 +66,8 @@ pub enum Outcome {
     Paste,
     /// Ctrl+F: the app opens its find bar.
     Find,
+    /// Ctrl+D: the app opens its Font… bar.
+    Font,
     Ignored,
 }
 
@@ -128,6 +131,8 @@ pub struct Editor {
     /// Attributes for the next typed text, set by a formatting key with no
     /// selection (Ctrl+B, then type).
     pub typing: Option<CharAttrs>,
+    /// Format Painter: the look picked up, put on the next selection made.
+    pub painter: Option<CharAttrs>,
     goal_x: Option<i64>,
     pub pages: Paginator,
     pub cache: LayoutCache,
@@ -217,7 +222,7 @@ pub enum DragKind {
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, continuous: false, reading: false, review_at: 0, edits_cache: None, dragging: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, painter: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, continuous: false, reading: false, review_at: 0, edits_cache: None, dragging: None };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
@@ -977,7 +982,17 @@ impl Editor {
     /// Types `s` over the selection. Newlines start paragraphs; other control
     /// characters are dropped (a tab and a line break, U+2028, stay).
     pub fn insert(&mut self, s: &str) -> bool {
-        let s: String = s.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|&c| (!c.is_control() || c == '\n' || c == '\t') && c != OBJECT_CHAR).collect();
+        self.insert_text(s, false)
+    }
+
+    /// A page break at the caret (Ctrl+Enter): the text after it starts
+    /// the next page, in the same paragraph (Word's page break).
+    pub fn page_break(&mut self) -> bool {
+        self.insert_text(&PAGE_BREAK.to_string(), true)
+    }
+
+    fn insert_text(&mut self, s: &str, page_break: bool) -> bool {
+        let s: String = s.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|&c| (!c.is_control() || c == '\n' || c == '\t' || (page_break && c == PAGE_BREAK)) && c != OBJECT_CHAR).collect();
         if s.is_empty() {
             return false;
         }
@@ -1763,10 +1778,190 @@ impl Editor {
                 self.format("Underline", move |a| a.underline = Some(v))
             }
             Toggle::Strike => {
-                let v = !cur.strike;
-                self.format("Strikethrough", move |a| a.strike = Some(v))
+                let v = !(cur.strike && !cur.dstrike);
+                self.format("Strikethrough", move |a| (a.strike, a.dstrike) = (Some(v), Some(false)))
+            }
+            Toggle::DoubleStrike => {
+                let v = !cur.dstrike;
+                self.format("Double Strikethrough", move |a| (a.strike, a.dstrike) = (Some(v), Some(v)))
+            }
+            Toggle::Superscript => {
+                let v = if cur.vert == VertAlign::Super { VertAlign::Baseline } else { VertAlign::Super };
+                self.format("Superscript", move |a| a.vert = Some(v))
+            }
+            Toggle::Subscript => {
+                let v = if cur.vert == VertAlign::Sub { VertAlign::Baseline } else { VertAlign::Sub };
+                self.format("Subscript", move |a| a.vert = Some(v))
+            }
+            Toggle::SmallCaps => {
+                let v = if cur.caps == Caps::Small { Caps::Normal } else { Caps::Small };
+                self.format("Small Caps", move |a| a.caps = Some(v))
+            }
+            Toggle::AllCaps => {
+                let v = if cur.caps == Caps::All { Caps::Normal } else { Caps::All };
+                self.format("All Caps", move |a| a.caps = Some(v))
+            }
+            Toggle::Hidden => {
+                let v = !cur.hidden;
+                self.format("Hidden", move |a| a.hidden = Some(v))
             }
         }
+    }
+
+    /// The selection's font (None: the paragraph's).
+    pub fn set_family(&mut self, family: Option<std::sync::Arc<str>>) {
+        self.format("Font", move |a| a.family = family.clone());
+    }
+
+    /// The selection's size, half points.
+    pub fn set_size(&mut self, half_points: u16) {
+        let v = half_points.clamp(2, 3276);
+        self.format("Font Size", move |a| a.size = Some(v));
+    }
+
+    /// Grow Font and Shrink Font (Ctrl+Shift+> and <): the next size of
+    /// Word's list, past 72 pt by tens; `step` (Ctrl+] and [) by one point.
+    pub fn grow_font(&mut self, up: bool, step: bool) {
+        const SIZES: [u16; 16] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
+        let cur = self.format_at_caret().size;
+        let pt = cur / 2;
+        let next = if step {
+            if up { cur + 2 } else { cur.saturating_sub(2) }
+        } else if up {
+            SIZES.iter().find(|&&s| s * 2 > cur).map(|&s| s * 2).unwrap_or((pt / 10 + 1) * 20)
+        } else {
+            SIZES.iter().rev().find(|&&s| s * 2 < cur).map(|&s| s * 2).unwrap_or(if pt > 80 { (pt - 1) / 10 * 20 } else { 2 })
+        };
+        self.set_size(next.clamp(2, 3276));
+    }
+
+    /// The selection's colour (None: automatic) or highlight (None: none).
+    pub fn set_color(&mut self, color: Option<u32>) {
+        self.format("Font Colour", move |a| a.color = color);
+    }
+    pub fn set_highlight(&mut self, color: Option<u32>) {
+        self.format("Highlight", move |a| a.highlight = color);
+    }
+
+    /// Letter spacing (twips) and width (percent).
+    pub fn set_spacing(&mut self, twips: i16) {
+        let v = twips.clamp(-MAX_SPACING, MAX_SPACING);
+        self.format("Character Spacing", move |a| a.spacing = (v != 0).then_some(v));
+    }
+    pub fn set_scale(&mut self, percent: u16) {
+        let v = percent.clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+        self.format("Character Scale", move |a| a.scale = (v != 100).then_some(v));
+    }
+
+    /// One text effect on or off, by what the caret shows.
+    pub fn toggle_effect(&mut self, bit: u8) {
+        let on = self.format_at_caret().effects & bit == 0;
+        let was = self.format_at_caret().effects;
+        let v = if on { was | bit } else { was & !bit };
+        self.format("Text Effects", move |a| a.effects = Some(v & EFFECTS));
+    }
+
+    /// Clear Formatting (Ctrl+Space): the selection's own character look
+    /// and character style go, leaving what its paragraph style gives.
+    pub fn clear_formatting(&mut self) {
+        self.format("Clear Formatting", clear_look);
+    }
+
+    /// Change Case on the selection (or the word at the caret).
+    pub fn change_case(&mut self, case: Case) -> bool {
+        if !self.has_selection() {
+            self.select_word_at_caret();
+        }
+        let (a, b) = self.selection();
+        let mut ops = Vec::new();
+        let mut first = true;
+        for k in a.block..=b.block {
+            let Some(p) = self.doc.para(k) else { continue };
+            let s = if k == a.block { a.at } else { 0 } as usize;
+            let e = if k == b.block { b.at as usize } else { p.text.len() };
+            if s >= e {
+                continue;
+            }
+            let old = &p.text[s..e];
+            let new = recase(old, case, first && (s == 0 || p.text[..s].trim_end().ends_with(['.', '!', '?'])));
+            first = false;
+            if new == old {
+                continue;
+            }
+            // Same bytes per character, so the runs keep their places.
+            let runs: Vec<(u32, AttrId)> = p.spans().filter(|r| (r.1 as usize) > s && (r.0 as usize) < e).map(|r| ((r.0 as usize).max(s) as u32 - s as u32, r.2)).collect();
+            ops.push(TextOp::Splice { block: k as u32, at: s as u32, del: (e - s) as u32, ins: Fragment { text: new, runs } });
+        }
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply("Change Case", ops, Kind::Other);
+        self.anchor = a;
+        self.caret = b;
+        true
+    }
+
+    /// Shift+F3: UPPERCASE, then lowercase, then Capitalize Each Word.
+    pub fn cycle_case(&mut self) -> bool {
+        if !self.has_selection() {
+            self.select_word_at_caret();
+        }
+        let t = self.selected_text();
+        let case = if !t.chars().any(char::is_lowercase) {
+            Case::Lower
+        } else if !t.chars().any(char::is_uppercase) {
+            Case::Upper
+        } else if recase(&t, Case::Upper, false) == t {
+            Case::Lower
+        } else if recase(&t, Case::Title, false) == t {
+            Case::Upper
+        } else {
+            Case::Upper
+        };
+        let case = if case == Case::Lower && t.chars().any(char::is_lowercase) { Case::Title } else { case };
+        self.change_case(case)
+    }
+
+    /// Format Painter: picks up the caret's character look; the next
+    /// selection made (or [`Editor::paint_format`]) takes it.
+    pub fn pick_format(&mut self) {
+        let (a, _) = self.selection();
+        let at = if self.has_selection() { a.at } else { a.at.saturating_sub(1) };
+        let mut look = self.doc.para(a.block).map(|p| self.doc.attrs.get(p.attr_at(at)).clone()).unwrap_or_default();
+        if let Some(t) = &self.typing {
+            look = t.over(&look);
+        }
+        self.painter = Some(only_look(&look));
+    }
+
+    /// Puts the picked look on the selection (Ctrl+Shift+V, or the end of a
+    /// drag while Format Painter is on); it stays picked only for the
+    /// keyboard's paste.
+    pub fn paint_format(&mut self, keep: bool) -> bool {
+        let Some(look) = self.painter.clone() else { return false };
+        if !self.has_selection() {
+            return false;
+        }
+        if !keep {
+            self.painter = None;
+        }
+        self.format("Format Painter", move |a| {
+            clear_look(a);
+            *a = look.over(a);
+        });
+        true
+    }
+
+    fn select_word_at_caret(&mut self) {
+        let c = self.caret;
+        let Some(p) = self.doc.para(c.block) else { return };
+        let t = &p.text;
+        let at = (c.at as usize).min(t.len());
+        let is_word = |ch: char| ch.is_alphanumeric() || ch == '\'' || ch == '’';
+        let start = t[..at].char_indices().rev().take_while(|(_, ch)| is_word(*ch)).last().map_or(at, |(i, _)| i);
+        let end = t[at..].char_indices().find(|(_, ch)| !is_word(*ch)).map_or(t.len(), |(i, _)| at + i);
+        self.anchor = Pos::new(c.block, start as u32);
+        self.caret = Pos::new(c.block, end as u32);
     }
 
     /// Sets the selected paragraphs' style, or changes their direct
@@ -2952,14 +3147,14 @@ impl Editor {
         let edited = |b: bool| if b { Outcome::Edited } else { Outcome::Ignored };
         match key {
             Key::Char if cmd => match chars.to_ascii_lowercase().as_str() {
-                "a" => {
+                "a" if !m.shift => {
                     self.select_all();
                     Outcome::Moved
                 }
-                "c" if self.has_selection() => Outcome::Copy(self.selected_text()),
+                "c" if !m.shift && self.has_selection() => Outcome::Copy(self.selected_text()),
                 "x" => self.cut().map_or(Outcome::Ignored, Outcome::Copy),
-                "v" => Outcome::Paste,
-                "f" | "h" => Outcome::Find,
+                "v" if !m.shift => Outcome::Paste,
+                "f" | "h" if !m.shift => Outcome::Find,
                 "z" if m.shift => edited(self.redo()),
                 "z" => edited(self.undo()),
                 "y" => edited(self.redo()),
@@ -2991,6 +3186,57 @@ impl Editor {
                     self.align(Align::Justify);
                     Outcome::Edited
                 }
+                // Word's character keys.
+                ">" | "." if m.shift => {
+                    self.grow_font(true, false);
+                    Outcome::Edited
+                }
+                "<" | "," if m.shift => {
+                    self.grow_font(false, false);
+                    Outcome::Edited
+                }
+                "]" => {
+                    self.grow_font(true, true);
+                    Outcome::Edited
+                }
+                "[" => {
+                    self.grow_font(false, true);
+                    Outcome::Edited
+                }
+                "+" | "=" if m.shift => {
+                    self.toggle(Toggle::Superscript);
+                    Outcome::Edited
+                }
+                "=" => {
+                    self.toggle(Toggle::Subscript);
+                    Outcome::Edited
+                }
+                " " => {
+                    self.clear_formatting();
+                    Outcome::Edited
+                }
+                "d" if !m.shift => Outcome::Font,
+                "d" => {
+                    self.toggle(Toggle::DoubleStrike);
+                    Outcome::Edited
+                }
+                "a" if m.shift => {
+                    self.toggle(Toggle::AllCaps);
+                    Outcome::Edited
+                }
+                "k" if m.shift => {
+                    self.toggle(Toggle::SmallCaps);
+                    Outcome::Edited
+                }
+                "h" if m.shift => {
+                    self.toggle(Toggle::Hidden);
+                    Outcome::Edited
+                }
+                "c" if m.shift => {
+                    self.pick_format();
+                    Outcome::Moved
+                }
+                "v" if m.shift => edited(self.paint_format(true)),
                 "7" | "&" if m.shift => {
                     self.toggle_list(ListKind::Numbered);
                     Outcome::Edited
@@ -3019,7 +3265,9 @@ impl Editor {
             Key::Tab if !cmd && (self.caret.at == 0 || self.selection().0.block != self.selection().1.block) && self.list_of(self.caret.block).is_some() => edited(self.list_level(if m.shift { -1 } else { 1 })),
             Key::Tab if !cmd && m.shift => Outcome::Ignored,
             Key::Tab if !cmd => edited(self.insert("\t")),
+            Key::Enter if cmd => edited(self.page_break()),
             Key::Enter if m.shift => edited(self.insert("\u{2028}")),
+            Key::F(3) if m.shift => edited(self.cycle_case()),
             Key::Enter => {
                 self.new_paragraph();
                 Outcome::Edited
@@ -3045,6 +3293,70 @@ pub enum Toggle {
     Italic,
     Underline,
     Strike,
+    DoubleStrike,
+    Superscript,
+    Subscript,
+    SmallCaps,
+    AllCaps,
+    Hidden,
+}
+
+/// Change Case's choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Case {
+    /// The first letter of each sentence a capital, the rest small.
+    Sentence,
+    Lower,
+    Upper,
+    /// Capitalize Each Word.
+    Title,
+    /// tOGGLE cASE.
+    Toggle,
+}
+
+/// `text` in `case`, each character changed only where its other case is
+/// one character of the same length (so byte places hold). `starts`: the
+/// text starts a sentence.
+pub fn recase(text: &str, case: Case, starts: bool) -> String {
+    let one = |c: char, up: bool| {
+        let mut m: Box<dyn Iterator<Item = char>> = if up { Box::new(c.to_uppercase()) } else { Box::new(c.to_lowercase()) };
+        match (m.next(), m.next()) {
+            (Some(x), None) if x.len_utf8() == c.len_utf8() => x,
+            _ => c,
+        }
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut word_start = true;
+    let mut sentence_start = starts;
+    for c in text.chars() {
+        let x = match case {
+            Case::Lower => one(c, false),
+            Case::Upper => one(c, true),
+            Case::Toggle => one(c, !c.is_uppercase()),
+            Case::Title => one(c, word_start),
+            Case::Sentence => one(c, sentence_start && c.is_alphabetic()),
+        };
+        if c.is_alphabetic() {
+            sentence_start = false;
+        }
+        if matches!(c, '.' | '!' | '?') {
+            sentence_start = true;
+        }
+        word_start = !(c.is_alphanumeric() || c == '\'' || c == '’');
+        out.push(x);
+    }
+    out
+}
+
+/// A run's own character look (what Clear Formatting takes off and Format
+/// Painter carries), the rest of its attributes left.
+fn clear_look(a: &mut CharAttrs) {
+    (a.bold, a.italic, a.underline, a.strike, a.size, a.color, a.highlight, a.family, a.style, a.vert) = (None, None, None, None, None, None, None, None, None, None);
+    (a.caps, a.hidden, a.dstrike, a.spacing, a.scale, a.effects) = (None, None, None, None, None, None);
+}
+
+fn only_look(a: &CharAttrs) -> CharAttrs {
+    CharAttrs { bold: a.bold, italic: a.italic, underline: a.underline, strike: a.strike, size: a.size, color: a.color, highlight: a.highlight, family: a.family.clone(), style: a.style, vert: a.vert, caps: a.caps, hidden: a.hidden, dstrike: a.dstrike, spacing: a.spacing, scale: a.scale, effects: a.effects, ..Default::default() }
 }
 
 #[cfg(test)]
@@ -4094,6 +4406,98 @@ pub(crate) mod tests {
         e.redo();
         check(&mut e);
     }
+
+    fn look_at(e: &Editor, b: usize, at: u32) -> CharAttrs {
+        let p = e.doc.para(b).unwrap();
+        e.doc.attrs.get(p.attr_at(at)).clone()
+    }
+
+    /// Word's character keys over a selection, each one undoable.
+    #[test]
+    fn words_character_keys() {
+        let mut e = ed(&["Small words here"]);
+        e.anchor = Pos::new(0, 0);
+        e.caret = Pos::new(0, 5);
+        let size = e.format_at_caret().size;
+        e.key(Key::Char, CTRL_SHIFT, ">", 0);
+        assert!(look_at(&e, 0, 1).size.unwrap() > size, "grow");
+        e.key(Key::Char, CTRL, "[", 0);
+        let grown = look_at(&e, 0, 1).size.unwrap();
+        e.key(Key::Char, CTRL, "]", 0);
+        assert_eq!(look_at(&e, 0, 1).size, Some(grown + 2), "a point larger");
+        e.key(Key::Char, CTRL_SHIFT, "A", 0);
+        assert_eq!(look_at(&e, 0, 1).caps, Some(Caps::All));
+        e.key(Key::Char, CTRL_SHIFT, "K", 0);
+        assert_eq!(look_at(&e, 0, 1).caps, Some(Caps::Small));
+        e.key(Key::Char, CTRL_SHIFT, "H", 0);
+        assert_eq!(look_at(&e, 0, 1).hidden, Some(true));
+        e.key(Key::Char, CTRL_SHIFT, "D", 0);
+        assert_eq!(look_at(&e, 0, 1).dstrike, Some(true));
+        e.key(Key::Char, CTRL, "=", 0);
+        assert_eq!(look_at(&e, 0, 1).vert, Some(VertAlign::Sub));
+        e.key(Key::Char, CTRL_SHIFT, "+", 0);
+        assert_eq!(look_at(&e, 0, 1).vert, Some(VertAlign::Super));
+        assert_eq!(look_at(&e, 0, 7), CharAttrs::default(), "outside the selection");
+        assert_eq!(e.key(Key::Char, CTRL, "d", 0), Outcome::Font);
+        e.key(Key::Char, CTRL, " ", 0);
+        assert_eq!(look_at(&e, 0, 1), CharAttrs::default(), "Clear Formatting");
+        e.undo();
+        assert_eq!(look_at(&e, 0, 1).vert, Some(VertAlign::Super), "undone");
+        assert_eq!(e.key(Key::Char, CTRL_SHIFT, "a", 0), Outcome::Edited, "not Select All");
+    }
+
+    #[test]
+    fn change_case_keeps_formatting() {
+        let mut e = ed(&["hello world. again here"]);
+        e.anchor = Pos::new(0, 0);
+        e.caret = Pos::new(0, 5);
+        e.toggle(Toggle::Bold);
+        e.select_all();
+        assert!(e.change_case(Case::Upper));
+        assert_eq!(texts(&e), ["HELLO WORLD. AGAIN HERE"]);
+        assert_eq!(look_at(&e, 0, 2).bold, Some(true));
+        assert_eq!(look_at(&e, 0, 8).bold, None);
+        e.change_case(Case::Sentence);
+        assert_eq!(texts(&e), ["Hello world. Again here"]);
+        e.change_case(Case::Title);
+        assert_eq!(texts(&e), ["Hello World. Again Here"]);
+        e.change_case(Case::Toggle);
+        assert_eq!(texts(&e), ["hELLO wORLD. aGAIN hERE"]);
+        assert_eq!(recase("straße", Case::Upper, false), "STRAßE", "ß has no one-letter capital");
+        // Shift+F3 on a word with no selection: UPPER, lower, Each Word.
+        let mut e = ed(&["one two"]);
+        e.caret = Pos::new(0, 1);
+        e.anchor = e.caret;
+        e.key(Key::F(3), SHIFT, "", 0);
+        assert_eq!(texts(&e), ["ONE two"]);
+        e.key(Key::F(3), SHIFT, "", 0);
+        assert_eq!(texts(&e), ["one two"]);
+    }
+
+    #[test]
+    fn format_painter_and_page_break() {
+        let mut e = ed(&["Source target"]);
+        e.anchor = Pos::new(0, 0);
+        e.caret = Pos::new(0, 6);
+        e.toggle(Toggle::Italic);
+        e.set_color(Some(0xC00000));
+        e.anchor = Pos::new(0, 2);
+        e.caret = Pos::new(0, 2);
+        e.pick_format();
+        e.anchor = Pos::new(0, 7);
+        e.caret = Pos::new(0, 13);
+        assert!(e.paint_format(false));
+        let a = look_at(&e, 0, 9);
+        assert_eq!((a.italic, a.color), (Some(true), Some(0xC00000)));
+        assert!(e.painter.is_none(), "the mouse's painter is spent");
+        // Ctrl+Enter: a page break in the paragraph; plain typing can't put one.
+        e.caret = Pos::new(0, 6);
+        e.anchor = e.caret;
+        e.key(Key::Enter, CTRL, "", 0);
+        assert_eq!(texts(&e), ["Source\u{000C} target"]);
+        assert!(!e.insert("\u{000C}"));
+        assert_eq!(e.pages.pages().len() >= 1, true);
+    }
 }
 
 /// `src`'s set paragraph settings over `dst`'s.
@@ -4105,10 +4509,11 @@ fn merge_para(dst: &mut ParaProps, src: &ParaProps) {
 /// `src`'s set character settings over `dst`'s.
 fn merge_chars(dst: &mut CharAttrs, src: &CharAttrs) {
     macro_rules! m { ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* } }
-    m!(bold, italic, underline, strike, size, color, highlight, family);
+    m!(bold, italic, underline, strike, size, color, highlight, family, caps, hidden, dstrike, spacing, scale, effects);
 }
 
 /// Takes off a run's own look (what a character style gives).
 fn shed_chars(a: &mut CharAttrs) {
     (a.bold, a.italic, a.underline, a.strike, a.size, a.color, a.highlight, a.family) = (None, None, None, None, None, None, None, None);
+    (a.caps, a.hidden, a.dstrike, a.spacing, a.scale, a.effects) = (None, None, None, None, None, None);
 }

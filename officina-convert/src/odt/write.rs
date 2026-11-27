@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{AttrId, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -97,8 +97,31 @@ pub(crate) fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
             s += r#" style:text-underline-style="none""#;
         }
     }
-    if let Some(v) = a.strike {
-        let _ = write!(s, r#" style:text-line-through-style="{}""#, if v { "solid" } else { "none" });
+    match (a.strike, a.dstrike) {
+        (_, Some(true)) => s += r#" style:text-line-through-style="solid" style:text-line-through-type="double""#,
+        (Some(v), _) => {
+            let _ = write!(s, r#" style:text-line-through-style="{}""#, if v { "solid" } else { "none" });
+        }
+        (None, Some(false)) => s += r#" style:text-line-through-type="single""#,
+        (None, None) => {}
+    }
+    match a.caps {
+        Some(Caps::All) => s += r#" fo:text-transform="uppercase""#,
+        Some(Caps::Small) => s += r#" fo:font-variant="small-caps""#,
+        Some(Caps::Normal) => s += r#" fo:text-transform="none" fo:font-variant="normal""#,
+        None => {}
+    }
+    if let Some(h) = a.hidden {
+        let _ = write!(s, r#" text:display="{}""#, if h { "none" } else { "true" });
+    }
+    if let Some(v) = a.spacing {
+        let _ = write!(s, r#" fo:letter-spacing="{}""#, pt(v as i64));
+    }
+    if let Some(v) = a.scale {
+        let _ = write!(s, r#" style:text-scale="{v}%""#);
+    }
+    if let Some(fx) = a.effects {
+        let _ = write!(s, r#" style:text-outline="{}" fo:text-shadow="{}" style:font-relief="{}""#, fx & EFFECT_OUTLINE != 0, if fx & EFFECT_SHADOW != 0 { "1pt 1pt" } else { "none" }, if fx & EFFECT_EMBOSS != 0 { "embossed" } else if fx & EFFECT_ENGRAVE != 0 { "engraved" } else { "none" });
     }
     if let Some(z) = a.size {
         let p = format!("{}pt", z as f64 / 2.0);
@@ -651,7 +674,18 @@ impl Out<'_> {
         let doc = self.doc;
         let Some(p) = doc.para(b) else { return };
         self.cur = Some(b);
-        self.para_of(p, out);
+        if p.text.contains('\u{000C}') {
+            // ODF has no page break inside a paragraph: the text after each
+            // starts a paragraph of its own on a new page (as LibreOffice does).
+            for (i, piece) in split_page_breaks(p).iter().enumerate() {
+                if i == 1 {
+                    self.cur = None;
+                }
+                self.para_of(piece, out);
+            }
+        } else {
+            self.para_of(p, out);
+        }
         self.cur = None;
     }
 
@@ -904,8 +938,14 @@ impl Out<'_> {
             out.push_str("<table:table-row>");
             for cell in cells_of(doc, row.clone()) {
                 let _ = write!(out, r#"<table:table-cell table:style-name="{cell_style}" office:value-type="string">"#);
-                for x in cell {
-                    self.para(x, out);
+                let mut x = cell.start;
+                while x < cell.end {
+                    if doc.para(x).and_then(|p| p.props.list.flatten()).is_some() {
+                        x = self.list(x, cell.end, out).max(x + 1);
+                    } else {
+                        self.para(x, out);
+                        x += 1;
+                    }
                 }
                 out.push_str("</table:table-cell>");
             }
@@ -1217,4 +1257,27 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         z.add_stored(name, bytes)?;
     }
     z.finish()
+}
+
+/// `p` cut after each page break (U+000C, dropped): the pieces after the
+/// first start a page and keep the paragraph's look but not its section.
+fn split_page_breaks(p: &Para) -> Vec<Para> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    let cuts: Vec<usize> = p.text.match_indices('\u{000C}').map(|(i, _)| i).chain(std::iter::once(p.text.len())).collect();
+    for (i, &to) in cuts.iter().enumerate() {
+        let runs: Vec<(u32, AttrId)> = {
+            let mut v: Vec<(u32, AttrId)> = vec![(0, p.attr_at(from as u32))];
+            v.extend(p.runs.iter().filter(|r| (r.0 as usize) > from && (r.0 as usize) < to).map(|r| (r.0 - from as u32, r.1)));
+            v
+        };
+        let mut props = p.props.clone();
+        if i > 0 {
+            props.page_break_before = Some(true);
+            props.section = None;
+        }
+        out.push(Para { id: p.id, text: p.text[from..to].to_string(), runs, style: p.style, props });
+        from = to + 1;
+    }
+    out
 }

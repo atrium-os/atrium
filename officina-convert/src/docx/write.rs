@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -48,6 +48,7 @@ fn on(tag: &str, v: bool) -> String {
 }
 
 fn rpr(a: &CharAttrs, styles: &[String]) -> String {
+    // In the order the schema gives (Word refuses some others).
     let mut s = String::new();
     if let Some(st) = a.style.and_then(|k| styles.get(k as usize)) {
         let _ = write!(s, r#"<w:rStyle w:val="{}"/>"#, esc(st));
@@ -62,14 +63,45 @@ fn rpr(a: &CharAttrs, styles: &[String]) -> String {
     if let Some(i) = a.italic {
         s += &on("i", i);
     }
+    match a.caps {
+        Some(Caps::All) => s += &on("caps", true),
+        Some(Caps::Small) => s += &on("smallCaps", true),
+        Some(Caps::Normal) => s += &(on("caps", false) + &on("smallCaps", false)),
+        None => {}
+    }
     if let Some(v) = a.strike {
         s += &on("strike", v);
+    }
+    if let Some(v) = a.dstrike {
+        s += &on("dstrike", v);
+    }
+    if let Some(fx) = a.effects {
+        for (bit, tag) in [(EFFECT_OUTLINE, "outline"), (EFFECT_SHADOW, "shadow"), (EFFECT_EMBOSS, "emboss"), (EFFECT_ENGRAVE, "imprint")] {
+            s += &on(tag, fx & bit != 0);
+        }
+    }
+    if let Some(v) = a.hidden {
+        s += &on("vanish", v);
     }
     if let Some(c) = a.color {
         let _ = write!(s, r#"<w:color w:val="{:06X}"/>"#, c & 0xFF_FFFF);
     }
+    if let Some(v) = a.spacing {
+        let _ = write!(s, r#"<w:spacing w:val="{v}"/>"#);
+    }
+    if let Some(v) = a.scale {
+        let _ = write!(s, r#"<w:w w:val="{v}"/>"#);
+    }
     if let Some(z) = a.size {
         let _ = write!(s, r#"<w:sz w:val="{z}"/><w:szCs w:val="{z}"/>"#);
+    }
+    match (a.underline, a.link.is_some()) {
+        (Some(true), _) => s += r#"<w:u w:val="single"/>"#,
+        (Some(false), _) => s += r#"<w:u w:val="none"/>"#,
+        _ => {}
+    }
+    if let Some(h) = a.highlight {
+        let _ = write!(s, r#"<w:shd w:val="clear" w:color="auto" w:fill="{:06X}"/>"#, h & 0xFF_FFFF);
     }
     if let Some(v) = a.vert {
         let _ = write!(s, r#"<w:vertAlign w:val="{}"/>"#, match v {
@@ -77,14 +109,6 @@ fn rpr(a: &CharAttrs, styles: &[String]) -> String {
             VertAlign::Sub => "subscript",
             VertAlign::Baseline => "baseline",
         });
-    }
-    if let Some(h) = a.highlight {
-        let _ = write!(s, r#"<w:shd w:val="clear" w:color="auto" w:fill="{:06X}"/>"#, h & 0xFF_FFFF);
-    }
-    match (a.underline, a.link.is_some()) {
-        (Some(true), _) => s += r#"<w:u w:val="single"/>"#,
-        (Some(false), _) => s += r#"<w:u w:val="none"/>"#,
-        _ => {}
     }
     if let Some(l) = &a.lang_ea {
         let _ = write!(s, r#"<w:lang w:eastAsia="{}"/>"#, esc(l));
@@ -355,6 +379,10 @@ impl Out {
                         flush(&mut text, &mut body);
                         let _ = write!(body, "<w:r>{props}<w:br/></w:r>");
                     }
+                    '\u{000C}' => {
+                        flush(&mut text, &mut body);
+                        let _ = write!(body, r#"<w:r>{props}<w:br w:type="page"/></w:r>"#);
+                    }
                     OBJECT_CHAR if attrs.field.is_some() => {
                         flush(&mut text, &mut body);
                         let f = attrs.field.expect("checked");
@@ -369,7 +397,9 @@ impl Out {
                         let id = attrs.note.expect("checked");
                         if let Some(&(kind, n)) = self.notes.get(&id) {
                             let tag = if kind == NoteKind::Foot { "footnoteReference" } else { "endnoteReference" };
-                            let _ = write!(body, r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:{tag} w:id="{n}"/></w:r>"#);
+                            // The mark keeps its run's look, raised.
+                            let mark = rpr(&CharAttrs { vert: Some(VertAlign::Super), note: None, ..attrs.clone() }, &self.styles);
+                            let _ = write!(body, r#"<w:r>{mark}<w:{tag} w:id="{n}"/></w:r>"#);
                         }
                     }
                     OBJECT_CHAR => {

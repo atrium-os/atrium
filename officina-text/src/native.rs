@@ -31,7 +31,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Caps, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -103,7 +103,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
     let float = a.object.and_then(|o| o.float);
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5 | (a.lang_ea.is_some() as u16) << 6;
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5 | (a.lang_ea.is_some() as u16) << 6 | ((look_mask(a) != 0) as u16) << 7;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -186,12 +186,36 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     if let Some(l) = &a.lang_ea {
         w.str(l);
     }
+    let lm = look_mask(a);
+    if lm != 0 {
+        w.u8(lm);
+        if let Some(c) = a.caps {
+            w.u8(c as u8);
+        }
+        for b in [a.hidden, a.dstrike].into_iter().flatten() {
+            w.u8(b as u8);
+        }
+        if let Some(v) = a.spacing {
+            w.ivar(v as i64);
+        }
+        if let Some(v) = a.scale {
+            w.u16(v);
+        }
+        if let Some(v) = a.effects {
+            w.u8(v);
+        }
+    }
+}
+
+/// Which of the letters' look fields are set (ext bit 7's own mask).
+fn look_mask(a: &CharAttrs) -> u8 {
+    [a.caps.is_some(), a.hidden.is_some(), a.dstrike.is_some(), a.spacing.is_some(), a.scale.is_some(), a.effects.is_some()].into_iter().enumerate().fold(0, |m, (i, on)| m | (on as u8) << i)
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 7 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 & 3 != 0 && m & (1 << 10) == 0) {
+    if ext >> 8 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 & 3 != 0 && m & (1 << 10) == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -327,6 +351,52 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
             return Err(WireError::Invalid("language"));
         }
         a.lang_ea = Some(Arc::from(l));
+    }
+    if ext >> 7 & 1 != 0 {
+        let lm = r.u8()?;
+        if lm == 0 || lm >> 6 != 0 {
+            return Err(WireError::Invalid("letters mask"));
+        }
+        if lm & 1 != 0 {
+            a.caps = Some(match r.u8()? {
+                0 => Caps::Normal,
+                1 => Caps::All,
+                2 => Caps::Small,
+                _ => return Err(WireError::Invalid("capitals")),
+            });
+        }
+        let flag = |r: &mut Reader| match r.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WireError::Invalid("flag")),
+        };
+        if lm & 2 != 0 {
+            a.hidden = Some(flag(r)?);
+        }
+        if lm & 4 != 0 {
+            a.dstrike = Some(flag(r)?);
+        }
+        if lm & 8 != 0 {
+            let v = r.ivar()?;
+            if v.unsigned_abs() > MAX_SPACING as u64 {
+                return Err(WireError::Invalid("letter spacing"));
+            }
+            a.spacing = Some(v as i16);
+        }
+        if lm & 16 != 0 {
+            let v = r.u16()?;
+            if !SCALE_RANGE.contains(&v) {
+                return Err(WireError::Invalid("letter width"));
+            }
+            a.scale = Some(v);
+        }
+        if lm & 32 != 0 {
+            let v = r.u8()?;
+            if v & !EFFECTS != 0 {
+                return Err(WireError::Invalid("text effects"));
+            }
+            a.effects = Some(v);
+        }
     }
     Ok(a)
 }
