@@ -36,17 +36,21 @@ thread for the fork changes.
     NVMe disk, wired NICs. Atrium's native drivers run on the real hardware with IOMMU
     confinement, so the cost is the second stage of address translation and nothing else:
     no exits on I/O, interrupts delivered straight to the guest.
-  - **A driver domain behind a standard virtio interface**, for devices that are slow but
-    crash-prone and parse hostile input: Wi-Fi (Aura and its firmware), USB host
-    controllers, Bluetooth radios, audio codecs, card readers. At their data rates the
-    virtio hop is not measurable; a crash restarts the domain and Atrium carries on.
+  - **A driver domain or driver process behind a standard interface**, for devices that
+    are slow but crash-prone and parse hostile input: Wi-Fi (Aura and its firmware), USB
+    host controllers, Bluetooth radios, audio codecs, card readers. The interface is not
+    an emulated device: it is the protocol Atrium's own service for that class already
+    speaks (Lyra rings, Tactus events, HCI, file operations, Ethernet frames), carried on a
+    Solum **link** (§5.2). At these data rates the hop is not measurable; a crash restarts
+    the domain and Atrium carries on. virtio stays for guests we don't write (the Linux
+    lane). Study: `docs/reviews/2026-11-27-solum-device-interfaces.md`.
 - **Graphics gets an Atrium-specific option:** the standard interface for the GPU is
   Fresco itself. A later **graphics domain** (frescod plus `atrium-gpu-amd` with the GPU
   passed through) keeps rendering native, and a GPU driver crash becomes a Fresco server
   restart that apps already survive by replay (fresco-recovery.md). No virtual GPU.
 - **Security** comes from four things: drivers that parse hostile input leave the main
-  kernel; the main kernel can drop most hardware drivers (it needs virtio plus the
-  passthrough drivers); a protected **vault** domain holds Arca's root keys and locked
+  kernel; the main kernel can drop most hardware drivers (it needs the link driver plus
+  the passthrough drivers); a protected **vault** domain holds Arca's root keys and locked
   personas' keys out of the main kernel's reach; and Solum freezes kernel text and signs
   module loads.
 - **Crash protection** at three levels (§6): a driver domain restarts alone; a graphics
@@ -65,7 +69,7 @@ thread for the fork changes.
 | near-native performance | main-domain CPU, memory, GPU, disk and wired network within the §9 gates of bare metal | identity-like stage-2 with large blocks, passthrough for hot devices, no exits in steady state (§4, §5) |
 | crash protection | a crashing driver does not take the desktop down; a main-kernel panic does not lose the machine's state silently | driver domains, graphics domain, Solum crash dump and warm restart (§6) |
 | security | a compromised driver or main kernel reaches less | domains, smaller main kernel, vault, kernel text freeze (§7) |
-| standardised device interfaces | the main kernel sees the same few interfaces on any hardware | virtio 1.x for every abstracted class; Fresco for graphics (§5) |
+| standardised device interfaces | the main kernel sees the same few interfaces on any hardware | Atrium class protocols on Solum links for every abstracted class, the same on machines without Solum; Fresco for graphics; virtio only for foreign guests (§5) |
 | passthrough with safeguards | hot devices go direct, and cannot DMA, interrupt or reset their way out | IOMMU with interrupt remapping required, whole-group assignment, config-space filter, reset policy (§5.3) |
 
 Non-goals: running several general-purpose OSes side by side as equals (a Qubes-style
@@ -106,18 +110,18 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
 | Jailhouse, NOVA | GPL-2 | licence |
 | Hafnium | BSD-3 | Arm only, built as an FF-A secure-partition manager next to TF-A; C |
 | Bao, ACRN | Apache-2.0, BSD-3 | static partitioning for embedded / automotive; no dynamic memory or device moves; C |
-| Cloud Hypervisor, Firecracker, crosvm, OpenVMM | Apache-2.0/BSD-3, Apache-2.0, BSD-3, MIT | VMMs: user processes on KVM, MSHV, WHP or HVF, not a bottom layer. Their virtio device crates are useful for Solum's driver-domain backends (§5.2) |
+| Cloud Hypervisor, Firecracker, crosvm, OpenVMM | Apache-2.0/BSD-3, Apache-2.0, BSD-3, MIT | VMMs: user processes on KVM, MSHV, WHP or HVF, not a bottom layer. Their virtio crates serve the Linux lane, and the virtio-net code the net link (§5.2) |
 
 ### 3.3 Why a tailored Rust hypervisor
 
 - Atrium needs exactly one big domain at full speed and a few small ones; a general
   hypervisor carries scheduling, emulation and management we would switch off.
-- The interfaces are ours already: virtio for devices, Fresco for graphics, Aqueduct-style
+- The interfaces are ours already: the class protocols of Atrium's own services, Fresco for graphics, Aqueduct-style
   rings for the vault, jaild-style signed policy for which domain owns what.
 - Rust by default for new kernel-level code (LANGUAGE-POLICY, D2); permissive licence.
 - Both architectures from one design: EL2 on arm64, VMX root (then SVM) on amd64.
 - Expected size: on the order of 15 to 20 thousand lines of Rust for the core, with the
-  virtio backends living in domains, not in Solum.
+  driver back ends living in domains, not in Solum.
 
 ## 4. Solum's shape
 
@@ -126,7 +130,7 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
 ```
  main domain (Atrium)           driver domains            vault        graphics domain (later)
  FreeBSD + kmods + jails        net-wifi, usb, audio ...  (no_std)     frescod + atrium-gpu-amd
- virtio front ends, passthrough  real driver + virtio back
+ link driver, passthrough       real driver + link back end
  drivers for GPU/NVMe/NIC
  ------------------------------------------------------------------------------------------
  Solum (EL2 / VMX root): stage-2 tables, IOMMU, interrupt routing, scheduler, hypercalls,
@@ -144,8 +148,8 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
   TLB miss and Solum never takes a stage-2 fault in steady state. No ballooning, no
   overcommit, no demand paging by Solum.
 - Small domains get fixed reservations at boot from a signed domain manifest (§4.6).
-- virtio rings and buffers are pages the front end shares with exactly one back end, by
-  hypercall, two-sided; the back end can never map anything else of the main domain.
+- A link's arena is pages shared by exactly two sides, named in the manifest; neither side
+  can map anything else of the other (§5.2).
 
 ### 4.3 CPU and scheduling
 
@@ -153,7 +157,7 @@ desktop), live migration, overcommitting memory, and moving apps out of jails in
   topology and keeps all its scheduling decisions. Solum never preempts it for timeslicing
   on its own account.
 - Driver domains have one vCPU each, no pinned core. They run when there is work: an
-  interrupt for their device or a virtio kick from the main domain. Solum runs them on the
+  interrupt for their device or a link kick from the main domain. Solum runs them on the
   CPU that took the event, for as long as they have work, at higher priority than the
   main domain's vCPU there, then returns. This is the only scheduling Solum does: a
   per-CPU priority run queue with a budget per domain so a looping driver domain cannot
@@ -182,7 +186,7 @@ ack, and DMA-map requests limited to their own pages.
 
 ### 4.6 The domain manifest
 
-Which domains exist, their memory, which PCI functions each owns, which virtio links join
+Which domains exist, their memory, which PCI functions each owns, which links join
 them, and who may restart whom: one TOML file, signed with the Opifex base key role,
 measured by the loader with Solum (tpm-boot.md §5). It is rendered from validated tokens
 like other Atrium policy files. The main domain cannot change it at run time; it can only
@@ -204,31 +208,51 @@ kernel directly as today: same kernel, with native drivers for everything.
 | class | mode | interface the main domain sees | why |
 |---|---|---|---|
 | GPU + display (R9700) | passthrough to main (S-phase); graphics domain later (§5.4) | the real device / Fresco | bandwidth, MES user queues and doorbells must be direct; near native is non-negotiable here |
-| NVMe | passthrough to main | the real device | Tessera's I/O path; a virtio hop would cost latency at NVMe rates |
+| NVMe | passthrough to main | the real device | Tessera's I/O path; an extra hop would cost latency at NVMe rates |
 | wired NIC | passthrough to main | the real device | throughput and latency; option: net domain if the NIC's driver is untrusted |
-| Wi-Fi (Aura) | net driver domain | virtio-net | firmware and 802.11 frame parsing are hostile input; crash-prone; desktop Wi-Fi rates are far below virtio's ceiling |
-| USB host controllers | usb driver domain | virtio-input, virtio-snd, virtio-blk for sticks, and a per-device USB channel for jailed user-space drivers (Vinculum, CCID) | descriptor parsing from any plugged device; hot-plug faults |
+| Wi-Fi (Aura) | net driver domain | Ethernet-frame link (virtio-net header) | firmware and 802.11 frame parsing are hostile input; crash-prone; Wi-Fi rates are far below the link's ceiling |
+| USB host controllers | usb driver domain | Tactus events for HID, Lyra rings for USB audio, file operations for sticks (FAT/exFAT parsed in the domain), HCI for Bluetooth, per-device USB transfers for jailed user-space drivers (CCID) | descriptor and file-system parsing from any plugged device; hot-plug faults |
 | Bluetooth radio | with USB (it is USB) | as above | firmware loader and HCI parsing |
-| HD audio / codecs | audio driver domain | virtio-snd | crash-prone codec drivers; audio rates are tiny |
-| SD / card readers, serial, sensors | driver domains | virtio-blk, virtio-console | low rate, rare drivers |
+| HD audio / codecs | audio driver domain (or driver process) | Lyra stream rings and clock | crash-prone codec drivers; audio rates are tiny |
+| SD / card readers, serial, sensors | driver domains or processes | file operations, byte streams | low rate, rare drivers |
 | TPM | vault | none (main domain asks the vault) | keys (§7.2) |
 | platform (timers, interrupt controller, power) | Solum / main direct | real hardware | performance and simplicity |
 
 A "driver domain" is a minimal FreeBSD kernel from our fork (a new `ATRIUM-DD` config with
 only that domain's drivers, no network stack unless it is the net domain, no jails, no
-user accounts) plus one Rust back-end process speaking virtio to the main domain. Later,
-simple classes can be no_std Rust driver images instead.
+user accounts) plus one Rust back-end process serving the class protocol over a link. It
+is for the C drivers we keep. A driver rewritten in Rust instead becomes a **driver
+process**: a jailed user-space process in the main domain with the device's BARs mapped,
+an IOMMU domain of its own that Solum programs, and interrupts as events. It restarts at
+process cost and needs no guest kernel (study §6.1). Both kinds serve the same protocols,
+so the main domain cannot tell them apart.
 
-### 5.2 Virtio path
+### 5.2 Links, not virtio
 
-- virtio 1.x split or packed rings in shared pages; event-index notification suppression
-  so a busy queue does not kick on every buffer; multiqueue where the device has it.
-- The back end runs in the driver domain's user space (vhost-user style), from the rust-vmm
-  `virtio-queue` and device crates (Apache-2.0/BSD-3) where they fit; it treats the front
-  end's descriptors as hostile, and the front end in the main kernel treats the back end's
-  used-ring entries as hostile.
-- A back end can only touch pages shared with it; a corrupted ring fails that device, not
-  the domain on the other side.
+Study: `docs/reviews/2026-11-27-solum-device-interfaces.md`. In short, virtio assumes a
+trusted device side that can see all of the driver's memory, an emulated transport, and
+rare resets. A driver domain is untrusted, Solum emulates nothing, and restarts are
+routine. So:
+
+- A **link** joins two sides named in the manifest. Its **arena** is a fixed set of pages
+  shared by those two only: rings of fixed-size records (packed-ring layout and event-index
+  suppression borrowed from virtio), and a data area addressed by **offset and length**,
+  bounds-checked on every use. No physical addresses ever cross.
+- **Bulk data** moves by copy (small records, network frames), by **seal** (the producer
+  writes in place, then Solum makes the pages read-only to both sides until released, so
+  nothing can change after it has been checked), or by **donation** (pages change owner).
+  The thresholds are measured in S1.
+- **Kick:** a doorbell hypercall that injects a virtual interrupt into the peer, suppressed
+  while the peer is already busy.
+- **Epoch:** Solum increments it when either side restarts. Everything in flight fails, and
+  each class protocol says what it replays (as Fresco clients replay after a frescod
+  restart).
+- The **protocols** are Atrium's (study §5.3), registered as Aqueduct classes. On a machine
+  without Solum the same driver service runs as a jailed process and serves the same
+  protocol over a socket, so lyrad, tactusd, Vinculum and Capsa see one interface either
+  way.
+- **virtio** stays for guests we don't write (the Linux lane, §8), with back ends jailed in
+  the main domain, where Atrium is the trusted side.
 
 ### 5.3 Passthrough safeguards
 
@@ -343,9 +367,8 @@ measurement.
   `allow.vmm`-style grants only for the Linux lane's VM host, which on Solum machines asks
   Solum for a guest domain instead of loading FreeBSD's `vmm`.
 - **dispensatord** (device-assignment.md) stays the policy point for which jail gets which
-  device. On Solum machines it sees devices through their virtio interfaces (a stick is a
-  virtio-blk device the usb domain offers) and asks Solum only for moves the manifest
-  allows.
+  device. On Solum machines it sees devices through their links (a stick is a file
+  link the usb domain offers) and asks Solum only for moves the manifest allows.
 - **Fresco / frescod / F4e:** unchanged in the S-phases. F4e's per-window VMs are GPU
   address spaces, unrelated to Solum domains.
 - **Tessera:** unchanged on disk and in the kernel; its keys come from the vault (§7.2).
@@ -378,11 +401,11 @@ runs per arm, exits counted by a positive-controlled counter:
 
 | step | what | gate |
 |---|---|---|
-| **P0** | prototype the topology on bhyve on the R9700 box (amd64): FreeBSD host, Atrium as a guest with the R9700 and NVMe passed through, Wi-Fi/USB in a second guest over virtio | the §9 numbers for passthrough vs bare metal, and virtio costs for the slow classes, measured before Solum code exists. No product code |
+| **P0** | prototype the topology on bhyve on the R9700 box (amd64): FreeBSD host, Atrium as a guest with the R9700 and NVMe passed through, Wi-Fi/USB in a second guest over virtio (bhyve has no links) | the §9 numbers for passthrough vs bare metal, and the cost of a hop for the slow classes, measured before Solum code exists. No product code |
 | **S0** | null Solum on amd64: boots from the loader, launches the unchanged kernel on large-block EPT, everything passed through | boots to frescod on the R9700; §9 CPU, NVMe, GPU gates. **Stop rule:** if missed and not fixable, stop lane S |
-| **S1** | memory ownership, hypercalls, domain manifest, a test domain that echoes over virtio-console | a main-domain read of another domain's page faults (positive control first) |
+| **S1** | memory ownership, hypercalls, domain manifest, the link (arena, kick, epoch, seal, donate) with a test domain that echoes | a main-domain read of another domain's page faults (positive control first); copy vs seal vs donate and kick latency measured, thresholds fixed |
 | **S2** | IOMMU ownership and §5.3 safeguards; FreeBSD `dmar` backend over hypercalls, batched | a DMA to another domain's page faults; group, reset and config-filter checks; GPU gates still met |
-| **S3** | first driver domain: usb (xHCI) with virtio-input, virtio-blk and the USB channel; restart path (§6.1) | kill the domain mid-copy: the stick remounts, nothing else stops |
+| **S3** | first driver domain: usb (xHCI) serving Tactus, file and USB-transfer links; restart path (§6.1) | kill the domain mid-copy: the stick remounts, nothing else stops |
 | **S4** | vault with the TPM (§7.2); arcad's vault ring | arca-vm-test.sh passes; vault memory unreadable from root in the main domain; sealing fails without Solum |
 | **S5** | net domain (Aura Wi-Fi), audio domain | crash and restart gates per class |
 | **S6** | kernel text freeze and signed module loads (§7.3); main-domain crash dump and warm restart (§6.3) | a text write from a test kmod faults; a forced panic dumps and restarts |
@@ -408,15 +431,14 @@ platform yet.
 - **Side channels** between the main domain and the vault: flush on switch, no SMT
   sibling sharing while the vault runs; it runs rarely.
 - **Firmware** (SMM, PSP, ME) stays above Solum, as in tpm-boot.md.
-- **Fork changes:** the `dmar`/`smmu` backend, the module-load hypercall, virtio front ends
-  we already have, the `ATRIUM-DD` config. Small, but ours to carry.
+- **Fork changes:** the `dmar`/`smmu` backend, the module-load hypercall, the link driver, the `ATRIUM-DD` config. Small, but ours to carry.
 - **Size of the job:** a hypervisor is a security product. It needs its own review thread
   pass and fuzzing before any default boot uses it.
 
 ## 12. Licences
 
 Solum, the vault and the back ends are ours (BSD-2). Likely crates: `x86_64`/`x86`,
-`aarch64-cpu` (MIT/Apache-2.0), rust-vmm `virtio-queue` and device crates
+`aarch64-cpu` (MIT/Apache-2.0), rust-vmm `virtio-queue` and device crates for the Linux lane and the net link
 (Apache-2.0/BSD-3), each through `scripts/licence-audit.py`. bhyve (P0 only) is BSD-2. GPL
 hypervisors are read for design only.
 
@@ -425,8 +447,13 @@ hypervisors are read for design only.
 1. **Build Solum, a tailored Rust type-1 hypervisor; bhyve is the prototype and the
    non-Solum VM engine, not the product.** *Recommend yes.*
 2. **Two device modes:** passthrough with the §5.3 safeguards for GPU, NVMe and wired NICs;
-   virtio driver domains for Wi-Fi, USB, Bluetooth, audio and other slow, crash-prone
-   devices (§5.1 table). *Recommend yes.*
+   driver domains or driver processes for Wi-Fi, USB, Bluetooth, audio and other slow,
+   crash-prone devices (§5.1 table). *Recommend yes.*
+2a. **Links carrying Atrium's class protocols, not virtio, between Atrium and its own
+   driver domains;** virtio only for foreign guests (§5.2 and the study). *Recommend yes.*
+2b. **Driver processes** (jailed user-space drivers with a Solum-programmed IOMMU domain)
+   for drivers rewritten in Rust; FreeBSD driver domains only for C drivers we keep.
+   *Recommend yes.*
 3. **Fresco is the graphics interface;** a graphics domain later (S8), no virtual GPU.
    *Recommend yes.*
 4. **Apps stay jails in the main domain;** no app micro-VMs. *Recommend yes.*
