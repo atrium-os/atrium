@@ -3,7 +3,9 @@
 //! "the block holding character c" and an insert or edit are O(log n) plus the
 //! work inside one leaf, at any document length.
 
-use crate::model::Block;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use crate::model::{AttrTable, Block, BlockId, CaptionKind, OBJECT_CHAR};
 
 /// Blocks per leaf, at most; a fuller leaf splits.
 pub const LEAF: usize = 256;
@@ -100,12 +102,82 @@ impl Fenwick {
     }
 }
 
+/// Caption counts per sequence in each Fenwick node. Positions within a
+/// changed leaf are rebuilt together; later leaves retain their local ranks.
+#[derive(Debug, Clone, Default)]
+struct CaptionIndex {
+    sums: Vec<[i64; 3]>,
+    keys: Vec<Vec<(BlockId, u32)>>,
+    local: HashMap<(BlockId, u32), (usize, CaptionKind, u32)>,
+    dirty: BTreeSet<usize>,
+}
+
+impl CaptionIndex {
+    fn refresh(&mut self, leaves: &[Leaf], attrs: &AttrTable) {
+        if self.sums.is_empty() {
+            self.sums.resize(leaves.len() + 1, [0; 3]);
+            self.keys.resize_with(leaves.len(), Vec::new);
+            self.dirty.extend(0..leaves.len());
+        }
+        let dirty = std::mem::take(&mut self.dirty);
+        // Remove all old locations first: a split or join can move an anchor
+        // from one dirty leaf to another.
+        for &leaf in &dirty {
+            let mut delta = [0; 3];
+            for key in self.keys[leaf].drain(..) {
+                if let Some((_, kind, _)) = self.local.remove(&key) {
+                    delta[kind as usize] -= 1;
+                }
+            }
+            self.add(leaf, delta);
+        }
+        for leaf in dirty {
+            let mut counts = [0u32; 3];
+            for b in &leaves[leaf].blocks {
+                let Some(p) = b.as_para() else { continue };
+                for (s, e, id) in p.spans() {
+                    let a = attrs.get(id);
+                    let Some(kind) = a.sequence.filter(|_| a.deleted.is_none() && a.conflict.is_none()) else { continue };
+                    for (off, _) in p.text[s as usize..e as usize].match_indices(OBJECT_CHAR) {
+                        let key = (p.id, s + off as u32);
+                        counts[kind as usize] += 1;
+                        self.local.insert(key, (leaf, kind, counts[kind as usize]));
+                        self.keys[leaf].push(key);
+                    }
+                }
+            }
+            self.add(leaf, counts.map(i64::from));
+        }
+    }
+
+    fn add(&mut self, leaf: usize, delta: [i64; 3]) {
+        let mut k = leaf + 1;
+        while k < self.sums.len() {
+            for (n, d) in self.sums[k].iter_mut().zip(delta) {
+                *n += d;
+            }
+            k += k & k.wrapping_neg();
+        }
+    }
+
+    fn number(&self, key: (BlockId, u32)) -> Option<u64> {
+        let &(mut k, kind, local) = self.local.get(&key)?;
+        let mut n = i64::from(local);
+        while k > 0 {
+            n += self.sums[k][kind as usize];
+            k &= k - 1;
+        }
+        u64::try_from(n).ok()
+    }
+}
+
 /// The document's blocks.
 #[derive(Debug, Clone, Default)]
 pub struct BlockTree {
     leaves: Vec<Leaf>,
     index: Fenwick,
     total: Counts,
+    captions: RefCell<CaptionIndex>,
 }
 
 impl BlockTree {
@@ -115,6 +187,19 @@ impl BlockTree {
     pub fn is_empty(&self) -> bool {
         self.total.blocks == 0
     }
+    pub fn caption_number(&self, attrs: &AttrTable, block: BlockId, offset: u32) -> Option<u64> {
+        let mut captions = self.captions.borrow_mut();
+        captions.refresh(&self.leaves, attrs);
+        captions.number((block, offset))
+    }
+
+    fn caption_leaf_changed(&mut self, leaf: usize) {
+        let index = self.captions.get_mut();
+        if !index.sums.is_empty() {
+            index.dirty.insert(leaf);
+        }
+    }
+
     pub fn counts(&self) -> Counts {
         self.total
     }
@@ -136,6 +221,7 @@ impl BlockTree {
     /// Changes block `i` through `f`, keeping the counts right.
     pub fn update<R>(&mut self, i: usize, f: impl FnOnce(&mut Block) -> R) -> Option<R> {
         let (l, k) = self.locate(i)?;
+        self.caption_leaf_changed(l);
         let before = count(&self.leaves[l].blocks[k]);
         let r = f(&mut self.leaves[l].blocks[k]);
         let after = count(&self.leaves[l].blocks[k]);
@@ -155,6 +241,7 @@ impl BlockTree {
     pub fn insert(&mut self, i: usize, b: Block) {
         let i = i.min(self.len());
         if self.leaves.is_empty() {
+            *self.captions.get_mut() = CaptionIndex::default();
             self.leaves.push(Leaf::default());
         }
         let (l, k) = if i == self.len() {
@@ -176,7 +263,9 @@ impl BlockTree {
             self.leaves[l].recount();
             self.leaves.insert(l + 1, nl);
             self.index = Fenwick::build(&self.leaves);
+            *self.captions.get_mut() = CaptionIndex::default();
         } else {
+            self.caption_leaf_changed(l);
             self.index.add(l, c.blocks as i64, c.chars as i64);
         }
     }
@@ -193,7 +282,9 @@ impl BlockTree {
         if self.leaves[l].blocks.is_empty() && self.leaves.len() > 1 {
             self.leaves.remove(l);
             self.index = Fenwick::build(&self.leaves);
+            *self.captions.get_mut() = CaptionIndex::default();
         } else {
+            self.caption_leaf_changed(l);
             self.index.add(l, -(c.blocks as i64), -(c.chars as i64));
         }
         Some(b)

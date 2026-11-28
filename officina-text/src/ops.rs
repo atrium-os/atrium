@@ -708,7 +708,7 @@ impl TextDoc {
                 (None, Some(last)) => {
                     let a = last.attr_at(last.text.len() as u32);
                     let x = self.attrs.get(a);
-                    let a = if x.object.is_some() || x.note.is_some() || x.field.is_some() { plain } else { a };
+                    let a = if x.object.is_some() || x.note.is_some() || x.field.is_some() || x.sequence.is_some() { plain } else { a };
                     let mut p = Para::new(self.new_id(), &t, last.style);
                     p.props = last.props.clone();
                     p.runs = vec![(0, a)];

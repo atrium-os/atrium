@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use officina_text::fields;
 use officina_text::paginate::{COLUMN_BREAK, PAGE_BREAK};
-use officina_text::model::{CellBorders, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, HAlign as TableAlign, LOOK_HEADER, LOOK_TOTAL, LOOK_FIRST_COLUMN, LOOK_LAST_COLUMN, LOOK_BANDED_ROWS, LOOK_BANDED_COLUMNS, MAX_TABLE_STYLES, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{CaptionKind, CellBorders, CellPad, RowLook, VAlign, TableBorders, TableLook, TableStyle, HAlign as TableAlign, LOOK_HEADER, LOOK_TOTAL, LOOK_FIRST_COLUMN, LOOK_LAST_COLUMN, LOOK_BANDED_ROWS, LOOK_BANDED_COLUMNS, MAX_TABLE_STYLES, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -731,6 +731,7 @@ fn all_of<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
 struct Para {
     /// At least one character was emitted inside a TOC result.
     has_toc_result: bool,
+    figure_list: Option<CaptionKind>,
     text: String,
     runs: Vec<(u32, CharAttrs)>,
     /// The deletion being read, and the deleted text read: (from, to, revision).
@@ -743,7 +744,8 @@ impl Para {
         if s.is_empty() {
             return;
         }
-        self.has_toc_result = self.has_toc_result || field.in_toc();
+        self.has_toc_result |= field.in_toc();
+        self.figure_list = self.figure_list.or_else(|| field.stack.iter().rev().find_map(|f| f.figure_list));
         let at = self.text.len() as u32;
         if self.runs.last().map(|r| &r.1) != Some(a) {
             self.runs.push((at, a.clone()));
@@ -1398,42 +1400,47 @@ impl<'a> Reader<'a> {
         f
     }
 
+    fn run_attrs(&mut self, x: &El, link: Option<&Arc<str>>, field: &FieldState) -> CharAttrs {
+        let mut a = x.child("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
+        if let Some(rs) = x.child("w:rPr").and_then(|r| r.child("w:rStyle")).and_then(val).and_then(|s| self.styles.get(s)) {
+            a.style = Some(*rs);
+        }
+        if let Some(l) = link {
+            a.link = Some(l.clone());
+        } else if let Some(l) = field.stack.iter().rev().filter(|f| f.stage == Stage::Result).find_map(|f| hyperlink_field(&f.instr)) {
+            // A complex HYPERLINK field: its result is the link.
+            a.link = Some(l);
+        }
+        if !self.active.is_empty() && !self.in_note && !field.in_margin {
+            a.comments = Some(self.active.as_slice().into());
+        }
+        if !self.in_note && !field.in_margin {
+            a.rev = self.ins;
+            // A formatting change: the attributes before it.
+            if let Some(ch) = x.child("w:rPr").and_then(|r| r.child("w:rPrChange")) {
+                if let Some(rev) = self.rev_of(ch) {
+                    let mut old = ch.child("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
+                    if let Some(rs) = ch.child("w:rPr").and_then(|r| r.child("w:rStyle")).and_then(val).and_then(|s| self.styles.get(s)) {
+                        old.style = Some(*rs);
+                    }
+                    old.link = a.link.clone();
+                    old.comments = a.comments.clone();
+                    old.rev = a.rev;
+                    if old != a {
+                        a.fmt = Some(FmtChange { rev, old: self.doc.attrs.intern(old) });
+                    }
+                }
+            }
+        }
+        a
+    }
+
     /// The runs of `e` (a paragraph or something inside one) into `p`.
     fn runs(&mut self, e: &El, p: &mut Para, link: Option<&Arc<str>>, field: &mut FieldState) {
         for x in e.els() {
             match x.name.as_str() {
                 "w:r" => {
-                    let mut a = x.child("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
-                    if let Some(rs) = x.child("w:rPr").and_then(|r| r.child("w:rStyle")).and_then(val).and_then(|s| self.styles.get(s)) {
-                        a.style = Some(*rs);
-                    }
-                    if let Some(l) = link {
-                        a.link = Some(l.clone());
-                    } else if let Some(l) = field.stack.iter().rev().filter(|f| f.stage == Stage::Result).find_map(|f| hyperlink_field(&f.instr)) {
-                        // A complex HYPERLINK field: its result is the link.
-                        a.link = Some(l);
-                    }
-                    if !self.active.is_empty() && !self.in_note && !field.in_margin {
-                        a.comments = Some(self.active.as_slice().into());
-                    }
-                    if !self.in_note && !field.in_margin {
-                        a.rev = self.ins;
-                        // A formatting change: the attributes before it.
-                        if let Some(ch) = x.child("w:rPr").and_then(|r| r.child("w:rPrChange")) {
-                            if let Some(rev) = self.rev_of(ch) {
-                                let mut old = ch.child("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
-                                if let Some(rs) = ch.child("w:rPr").and_then(|r| r.child("w:rStyle")).and_then(val).and_then(|s| self.styles.get(s)) {
-                                    old.style = Some(*rs);
-                                }
-                                old.link = a.link.clone();
-                                old.comments = a.comments.clone();
-                                old.rev = a.rev;
-                                if old != a {
-                                    a.fmt = Some(FmtChange { rev, old: self.doc.attrs.intern(old) });
-                                }
-                            }
-                        }
-                    }
+                    let a = self.run_attrs(x, link, field);
                     // Markup compatibility: the choice we read, else the fallback.
                     let mut kids: Vec<&El> = Vec::new();
                     for k in x.els() {
@@ -1475,6 +1482,8 @@ impl<'a> Reader<'a> {
                                     if let Some(f) = field.stack.last_mut().filter(|f| f.stage == Stage::Instr) {
                                         f.stage = Stage::Result;
                                         f.toc_result = is_toc(&f.instr);
+                                        f.figure_list = figure_index(&f.instr);
+                                        f.sequence = sequence_field(&f.instr);
                                     }
                                 }
                                 Some("end") => {
@@ -1484,7 +1493,11 @@ impl<'a> Reader<'a> {
                                                 p.push(s, &a, field);
                                             }
                                         }
-                                        if field.live_ref(&f.instr) && field.shows_result() {
+                                        if let Some(kind) = f.sequence.or_else(|| sequence_field(&f.instr)).filter(|_| field.live_sequences() && field.shows_result()) {
+                                            let mut attrs = f.sequence_attrs.unwrap_or_else(|| a.clone());
+                                            attrs.sequence = Some(kind);
+                                            p.push(&OBJECT_CHAR.to_string(), &attrs, field);
+                                        } else if field.live_ref(&f.instr) && field.shows_result() {
                                             self.push_ref(p, &a, &f.instr, &f.result, field);
                                         }
                                     }
@@ -1504,6 +1517,8 @@ impl<'a> Reader<'a> {
                                 let t: String = t.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
                                 if field.shows_result() {
                                     p.push(&t, &a, field);
+                                } else if let Some(f) = field.stack.last_mut().filter(|f| f.sequence.is_some()) {
+                                    f.sequence_attrs.get_or_insert_with(|| a.clone());
                                 } else if let Some(i) = field.stack.iter().rposition(|f| f.stage == Stage::Result && field.live_ref(&f.instr)) {
                                     // A reference's result, kept to show until pages are laid out.
                                     if field.stack[i + 1..].iter().all(|f| f.stage == Stage::Result) && field.stack[i].result.len() < 1024 {
@@ -1583,6 +1598,17 @@ impl<'a> Reader<'a> {
                 }
                 "w:fldSimple" => {
                     let instr = x.attr("w:instr").unwrap_or("");
+                    if let Some(kind) = sequence_field(instr).filter(|_| field.live_sequences() && field.shows_result()) {
+                        let mut a = x.find("w:r").map(|r| self.run_attrs(r, link, field)).unwrap_or_default();
+                        a.sequence = Some(kind);
+                        p.push(&OBJECT_CHAR.to_string(), &a, field);
+                        continue;
+                    }
+                    if let Some(kind) = figure_index(instr).filter(|_| field.live_sequences() && field.shows_result()) {
+                        let mut index = FieldState { stack: vec![Frame { stage: Stage::Result, figure_list: Some(kind), ..Default::default() }], ..Default::default() };
+                        self.runs(x, p, link, &mut index);
+                        continue;
+                    }
                     match page_field(instr) {
                         Some(s) if field.in_margin => {
                             let a = x.find("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
@@ -1873,8 +1899,11 @@ impl<'a> Reader<'a> {
         // The paragraph mark's formatting is its typing format when it is empty.
         let mark = pp.and_then(|p| p.child("w:rPr")).map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
         field.in_note = self.in_note;
+        field.in_shape = self.in_shape;
         self.runs(e, &mut p, None, field);
-        if p.has_toc_result && cell.is_none() && !self.in_note && !field.in_margin {
+        if p.figure_list.is_some() && cell.is_none() && !field.in_note && !field.in_margin {
+            props.figure_list = p.figure_list;
+        } else if p.has_toc_result && cell.is_none() && !self.in_note && !field.in_margin {
             let name = self.doc.styles.styles[style as usize].name.to_ascii_lowercase();
             let level = name.strip_prefix("toc").or_else(|| name.strip_prefix("contents")).and_then(|n| n.trim().parse::<u8>().ok()).filter(|l| (1..=9).contains(l)).unwrap_or(1);
             props.toc = Some(level);
@@ -2441,6 +2470,9 @@ struct Frame {
     instr: String,
     /// Set at the separator once the complete TOC instruction is known.
     toc_result: bool,
+    figure_list: Option<CaptionKind>,
+    sequence: Option<CaptionKind>,
+    sequence_attrs: Option<CharAttrs>,
     /// A reference's result, as the file shows it.
     result: String,
 }
@@ -2453,17 +2485,21 @@ struct FieldState {
     in_margin: bool,
     /// Reading a note: references stay text.
     in_note: bool,
+    in_shape: bool,
 }
 
 /// Deepest nesting of complex fields read.
 const MAX_FIELD_DEPTH: usize = 16;
 
 impl FieldState {
+    fn live_sequences(&self) -> bool {
+        !self.in_margin && !self.in_note && !self.in_shape
+    }
     fn shows_result(&self) -> bool {
         self.stack.iter().all(|f| match f.stage {
             Stage::Outside => true,
             Stage::Instr => false,
-            Stage::Result => !(self.in_margin && page_field(&f.instr).is_some()) && !(self.live_ref(&f.instr)),
+            Stage::Result => !(self.in_margin && page_field(&f.instr).is_some()) && !(self.live_ref(&f.instr)) && (f.sequence.is_none() || !self.live_sequences()),
         })
     }
     /// A reference this reader makes a field of (not in margins or notes).
@@ -2523,6 +2559,27 @@ fn ref_field(instr: &str) -> Option<(bool, &str)> {
     };
     let name = w.next()?.trim_matches('"');
     (!name.is_empty() && !name.starts_with('\\')).then_some((page, name))
+}
+
+/// Decimal, incrementing caption fields. Other counters keep their cached result.
+fn sequence_field(instr: &str) -> Option<CaptionKind> {
+    let mut words = instr.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("SEQ") { return None; }
+    let kind = CaptionKind::from_name(words.next()?.trim_matches('"'))?;
+    while let Some(switch) = words.next() {
+        if switch.eq_ignore_ascii_case(r"\n") { continue; }
+        if switch != r"\*" { return None; }
+        let format = words.next()?;
+        if !format.eq_ignore_ascii_case("ARABIC") && !format.eq_ignore_ascii_case("MERGEFORMAT") { return None; }
+    }
+    Some(kind)
+}
+
+fn figure_index(instr: &str) -> Option<CaptionKind> {
+    let mut words = instr.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("TOC") { return None; }
+    words.find(|w| w.eq_ignore_ascii_case(r"\c"))?;
+    CaptionKind::from_name(words.next()?.trim_matches('"'))
 }
 
 fn is_toc(instr: &str) -> bool {

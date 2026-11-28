@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::model::{AttrId, Block, BlockId, CharAttrs, Field, Leader, Para, ParaProps, StyleId, TabAlign, TabStop, TextDoc, MAX_REF_TEXT, OBJECT_CHAR};
+use crate::model::{AttrId, Block, BlockId, CaptionKind, CharAttrs, Field, Leader, Para, ParaProps, StyleId, TabAlign, TabStop, TextDoc, MAX_REF_TEXT, OBJECT_CHAR};
 use crate::ops::TextOp;
 use crate::paginate::Page;
 
@@ -27,6 +27,10 @@ pub const MAX_TOC_ENTRIES: usize = 10_000;
 pub const TOC_INDENT: i32 = 360;
 
 impl TextDoc {
+    pub fn caption_number(&self, id: BlockId, at: u32) -> String {
+        self.blocks.caption_number(&self.attrs, id, at).map_or_else(|| "?".into(), |n| n.to_string())
+    }
+
     /// What field `f` shows: its value as last worked out, or, before that, a
     /// text reference's text and "?" for a page.
     pub fn field_text(&self, f: Field) -> String {
@@ -48,6 +52,14 @@ impl TextDoc {
     /// tombstones, pictures, anchors or fields), trimmed, at most
     /// [`MAX_REF_TEXT`] chars.
     pub fn ref_text(&self, p: &Para) -> String {
+        let text = self.caption_text(p);
+        match text.char_indices().nth(MAX_REF_TEXT) {
+            Some((i, _)) => format!("{}…", text[..i].trim_end()),
+            None => text,
+        }
+    }
+
+    pub fn caption_text(&self, p: &Para) -> String {
         let mut s = String::new();
         for (a, b, at) in p.spans() {
             let x = self.attrs.get(at);
@@ -55,18 +67,40 @@ impl TextDoc {
             if x.deleted.is_some() || x.conflict.is_some() {
                 continue;
             }
-            for ch in t.chars() {
+            for (off, ch) in t.char_indices() {
                 if ch == OBJECT_CHAR {
+                    if x.sequence.is_some() {
+                        s.push_str(&self.caption_number(p.id, a + off as u32));
+                    }
                     continue;
                 }
                 s.push(if ch == '\t' || ch == '\u{2028}' { ' ' } else { ch });
             }
         }
-        let s = s.trim();
-        match s.char_indices().nth(MAX_REF_TEXT) {
-            Some((i, _)) => format!("{}…", s[..i].trim_end()),
-            None => s.to_string(),
+        s.trim().to_string()
+    }
+
+    fn caption_kinds(&self, p: &Para) -> [bool; 3] {
+        let mut found = [false; 3];
+        if p.props.figure_list.is_some() || p.props.toc.is_some() || !p.text.contains(OBJECT_CHAR) {
+            return found;
         }
+        for (start, end, attr) in p.spans() {
+            let a = self.attrs.get(attr);
+            if let Some(kind) = a.sequence.filter(|_| a.deleted.is_none() && a.conflict.is_none()) {
+                found[kind as usize] |= p.text[start as usize..end as usize].contains(OBJECT_CHAR);
+            }
+        }
+        found
+    }
+
+    /// The caption a generated entry's page field links to.
+    pub fn figure_list_target(&self, p: &Para) -> Option<BlockId> {
+        p.props.figure_list?;
+        self.fields_in(p).into_iter().find_map(|(_, f)| match f {
+            Field::PageRef(target) => Some(target),
+            _ => None,
+        })
     }
 
     /// The fields in paragraph `p`: (byte, field).
@@ -90,20 +124,35 @@ impl TextDoc {
 /// Works every field out against `pages` (complete) and stores the values;
 /// returns the blocks, in order, whose fields now show something else.
 pub fn resolve(doc: &mut TextDoc, pages: &[Page]) -> Vec<usize> {
+    let mut changed = Vec::new();
+    let mut sequences = HashMap::new();
     // Which blocks hold fields, and what they refer to.
     let mut holders: Vec<(usize, Vec<Field>)> = Vec::new();
     let mut wanted: HashSet<BlockId> = HashSet::new();
     for (i, b) in doc.blocks.iter().enumerate() {
         let Some(p) = b.as_para() else { continue };
+        let mut renumbered = false;
+        for (start, end, attr) in p.spans() {
+            if doc.attrs.get(attr).sequence.is_none() { continue; }
+            for (offset, _) in p.text[start as usize..end as usize].match_indices(OBJECT_CHAR) {
+                let key = (p.id, start + offset as u32);
+                if let Some(n) = doc.blocks.caption_number(&doc.attrs, key.0, key.1) {
+                    renumbered |= doc.sequence_values.get(&key) != Some(&n);
+                    sequences.insert(key, n);
+                }
+            }
+        }
+        if renumbered { changed.push(i); }
         let f: Vec<Field> = doc.fields_in(p).into_iter().map(|x| x.1).collect();
         if !f.is_empty() {
             wanted.extend(f.iter().map(|x| x.target()));
             holders.push((i, f));
         }
     }
+    doc.sequence_values = sequences;
     if holders.is_empty() {
         doc.field_values.clear();
-        return Vec::new();
+        return changed;
     }
     let mut at: HashMap<BlockId, usize> = HashMap::new();
     for (i, b) in doc.blocks.iter().enumerate() {
@@ -113,7 +162,6 @@ pub fn resolve(doc: &mut TextDoc, pages: &[Page]) -> Vec<usize> {
     }
     let page_of = |i: usize| pages.partition_point(|p| p.start.block < i || (p.start.block == i && p.start.line == 0)).saturating_sub(1);
     let mut values: HashMap<Field, Arc<str>> = HashMap::new();
-    let mut changed = Vec::new();
     for (i, fs) in &holders {
         let mut differs = false;
         for &f in fs {
@@ -132,6 +180,8 @@ pub fn resolve(doc: &mut TextDoc, pages: &[Page]) -> Vec<usize> {
         }
     }
     doc.field_values = values;
+    changed.sort_unstable();
+    changed.dedup();
     changed
 }
 
@@ -219,6 +269,7 @@ pub fn bind(doc: &mut TextDoc, names: &[String], marks: &HashMap<String, BlockId
             if let Some(q) = b.as_para_mut() {
                 if text.is_empty() {
                     q.props.toc = None;
+                    q.props.figure_list = None;
                 }
                 q.text = text;
                 q.runs = runs;
@@ -235,18 +286,26 @@ pub fn bind(doc: &mut TextDoc, names: &[String], marks: &HashMap<String, BlockId
 /// matched, so repeated titles pair in order. Returns how many were linked.
 pub fn relink_toc(doc: &mut TextDoc) -> usize {
     let mut heads: Vec<(BlockId, String)> = Vec::new();
+    let mut captions = HashMap::new();
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     for b in doc.blocks.iter() {
         let Some(p) = b.as_para() else { continue };
-        if p.props.toc.is_none() && p.props.cell.is_none() && doc.styles.para_format(p.style, &p.props).0.outline_level.is_some() {
+        let kinds = doc.caption_kinds(p);
+        if kinds.contains(&true) {
+            let title = norm(&doc.caption_text(p));
+            for kind in CaptionKind::ALL.into_iter().filter(|&k| kinds[k as usize]) {
+                captions.entry((kind, title.clone())).or_insert(p.id);
+            }
+        }
+        if p.props.toc.is_none() && p.props.figure_list.is_none() && p.props.cell.is_none() && doc.styles.para_format(p.style, &p.props).0.outline_level.is_some() {
             heads.push((p.id, doc.ref_text(p)));
         }
     }
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut from = 0;
     let mut n = 0;
     for i in 0..doc.blocks.len() {
         let Some(p) = doc.para(i) else { continue };
-        if p.props.toc.is_none() || p.text.contains(OBJECT_CHAR) {
+        if (p.props.toc.is_none() && p.props.figure_list.is_none()) || p.text.contains(OBJECT_CHAR) {
             continue;
         }
         let Some(tab) = p.text.rfind('\t') else { continue };
@@ -255,9 +314,14 @@ pub fn relink_toc(doc: &mut TextDoc) -> usize {
             continue;
         }
         let title = norm(p.text[..tab].trim());
-        let Some(k) = (from..heads.len()).chain(0..from).find(|&k| norm(&heads[k].1) == title) else { continue };
-        from = k + 1;
-        let target = heads[k].0;
+        let target = if let Some(kind) = p.props.figure_list {
+            let Some(&id) = captions.get(&(kind, title)) else { continue };
+            id
+        } else {
+            let Some(k) = (from..heads.len()).chain(0..from).find(|&k| norm(&heads[k].1) == title) else { continue };
+            from = k + 1;
+            heads[k].0
+        };
         let num = num.to_string();
         let at = (tab + 1) as u32;
         let mut a = doc.attrs.get(p.attr_at(at)).clone();
@@ -292,7 +356,7 @@ pub fn toc_entries(doc: &TextDoc, max_level: u8) -> Vec<TocEntry> {
     let mut v = Vec::new();
     for b in doc.blocks.iter() {
         let Some(p) = b.as_para() else { continue };
-        if p.props.toc.is_some() || p.props.cell.is_some() {
+        if p.props.toc.is_some() || p.props.figure_list.is_some() || p.props.cell.is_some() {
             continue;
         }
         let Some(level) = doc.styles.para_format(p.style, &p.props).0.outline_level.filter(|l| *l <= max_level) else { continue };
@@ -311,7 +375,14 @@ pub fn toc_entries(doc: &TextDoc, max_level: u8) -> Vec<TocEntry> {
 /// The table of contents' blocks: `first..end`, the run of entries holding
 /// block `near` or, if none does, the first run in the document.
 pub fn toc_range(doc: &TextDoc, near: Option<usize>) -> Option<(usize, usize)> {
-    let is = |i: usize| doc.para(i).is_some_and(|p| p.props.toc.is_some());
+    index_range(doc, near, None)
+}
+
+pub fn index_range(doc: &TextDoc, near: Option<usize>, figures: Option<CaptionKind>) -> Option<(usize, usize)> {
+    let is = |i: usize| doc.para(i).is_some_and(|p| match figures {
+        Some(k) => p.props.figure_list == Some(k),
+        None => p.props.toc.is_some(),
+    });
     let n = doc.blocks.len();
     let start = match near.filter(|&i| is(i)) {
         Some(mut i) => {
@@ -367,26 +438,58 @@ pub fn entry_blocks(doc: &mut TextDoc, entries: &[TocEntry], ids: &mut dyn FnMut
 /// means it is already current (or there are no headings to list).
 pub fn toc_ops(doc: &mut TextDoc, at: usize, max_level: u8) -> Vec<TextOp> {
     let entries = toc_entries(doc, max_level);
+    generated_ops(doc, at, &entries, None)
+}
+
+pub fn figure_list_ops(doc: &mut TextDoc, at: usize, kind: CaptionKind) -> Vec<TextOp> {
+    let mut entries = Vec::new();
+    for block in doc.blocks.iter() {
+        let Some(p) = block.as_para() else { continue };
+        if doc.caption_kinds(p)[kind as usize] {
+            entries.push(TocEntry { level: 1, text: doc.caption_text(p), target: p.id });
+            if entries.len() == MAX_TOC_ENTRIES { break; }
+        }
+    }
+    generated_ops(doc, at, &entries, Some(kind))
+}
+
+fn generated_ops(doc: &mut TextDoc, at: usize, entries: &[TocEntry], figures: Option<CaptionKind>) -> Vec<TextOp> {
     let width = (doc.page.width - doc.page.margin_start - doc.page.margin_end).max(1440);
-    let existing = toc_range(doc, None);
+    let existing = index_range(doc, figures.map(|_| at), figures);
     let style = 0;
     let attr = doc.attrs.intern(CharAttrs::default());
+    let blocks = |d: &mut TextDoc, ids: &mut dyn FnMut(&mut TextDoc) -> BlockId| {
+        let mut blocks = entry_blocks(d, entries, ids, style, attr, width);
+        if let Some(kind) = figures {
+            for b in &mut blocks {
+                if let Some(p) = b.as_para_mut() {
+                    p.props.toc = None;
+                    p.props.figure_list = Some(kind);
+                }
+            }
+        }
+        blocks
+    };
     match existing {
         Some((first, end)) => {
             // Same entries, same props: nothing to do (page numbers are fields).
             let olds: Vec<&Para> = (first..end).filter_map(|i| doc.para(i)).collect();
             let same = olds.len() == entries.len()
-                && olds.iter().zip(&entries).all(|(p, e)| p.props.toc == Some(e.level) && doc.fields_in(p).first().map(|x| x.1) == Some(Field::PageRef(e.target)) && p.text.strip_suffix(&format!("\t{OBJECT_CHAR}")) == Some(e.text.as_str()));
+                && olds.iter().zip(entries).all(|(p, e)| (figures.is_some() || p.props.toc == Some(e.level)) && doc.fields_in(p).first().map(|x| x.1) == Some(Field::PageRef(e.target)) && p.text.strip_suffix(&format!("\t{OBJECT_CHAR}")) == Some(e.text.as_str()));
             if same {
                 return Vec::new();
             }
-            let old_ids: Vec<BlockId> = olds.iter().map(|p| p.id).collect();
-            let mut k = 0;
-            let mut ids = |d: &mut TextDoc| {
-                k += 1;
-                old_ids.get(k - 1).copied().unwrap_or_else(|| d.new_id())
+            let old_ids: Vec<Option<BlockId>> = if figures.is_some() {
+                // A caption entry retains its id when another caption moves ahead of it.
+                let mut by_target: HashMap<BlockId, BlockId> = olds.iter().filter_map(|p| {
+                    doc.figure_list_target(p).map(|target| (target, p.id))
+                }).collect();
+                entries.iter().map(|e| by_target.remove(&e.target)).collect()
+            } else {
+                olds.iter().map(|p| Some(p.id)).collect()
             };
-            let blocks = entry_blocks(doc, &entries, &mut ids, style, attr, width);
+            let mut ids = old_ids.into_iter();
+            let blocks = blocks(doc, &mut |d| ids.next().flatten().unwrap_or_else(|| d.new_id()));
             let mut ops = vec![TextOp::Remove { at: first as u32, n: (end - first) as u32 }];
             if !blocks.is_empty() {
                 ops.push(TextOp::Insert { at: first as u32, blocks });
@@ -397,7 +500,7 @@ pub fn toc_ops(doc: &mut TextDoc, at: usize, max_level: u8) -> Vec<TextOp> {
             if entries.is_empty() {
                 return Vec::new();
             }
-            let blocks = entry_blocks(doc, &entries, &mut |d| d.new_id(), style, attr, width);
+            let blocks = blocks(doc, &mut |d| d.new_id());
             vec![TextOp::Insert { at: at.min(doc.blocks.len()) as u32, blocks }]
         }
     }
@@ -450,6 +553,32 @@ mod tests {
             let f = d.fields_in(p);
             format!("{} {}", p.text.split('\t').next().unwrap(), d.field_text(f[0].1))
         }).collect()
+    }
+
+    #[test]
+    fn caption_ranks_follow_edits_across_leaves_and_invalidate_distant_pages() {
+        let mut d = TextDoc::new();
+        let figure = d.attrs.intern(CharAttrs { sequence: Some(CaptionKind::Figure), ..Default::default() });
+        let table = d.attrs.intern(CharAttrs { sequence: Some(CaptionKind::Table), ..Default::default() });
+        for i in 0..=crate::tree::LEAF + 2 {
+            d.push_para(&format!("Item {i}"), 0, vec![]);
+        }
+        let last = d.push_para(&format!("{OBJECT_CHAR}/{OBJECT_CHAR}"), 0, vec![(0, figure), (3, 0), (4, table)]);
+        let id = d.para(last).unwrap().id;
+        assert_eq!(d.caption_number(id, 0), "1");
+        assert_eq!(d.caption_number(id, 4), "1");
+        resolve(&mut d, &[]);
+        let mut first = Para::new(d.new_id(), &format!("{OBJECT_CHAR} {OBJECT_CHAR}"), 0);
+        first.runs = vec![(0, figure)];
+        d.blocks.insert(0, Block::Para(first));
+        assert_eq!(d.caption_number(id, 0), "3");
+        assert_eq!(d.caption_number(id, 4), "1");
+        assert_eq!(resolve(&mut d, &[]), [0, last + 1]);
+        let moved = d.blocks.remove(0).unwrap();
+        d.blocks.insert(d.blocks.len(), moved);
+        assert_eq!(d.caption_number(id, 0), "1");
+        assert_eq!(d.caption_number(id, 4), "1");
+        assert_eq!(d.caption_text(d.para(d.blocks.len() - 1).unwrap()), "2 3");
     }
 
     #[test]

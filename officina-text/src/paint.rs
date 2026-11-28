@@ -768,6 +768,11 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
                     // A note anchor's glyphs show its label.
                     match f.note {
                         Some(id) if ch == OBJECT_CHAR => run.text.push_str(&doc.note_label(id)),
+                        _ if ch == OBJECT_CHAR && f.sequence.is_some() => {
+                            if let Some(p) = block.and_then(|b| doc.para(b)) {
+                                run.text.push_str(&doc.caption_number(p.id, g.cluster));
+                            }
+                        }
                         _ => match f.field {
                             Some(x) if ch == OBJECT_CHAR => run.text.push_str(&doc.field_text(x)),
                             _ => run.text.push_str(t),

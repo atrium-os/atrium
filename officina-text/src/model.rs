@@ -57,6 +57,8 @@ pub struct CharAttrs {
     /// The character (U+FFFC) is a field: it shows a value worked out from
     /// the rest of the document (see [`TextDoc::field_text`]).
     pub field: Option<Field>,
+    /// An inline sequence number, derived from the order of its U+FFFC markers.
+    pub sequence: Option<CaptionKind>,
     /// The language of East Asian text (BCP 47, "ja-JP", "zh-TW"): which
     /// forms a Han character takes (Word's `w:lang w:eastAsia`).
     pub lang_ea: Option<Arc<str>>,
@@ -98,6 +100,34 @@ pub enum Caps {
     All,
     /// Lower-case letters as smaller capitals.
     Small,
+}
+
+/// Independent decimal sequences used by captions and their generated lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CaptionKind {
+    Figure,
+    Table,
+    Equation,
+}
+
+impl CaptionKind {
+    pub const ALL: [Self; 3] = [Self::Figure, Self::Table, Self::Equation];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Figure => "Figure",
+            Self::Table => "Table",
+            Self::Equation => "Equation",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("Illustration") {
+            return Some(Self::Figure);
+        }
+        Self::ALL.into_iter().find(|k| name.eq_ignore_ascii_case(k.name()))
+    }
 }
 
 /// A value shown in the text and worked out after pagination: a reference
@@ -692,6 +722,7 @@ impl CharAttrs {
             fmt: self.fmt.or(under.fmt),
             conflict: self.conflict.or(under.conflict),
             field: self.field.or(under.field),
+            sequence: self.sequence.or(under.sequence),
             lang_ea: self.lang_ea.clone().or_else(|| under.lang_ea.clone()),
             caps: self.caps.or(under.caps),
             hidden: self.hidden.or(under.hidden),
@@ -726,6 +757,8 @@ pub struct CharFormat {
     pub fmt: Option<FmtChange>,
     pub conflict: Option<ConflictId>,
     pub field: Option<Field>,
+    /// An inline sequence number, derived from the order of its U+FFFC markers.
+    pub sequence: Option<CaptionKind>,
     /// See [`CharAttrs::lang_ea`].
     pub lang_ea: Option<Arc<str>>,
     pub caps: Caps,
@@ -740,7 +773,7 @@ pub struct CharFormat {
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None, lang_ea: None, caps: Caps::Normal, hidden: false, dstrike: false, spacing: 0, scale: 100, effects: 0 }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None, sequence: None, lang_ea: None, caps: Caps::Normal, hidden: false, dstrike: false, spacing: 0, scale: 100, effects: 0 }
     }
 }
 
@@ -811,6 +844,9 @@ impl CharFormat {
         }
         if a.conflict.is_some() {
             self.conflict = a.conflict;
+        }
+        if a.sequence.is_some() {
+            self.sequence = a.sequence;
         }
         if a.field.is_some() {
             self.field = a.field;
@@ -1017,6 +1053,8 @@ pub struct ParaProps {
     /// An entry of a generated table of contents, for a heading of this level
     /// (Update Table of Contents replaces the run of them).
     pub toc: Option<u8>,
+    /// An entry in the generated list for this caption sequence.
+    pub figure_list: Option<CaptionKind>,
     /// The paragraph starts a section with these settings (never from a
     /// style). On the first paragraph it sets the first section's columns.
     pub section: Option<Section>,
@@ -1062,6 +1100,7 @@ impl ParaProps {
             rev: self.rev.or(under.rev),
             tabs: self.tabs.clone().or_else(|| under.tabs.clone()),
             toc: self.toc.or(under.toc),
+            figure_list: self.figure_list,
             section: self.section.or(under.section),
             rtl: self.rtl.or(under.rtl),
             borders: self.borders.or(under.borders),
@@ -1829,7 +1868,7 @@ impl Para {
         let delta = new_end as i64 - old_end as i64;
         let mid = {
             let a = self.attr_at((pre as u32).saturating_sub(1));
-            if attrs.get(a).object.is_some() || attrs.get(a).note.is_some() || attrs.get(a).field.is_some() { plain } else { a }
+            if attrs.get(a).object.is_some() || attrs.get(a).note.is_some() || attrs.get(a).field.is_some() || attrs.get(a).sequence.is_some() { plain } else { a }
         };
         let mut runs = Vec::with_capacity(self.runs.len() + 2);
         for &(at, a) in &self.runs {
@@ -2106,6 +2145,8 @@ pub struct TextDoc {
     /// What each field shows, as last worked out (derived: not saved, not
     /// part of undo); see [`crate::fields`].
     pub field_values: HashMap<Field, Arc<str>>,
+    /// Ordinals at the previous pagination, to invalidate distant caption lines after edits.
+    pub(crate) sequence_values: HashMap<(BlockId, u32), u64>,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -2144,7 +2185,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, settings: Settings::default(), tables: Default::default(), field_values: HashMap::new(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, settings: Settings::default(), tables: Default::default(), field_values: HashMap::new(), sequence_values: HashMap::new(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

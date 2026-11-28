@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, PageBorders, MAX_BORDER_SPACE, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{CaptionKind, CellBorders, CellLook, CellPad, RowLook, VAlign, TableBorders, TableLook, MAX_CELL_PAD, Border, BorderStyle, ParaBorders, PageBorders, MAX_BORDER_SPACE, DropCap, DROP_CAP_LINES, ListDef, ListLevel, NumFormat, LineNumbering, LineRestart, MAX_LIST_START, Caps, MAX_SPACING, SCALE_RANGE, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El, Node};
@@ -579,6 +579,7 @@ struct Reader<'a> {
     open_marks: Vec<String>,
     marks: HashMap<String, BlockId>,
     in_toc: bool,
+    figure_list: Option<CaptionKind>,
     /// Tab stops count from the start indent (ODF's way; LibreOffice turns it
     /// off for documents from Word).
     tabs_from_indent: bool,
@@ -1504,11 +1505,38 @@ impl<'a> Reader<'a> {
                     "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments in notes, headers and footers"),
                     "text:change" | "text:change-start" | "text:change-end" if at == Where::Body && !self.in_note => self.change_mark(x, p, a),
                     "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes in notes, headers and footers (shown as they stand)"),
+                    "text:sequence" if at == Where::Body && !self.in_note && !self.in_shape => {
+                        let name = x.attr("text:name").unwrap_or("");
+                        let kind = CaptionKind::from_name(name);
+                        let formula = x.attr("text:formula").unwrap_or("");
+                        let increment = formula.split_once(':').map_or(formula, |(_, expr)| expr);
+                        if let Some(kind) = kind.filter(|_| increment.trim() == format!("{name}+1") && x.attr("style:num-format").unwrap_or("1") == "1") {
+                            let mut attrs = a.clone();
+                            attrs.sequence = Some(kind);
+                            p.push(&OBJECT_CHAR.to_string(), &attrs);
+                            if let Some(reference) = x.attr("text:ref-name").filter(|n| !n.is_empty() && n.len() <= 256 && self.open_marks.len() < 63) {
+                                self.open_marks.push(reference.to_string());
+                                // Writer hyperlinks its generated indexes to a zero-based sequence bookmark.
+                                if let Some(index) = reference.strip_prefix("ref").and_then(|n| n.strip_prefix(name)).filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())) {
+                                    self.open_marks.push(format!("{name}!{index}%7Csequence"));
+                                }
+                            }
+                        } else {
+                            self.inline(x, p, a, at);
+                        }
+                    }
                     "text:bookmark" | "text:bookmark-start" if at == Where::Body && !self.in_note => {
                         if let Some(n) = x.attr("text:name").filter(|n| !n.is_empty() && n.len() <= 256) {
                             if self.open_marks.len() < 64 {
                                 self.open_marks.push(n.to_string());
                             }
+                        }
+                    }
+                    "text:sequence-ref" if self.figure_list.is_some() && at == Where::Body && !self.in_note && x.attr("text:reference-format") == Some("page") => {
+                        if let Some(name) = x.attr("text:ref-name").filter(|n| !n.is_empty() && n.len() <= 256) {
+                            self.push_ref(p, a, true, name, &x.text());
+                        } else {
+                            self.inline(x, p, a, at);
                         }
                     }
                     "text:bookmark-ref" if at == Where::Body && !self.in_note && matches!(x.attr("text:reference-format"), Some("page" | "text")) && x.attr("text:ref-name").is_some_and(|n| !n.is_empty()) => {
@@ -1776,10 +1804,11 @@ impl<'a> Reader<'a> {
                 props.tabs = Some(pf.tabs.iter().map(|t| TabStop { pos: (t.pos + ind).max(0), ..*t }).collect());
             }
         }
-        if self.in_toc && cell.is_none() && !self.in_note && !p.text.is_empty() {
+        if (self.in_toc || self.figure_list.is_some()) && cell.is_none() && !self.in_note && !p.text.is_empty() {
             let name = self.doc.styles.styles[style as usize].name.to_ascii_lowercase();
             let level = name.strip_prefix("contents").or_else(|| name.strip_prefix("toc")).and_then(|n| n.trim().parse::<u8>().ok()).filter(|l| (1..=9).contains(l)).unwrap_or(1);
-            props.toc = Some(level);
+            props.figure_list = self.figure_list;
+            props.toc = self.figure_list.is_none().then_some(level);
             // An entry LibreOffice wrote: a link to the heading's bookmark, the
             // page number as text after the tab; the number becomes a field.
             if !p.text.contains(OBJECT_CHAR) {
@@ -2126,7 +2155,20 @@ impl<'a> Reader<'a> {
                         self.in_toc = was;
                     }
                 }
-                "text:alphabetical-index" | "text:illustration-index" | "text:table-index" | "text:bibliography" | "text:user-index" | "text:object-index" => {
+                "text:illustration-index" | "text:table-index" => {
+                    if let Some(body) = x.child("text:index-body") {
+                        let source = x.child(&format!("{}-source", x.name));
+                        let name = source.and_then(|s| s.attr("text:caption-sequence-name")).unwrap_or(if x.name == "text:table-index" { "Table" } else { "Illustration" });
+                        let kind = CaptionKind::from_name(name).filter(|_| source.and_then(|s| s.attr("text:use-caption")) != Some("false"));
+                        let outer = self.figure_list;
+                        for y in body.els() {
+                            self.figure_list = kind.filter(|_| y.name != "text:index-title");
+                            self.body(&El { name: "x".into(), attrs: vec![], kids: vec![Node::El(y.clone())] });
+                        }
+                        self.figure_list = outer;
+                    }
+                }
+                "text:alphabetical-index" | "text:bibliography" | "text:user-index" | "text:object-index" => {
                     self.rep.note(Kind::Approximate, "tables of contents and indexes (their text kept)");
                     if let Some(b) = x.child("text:index-body") {
                         self.body(b);
@@ -2331,7 +2373,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), list_defs: HashMap::new(), columns: HashMap::new(), cell_styles: HashMap::new(), span_above: HashMap::new(), row_styles: HashMap::new(), table_styles: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), list_defs: HashMap::new(), columns: HashMap::new(), cell_styles: HashMap::new(), span_above: HashMap::new(), row_styles: HashMap::new(), table_styles: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, figure_list: None, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {

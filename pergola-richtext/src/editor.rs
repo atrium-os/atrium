@@ -15,7 +15,7 @@ use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{builtin_table_styles, CellPad, TableLook, VAlign, Border, ParaBorders, DropCap, ListDef, ListLevel, LineNumbering, LineSpacing, ParaFormat, Settings, TabStop, TabAlign, Leader, MAX_TABS, LIST_INDENT, Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{CaptionKind, builtin_table_styles, CellPad, TableLook, VAlign, Border, ParaBorders, DropCap, ListDef, ListLevel, LineNumbering, LineSpacing, ParaFormat, Settings, TabStop, TabAlign, Leader, MAX_TABS, LIST_INDENT, Caps, VertAlign, MAX_SPACING, SCALE_RANGE, EFFECTS, Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::{COLUMN_BREAK, PAGE_BREAK};
 use officina_text::model::{RevId, Revision};
@@ -537,7 +537,7 @@ impl Editor {
         }
         let before = para.attr_at(k.saturating_sub(1));
         let mut base = self.doc.attrs.get(before).clone();
-        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.field.take().is_some() | base.deleted.take().is_some() | base.conflict.take().is_some() | (k != p.at);
+        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.field.take().is_some() | base.sequence.take().is_some() | base.deleted.take().is_some() | base.conflict.take().is_some() | (k != p.at);
         // Tracking marks are the typing's own, never inherited.
         pic |= base.rev.take().is_some() | base.fmt.take().is_some();
         // Typing inside commented text stays in the comment; at its end it doesn't.
@@ -865,14 +865,44 @@ impl Editor {
     /// is nothing to do (no headings, or it is current: page numbers are
     /// fields and keep themselves current).
     pub fn insert_toc(&mut self) -> bool {
-        let had = fields::toc_range(&self.doc, None);
-        let at = self.caret.block;
-        let ops = fields::toc_ops(&mut self.doc, at, 3);
+        self.insert_index(None)
+    }
+
+    /// Add a caption below the current paragraph or table and leave the
+    /// caret after its separator, ready for the description.
+    pub fn insert_caption(&mut self, kind: CaptionKind) {
+        let table = self.table_range(self.caret.block);
+        let at = if table.is_empty() { self.caret.block + 1 } else { table.end };
+        let label = format!("{} ", kind.name());
+        let text = format!("{label}{OBJECT_CHAR}: ");
+        let mut p = Para::new(self.doc.new_id(), &text, self.doc.styles.by_name("Caption").unwrap_or(0));
+        let mark = self.doc.attrs.intern(CharAttrs { sequence: Some(kind), ..Default::default() });
+        let offset = label.len() as u32;
+        p.runs = vec![(0, 0), (offset, mark), (offset + OBJECT_CHAR.len_utf8() as u32, 0)];
+        self.apply("Insert Caption", vec![TextOp::Insert { at: at as u32, blocks: vec![Block::Para(p)] }], Kind::Other);
+        self.set_caret(Pos::new(at, text.len() as u32), false);
+    }
+
+    pub fn insert_figure_list(&mut self, kind: CaptionKind) -> bool {
+        self.insert_index(Some(kind))
+    }
+
+    fn insert_index(&mut self, figures: Option<CaptionKind>) -> bool {
+        let at = figures.map_or(self.caret.block, |_| self.table_range(self.caret.block).start);
+        let had = fields::index_range(&self.doc, figures.map(|_| at), figures);
+        let (ops, label) = match figures {
+            Some(kind) => (fields::figure_list_ops(&mut self.doc, at, kind), if had.is_some() { "Update Caption List" } else { "Insert Caption List" }),
+            None => (fields::toc_ops(&mut self.doc, at, 3), if had.is_some() { "Update Table of Contents" } else { "Insert Table of Contents" }),
+        };
         if ops.is_empty() {
             return false;
         }
-        self.apply(if had.is_some() { "Update Table of Contents" } else { "Insert Table of Contents" }, ops, Kind::Other);
-        let end = fields::toc_range(&self.doc, None).map_or(0, |r| r.1);
+        let first = had.map_or(at, |r| r.0);
+        self.apply(label, ops, Kind::Other);
+        let end = match figures {
+            Some(_) => fields::index_range(&self.doc, Some(first), figures).filter(|r| r.0 == first).map_or(first, |r| r.1),
+            None => fields::toc_range(&self.doc, None).map_or(0, |r| r.1),
+        };
         match had {
             // An update: text past the contents keeps its place.
             Some((_, old_end)) if self.caret.block >= old_end && self.anchor.block >= old_end => {
@@ -1029,6 +1059,7 @@ impl Editor {
                 let (style, mut props) = self.doc.para(start.block).map(|q| (q.style, q.props.clone())).unwrap_or_default();
                 props.rev = rev;
                 props.section = None;
+                props.figure_list = None;
                 let id = self.doc.new_id();
                 ops.push(TextOp::Split { block: p.block as u32, at: p.at, id, style, props });
                 p = Pos::new(p.block + 1, 0);
@@ -1062,6 +1093,7 @@ impl Editor {
         props.rev = None;
         // A section starts once: the new paragraph is inside it.
         props.section = None;
+        props.figure_list = None;
         if let Some((rev, rops)) = track {
             props.rev = Some(rev);
             ops.extend(rops);
@@ -1476,6 +1508,7 @@ impl Editor {
         a.object = Some(ObjectRef { image: id, width: w, height: h, float: Some(Float { wrap: Wrap::Square, ..Float::default() }), shape: true });
         a.note = None;
         a.field = None;
+        a.sequence = None;
         let attr = self.doc.attrs.intern(a);
         ops.insert(0, TextOp::SetShape { id, shape: Some(sd) });
         ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins: Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, attr)] } });
@@ -1982,7 +2015,7 @@ impl Editor {
                 Some(s) => {
                     // A new style clears direct paragraph formatting (the
                     // paragraph stays in its list, cell and section).
-                    props = ParaProps { list: props.list, cell: props.cell, inner: props.inner, rev: props.rev, toc: props.toc, section: props.section, ..ParaProps::default() };
+                    props = ParaProps { list: props.list, cell: props.cell, inner: props.inner, rev: props.rev, toc: props.toc, figure_list: props.figure_list, section: props.section, ..ParaProps::default() };
                     s
                 }
                 None => p.style,
@@ -3313,7 +3346,7 @@ impl Editor {
     /// lists, cells and sections stay.
     pub fn reset_paragraph(&mut self) {
         self.set_paragraphs("Reset Paragraph", None, |p| {
-            *p = ParaProps { list: p.list, list_start: p.list_start, cell: p.cell, inner: p.inner, rev: p.rev, toc: p.toc, section: p.section, ..Default::default() };
+            *p = ParaProps { list: p.list, list_start: p.list_start, cell: p.cell, inner: p.inner, rev: p.rev, toc: p.toc, figure_list: p.figure_list, section: p.section, ..Default::default() };
         });
     }
 
@@ -3623,7 +3656,7 @@ impl Editor {
         let mut ops = Vec::new();
         for k in a.block..=b.block {
             let Some(p) = self.doc.para(k) else { continue };
-            let props = ParaProps { list: p.props.list, cell: p.props.cell, inner: p.props.inner, rev: p.props.rev, toc: p.props.toc, section: p.props.section, ..Default::default() };
+            let props = ParaProps { list: p.props.list, cell: p.props.cell, inner: p.props.inner, rev: p.props.rev, toc: p.props.toc, figure_list: p.props.figure_list, section: p.props.section, ..Default::default() };
             if props != p.props || style != p.style {
                 ops.push(TextOp::SetPara { block: k as u32, style, props });
             }

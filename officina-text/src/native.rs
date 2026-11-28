@@ -110,7 +110,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
     let float = a.object.and_then(|o| o.float);
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5 | (a.lang_ea.is_some() as u16) << 6 | ((look_mask(a) != 0) as u16) << 7;
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5 | (a.lang_ea.is_some() as u16) << 6 | ((look_mask(a) != 0) as u16) << 7 | (a.sequence.is_some() as u16) << 8;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -212,6 +212,9 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
             w.u8(v);
         }
     }
+    if let Some(sequence) = a.sequence {
+        w.u8(sequence as u8);
+    }
 }
 
 /// Which of the letters' look fields are set (ext bit 7's own mask).
@@ -222,7 +225,7 @@ fn look_mask(a: &CharAttrs) -> u8 {
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 8 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 & 3 != 0 && m & (1 << 10) == 0) {
+    if ext >> 9 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 & 3 != 0 && m & (1 << 10) == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -405,7 +408,17 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
             a.effects = Some(v);
         }
     }
+    if ext & 256 != 0 {
+        if a.object.is_some() || a.note.is_some() || a.field.is_some() {
+            return Err(WireError::Invalid("conflicting caption anchor"));
+        }
+        a.sequence = Some(decode_caption_kind(r)?);
+    }
     Ok(a)
+}
+
+fn decode_caption_kind(r: &mut Reader) -> Result<crate::model::CaptionKind, WireError> {
+    crate::model::CaptionKind::ALL.get(usize::from(r.u8()?)).copied().ok_or(WireError::Invalid("caption sequence"))
 }
 
 /// Paragraph properties: a mask of the fields set, then their values.
@@ -418,7 +431,7 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     }
     // Bit 15: a second mask follows (tab stops, table of contents entry).
     let more = box_mask(p);
-    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3 | (p.rtl.is_some() as u16) << 4 | ((more != 0) as u16) << 5;
+    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3 | (p.rtl.is_some() as u16) << 4 | ((more != 0) as u16) << 5 | (p.figure_list.is_some() as u16) << 6;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -568,6 +581,9 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
             w.var(c.width as u64);
             encode_cell_extras(w, c);
         }
+    }
+    if let Some(kind) = p.figure_list {
+        w.u8(kind as u8);
     }
 }
 
@@ -1052,7 +1068,7 @@ const MAX_TWIPS: i64 = 31_680;
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 6 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
+    if ext >> 7 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let more = if ext & 32 != 0 { r.u8()? } else { 0 };
@@ -1254,6 +1270,12 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
         let mut c = CellRef { table, row, col, width: width as u32, ..CellRef::default() };
         decode_cell_extras(r, &mut c)?;
         p.inner = Some(c);
+    }
+    if ext & 64 != 0 {
+        if p.toc.is_some() {
+            return Err(WireError::Invalid("conflicting generated index"));
+        }
+        p.figure_list = Some(decode_caption_kind(r)?);
     }
     Ok(p)
 }

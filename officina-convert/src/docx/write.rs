@@ -382,6 +382,7 @@ impl Out {
 
     /// The runs of block `b`.
     fn runs(&mut self, doc: &TextDoc, p: &Para, out: &mut String) {
+        let caption_link = doc.figure_list_target(p).map(ref_name);
         let marks = self.cur.and_then(|b| self.marks.get(&b)).cloned().unwrap_or_default();
         let mut m = 0;
         for (s, e, a) in p.spans() {
@@ -413,7 +414,7 @@ impl Out {
                     text.clear();
                 }
             };
-            for c in p.text[s as usize..e as usize].chars() {
+            for (offset, c) in p.text[s as usize..e as usize].char_indices() {
                 match c {
                     '\t' => {
                         flush(&mut text, &mut body);
@@ -430,6 +431,12 @@ impl Out {
                     '\u{000B}' => {
                         flush(&mut text, &mut body);
                         let _ = write!(body, r#"<w:r>{props}<w:br w:type="column"/></w:r>"#);
+                    }
+                    OBJECT_CHAR if attrs.sequence.is_some() => {
+                        flush(&mut text, &mut body);
+                        if let Some(kind) = attrs.sequence {
+                            field_runs(&mut body, &props, &format!(r"SEQ {} \* ARABIC", kind.name()), &doc.caption_number(p.id, s + offset as u32));
+                        }
                     }
                     OBJECT_CHAR if attrs.field.is_some() => {
                         flush(&mut text, &mut body);
@@ -501,7 +508,7 @@ impl Out {
             }
             match link {
                 Some(url) if url.starts_with('#') => {
-                    let _ = write!(out, r#"<w:hyperlink w:anchor="{}">{body}</w:hyperlink>"#, esc(&url[1..]));
+                    let _ = write!(out, r#"<w:hyperlink w:anchor="{}">{body}</w:hyperlink>"#, esc(caption_link.as_deref().unwrap_or(&url[1..])));
                 }
                 Some(url) => {
                     let r = self.link(&url);
@@ -519,10 +526,18 @@ impl Out {
         let Some(p) = doc.para(b) else { return };
         self.cur = Some(b);
         // A table of contents is a TOC field over its run of entries.
-        let toc = |i: usize| doc.para(i).is_some_and(|q| q.props.toc.is_some() && q.props.cell.is_none());
+        let index = |i: usize| {
+            let q = doc.para(i).filter(|q| q.props.cell.is_none())?;
+            q.props.figure_list.map(Some).or_else(|| q.props.toc.map(|_| None))
+        };
+        let current = index(b);
         let mut lead = String::new();
-        if toc(b) && (b == 0 || !toc(b - 1)) {
-            let _ = write!(lead, r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-{}" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>"#, toc_depth(doc, b));
+        if let Some(list) = current.filter(|_| b == 0 || index(b - 1) != current) {
+            let switches = match list {
+                Some(kind) => format!(r#"\c "{}" \h \z"#, kind.name()),
+                None => format!(r#"\o "1-{}" \h \z \u"#, toc_depth(doc, b)),
+            };
+            let _ = write!(lead, r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC {switches} </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>"#);
         }
         if self.targets.contains(&p.id) {
             self.bookmark += 1;
@@ -532,7 +547,7 @@ impl Out {
         if self.targets.contains(&p.id) {
             let _ = write!(tail, r#"<w:bookmarkEnd w:id="{}"/>"#, self.bookmark);
         }
-        if toc(b) && !toc(b + 1) {
+        if current.is_some() && index(b + 1) != current {
             tail += r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
         }
         self.para_of(doc, p, out, &lead, &tail);

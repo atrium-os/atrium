@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use officina_text::model::CaptionKind;
 use officina_text::model::{StyleId, HAlign, Rel, Wrap, SectionStart, Align, CommentId, ListKind, NoteId, NoteKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
@@ -46,7 +47,7 @@ pub const TOOLS: [&str; 9] = ["Find and Replace", "Spelling", "Track Changes", "
 pub const LANGS_EA: [(&str, Option<&str>); 5] = [("Asian Text as Document", None), ("Chinese (Simplified)", Some("zh-Hans")), ("Chinese (Traditional)", Some("zh-Hant")), ("Japanese", Some("ja")), ("Korean", Some("ko"))];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 41] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…", "Table Tools…", "Page Background…"];
+pub const INSERT: [&str; 47] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…", "Table Tools…", "Page Background…", "Figure Caption", "Table Caption", "Equation Caption", "Table of Figures", "List of Tables", "List of Equations"];
 
 /// The shapes the shape bar draws: (label, preset; "textBox", "line" and
 /// "arrow" are the editor's own).
@@ -243,6 +244,8 @@ pub enum Cmd {
     ReviewTake(Take),
     /// Insert the table of contents, or bring it up to date.
     Toc,
+    Caption(CaptionKind),
+    CaptionList(CaptionKind),
     XrefOpen,
     XrefClose,
     /// The previous or next heading in the cross-reference bar.
@@ -381,7 +384,7 @@ pub const PAGE_CMDS: [PageCmd; 6] = [PageCmd::Portrait, PageCmd::Landscape, Page
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::SectionBreak(SectionStart::OddPage), Cmd::SectionBreak(SectionStart::EvenPage), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen, Cmd::Para(ParaCmd::Open(ParaKind::Table)), Cmd::Para(ParaCmd::Open(ParaKind::Page))][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::SectionBreak(SectionStart::OddPage), Cmd::SectionBreak(SectionStart::EvenPage), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen, Cmd::Para(ParaCmd::Open(ParaKind::Table)), Cmd::Para(ParaCmd::Open(ParaKind::Page)), Cmd::Caption(CaptionKind::Figure), Cmd::Caption(CaptionKind::Table), Cmd::Caption(CaptionKind::Equation), Cmd::CaptionList(CaptionKind::Figure), Cmd::CaptionList(CaptionKind::Table), Cmd::CaptionList(CaptionKind::Equation)][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -1557,6 +1560,17 @@ impl Write {
                     Cmd::FloatAlign(a) => {
                         e.set_float_align(a);
                     }
+                    Cmd::Caption(kind) => e.insert_caption(kind),
+                    Cmd::CaptionList(kind) => {
+                        if !e.insert_figure_list(kind) {
+                            let has = officina_text::fields::index_range(&e.doc, None, Some(kind)).is_some();
+                            drop(e);
+                            drop(d);
+                            self.doc.borrow_mut().status = if has { "The list is up to date".into() } else { format!("No {} captions to list", kind.name()) };
+                            self.changed();
+                            return false;
+                        }
+                    }
                     Cmd::Toc => {
                         if !e.insert_toc() {
                             drop(e);
@@ -1857,7 +1871,14 @@ impl View for Write {
         {
             let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
             let on_note = self.doc.borrow().ed.borrow().note_at_caret().is_some();
-            let has_toc = officina_text::fields::toc_range(&self.doc.borrow().ed.borrow().doc, None).is_some();
+            let mut has_toc = false;
+            let mut caption_lists = [false; 3];
+            for p in self.doc.borrow().ed.borrow().doc.blocks.iter().filter_map(|b| b.as_para()) {
+                has_toc |= p.props.toc.is_some();
+                if let Some(kind) = p.props.figure_list {
+                    caption_lists[kind as usize] = true;
+                }
+            }
             let sec = self.doc.borrow().ed.borrow().section();
             let page = self.doc.borrow().ed.borrow().section_page();
             let pic = self.doc.borrow().ed.borrow().picture_at_caret().map(|x| x.2.float);
@@ -1871,6 +1892,10 @@ impl View for Write {
                 27..=29 => {
                     let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 27]));
                     if i == 27 { m.separated() } else { m }
+                }
+                41 => MenuItem::new(*s).separated(),
+                44..=46 => {
+                    MenuItem::new(if caption_lists[i - 44] { format!("Update {s}") } else { s.to_string() })
                 }
                 36 | 37 => MenuItem::new(*s).separated(),
                 30..=35 => {
@@ -2683,6 +2708,82 @@ mod tests {
         while !ed.borrow_mut().paginate(std::time::Duration::from_millis(50)) {}
         assert_eq!(ed.borrow().doc.para(2).unwrap().props.section.unwrap().start, SectionStart::EvenPage);
         assert_eq!(blanks(&ed), [false, false, true, false]);
+    }
+
+    #[test]
+    fn caption_menu_updates_by_kind_and_undo_restores_the_list() {
+        use officina_text::fields::index_range;
+        use pergola_richtext::Pos;
+
+        let doc = Doc::from_text("book.txt", b"Front\nBody").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        let run = |i| {
+            w.cmds.lock().unwrap().push(Cmd::insert(i));
+            assert!(w.take_cmds().is_empty());
+        };
+        for (menu, title) in [(41, "North"), (42, "Costs"), (43, "Balance"), (41, "South")] {
+            run(menu);
+            assert!(ed.borrow_mut().insert(title));
+        }
+        ed.borrow_mut().set_caret(Pos::new(0, 0), false);
+        for menu in 44..=46 { run(menu); }
+        let titles = |kind| {
+            let e = ed.borrow();
+            let (a, b) = index_range(&e.doc, None, Some(kind)).unwrap();
+            (a..b).map(|i| {
+                let p = e.doc.para(i).unwrap();
+                p.text.split('\t').next().unwrap().to_string()
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(titles(CaptionKind::Table), ["Table 1: Costs"]);
+        assert_eq!(titles(CaptionKind::Equation), ["Equation 1: Balance"]);
+        assert_eq!(titles(CaptionKind::Figure), ["Figure 1: North", "Figure 2: South"]);
+        // A new caption before the first figure changes both later ordinals.
+        let front = ed.borrow().doc.blocks.iter().position(|b| b.as_para().is_some_and(|p| p.text == "Front")).unwrap();
+        ed.borrow_mut().set_caret(Pos::new(front, 0), false);
+        run(41);
+        assert!(ed.borrow_mut().insert("West"));
+        run(44);
+        assert_eq!(titles(CaptionKind::Figure), ["Figure 1: West", "Figure 2: North", "Figure 3: South"]);
+        assert!(ed.borrow_mut().undo());
+        assert_eq!(titles(CaptionKind::Figure), ["Figure 1: North", "Figure 2: South"]);
+        assert!(ed.borrow_mut().redo());
+        assert_eq!(titles(CaptionKind::Figure), ["Figure 1: West", "Figure 2: North", "Figure 3: South"]);
+        run(44);
+        assert_eq!(w.doc.borrow().status, "The list is up to date");
+        let saved = w.doc.borrow().native_bytes();
+        let reopened = Doc::from_native("book.owrite", &saved).unwrap();
+        let mut e = reopened.ed.borrow_mut();
+        assert!(e.paginate(std::time::Duration::from_secs(10)));
+        let (first, end) = index_range(&e.doc, None, Some(CaptionKind::Figure)).unwrap();
+        assert_eq!(end - first, 3);
+        for i in first..end {
+            let p = e.doc.para(i).unwrap();
+            let target = e.doc.figure_list_target(p).unwrap();
+            let at = e.doc.index_of(target).unwrap();
+            assert_eq!(p.text.split('\t').next().unwrap(), e.doc.caption_text(e.doc.para(at).unwrap()));
+            assert_eq!(e.doc.field_text(officina_text::model::Field::PageRef(target)), (e.pages.page_of(at, 0) + 1).to_string());
+        }
+        let target = e.doc.figure_list_target(e.doc.para(first).unwrap()).unwrap();
+        let page = officina_text::model::Field::PageRef(target);
+        let before = e.doc.field_text(page);
+        let front = e.doc.blocks.iter().position(|b| b.as_para().is_some_and(|p| p.text == "Front")).unwrap();
+        e.set_caret(Pos::new(front, 5), false);
+        assert!(e.page_break());
+        assert!(e.paginate(std::time::Duration::from_secs(10)));
+        assert_ne!(e.doc.field_text(page), before);
+        assert_eq!(e.doc.field_text(page), (e.pages.page_of(e.doc.index_of(target).unwrap(), 0) + 1).to_string());
+        assert!(e.undo());
+        assert!(e.paginate(std::time::Duration::from_secs(10)));
+        assert_eq!(e.doc.field_text(page), before);
+        assert!(e.insert_table(2, 2));
+        let table = e.table_range(e.caret.block);
+        assert!(!table.is_empty());
+        e.insert_caption(CaptionKind::Table);
+        assert_eq!(e.caret.block, table.end);
+        assert!(e.doc.cell(e.caret.block).is_none());
+        assert_eq!(e.doc.caption_text(e.doc.para(e.caret.block).unwrap()), "Table 1:");
     }
 
     #[test]

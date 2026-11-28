@@ -82,7 +82,7 @@ fn shape_with_objects(fonts: &dyn Fonts, text: &str, f: &CharFormat, o: &ObjectR
 
 /// Glyphs for a run in a note anchor's format: each U+FFFC shows the note's
 /// label (all its glyphs on the anchor's byte); anything else is shaped.
-fn shape_with_label(fonts: &dyn Fonts, text: &str, f: &CharFormat, label: &str) -> Vec<Glyph> {
+fn shape_with_label(fonts: &dyn Fonts, text: &str, f: &CharFormat, label: impl Fn(u32) -> String) -> Vec<Glyph> {
     let mut out = Vec::new();
     let mut from = 0;
     for (i, ch) in text.char_indices().chain(std::iter::once((text.len(), '\0'))) {
@@ -96,7 +96,7 @@ fn shape_with_label(fonts: &dyn Fonts, text: &str, f: &CharFormat, label: &str) 
             }));
         }
         if i < text.len() {
-            out.extend(fonts.shape(label, f).into_iter().map(|mut g| {
+            out.extend(fonts.shape(&label(i as u32), f).into_iter().map(|mut g| {
                 g.cluster = i as u32;
                 g
             }));
@@ -564,9 +564,10 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
             // A tombstone (tracked deletion) and hidden text take no room.
             _ if f.deleted.is_some() || f.conflict.is_some() || f.hidden => text.char_indices().map(|(i, _)| Glyph { face: OBJECT_FACE, id: 0, adv: 0, dx: 0, dy: 0, cluster: i as u32, fmt: 0 }).collect(),
             (Some(o), _) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
-            (None, Some(n)) => shape_with_label(fonts, text, &f, &doc.note_label(n)),
+            (None, Some(n)) => shape_with_label(fonts, text, &f, |_| doc.note_label(n)),
+            (None, None) if f.sequence.is_some() => shape_with_label(fonts, text, &f, |off| doc.caption_number(p.id, s + off)),
             (None, None) => match f.field {
-                Some(x) => shape_with_label(fonts, text, &f, &doc.field_text(x)),
+                Some(x) => shape_with_label(fonts, text, &f, |_| doc.field_text(x)),
                 None if f.caps == Caps::Small => {
                     // Typed lower-case letters as capitals at four fifths the size.
                     let small = CharFormat { size: ((f.size as u32 * 4 / 5) as u16).max(2), caps: Caps::Normal, ..f.clone() };
@@ -980,13 +981,18 @@ fn key(doc: &TextDoc, p: &Para, width: i64, bands: &[Band]) -> u64 {
     p.style.hash(&mut h);
     p.props.hash(&mut h);
     width.hash(&mut h);
-    for &(s, a) in &p.runs {
+    for (s, e, a) in p.spans() {
         s.hash(&mut h);
         let at = doc.attrs.get(a);
         at.hash(&mut h);
         // A note anchor shows its number, which other anchors move.
         if let Some(n) = at.note {
             doc.note_label(n).hash(&mut h);
+        }
+        if at.sequence.is_some() {
+            for (off, _) in p.text[s as usize..e as usize].match_indices(OBJECT_CHAR) {
+                doc.caption_number(p.id, s + off as u32).hash(&mut h);
+            }
         }
         if let Some(x) = at.field {
             doc.field_text(x).hash(&mut h);

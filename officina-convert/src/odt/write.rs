@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Border, BorderStyle, ListDef, ListLevel, NumFormat, LineRestart, AttrId, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{CaptionKind, Border, BorderStyle, ListDef, ListLevel, NumFormat, LineRestart, AttrId, Caps, EFFECT_OUTLINE, EFFECT_SHADOW, EFFECT_EMBOSS, EFFECT_ENGRAVE, ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
 
-const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" xmlns:officina="urn:atrium:officina:1.0" office:version="1.3""#;
+const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" xmlns:ooow="http://openoffice.org/2004/writer" xmlns:officina="urn:atrium:officina:1.0" office:version="1.3""#;
 
 /// Twips as points.
 fn pt(t: i64) -> String {
@@ -381,6 +381,7 @@ fn contents_style_level(doc: &TextDoc, p: &Para) -> Option<u8> {
 }
 
 struct Out<'a> {
+    sequences: [bool; 3],
     doc: &'a TextDoc,
     /// Before its automatic style and picture names (`M` in the header and
     /// footer, whose styles live in styles.xml).
@@ -485,6 +486,7 @@ impl Out<'_> {
         k.link = None;
         k.object = None;
         k.note = None;
+        k.sequence = None;
         k.rev = None;
         k.deleted = None;
         k.fmt = None;
@@ -836,6 +838,7 @@ impl Out<'_> {
 
     fn para_of(&mut self, p: &Para, out: &mut String) {
         let doc = self.doc;
+        let caption_link = doc.figure_list_target(p).map(|id| format!("#{}", ref_name(id)));
         let contents_level = if self.in_note == 0 { contents_style_level(doc, p) } else { None };
         let st = self.para_style(p.style, &p.props, contents_level);
         let level = doc.styles.para_format(p.style, &p.props).0.outline_level.filter(|_| doc.styles.styles.get(p.style as usize).is_some_and(|s| s.name.starts_with("Heading")));
@@ -884,6 +887,13 @@ impl Out<'_> {
                     continue;
                 }
                 Self::text(&piece[from..i], &mut inner);
+                if let Some(kind) = attrs.sequence.filter(|_| i < piece.len()) {
+                    self.sequences[kind as usize] = true;
+                    let name = kind.name();
+                    let offset = s + i as u32;
+                    let number = doc.caption_number(p.id, offset);
+                    let _ = write!(inner, r#"<text:sequence text:name="{name}" text:ref-name="seq{}_{}" text:formula="ooow:{name}+1" style:num-format="1">{number}</text:sequence>"#, p.id, offset);
+                }
                 if let (true, Some(f)) = (i < piece.len(), attrs.field) {
                     let (fmt, t) = match f {
                         Field::PageRef(t) => ("page", t),
@@ -940,7 +950,8 @@ impl Out<'_> {
             };
             match &attrs.link {
                 Some(l) => {
-                    let _ = write!(out, r#"<text:a xlink:type="simple" xlink:href="{}">{inner}</text:a>"#, esc(l));
+                    let href = if l.starts_with('#') { caption_link.as_deref().unwrap_or(l) } else { l };
+                    let _ = write!(out, r#"<text:a xlink:type="simple" xlink:href="{}">{inner}</text:a>"#, esc(href));
                 }
                 None => out.push_str(&inner),
             }
@@ -1219,7 +1230,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::collections::HashSet::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), sides: std::collections::HashSet::new() };
+    let mut o = Out { sequences: [false; 3], doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::collections::HashSet::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), sides: std::collections::HashSet::new() };
     let mut last_page = None;
     for k in 0..doc.blocks.len() {
         if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
@@ -1288,6 +1299,15 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 b = o.table(b, &mut body);
             } else if list_of(doc, b).is_some() {
                 b = o.list(b, to, &mut body);
+            } else if let Some(kind) = doc.para(b).and_then(|p| p.props.figure_list) {
+                let tag = if kind == CaptionKind::Table { "table-index" } else { "illustration-index" };
+                let name = kind.name();
+                let _ = write!(body, r#"<text:{tag} text:protected="true" text:name="{name} Index{}"><text:{tag}-source text:use-caption="true" text:caption-sequence-name="{name}" text:caption-sequence-format="text"><text:{tag}-entry-template text:style-name="{}"><text:index-entry-text/><text:index-entry-tab-stop style:type="right" style:leader-char="."/><text:index-entry-page-number/></text:{tag}-entry-template></text:{tag}-source><text:index-body>"#, b + 1, esc(&o.names[0]));
+                while b < to && doc.para(b).is_some_and(|p| p.props.figure_list == Some(kind) && p.props.cell.is_none() && list_of(doc, b).is_none()) {
+                    o.para(b, &mut body);
+                    b += 1;
+                }
+                let _ = write!(body, "</text:index-body></text:{tag}>");
             } else if doc.para(b).is_some_and(|p| p.props.toc.is_some()) {
                 // A table of contents: its run of entries as the index body.
                 let mut end = b;
@@ -1454,7 +1474,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             // Its own paragraphs: their automatic styles and pictures go
             // with the master page.
             let prefix = ["MH", "MHL", "MHF", "MF", "MFL", "MFF"][i * 3 + k];
-            let mut ho = Out { prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::mem::take(&mut o.common_names), pages: Vec::new(), page_changes: std::collections::HashSet::new(), sides: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
+            let mut ho = Out { sequences: [false; 3], prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::mem::take(&mut o.common_names), pages: Vec::new(), page_changes: std::collections::HashSet::new(), sides: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
             let mut x = String::new();
             for p in &hf.paras {
                 let mut q = p.clone();
@@ -1511,7 +1531,16 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     } else {
         format!(r#"<text:tracked-changes text:track-changes="{}">{}</text:tracked-changes>"#, doc.tracking, o.regions)
     };
-    let content = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{tracked}{body}</office:text></office:body></office:document-content>"#, o.auto);
+    let mut decls = String::new();
+    for kind in CaptionKind::ALL {
+        if o.sequences[kind as usize] {
+            let _ = write!(decls, r#"<text:sequence-decl text:display-outline-level="0" text:name="{}"/>"#, kind.name());
+        }
+    }
+    if !decls.is_empty() {
+        decls = format!("<text:sequence-decls>{decls}</text:sequence-decls>");
+    }
+    let content = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{tracked}{decls}{body}</office:text></office:body></office:document-content>"#, o.auto);
 
     let mut z = ZipWriter::new(out);
     z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text")?;

@@ -7,7 +7,8 @@
 //! Per file it records: read or refused (with the reason), a panic (a failure
 //! of the gate), the time, a count of what the document holds (paragraphs,
 //! table cells, pictures, shapes, notes, comments, tracked edits, sections,
-//! headers and footers, list items, fields, links, styled and formatted
+//! headers and footers, list items, fields, captions and figure-list entries
+//! by kind, links, styled and formatted
 //! characters), and for each written format whether the copy read back holds
 //! the same paragraphs' text and the same counts, or what differs first. At
 //! the end (on stderr) it sums the readers' fidelity notes over the files, so
@@ -20,7 +21,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use officina_convert::{doc, docx, odt};
-use officina_text::model::TextDoc;
+use officina_text::model::{CaptionKind, TextDoc, OBJECT_CHAR};
 
 /// How long one file may take, read and both round trips.
 const LIMIT: Duration = Duration::from_secs(120);
@@ -69,6 +70,8 @@ struct Counts {
     fields: usize,
     links: usize,
     toc: usize,
+    captions: [usize; 3],
+    figure_list_entries: [usize; 3],
     tabs: usize,
     bold: usize,
     italic: usize,
@@ -118,6 +121,9 @@ impl Counts {
             let (f, _) = d.styles.para_format(p.style, pr);
             c.list_items += k * f.list.is_some() as usize;
             c.toc += k * pr.toc.is_some() as usize;
+            if let Some(kind) = pr.figure_list {
+                c.figure_list_entries[kind as usize] += 1;
+            }
             c.tabs += k * pr.tabs.as_ref().is_some_and(|t| !t.is_empty()) as usize;
             c.styled += p.text.split('\u{000C}').filter(|t| p.style != 0 && !t.trim().is_empty()).count();
             // Over paragraphs with text (a writer may add empty ones, as
@@ -128,7 +134,8 @@ impl Counts {
             // A page break inside a paragraph, or before one (ODF has only that).
             c.page_breaks += p.text.matches('\u{000C}').count() + (b > 0 && pr.page_break_before == Some(true)) as usize;
             for (s, e, a) in p.spans() {
-                let n = p.text[s as usize..e as usize].chars().filter(|ch| !ch.is_whitespace()).count();
+                let span = &p.text[s as usize..e as usize];
+                let n = span.chars().filter(|ch| !ch.is_whitespace()).count();
                 let a = d.attrs.get(a);
                 if a.deleted.is_some() {
                     continue;
@@ -142,6 +149,9 @@ impl Counts {
                     c.floats += o.float.is_some() as usize;
                 }
                 c.fields += a.field.is_some() as usize;
+                if let Some(kind) = a.sequence.filter(|_| a.conflict.is_none()) {
+                    c.captions[kind as usize] += span.matches(OBJECT_CHAR).count();
+                }
                 c.links += (a.link.is_some() && n > 0) as usize;
                 if n > 0 {
                     c.bold += n * (a.bold == Some(true)) as usize;
@@ -276,6 +286,12 @@ impl Counts {
             ("fields", self.fields),
             ("links", self.links),
             ("toc", self.toc),
+            ("figure_captions", self.captions[CaptionKind::Figure as usize]),
+            ("table_captions", self.captions[CaptionKind::Table as usize]),
+            ("equation_captions", self.captions[CaptionKind::Equation as usize]),
+            ("figure_list_entries", self.figure_list_entries[CaptionKind::Figure as usize]),
+            ("table_list_entries", self.figure_list_entries[CaptionKind::Table as usize]),
+            ("equation_list_entries", self.figure_list_entries[CaptionKind::Equation as usize]),
             ("tabs", self.tabs),
             ("bold", self.bold),
             ("italic", self.italic),
