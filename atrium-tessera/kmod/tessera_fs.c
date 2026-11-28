@@ -1983,6 +1983,8 @@ struct tessera_kbio_ctx {
 	                                          * DISKFLAG_CANFLUSHCACHE gate). */
 };
 
+static bool tessera_kbio_latched(const struct tessera_kbio_ctx *k);
+
 static int
 tessera_kbio_read(void *ctx, uint64_t sector, uint8_t *out)
 {
@@ -2060,6 +2062,7 @@ static int
 tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 {
 	struct tessera_kbio_ctx *k = ctx;
+	if (tessera_kbio_latched(k)) return (EIO);
 	struct buf *bp = getblk(k->devvp, sector * btodb(TESSERA_SECTOR_SIZE),
 	    TESSERA_SECTOR_SIZE, 0, 0, 0);
 	if (bp == NULL) return (-1);
@@ -2139,6 +2142,7 @@ static int
 tessera_kbio_write_delayed(void *ctx, uint64_t sector, const uint8_t *buf)
 {
 	struct tessera_kbio_ctx *k = ctx;
+	if (tessera_kbio_latched(k)) return (EIO);
 	struct buf *bp = getblk(k->devvp, sector * btodb(TESSERA_SECTOR_SIZE),
 	    TESSERA_SECTOR_SIZE, 0, 0, 0);
 	if (bp == NULL) return (-1);
@@ -2174,13 +2178,34 @@ static int
 tessera_kbio_write_bulk(struct tessera_kbio_ctx *k, uint64_t start_sector,
     const uint8_t *bytes, uint64_t n_sectors)
 {
-	if (k->cp == NULL) return (-1);
+	if (k->cp == NULL || tessera_kbio_latched(k)) return (-1);
 	const off_t base = (off_t)start_sector * TESSERA_SECTOR_SIZE;
 	const off_t total = (off_t)n_sectors * TESSERA_SECTOR_SIZE;
 	off_t io = (off_t)maxphys;
 	if (io <= 0 || io > (1 << 20)) io = (1 << 20);   /* cap at 1 MiB */
 	io -= (io % TESSERA_SECTOR_SIZE);                /* sector-align */
 	if (io < TESSERA_SECTOR_SIZE) io = TESSERA_SECTOR_SIZE;
+
+	/* A rolled-back extent can still have a delayed write or writeback
+	 * in flight. Wait for each existing header before sending the raw
+	 * BIO. If it is still dirty, let the synchronous buffered fallback
+	 * replace its bytes under the buffer lock. Only this allocation can
+	 * start new writes to the range. Clean VM pages need the separate
+	 * post-write invalidation below. */
+	for (uint64_t i = 0; i < n_sectors; i++) {
+		daddr_t block = (start_sector + i) * btodb(TESSERA_SECTOR_SIZE);
+		struct buf *bp;
+		int err = getblkx(k->devvp, block, block, TESSERA_SECTOR_SIZE,
+		    0, 0, GB_NOCREAT, &bp);
+		if (err == EEXIST)	/* no buffer header */
+			continue;
+		if (err != 0)
+			return (-1);
+		int dirty = bp->b_flags & B_DELWRI;
+		bqrelse(bp);
+		if (dirty)
+			return (-1);
+	}
 
 	for (off_t off = 0; off < total; off += io) {
 		off_t len = total - off;
@@ -2216,18 +2241,18 @@ tessera_kbio_write_bulk(struct tessera_kbio_ctx *k, uint64_t start_sector,
 		struct buf *bp = getblk(k->devvp,
 		    (start_sector + i) * btodb(TESSERA_SECTOR_SIZE),
 		    TESSERA_SECTOR_SIZE, 0, 0, 0);
-		if (bp != NULL) {
-			/* A DIRTY buffer under a freshly allocated bulk
-			 * extent means these sectors are still owned by
-			 * unflushed data (double allocation) — invalidating
-			 * would destroy it. Never observed; scream if it is. */
-			if (bp->b_flags & B_DELWRI)
-				printf("tessera_fs: WARNING bulk write over "
-				    "DIRTY buffered sector %llu\n",
-				    (unsigned long long)(start_sector + i));
-			bp->b_flags |= B_INVAL | B_NOCACHE | B_RELBUF;
-			brelse(bp);
+		if (bp == NULL)
+			return (-1);
+		/* A newly dirty header violates exclusive ownership. */
+		if (bp->b_flags & B_DELWRI) {
+			printf("tessera_fs: WARNING bulk write over "
+			    "DIRTY buffered sector %llu\n",
+			    (unsigned long long)(start_sector + i));
+			bqrelse(bp);
+			return (-1);
 		}
+		bp->b_flags |= B_INVAL | B_NOCACHE | B_RELBUF;
+		brelse(bp);
 	}
 
 	return (0);
@@ -4530,7 +4555,7 @@ struct tessera_mount {
 	 * before the reboot and 447072 after, with sync(2) returning success
 	 * throughout. A filesystem that cannot commit must SAY SO.
 	 */
-	int                       commit_failed;
+	u_int                     commit_failed;
 	uint64_t                  snapshot_gen;
 
 	/* Read-only LIVE mount (MNT_RDONLY, not a tessera.gen snapshot):
@@ -6203,6 +6228,14 @@ tessera_fs_alloc_inode_no(struct tessera_mount *tmp_)
 	tmp_->sb.next_inode_no = n + 1;
 	mtx_unlock(&tmp_->flush_mtx);
 	return n;
+}
+
+/* Maintenance writers share the same refusal as foreground publishes. */
+static bool
+tessera_kbio_latched(const struct tessera_kbio_ctx *k)
+{
+	return (k->mount != NULL &&
+	    atomic_load_acq_int(&k->mount->commit_failed));
 }
 
 static int
@@ -9649,6 +9682,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		    tmp_->pending_manifest_count, tmp_->sb_dirty);
 
 	if (tmp_ != NULL) {
+		tmp_->flush_unmounting = 1;
 		/* v2-step-2a: stop accepting new flushes, drain any in-flight
 		 * callout / task, then do one final synchronous flush so the
 		 * SB on disk reflects every committed mutation before tear-
@@ -9671,20 +9705,29 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tmp_->pinscan_tq_init = 0;
 		}
 		if (tmp_->flush_co_init) {
-			tmp_->flush_unmounting = 1;
 			callout_drain(&tmp_->flush_co);
 			taskqueue_drain(tmp_->flush_tq, &tmp_->flush_task);
-			/* v2.6 B.2: stop the journal-log callout + drain its
-			 * task, then force a final synchronous drain so any
-			 * unjournaled ops become durable before we close
-			 * the journal. */
 			if (tmp_->journal_log_co_init) {
 				callout_drain(&tmp_->journal_log_co);
 				taskqueue_drain(tmp_->journal_tq,
 				    &tmp_->journal_log_task);
-				(void)tessera_fs_journal_log_drain(tmp_);
 				tmp_->journal_log_co_init = 0;
 			}
+		}
+		/* Stop producers before the final commit and journal reset.
+		 * An in-flight repack or GC may still own allocated extents. */
+		if (tmp_->gc_tq_init) {
+			tmp_->gc_tq_init = 0;
+			tmp_->gc_abort = 1;
+			taskqueue_drain(tmp_->gc_tq, &tmp_->gc_task);
+			taskqueue_free(tmp_->gc_tq);
+			tmp_->gc_tq = NULL;
+		}
+		if (tmp_->repack_task_init) {
+			taskqueue_drain(tmp_->repack_tq, &tmp_->repack_task);
+			tmp_->repack_task_init = 0;
+		}
+		if (tmp_->flush_co_init) {
 			/*
 			 * Force the final flush to run its full commit path
 			 * (drain dirty content + inodes, commit_sb, and its
@@ -9712,33 +9755,23 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			 * access (ronly=1 but dev_writable=1) and DOES need the
 			 * final commit. */
 			if (tmp_->dev_writable) {
-			tmp_->sb_dirty = 1;
-			(void)tessera_fs_flush(tmp_);
-			/* Clean-unmount journal reset. The final flush above made
-			 * the SB fully reflect every committed mutation and every
-			 * referenced manifest durable. Any journal records still
-			 * present are redo for ALREADY-committed ops — either
-			 * written by journal_log_drain just now, or left when a
-			 * prior periodic flush committed the SB (sb_dirty→0) so
-			 * this flush early-returned without a checkpoint. Replaying
-			 * them on the next mount is at best redundant and at worst
-			 * fatal: a record can name a directory manifest that was
-			 * only ever in the RAM pending cache (never persisted),
-			 * which replay then restores as a dead inode→manifest
-			 * pointer → mount-time "manifest fetch failed" → the root
-			 * dir is unreadable. Checkpoint unconditionally so a
-			 * cleanly-unmounted volume mounts with an empty journal and
-			 * replays nothing. (Crash recovery still relies on the live
-			 * journal; this only runs on the orderly unmount path.) */
-			if (tmp_->journal != NULL && tmp_->seal != NULL)
-				tessera_fs_journal_rotate_sealed(tmp_);
-			else if (tmp_->journal != NULL)
-				(void)tessera_journal_checkpoint(tmp_->journal);
-			} /* tmp_->dev_writable */
-		}
-		if (tmp_->repack_task_init) {
-			taskqueue_drain(tmp_->repack_tq, &tmp_->repack_task);
-			tmp_->repack_task_init = 0;
+				tmp_->sb_dirty = 1;
+				err = tessera_fs_flush(tmp_);
+				/* Only a successful final commit covers the
+				 * redo log. Sealed rotation also persists the
+				 * in-memory roots in both superblocks. */
+				if (err != 0) {
+					printf("tessera_fs: final flush of %s failed "
+					    "(error %d); keeping the journal\n",
+					    devtoname(tmp_->dev), err);
+				} else if (tmp_->journal != NULL) {
+					if (tmp_->seal != NULL)
+						tessera_fs_journal_rotate_sealed(tmp_);
+					else
+						(void)tessera_journal_checkpoint(
+						    tmp_->journal);
+				}
+			}
 		}
 		/* Flush queue first (its task may still enqueue prepare
 		 * work), then the prepare pool; taskqueue_free drains
@@ -9749,7 +9782,6 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		}
 		/* task #67: private gate-taking background queues. */
 		if (tmp_->repack_tq_init) {
-			taskqueue_drain(tmp_->repack_tq, &tmp_->repack_task);
 			taskqueue_free(tmp_->repack_tq);
 			tmp_->repack_tq = NULL;
 			tmp_->repack_tq_init = 0;
@@ -9760,24 +9792,6 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			taskqueue_free(tmp_->journal_tq);
 			tmp_->journal_tq = NULL;
 			tmp_->journal_tq_init = 0;
-		}
-		/* ★ #72: drain the GC queue before anything it touches goes
-		 * away. flush_unmounting is already set, so gc_arm is a no-op
-		 * by now and nothing can re-enqueue behind the drain. */
-		if (tmp_->gc_tq_init) {
-			/* Clear the init flag FIRST: gc_arm gates on it, so
-			 * closing that door before draining means nothing can
-			 * enqueue onto a queue we are about to free. */
-			tmp_->gc_tq_init = 0;
-			/* ★ #99: and tell a pass that is ALREADY WALKING to
-			 * stop. Closing the door only stops new passes; the
-			 * one in flight is O(volume) and drain waits for it,
-			 * which is why umount hung in "tq_drain" for over an
-			 * hour with tessgc <running>. */
-			tmp_->gc_abort = 1;
-			taskqueue_drain(tmp_->gc_tq, &tmp_->gc_task);
-			taskqueue_free(tmp_->gc_tq);
-			tmp_->gc_tq = NULL;
 		}
 		/* The SATB touch bitmap lives for the whole mount by design —
 		 * writers dereference it lock-free-ish, so it must not be
@@ -9920,6 +9934,13 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 					free(_jp, M_TESSERA);
 				}
 				tmp_->journal_pending_count = 0;
+				struct tessera_pending_inode *pi;
+				while ((pi = LIST_FIRST(
+				    &tmp_->journal_pending_inodes)) != NULL) {
+					LIST_REMOVE(pi, link);
+					free(pi, M_TESSERA);
+				}
+				tmp_->journal_pending_inode_count = 0;
 				while ((_jp = LIST_FIRST(
 				    &tmp_->jname_backlog)) != NULL) {
 					LIST_REMOVE(_jp, link);
@@ -10006,18 +10027,17 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 				    "discarding them\n",
 				    tmp_->dev != NULL ? devtoname(tmp_->dev) : "?",
 				    _left, _ferr);
-				(void)vinvalbuf(tmp_->devvp, 0, 0, 0);
+				(void)bufobj_invalbuf(_bo, 0, 0, 0);
+			}
+			if (tmp_->cp != NULL) {
+				/* Keep devvp locked from the drain through the
+				 * final invalidation and GEOM consumer close. */
+				g_topology_lock();
+				g_vfs_close(tmp_->cp);
+				g_topology_unlock();
 			}
 			VOP_UNLOCK(tmp_->devvp);
 		}
-		/* g_vfs_close invalidates devvp's buffers, syncing any still
-		 * dirty (the FSYNC above can fail, or a late bdwrite land),
-		 * and VOP_FSYNC needs devvp locked: the unlocked call
-		 * panicked a DEBUG_VFS_LOCKS kernel at umount with 5 dirty
-		 * buffers left. g_vfs_close_unlocked takes the lock, as
-		 * ffs_unmount does by hand. */
-		if (tmp_->cp != NULL)
-			g_vfs_close_unlocked(tmp_->cp);
 		if (tmp_->devvp != NULL) vrele(tmp_->devvp);
 		if (tmp_->dev != NULL)   dev_rel(tmp_->dev);
 		/* Release the credential reference taken at mount. */
@@ -16937,7 +16957,7 @@ tessera_fs_commit_failed_latch(struct tessera_mount *tmp_, int rc)
 {
 	if (tmp_->commit_failed)
 		return;
-	tmp_->commit_failed = 1;
+	atomic_store_rel_int(&tmp_->commit_failed, 1);
 	tessera_stat_commit_failed++;
 	printf("tessera_fs: ★ VOLUME CANNOT COMMIT (commit_sb rc=%d) — writes "
 	    "from here on are NOT durable and will be lost at reboot. fsync(2) "
@@ -18322,19 +18342,13 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 
 	mtx_lock(&tmp_->flush_mtx);
-	/*
-	 * #135: a latched volume writes nothing more. Its in-memory roots are
-	 * ahead of the durable superblock, so the preflight pinscan and the
-	 * epoch drain count as free the nodes and extents that superblock
-	 * still names, and any publish or COW here would land on them while
-	 * no superblock can follow. What is staged stays in RAM and is
-	 * dropped at unmount, as the latch message says.
-	 */
-	if (tmp_->commit_failed) {
-		mtx_unlock(&tmp_->flush_mtx);
-		return (EIO);
-	}
 	for (;;) {
+		/* The previous gate owner may have latched while we slept.
+		 * Its in-memory free map can include still-durable sectors. */
+		if (tmp_->commit_failed) {
+			mtx_unlock(&tmp_->flush_mtx);
+			return (EIO);
+		}
 		/*
 		 * ★ task #80: sb_dirty alone is NOT "nothing to do".
 		 *
@@ -18811,23 +18825,9 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		if (r != 0) {
 			printf("tessera_fs: flush — commit_sb failed: %d "
 			    "(unmounting=%d)\n", r, tmp_->flush_unmounting);
-			/*
-			 * ★ #135 LATCH HERE, and only here. The first version
-			 * latched on any non-zero return from tessera_fs_flush,
-			 * which is WRONG and cost a boot: flush returns non-zero
-			 * for reasons that are not "this volume cannot commit"
-			 * — notably during vfs_mountroot, where the root mounts
-			 * read-only and then upgrades. Latching there made
-			 * space_admit refuse everything and the mount itself
-			 * failed:
-			 *     panic: mountroot: unable to (re-)mount root.
-			 * The state means "a commit was ATTEMPTED and FAILED",
-			 * so it is set at the attempt. Teardown is excluded: a
-			 * commit failing while unmounting is already reported
-			 * and has no writes left to protect.
-			 */
-			if (!tmp_->flush_unmounting)
-				tessera_fs_commit_failed_latch(tmp_, r);
+			/* A commit that fails as unmount starts must also
+			 * stop the final flush from retrying its roots. */
+			tessera_fs_commit_failed_latch(tmp_, r);
 		}
 	}
 
@@ -23161,7 +23161,8 @@ snap_next:
 		if (gc_damaged_count > 0 && tessera_gc_retire_recycled) {
 			uint32_t _rr = 0;
 			tessera_fs_flush_gate_enter(tmp_);
-			for (uint32_t i = 0; i < gc_damaged_count; i++) {
+			for (uint32_t i = 0; !tmp_->commit_failed &&
+			    !tmp_->flush_unmounting && i < gc_damaged_count; i++) {
 				if (tessera_fs_snapshot_retire_gen(tmp_,
 				    gc_damaged_gens[i])) {
 					_rr++;
@@ -23775,8 +23776,22 @@ next_p:
 	 * and doing no data-zone reads (extents and PEL chains were
 	 * resolved during the scan).
 	 */
-	if (concurrent)
+	if (concurrent) {
 		tessera_fs_flush_gate_enter(tmp_);
+		/* A commit can fail during the ungated scan. No candidate
+		 * may be applied against that mount's in-memory roots. */
+		if (tmp_->commit_failed || tmp_->flush_unmounting) {
+			tessera_fs_flush_gate_exit(tmp_);
+			for (uint32_t i = 0; i < dead_count; i++) {
+				free(deads[i].bh_extra, M_TESSERA);
+				free(deads[i].exts, M_TESSERA);
+				free(deads[i].pels, M_TESSERA);
+			}
+			free(deads, M_TESSERA);
+			free(gc_groups, M_TESSERA);
+			return (0);
+		}
+	}
 
 	/*
 	 * ★ task #79: open the apply window (generation -> odd) BEFORE the
@@ -24104,11 +24119,8 @@ next_p:
 			_gc_crc = tessera_commit_extent(tmp_);
 			printf("tessera_fs: gc post commit_extent\n");
 		}
-		{
-			int _src = tessera_commit_sb(tmp_);
-			if (_gc_crc == 0)
-				_gc_crc = _src;
-		}
+		if (_gc_crc == 0)
+			_gc_crc = tessera_commit_sb(tmp_);
 		printf("tessera_fs: gc post commit_sb\n");
 	}
 	/* ★ #79: close the apply window. Must be AFTER commit_extent /
@@ -24122,7 +24134,7 @@ next_p:
 	 * would mount the old generation over overwritten data. Latch the
 	 * cannot-commit state, which refuses new allocations, so nothing is
 	 * handed out before a remount. */
-	if (_gc_crc != 0 && !tmp_->flush_unmounting)
+	if (_gc_crc != 0)
 		tessera_fs_commit_failed_latch(tmp_, _gc_crc);
 	atomic_store_rel_64(&tmp_->gc_apply_gen, tmp_->gc_apply_gen + 1);
 	KASSERT((tmp_->gc_apply_gen & 1) == 0,
@@ -32184,6 +32196,8 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 	if (!tmp_->dirty_init || tmp_->journal == NULL ||
 	    tmp_->flush_unmounting)
 		return (0);
+	if (tmp_->commit_failed)
+		return (EIO);
 
 	/* Replayed names of key groups whose keys are loaded now: into the
 	 * dirent log, and so into this drain's snapshot. */

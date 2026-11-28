@@ -16,7 +16,8 @@
 #      write, so tessera-fsck finds the volume clean;
 #   4. after each, with writes allowed again, the volume unmounts and
 #      tessera-fsck finds it clean (the on-disk SB names only durable
-#      sectors).
+#      sectors). A read-only remount must return the same bytes for a
+#      file synced before the fault.
 # Positive control: the same GC and sync with writes allowed print neither
 # line and leave the counter where it was.
 #
@@ -30,12 +31,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/gate.sh"
 VSSH="${VSSH:-$ROOT/scripts/vssh}"
 g() { VSSH_CONNECT_TIMEOUT=30 "$VSSH" "$@"; }
-T=/var/tmp/commit-refusal
-M=/tcref
-IMG=$T/scratch.img
+MD=
+NOP=
 MKFS=/root/sealed/tessera-mkfs-sealed
 GC=/root/sealed/tessera-gc
-gate_begin tessera-commit-refusal 16
+gate_begin tessera-commit-refusal 20
 
 g "test -x $MKFS && test -x $GC && command -v tessera-fsck >/dev/null && kldstat -q -n tessera_fs.ko" \
     || gate_abort "needs tessera_fs loaded, /root/sealed and tessera-fsck (see the header)"
@@ -45,34 +45,83 @@ counter() { g "sysctl -n kern.tessera.commit_failed"; }
 # Console lines since mark(): the message buffer wraps, so a count over its
 # tail stops growing once it is full. mark() saves the last line; since()
 # counts matches after its last occurrence (all lines if it scrolled out).
-MARK=/var/tmp/commit-refusal.mark
+T=$(g 'mktemp -d /var/tmp/commit-refusal.XXXXXXXX') || gate_abort "cannot create scratch directory"
+M=$T/mnt
+IMG=$T/scratch.img
+MARK=$T/mark
 mark() { g "dmesg | tail -1 > $MARK"; }
 since() { g "dmesg | awk -v p='$1' 'BEGIN { getline m < \"$MARK\" } \$0 == m { c = 0; next } \$0 ~ p { c++ } END { print c + 0 }'"; }
 teardown() {
-    g "umount -f $M >/dev/null 2>&1; for n in \$(ls /dev | grep '\\.nop\$'); do gnop destroy -f \$n >/dev/null 2>&1; done; \
-       for u in \$(mdconfig -l); do mdconfig -lv -u \$u | grep -q $IMG && mdconfig -d -u \$u; done; true"
+    if [ -n "$NOP" ]; then
+        g "gnop destroy $NOP" || return 1
+        NOP=
+    fi
+    if [ -n "$MD" ]; then
+        g "mdconfig -d -u $MD" || return 1
+        MD=
+    fi
 }
 fresh() {
-    teardown
-    g "rm -rf $T && mkdir -p $T $M && $MKFS --plain --create -s 256 -j 64 $IMG >/dev/null" || gate_abort "mkfs failed"
-    MD=$(g "mdconfig -a -t vnode -f $IMG")
-    g "gnop create /dev/$MD && mount -t tessera /dev/$MD.nop $M" || gate_abort "mount on $MD.nop failed"
+    teardown || gate_abort "cannot release the previous fixture ($T)"
+    g "mkdir -p $M && $MKFS --plain --create -s 256 -j 64 $IMG >/dev/null" || gate_abort "mkfs failed ($T)"
+    MD=$(g "mdconfig -a -t vnode -f $IMG") || gate_abort "md attach failed ($T)"
+    g "gnop create /dev/$MD" || gate_abort "gnop create failed for $MD ($T)"
+    NOP=/dev/$MD.nop
+    g "mount -t tessera $NOP $M" || gate_abort "mount on $NOP failed ($T)"
+    g "dd if=/dev/random of=$T/reference bs=1m count=2 status=none &&
+       dd if=$T/reference of=$M/committed bs=1m conv=fsync status=none" || gate_abort "could not sync reference data"
 }
 writes() { g "gnop configure -w $1 -e ${2:-5} /dev/$MD.nop"; }
 churn() { # a file written, synced and removed, so GC has packs to reclaim
     g "dd if=/dev/random of=$M/churn bs=1m count=16 status=none && sync && rm $M/churn && sync && sleep 2 && sync"
 }
+check_fsck() {
+    if r=$(g "tessera-fsck -n /dev/$MD 2>&1") &&
+        printf '%s\n' "$r" | grep -qE '^[[:space:]]*result:[[:space:]]+CLEAN — no inconsistencies found$'; then
+        ok "$1: tessera-fsck finds the volume clean"
+    else
+        bad "$1: fsck failed or did not report a clean volume"
+        printf '%s\n' "$r" | tail -40
+    fi
+}
+check_image() {
+    check_fsck "$1"
+    g "mount -t tessera -o ro $NOP $M" || gate_abort "$1: read-only remount failed"
+    if g "cmp -s $T/reference $M/committed"; then
+        ok "$1: committed file matches after remount"
+    else
+        bad "$1: committed file differs or cannot be read"
+    fi
+    g "umount $M" || gate_abort "$1: read-only unmount failed"
+}
 clean_after() { # label
     writes 0
-    g "umount $M" && ok "$1: unmounts with writes allowed again" || bad "$1: umount failed: $(g "dmesg | tail -5 | tr '\n' ';'")"
-    r=$(g "tessera-fsck /dev/$MD 2>&1")
-    n=$(printf '%s\n' "$r" | grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|torn|bad root')
-    [ "$n" = 0 ] || printf '%s\n' "$r" | sed 's/^/    fsck: /' | head -40
-    check "$1: tessera-fsck finds the volume clean" 0 "$n"
+    g "umount $M" || gate_abort "$1: unmount failed"
+    ok "$1: unmounts with writes allowed again"
+    check_image "$1"
 }
 
-GRACE=$(g "sysctl -n kern.tessera.gc_grace_seconds")
-g "sysctl kern.tessera.gc_grace_seconds=0 >/dev/null"
+GRACE=$(g "sysctl -n kern.tessera.gc_grace_seconds") || gate_abort "cannot read GC grace"
+cleanup() {
+    rc=$?
+    trap - 0 HUP INT TERM
+    if [ -n "$NOP" ]; then
+        g "gnop configure -w 0 $NOP" || rc=1
+        # This mountpoint is inside the run's private directory.
+        g "umount $M" >/dev/null 2>&1 || :
+    fi
+    if teardown; then
+        g "rm -f $IMG $MARK $T/reference && rmdir $M $T" || rc=1
+    else
+        echo "could not release the fixture at $T" >&2
+        rc=1
+    fi
+    g "sysctl kern.tessera.gc_grace_seconds=$GRACE >/dev/null" || rc=1
+    exit "$rc"
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+g "sysctl kern.tessera.gc_grace_seconds=0 >/dev/null" || gate_abort "cannot set GC grace"
 
 echo "=== control: GC and sync with writes allowed"
 fresh
@@ -118,12 +167,8 @@ g "sync; sleep 2; sync; true"
 writes 0
 g "dd if=/dev/random of=$M/e2 bs=1m count=1 status=none 2>/dev/null; sync; sleep 2; sync; true"
 [ "$(counter)" -gt "$c0" ] && ok "ENXIO: commit_failed latched ($c0 -> $(counter))" || bad "ENXIO: commit_failed stayed $c0"
-g "umount -f $M" && ok "ENXIO: unmounts (forced)" || bad "ENXIO: umount -f failed"
-r=$(g "tessera-fsck /dev/$MD 2>&1")
-n=$(printf '%s\n' "$r" | grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|torn|bad root|lost')
-[ "$n" = 0 ] || printf '%s\n' "$r" | sed 's/^/    fsck: /' | head -40
-check "ENXIO: tessera-fsck finds the volume clean (no SB over a dropped write)" 0 "$n"
+g "umount -f $M" || gate_abort "ENXIO: unmount failed"
+ok "ENXIO: unmounts (forced)"
+check_image ENXIO
 
-teardown
-g "rm -rf $T $MARK; sysctl kern.tessera.gc_grace_seconds=$GRACE >/dev/null"
 gate_end

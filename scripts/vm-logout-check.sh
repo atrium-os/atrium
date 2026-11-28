@@ -248,13 +248,9 @@ check "Work's counter went on" "$((${RUNS1:-0} + 1))" "${RUNS2:-none}"
 check "…from the remounted overlay" yes "$(mounted_under | grep -qx "$WORK" && echo yes || echo no)"
 
 echo "=== 7. something outside their uids writes into an overlay at logout"
-# A root writer (not one of their uids, so logout doesn't end it) keeps
-# appending to a file in Work's overlay through the logout, HELD_ROUNDS
-# times: the forced unmount revokes an open file with content staged, which
-# is the race with md's in-flight writes that once panicked in
-# g_vfs_strategy. Each round: forced and then unmounted, no md left on the
-# image, the guest still up (same boot), and at the next login the image
-# checks clean and the file reads back non-empty.
+# Root holds an open file in Work across logout. Each round checks the
+# forced unmount, device detach, boot time, offline image and that round's
+# marker after remount. The writer here is a process appending to a file.
 HELD_ROUNDS=${HELD_ROUNDS:-20}
 if [ "$(V "df -T $WORK 2>/dev/null | awk 'NR==2 {print \$2}'")" = tessera ]; then
     FSCK=$(V "command -v tessera-fsck" 2>/dev/null)
@@ -270,13 +266,21 @@ if [ "$(V "df -T $WORK 2>/dev/null | awk 'NR==2 {print \$2}'")" = tessera ]; the
         [ "$(V "sysctl -n kern.boottime" 2>/dev/null)" = "$BOOT0" ] && up=$((up+1)) || { bad "round $n: the guest rebooted or is gone (panic?)"; break; }
         V "diff $LOG.before $LOG | grep -q '$U logging out: forcing unmount of: .*persona-apps/work'" && forced=$((forced+1))
         V "diff $LOG.before $LOG | grep -q '$U logging out: .* overlays unmounted'" && unmounted=$((unmounted+1))
-        [ -z "$(mounted_under)" ] && [ -z "$(V "mdconfig -lv | grep -F '$WORK.img'")" ] && noleft=$((noleft+1))
+        if mounts=$(mounted_under) && [ -z "$mounts" ] &&
+            devices=$(V "mdconfig -lv") && ! printf '%s\n' "$devices" | grep -Fq "$WORK.img"; then
+            noleft=$((noleft+1))
+        else
+            bad "round $n: could not confirm Work's image was detached"
+            break
+        fi
         ost '{"op":"login","user":"'"$U"'","password":"'"$PW"'","frontend":"cli"}' >/dev/null
         if [ -n "$FSCK" ]; then
-            md=$(V "mdconfig -a -t vnode -f $WORK.img" 2>/dev/null)
-            r=$(V "$FSCK /dev/$md 2>&1"); V "mdconfig -d -u ${md#md}" >/dev/null 2>&1
-            [ "$(printf '%s\n' "$r" | grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|torn|bad root')" = 0 ] \
-                && clean=$((clean+1)) || echo "  round $n fsck: $(printf '%s' "$r" | tail -3 | tr '\n' ';')"
+            if r=$(V "$FSCK -n $WORK.img 2>&1") &&
+                printf '%s\n' "$r" | grep -qE '^[[:space:]]*result:[[:space:]]+CLEAN — no inconsistencies found$'; then
+                clean=$((clean+1))
+            else
+                printf '  round %s fsck: %s\n' "$n" "$r"
+            fi
         fi
         launch work; probe_line $B/probe-work.log >/dev/null
         V "test -s $WORK/held.txt && grep -q 'held-by-root-$n-' $WORK/held.txt" && reads=$((reads+1))

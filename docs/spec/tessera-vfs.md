@@ -485,7 +485,8 @@ vnode. `tessera_commit_sb` fsyncs the device before the journal record and
 the superblock, and when that fsync fails (EIO, or EACCES from an md over an
 image whose key group locked) it writes neither and returns EIO: the on-disk
 superblock keeps naming the last generation whose sectors are all durable.
-The failed buffers stay dirty and land at the next commit that succeeds.
+FreeBSD can re-dirty failed writes for device writeback. ENXIO can drop
+the buffer. The mount therefore refuses a later commit in either case.
 
 - The flush and the data-zone GC both latch the cannot-commit state on such
   a failure (fsync fails EIO, new allocations are refused until a remount). The GC used to ignore it and hand
@@ -532,10 +533,56 @@ fault clears, the sysctl is gone, a remount restores fsync), and the
 commit-refusal check (16/16) and A5 (46/46) pass on it too; evidence in
 `~/atrium-vm/evidence/tessera/latch-no-clear-2026-11-25/` on the Mac.
 
-Seen in the commit-refusal runs and not resolved: "bulk write over DIRTY
-buffered sector" fires when a data publish retries over sectors whose earlier write failed;
-the stale buffer is invalidated, which is right for that case, but the
-warning's comment still calls it a double allocation.
+#### Dirty sectors and forced unmount (host verification, 2026-11-28)
+
+The older module's `commit-refusal-2026-11-25/run2/dmesg-150.txt`
+records an EIO at byte 17137664 (4 KiB sector 4184), a failed publish and
+commit, then a bulk write over that same dirty sector during unmount.
+The flush-entry latch in 49ae7730c blocks that retry. In the saved
+`repro2/out.txt`, read-only fsck reported the retained generation and
+snapshots clean. Some previously submitted sectors still reached the device
+after the latch.
+
+A bulk writer now locks each existing buffer header for its allocation
+before submitting raw GEOM writes. This waits out old writeback. A dirty
+header selects synchronous buffered writes for the range, so an older
+write cannot land over a replacement pack. After a raw write, the writer
+still invalidates the VM pages even where no buffer header survived.
+
+A waiting flush rechecks the latch on wake. A concurrent GC rechecks
+before applying its scan or retiring snapshots. GC skips the superblock
+when its extent commit fails. The device write entry points also check the
+latch. Unmount drains GC and repack before the final flush. Only a successful
+final flush permits a journal reset, which on a sealed volume writes both
+superblocks with a new anchor. Teardown releases pending journal inode
+records and holds the device vnode lock from the last buffer drain through
+GEOM close.
+
+The Mail run 7 console shows three dirty buffers on md3 after EACCES, then
+the buffer daemon in `g_vfs_strategy`. This predates 94f17e5a4, which drops
+unwritable device buffers before close. On the later module, the saved
+logout run passed 29 checks including 20 forced unmounts with a root
+process appending to the overlay, device detach and round-specific file
+readback. Its fsck assertion counted diagnostic words and could also pass
+on an empty response. It exercised a different writer from the child md
+that held its backing file on the parent Tessera mount in Mail run 7.
+
+Host verification used the C-decoder arm64 module built against
+`9f2eed03a36c`. All 184 imports resolved against that kernel. The core
+suite passed 24/24 plain and 24/24 under ASan/UBSan. Read-only fsck found
+the seeded host image clean. The revised check rejected a missing image,
+empty output and a failing command that printed a clean result.
+Logs and the module are in `scratch/tessera-storage-20261128/` on the Mac.
+
+Guest verification is pending on a separate disposable keyed Tessera guest.
+Run the commit-refusal gate (20 checks including byte-for-byte readback
+on read-only remount) and the logout gate (20 held rounds). Both require
+a successful fsck with an explicit clean result when checking an image.
+The refusal gate formats plain fixtures. Separately verify a sealed
+volume retains its last committed roots, journal recovery and file data
+across a refused final flush. Check nested md teardown on the disposable
+guest with a committed marker, offline fsck and device detach. The saved
+logout run establishes only the process-writer case.
 
 ## 10. Snapshots and versioning
 
