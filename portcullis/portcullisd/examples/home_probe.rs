@@ -43,7 +43,8 @@ fn main() {
         let mut buf = [0u8; 64];
         let mut len = buf.len();
         let name = std::ffi::CString::new("kern.hostuuid").unwrap();
-        let r = unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0) };
+        // SAFETY: the output buffer is live for len bytes and the new-value pointer is null.
+        let r = unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
         if r == 0 { String::from_utf8_lossy(&buf[..len]).trim_end_matches('\0').to_string() } else { "?".into() }
     };
     // The named personas' folders (personas.md §4.1), for the file manager.

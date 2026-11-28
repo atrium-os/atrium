@@ -241,7 +241,7 @@ fn boot_id() -> Result<String, String> {
     // values whose size is passed; no new value is set.
     #[allow(unsafe_code)]
     let r = unsafe {
-        libc::sysctlbyname(c"kern.boottime".as_ptr(), (&mut tv as *mut libc::timeval).cast(), &mut len, std::ptr::null(), 0)
+        libc::sysctlbyname(c"kern.boottime".as_ptr(), (&mut tv as *mut libc::timeval).cast(), &mut len, std::ptr::null_mut(), 0)
     };
     if r != 0 || len != std::mem::size_of::<libc::timeval>() {
         return Err(format!("kern.boottime: {}", std::io::Error::last_os_error()));

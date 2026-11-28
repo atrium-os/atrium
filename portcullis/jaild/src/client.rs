@@ -11,9 +11,6 @@
 //! re-exports it as `portcullisd::jaild_client`, so there is one client, not
 //! two to drift apart.
 //!
-//! The `unsafe` is confined to the small `raw` module below — the
-//! `recvmsg(2)` that extracts ancillary fds.
-//!
 //! Usage:
 //! ```no_run
 //! use jaild::client::Client;
@@ -24,7 +21,7 @@
 //! ```
 
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, BorrowedFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -72,11 +69,7 @@ impl Client {
         write_frame(&mut self.stream, &body)?;
         self.stream.flush()?;
 
-        let (frame, fds) = recvmsg_frame(self.stream.as_raw_fd(), max_fds)?;
-        let resp: Response = serde_json::from_slice(&frame)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
-                format!("parse response: {e}")))?;
-        Ok((resp, fds))
+        read_response(&mut self.stream, max_fds)
     }
 }
 
@@ -102,11 +95,7 @@ impl Client {
         }
         let raw: Vec<i32> = fds.iter().map(|f| f.as_raw_fd()).collect();
         crate::ffi::send_frame_with_fds(self.stream.as_raw_fd(), &body, &raw)?;
-        let (frame, got) = recvmsg_frame(self.stream.as_raw_fd(), max_recv)?;
-        let resp: Response = serde_json::from_slice(&frame)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
-                format!("parse response: {e}")))?;
-        Ok((resp, got))
+        read_response(&mut self.stream, max_recv)
     }
 }
 
@@ -121,137 +110,22 @@ fn write_frame<W: Write>(mut w: W, body: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Read one length-prefixed frame plus optional SCM_RIGHTS fd
-/// in a single `recvmsg(2)`. The body and the cmsg arrive
-/// atomically because jaild sends them in the same `sendmsg`.
-fn recvmsg_frame(socket_fd: i32, max_fds: usize) -> io::Result<(Vec<u8>, Vec<i32>)> {
-    /* Read the 4-byte length prefix in a recvmsg call so any
-     * SCM_RIGHTS cmsg (which is associated with the FIRST
-     * recv on the socket since the server's sendmsg) arrives
-     * here. Subsequent body reads are plain `read`. */
-    let mut len_buf = [0u8; 4];
-    let fds = recvmsg_with_fds(socket_fd, &mut len_buf, max_fds)?;
-    let len = u32::from_le_bytes(len_buf);
+/// Descriptors ride on the first byte of the length prefix. Keep them owned
+/// until the complete response has been read and decoded.
+fn read_response(stream: &mut UnixStream, max_fds: usize) -> io::Result<(Response, Vec<i32>)> {
+    let mut prefix = [0u8; 4];
+    let received = atrium_fdpass::recv(stream.as_raw_fd(), &mut prefix, max_fds)?;
+    stream.read_exact(&mut prefix[received.n..])?;
+    let len = u32::from_le_bytes(prefix);
     if len > MAX_FRAME_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
             format!("inbound frame too large: {len}")));
     }
     let mut body = vec![0u8; len as usize];
-    /* Read the body via plain reads on a duplicate of the
-     * stream — it's already a unix socket, regular read works. */
-    let mut tmp = unsafe_socket_reader(socket_fd);
-    tmp.read_exact(&mut body)?;
-    Ok((body, fds))
-}
-
-/* The unsafe is localised to two small helpers below: the cmsg
- * extraction (which has to use libc::recvmsg directly) and a
- * dup-based reader to satisfy `read_exact` after we already used
- * recvmsg for the first 4 bytes.
- *
- * These are intentionally narrow — the Read/Write API surface
- * stays safe. */
-mod raw {
-    #![allow(unsafe_code)]
-    use std::io;
-    use std::os::unix::net::UnixStream;
-    use std::os::unix::io::FromRawFd;
-
-    /// recvmsg on `socket_fd` to read up to `out.len()` bytes AND up to
-    /// `max_fds` SCM_RIGHTS fds attached. Returns every fd in the cmsg's
-    /// SCM_RIGHTS array (CreateJail sends 1 = [procdesc]; ExecInJail sends
-    /// 2 = [procdesc, pty_master]). `out` is filled exactly.
-    pub fn recvmsg_with_fds(socket_fd: i32, out: &mut [u8], max_fds: usize) -> io::Result<Vec<i32>> {
-        let mut iov = libc::iovec {
-            iov_base: out.as_mut_ptr() as *mut _,
-            iov_len:  out.len(),
-        };
-
-        let intsz = std::mem::size_of::<libc::c_int>();
-        // SAFETY: CMSG_SPACE is a libc inline; safe. Size for max_fds ints.
-        let cmsg_space = unsafe { libc::CMSG_SPACE((max_fds * intsz) as u32) };
-        let mut cmsg_buf: Vec<u8> = vec![0u8; cmsg_space as usize];
-
-        let mut msg = libc::msghdr {
-            msg_name:        std::ptr::null_mut(),
-            msg_namelen:     0,
-            msg_iov:         &mut iov,
-            msg_iovlen:      1,
-            msg_control:     cmsg_buf.as_mut_ptr() as *mut _,
-            msg_controllen:  cmsg_space as _,
-            msg_flags:       0,
-        };
-
-        // SAFETY: msg fields all initialised; iov + cmsg buffers outlive
-        // the recvmsg call. Output bytes go into `out` (caller-owned); fds
-        // in the cmsg are read out as values — no aliasing.
-        // ★ CLOSE-ON-EXEC FROM RECEIPT. The fds here are procdescs (and a pty
-        // master). A caller like portcullisd serves many one-shots at once and
-        // spawns mount/umount/jls for each; a procdesc received without this
-        // is inherited by every one of those children, and a zombie is not
-        // reaped until its LAST descriptor closes — so a worker's exit would
-        // wait on whatever unrelated command happened to fork meanwhile.
-        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
-        let flags = libc::MSG_CMSG_CLOEXEC;
-        #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
-        let flags = 0;
-        let n = unsafe { libc::recvmsg(socket_fd, &mut msg, flags) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if (n as usize) < out.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                format!("short recvmsg: got {} of {}", n, out.len())));
-        }
-
-        // Collect every fd across SCM_RIGHTS cmsgs (one cmsg can carry an
-        // array of fds; count = payload_len / sizeof(int)).
-        let mut fds: Vec<i32> = Vec::new();
-        // SAFETY: cmsg_buf is valid + correctly sized; CMSG_FIRSTHDR returns
-        // null on empty cmsg, which we handle.
-        unsafe {
-            let cmsg_len0 = libc::CMSG_LEN(0) as usize;
-            let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg_ptr.is_null() {
-                let cmsg = &*cmsg_ptr;
-                if cmsg.cmsg_level == libc::SOL_SOCKET
-                    && cmsg.cmsg_type == libc::SCM_RIGHTS
-                {
-                    let payload = (cmsg.cmsg_len as usize).saturating_sub(cmsg_len0);
-                    let count = payload / intsz;
-                    let data = libc::CMSG_DATA(cmsg_ptr) as *const libc::c_int;
-                    for i in 0..count {
-                        fds.push(data.add(i).read_unaligned());
-                    }
-                }
-                cmsg_ptr = libc::CMSG_NXTHDR(&msg, cmsg_ptr);
-            }
-        }
-        Ok(fds)
-    }
-
-    /// Duplicate `socket_fd` into a `UnixStream` for later reads.
-    /// Caller must NOT close the original; both fds reference the
-    /// same socket and either close ends both sides.
-    pub fn dup_to_stream(socket_fd: i32) -> UnixStream {
-        // SAFETY: `dup` returns a fresh fd pointing at the same
-        // open file table entry. Wrapping it in UnixStream gives
-        // safe access; std drops the dup'd fd when the stream
-        // drops. The original fd remains valid in the caller.
-        unsafe {
-            let dup = libc::dup(socket_fd);
-            assert!(dup >= 0, "dup failed");
-            UnixStream::from_raw_fd(dup)
-        }
-    }
-}
-
-fn recvmsg_with_fds(socket_fd: i32, out: &mut [u8], max_fds: usize) -> io::Result<Vec<i32>> {
-    raw::recvmsg_with_fds(socket_fd, out, max_fds)
-}
-
-fn unsafe_socket_reader(socket_fd: i32) -> std::os::unix::net::UnixStream {
-    raw::dup_to_stream(socket_fd)
+    stream.read_exact(&mut body)?;
+    let response = serde_json::from_slice(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse response: {e}")))?;
+    Ok((response, received.fds.into_iter().map(IntoRawFd::into_raw_fd).collect()))
 }
 
 /// The jail(8) lane's network (network.md §0): ask jaild — the one allocator —

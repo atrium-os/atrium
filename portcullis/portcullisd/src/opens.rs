@@ -298,6 +298,7 @@ pub fn check(fd: &OwnedFd, write: bool) -> Result<(), String> {
 /// Check an attachment's descriptor (mail.md §8.2): a regular file
 /// sealed against writing, growing and shrinking, so what the app gets is
 /// what the person pressed Open on; its first bytes, for its type.
+#[cfg(not(target_os = "macos"))]
 pub fn check_sealed(fd: &OwnedFd) -> Result<Vec<u8>, String> {
     check(fd, false)?;
     // SAFETY: F_GET_SEALS on a descriptor we hold.
@@ -323,6 +324,12 @@ pub fn check_sealed(fd: &OwnedFd) -> Result<Vec<u8>, String> {
     }
     head.truncate(got);
     Ok(head)
+}
+
+/// macOS cannot establish that a memory file is sealed against changes.
+#[cfg(target_os = "macos")]
+pub fn check_sealed(_fd: &OwnedFd) -> Result<Vec<u8>, String> {
+    Err("sealed attachment descriptors are unsupported on macOS".into())
 }
 
 /// Narrow `fd` to what an app may do with an opened file (§6.2): read,
@@ -425,13 +432,6 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("opens-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     #[test]
     fn workbook_commit_leaves_the_following_descriptor_for_recvmsg() {
         use std::io::Write;
@@ -455,7 +455,9 @@ mod tests {
 
     #[test]
     fn only_the_app_itself_gets_its_files() {
-        let d = tmp("hub");
+        // The socket path, including the persona suffix, must fit sockaddr_un.
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let d = tmp.path();
         let me = unsafe { libc::getuid() };
         let reg = d.join("registry");
         std::fs::write(&reg, format!("{me} alice org.test.player\n")).unwrap();
@@ -495,12 +497,13 @@ mod tests {
         drop(ch);
         std::thread::sleep(Duration::from_millis(200));
         assert!(!hub.connected("org.test.player"));
-        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
     fn a_work_instance_has_a_channel_of_its_own() {
-        let d = tmp("persona");
+        // The socket path, including the persona suffix, must fit sockaddr_un.
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let d = tmp.path();
         let me = unsafe { libc::getuid() };
         let reg = d.join("registry");
         // This uid is alice's Work player: the Personal channel isn't its.
@@ -526,12 +529,12 @@ mod tests {
             Some(atrium_open::Message::Crossed { url, from }) => assert_eq!((url.as_str(), from.as_str()), ("https://x.example/", "personal")),
             other => panic!("{other:?}"),
         }
-        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
     fn a_descriptor_is_a_regular_file_opened_as_claimed() {
-        let d = tmp("check");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::write(d.join("f"), b"x").unwrap();
         let ro = OwnedFd::from(File::open(d.join("f")).unwrap());
         assert!(check(&ro, false).is_ok());
@@ -542,7 +545,6 @@ mod tests {
         assert!(check(&dir, false).is_err(), "a folder");
         let (a, _b) = UnixStream::pair().unwrap();
         assert!(check(&OwnedFd::from(a), false).is_err(), "a socket");
-        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

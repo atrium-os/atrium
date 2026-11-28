@@ -20,8 +20,7 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-/// Most descriptors one message may carry, on either side. Ancillary space is
-/// sized from the caller's limit, so this bounds what a caller can ask for.
+/// Most descriptors a caller may send or accept in one message.
 pub const MAX_FDS: usize = 64;
 
 #[cfg(any(target_os = "freebsd", target_os = "linux"))]
@@ -59,7 +58,13 @@ pub fn recv(sock: RawFd, buf: &mut [u8], max_fds: usize) -> io::Result<Received>
     if max_fds > MAX_FDS {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "atrium-fdpass: max_fds above MAX_FDS"));
     }
+    #[cfg(not(target_os = "macos"))]
     let space = space_for(max_fds.max(1));
+    // XNU installs all rights before copying control data to userspace.
+    // Receive a whole control mbuf (sockargs caps it at MCLBYTES) so we
+    // can close every descriptor even when the caller accepts fewer.
+    #[cfg(target_os = "macos")]
+    let space: usize = 2048;
     // u64 backing keeps the cmsghdr reads below aligned.
     let mut cbuf = vec![0u64; space.div_ceil(8)];
     let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
@@ -91,13 +96,16 @@ pub fn recv(sock: RawFd, buf: &mut [u8], max_fds: usize) -> io::Result<Received>
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                 let data = libc::CMSG_DATA(c) as *const RawFd;
-                let len = ((*c).cmsg_len as usize).saturating_sub(data as usize - c as usize);
+                // Darwin can retain the original cmsg_len on MSG_CTRUNC. Only
+                // complete descriptor slots copied into the buffer are readable.
+                let end = msg.msg_control as usize + space.min(msg.msg_controllen as usize);
+                let copied = end.saturating_sub(data as usize);
+                let len = ((*c).cmsg_len as usize)
+                    .saturating_sub(data as usize - c as usize)
+                    .min(copied);
                 for i in 0..len / mem::size_of::<RawFd>() {
                     let fd = std::ptr::read_unaligned(data.add(i));
                     fds.push(OwnedFd::from_raw_fd(fd));
-                    if RECV_FLAGS == 0 {
-                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
                 }
             }
             c = libc::CMSG_NXTHDR(&msg, c);
@@ -108,6 +116,15 @@ pub fn recv(sock: RawFd, buf: &mut [u8], max_fds: usize) -> io::Result<Received>
     }
     if fds.len() > max_fds {
         return Err(bad("atrium-fdpass: peer sent more descriptors than accepted"));
+    }
+    if RECV_FLAGS == 0 {
+        // All installed descriptors are owned, including any after a failing fcntl.
+        for fd in &fds {
+            // SAFETY: fd is owned and F_SETFD takes an integer flag.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
     }
     Ok(Received { n, fds })
 }

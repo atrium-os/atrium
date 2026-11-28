@@ -162,6 +162,7 @@ dependencies = [
 name = "atrium-open"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
 ]
 

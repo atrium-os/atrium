@@ -1152,31 +1152,7 @@ pub fn send_one_fd(sock: i32, fd: i32) -> io::Result<()> {
 
 /// Receive the one descriptor [`send_one_fd`] sent (close-on-exec).
 pub fn recv_one_fd(sock: i32) -> io::Result<i32> {
-    #[allow(unsafe_code)]
-    // SAFETY: as in send_one_fd; the kernel fills at most `space` bytes.
-    unsafe {
-        let mut byte = [0u8; 1];
-        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-        let space = libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize;
-        let mut ctl = vec![0u8; space];
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = ctl.as_mut_ptr().cast();
-        msg.msg_controllen = space as _;
-        #[cfg(target_os = "freebsd")]
-        let flags = libc::MSG_CMSG_CLOEXEC;
-        #[cfg(not(target_os = "freebsd"))]
-        let flags = 0;
-        if libc::recvmsg(sock, &mut msg, flags) != 1 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no descriptor"));
-        }
-        let c = libc::CMSG_FIRSTHDR(&msg);
-        if c.is_null() || (*c).cmsg_level != libc::SOL_SOCKET || (*c).cmsg_type != libc::SCM_RIGHTS {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "no descriptor"));
-        }
-        Ok(std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<i32>()))
-    }
+    atrium_fdpass::recv_fd(sock).map(std::os::fd::IntoRawFd::into_raw_fd)
 }
 
 /// Is `fd` a socket?

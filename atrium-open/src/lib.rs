@@ -25,7 +25,7 @@
 
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -271,44 +271,12 @@ impl Channel {
 
     fn read_one(&mut self) -> io::Result<Option<Message>> {
         let mut len = [0u8; 2];
-        let mut iov = libc::iovec { iov_base: len.as_mut_ptr().cast(), iov_len: 2 };
-        // Room for a few descriptors: a sender that puts in more than one
-        // gets them closed, not left in a truncated message.
-        // SAFETY: a size computation.
-        let space = unsafe { libc::CMSG_SPACE((4 * std::mem::size_of::<RawFd>()) as u32) } as usize;
-        let mut cbuf = vec![0u8; space];
-        let mut fds: Vec<OwnedFd> = Vec::new();
-        // SAFETY: as in `send`; the descriptors the kernel put in the
-        // control buffer are ours and each is wrapped once.
-        let n = unsafe {
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cbuf.as_mut_ptr().cast();
-            msg.msg_controllen = space as _;
-            let n = libc::recvmsg(self.s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC | libc::MSG_WAITALL);
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut c = libc::CMSG_FIRSTHDR(&msg);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let k = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
-                    let p = libc::CMSG_DATA(c).cast::<RawFd>();
-                    for i in 0..k {
-                        fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(p.add(i))));
-                    }
-                }
-                c = libc::CMSG_NXTHDR(&msg, c);
-            }
-            n
-        };
+        let atrium_fdpass::Received { n, mut fds } =
+            atrium_fdpass::recv(self.s.as_raw_fd(), &mut len, 1)?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "portcullisd closed the document channel"));
         }
-        if n < 2 {
-            self.s.read_exact(&mut len[n as usize..])?;
-        }
+        self.s.read_exact(&mut len[n..])?;
         let want = u16::from_le_bytes(len) as usize;
         if want > MAX {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a message over 10 KiB"));
@@ -342,10 +310,8 @@ impl Channel {
         if commit.is_some() && !write {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "read-only save grant"));
         }
-        if fds.len() != 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("an open with {} descriptors", fds.len())));
-        }
-        Ok(Some(Message::File(Opened { name, mime, write, commit, file: File::from(fds.pop().unwrap()) })))
+        let fd = fds.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "an open without a descriptor"))?;
+        Ok(Some(Message::File(Opened { name, mime, write, commit, file: File::from(fd) })))
     }
 }
 

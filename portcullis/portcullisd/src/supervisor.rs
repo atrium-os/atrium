@@ -1097,11 +1097,4 @@ mod tests {
         };
         assert_eq!(want, true);
     }
-
-    /* Real kqueue tests need a FreeBSD host; they don't run on
-     * macOS dev. Validation is via the VM smoke. Suppress unused
-     * warnings on macOS host: */
-    #[cfg(not(target_os = "freebsd"))]
-    #[allow(dead_code)]
-    fn _stub_uses_macos_path() { let _ = MountKindStr::Tmpfs; let _ = ManifestEnv { key: "".into(), value: "".into() }; }
 }

@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-open"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
 ]
 

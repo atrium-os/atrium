@@ -198,6 +198,14 @@ Code: `scrinium/src/workbook.rs` (`give_back`),
 `portcullis/portcullisd/src/workbook_owner.rs`.
 A directory sync error after rename means publication could have succeeded.
 
+On macOS, `cargo test -p portcullisd --lib` in `portcullis/` exercises the
+ownership policy and rejects a read-only workbook. The transfer itself needs
+root. All four ownership checks ran as root in the November 27 FreeBSD arm64
+guest check, which also saved and reopened the workbook in a fresh jail.
+The document channel and jaild receive descriptors through `atrium-fdpass`.
+FreeBSD sets close-on-exec in `recvmsg`. On macOS the helper sets it
+with `fcntl` and returns an error if that fails. The full daemon and integration targets run on FreeBSD.
+
 Known limit: the descriptor is on Scrinium's grant mount, so it stops working
 if Scrinium's jail goes, or the session locks, the stick is ejected or
 unplugged. That matches §4.8.4's one-shot rule.
