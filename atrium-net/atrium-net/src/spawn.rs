@@ -90,9 +90,18 @@ impl Spawner {
 
     /// Start program `kind`; our end of its socket.
     pub fn spawn(&self, kind: u8) -> io::Result<UnixStream> {
-        assert!(!matches!(kind, b'M' | b'S' | b'U' | b'T' | b'F' | b'H'));
+        assert!(!matches!(kind, b'N' | b'M' | b'S' | b'U' | b'T' | b'F' | b'H'));
         let mut v = self.ask(&[kind], 1, "spawner could not start it")?;
         Ok(UnixStream::from(v.remove(0)))
+    }
+
+    /// A UDP socket connected to the scoped DNS server in its own FIB.
+    #[cfg(target_os = "freebsd")]
+    pub fn tunnel_dns(&self, fib: u8, server: Ipv4Addr) -> io::Result<std::net::UdpSocket> {
+        let mut req = vec![b'N', fib];
+        req.extend_from_slice(&server.octets());
+        let mut fds = self.ask(&req, 1, "could not connect to tunnel DNS")?;
+        Ok(fds.pop().ok_or(io::ErrorKind::InvalidData)?.into())
     }
 
     /// Printer discovery's sockets on the interface with IPv4 address
@@ -324,6 +333,24 @@ fn serve(s: RawFd, progs: &[Prog]) -> ! {
             unsafe { libc::_exit(0) };
         }
         if n != 1 {
+            continue;
+        }
+        #[cfg(target_os = "freebsd")]
+        if k == b'N' {
+            let mut args = [0u8; 5];
+            if !read_exact(s, &mut args) { std::process::exit(1) }
+            let [fib, a, b, c, d] = args;
+            let socket = (|| -> io::Result<_> {
+                if !(1..=8).contains(&fib) { return Err(io::ErrorKind::InvalidInput.into()) }
+                let udp = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+                sockopt(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SETFIB, &i32::from(fib))?;
+                udp.connect((Ipv4Addr::new(a, b, c, d), 53))?;
+                Ok(udp)
+            })();
+            match socket {
+                Ok(udp) => { let _ = send_fd(s, b'K', Some(udp.as_raw_fd())); }
+                Err(_) => { let _ = send_fd(s, b'E', None); }
+            }
             continue;
         }
         if k == b'M' || k == b'U' {

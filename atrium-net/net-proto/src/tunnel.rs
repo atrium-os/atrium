@@ -191,6 +191,17 @@ impl Tunnel {
         v
     }
 
+    pub fn link_address_inside(&self, ip: std::net::IpAddr) -> bool {
+        match ip.to_canonical() {
+            std::net::IpAddr::V4(addr) => self.routes_to(addr),
+            std::net::IpAddr::V6(_) => self.full,
+        }
+    }
+
+    pub fn link_domain_inside(&self, host: &str) -> bool {
+        self.domains.iter().any(|d| host == d || host.strip_suffix(d).is_some_and(|prefix| prefix.ends_with('.')))
+    }
+
     /// Whether `a` goes into the tunnel by these routes.
     pub fn routes_to(&self, a: Ipv4Addr) -> bool {
         self.full || self.includes.iter().chain(&self.addrs).any(|n| n.contains(a))
@@ -382,6 +393,14 @@ pub fn render_anchor(tunnels: &[AnchorTunnel], phys: Option<&str>) -> String {
         r.push_str(&format!("nat on {} inet from {}/{} to any -> ({})\n", t.iface, APP_NET.0, APP_NET.1, t.iface));
     }
     for t in tunnels {
+        if let Some((_, dns)) = t.rdr {
+            // Root's tunnel-link questions must stay on this interface
+            // even if a more-specific physical route appears. Bind their
+            // reply state to the tun so it cannot bypass the egress block.
+            let iface = t.iface;
+            r.push_str(&format!("pass out quick on {iface} inet proto udp from ({iface}) to {dns} port 53 user root keep state (if-bound)\n"));
+            r.push_str(&format!("block out quick on ! {iface} inet proto udp from ({iface}) to {dns} port 53 user root\n"));
+        }
         // ServerIP (§6): only the engine's own flows reach the gateway's
         // address outside the tunnel; anything else to it is dropped here
         // (with `full`, the pinned host route would otherwise carry it).
@@ -464,6 +483,18 @@ mod tests {
 
     fn host() -> HostView {
         HostView { others: vec![(Ipv4Addr::new(10, 88, 0, 50), 24)] }
+    }
+
+    #[test]
+    fn link_domains_and_addresses_follow_the_source_tunnel() {
+        let mut t = tunnel();
+        t.full = false;
+        assert!(t.link_domain_inside("corp.test") && t.link_domain_inside("a.corp.test"));
+        assert!(!t.link_domain_inside("notcorp.test"));
+        assert!(t.link_address_inside("::ffff:10.99.0.19".parse().unwrap()));
+        assert!(!t.link_address_inside("203.0.113.2".parse().unwrap()));
+        t.full = true;
+        assert!(t.link_address_inside("203.0.113.2".parse().unwrap()));
     }
 
     #[test]
@@ -555,6 +586,8 @@ mod tests {
         let work = AnchorTunnel { iface: "tun3", gateway: Ipv4Addr::new(198, 51, 100, 54), port: 51820, tcp: false, gp_esp: false, full: false, block: false, rdr: Some((2, Ipv4Addr::new(10, 99, 0, 1))) };
         let a = render_anchor(&[work], Some("vtnet1"));
         assert_eq!(a.lines().next().unwrap(), "rdr pass on atrium inet proto { udp tcp } from <atrium_fib_2> to any port 53 -> 10.99.0.1 port 53");
+        assert!(a.contains("from (tun3) to 10.99.0.1 port 53 user root keep state (if-bound)"));
+        assert!(a.contains("block out quick on ! tun3 inet proto udp from (tun3) to 10.99.0.1 port 53 user root"));
         assert!(!a.contains("block out quick on vtnet1 all"));
         // AnyConnect's engine: TCP to the gateway.
         let ac = AnchorTunnel { iface: "tun4", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 443, tcp: true, gp_esp: false, full: false, block: false, rdr: None };

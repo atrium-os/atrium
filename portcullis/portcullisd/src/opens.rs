@@ -68,6 +68,9 @@ struct Pending {
     /// A link the person sent from another persona: its name
     /// (personas.md §6).
     from: Option<String>,
+    /// A link accepted because the receiver shares the source VPN. Keep
+    /// that condition through a cold launch or a channel reconnect.
+    required_vpn: Option<String>,
 }
 
 #[derive(Default)]
@@ -171,7 +174,7 @@ impl Hub {
             let mut apps = self.apps.lock().unwrap();
             let slot = apps.entry(app.to_string()).or_default();
             slot.conn = Some((id, s, owner));
-            Self::flush(app, slot);
+            let _ = Self::flush(app, slot);
         }
         eprintln!("portcullisd: {app} connected its document channel");
         // Anything the app sends is ignored; its end closing ends the channel.
@@ -189,16 +192,30 @@ impl Hub {
     }
 
     /// Send what waits, oldest first; drop what waited too long.
-    fn flush(app: &str, slot: &mut Slot) {
+    fn flush(app: &str, slot: &mut Slot) -> io::Result<()> {
         slot.pending.retain(|p| p.at.elapsed() < PENDING_FOR);
         while !slot.pending.is_empty() {
-            let Some((_, c, owner)) = &slot.conn else { return };
+            let Some((_, c, owner)) = &slot.conn else { return Ok(()) };
             let p = &slot.pending[0];
             // ★ Another person's instance: never theirs to have.
             if &p.owner != owner {
                 eprintln!("portcullisd: {app}: “{}” was {}'s, and {app} runs for {owner}: dropped", p.name, p.owner);
                 slot.pending.remove(0);
                 continue;
+            }
+            if let Some(vpn) = &p.required_vpn {
+                let policy = portcullis_policy::Policy::load(&portcullis_policy::Policy::user_path(owner));
+                let permitted = policy.as_ref().ok().and_then(|pol|
+                    app.split_once('@').and_then(|(_, persona)| pol.personas.get(persona))
+                ).and_then(|d| d.vpn.as_ref()) == Some(vpn);
+                if !permitted {
+                    eprintln!("portcullisd: {app}: receiving VPN changed, link dropped");
+                    slot.pending.remove(0);
+                    if slot.pending.is_empty() {
+                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "receiving VPN changed"));
+                    }
+                    continue;
+                }
             }
             let sent = match &p.fd {
                 Some(fd) => atrium_open::send(c, &p.name, &p.mime, p.write, fd.as_raw_fd()),
@@ -221,12 +238,13 @@ impl Hub {
                 }
             }
         }
+        Ok(())
     }
 
     /// Hand `fd` to `owner`'s `app`, now or once it connects. Refused while
     /// the app runs for someone else.
     pub fn deliver(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: OwnedFd) -> io::Result<Delivery> {
-        self.push(owner, app, name, mime, write, Some(fd), None)
+        self.push(owner, app, name, mime, write, Some(fd), None, None)
     }
 
     /// Hand `url` (a link of `scheme`) to `owner`'s `app`, as [`Hub::deliver`].
@@ -238,6 +256,10 @@ impl Hub {
     /// `from` (`personal` for Personal): the app is told so, and a Work
     /// app opens it as a stranger would (personas.md §6).
     pub fn deliver_link_from(&self, owner: &str, app: &str, scheme: &str, url: &str, from: Option<&str>) -> io::Result<Delivery> {
+        self.deliver_vpn_link(owner, app, scheme, url, from, None)
+    }
+
+    pub fn deliver_vpn_link(&self, owner: &str, app: &str, scheme: &str, url: &str, from: Option<&str>, required_vpn: Option<&str>) -> io::Result<Delivery> {
         let ok = match from {
             None => atrium_open::encode_link(url).is_some(),
             Some(f) => atrium_open::encode_crossed_link(url, f).is_some(),
@@ -245,11 +267,11 @@ impl Hub {
         if !ok {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"));
         }
-        self.push(owner, app, url, scheme, false, None, from.map(String::from))
+        self.push(owner, app, url, scheme, false, None, from.map(String::from), required_vpn.map(String::from))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn push(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: Option<OwnedFd>, from: Option<String>) -> io::Result<Delivery> {
+    fn push(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: Option<OwnedFd>, from: Option<String>, required_vpn: Option<String>) -> io::Result<Delivery> {
         let mut apps = self.apps.lock().unwrap();
         let slot = apps.entry(app.to_string()).or_default();
         if let Some((_, _, o)) = &slot.conn {
@@ -261,8 +283,8 @@ impl Hub {
         if slot.pending.len() >= MAX_PENDING {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, format!("{MAX_PENDING} files or links are already waiting for {app}")));
         }
-        slot.pending.push(Pending { at: Instant::now(), owner: owner.into(), name: name.into(), mime: mime.into(), write, fd, from });
-        Self::flush(app, slot);
+        slot.pending.push(Pending { at: Instant::now(), owner: owner.into(), name: name.into(), mime: mime.into(), write, fd, from, required_vpn });
+        Self::flush(app, slot)?;
         Ok(if slot.pending.is_empty() { Delivery::Sent } else { Delivery::Queued })
     }
 
@@ -497,6 +519,27 @@ mod tests {
         drop(ch);
         std::thread::sleep(Duration::from_millis(200));
         assert!(!hub.connected("org.test.player"));
+    }
+
+    #[test]
+    fn a_queued_link_cannot_leave_with_a_missing_receiver_vpn() {
+        let hub = Hub::new(PathBuf::new(), "");
+        let key = "org.test.receiver@work";
+        let owner = "missing-link-test-person";
+        assert_eq!(hub.deliver_vpn_link(owner, key, "https", "https://secret.example/", Some("other"), Some("corp")).unwrap(), Delivery::Queued);
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut slots = hub.apps.lock().unwrap();
+        let slot = slots.get_mut(key).unwrap();
+        slot.conn = Some((1, sender, owner.to_owned()));
+        assert_eq!(Hub::flush(key, slot).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(slot.pending.is_empty());
+        let mut bytes = [0; 128];
+        assert_eq!(receiver.read(&mut bytes).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        drop(slots);
+        assert_eq!(hub.deliver_link_from(owner, key, "https", "https://public.example/", Some("other")).unwrap(), Delivery::Sent);
+        let n = receiver.read(&mut bytes).unwrap();
+        assert!(bytes[..n].windows(14).any(|w| w == b"public.example"));
     }
 
     #[test]

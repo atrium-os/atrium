@@ -67,7 +67,9 @@ fn sandbox(uid: Option<u32>) {
             if libc::setgroups(1, &g) != 0 || libc::setgid(g) != 0 || libc::setuid(uid) != 0 {
                 die("drop to its uid");
             }
-            if libc::setuid(0) == 0 {
+            let mut group = 0;
+            if libc::getuid() != uid || libc::geteuid() != uid || libc::getgid() != g || libc::getegid() != g
+                || libc::getgroups(1, &mut group) != 1 || group != g || libc::setuid(0) == 0 {
                 die("could get root back");
             }
         }
@@ -109,6 +111,33 @@ fn main() {
     // SAFETY: fd 3 is ours, from the spawner.
     let ctl = unsafe { UnixStream::from_raw_fd(3) };
     let (l, mut fds) = start(&ctl);
+    if l.verb == "link-answer" {
+        let Some(uid) = uid.filter(|u| *u != 0) else { die("link-answer needs a sandbox uid") };
+        sandbox(Some(uid));
+        let [fd]: [OwnedFd; 1] = fds.try_into().unwrap_or_else(|_| die("link-answer needs one socket"));
+        let sock = UdpSocket::from(fd);
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap_or_else(|_| die("receive timeout"));
+        // The extra byte distinguishes an oversized datagram from a complete reply.
+        let mut buf = [0u8; 513];
+        let answers = (|| {
+            let mut kinds = Vec::new();
+            let mut ips = Vec::new();
+            for _ in 0..2 {
+                let n = sock.recv(&mut buf).ok().filter(|n| *n <= 512)?;
+                let (kind, mut addrs) = atrium_mdns::link_addresses(buf.get(..n)?, l.num("id")?, l.get("host")?)?;
+                if kinds.contains(&kind) { return None }
+                kinds.push(kind);
+                ips.append(&mut addrs);
+            }
+            (!ips.is_empty()).then_some(ips)
+        })();
+        let reply = match answers {
+            Some(ips) => Line::new("addresses").with("list", ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")),
+            None => Line::new("unknown"),
+        };
+        let _ = reply.send(&mut &ctl);
+        return;
+    }
     let net = l
         .get("addr")
         .and_then(|s| s.split_once('/'))

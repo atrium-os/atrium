@@ -347,3 +347,58 @@ impl<C: Clone> Resolver<C> {
 
 #[cfg(test)]
 mod tests;
+
+/// All addresses in a complete answer to one tunnel DNS address question. An
+/// ambiguous or incomplete answer cannot authorize an out-of-tunnel open.
+pub fn link_addresses(msg: &[u8], id: u16, host: &str) -> Option<(u16, Vec<IpAddr>)> {
+    let flags = u16at(msg, 2)?;
+    if u16at(msg, 0)? != id || flags & 0xfa0f != 0x8000 || u16at(msg, 4)? != 1 {
+        return None;
+    }
+    let count = usize::from(u16at(msg, 6)?);
+    if count > MAX_RECORDS {
+        return None;
+    }
+    let (mut name, end) = read_name(msg, 12)?;
+    let question = u16at(msg, end)?;
+    if !name.iter().map(Vec::as_slice).eq(host.as_bytes().split(|b| *b == b'.'))
+        || !matches!(question, TYPE_A | TYPE_AAAA) || u16at(msg, end + 2)? != CLASS_IN {
+        return None;
+    }
+    let mut at = end + 4;
+    let mut aliases = HashMap::new();
+    let mut records = Vec::new();
+    for _ in 0..count {
+        let (owner, end) = read_name(msg, at)?;
+        let kind = u16at(msg, end)?;
+        let size = usize::from(u16at(msg, end + 8)?);
+        let start = end + 10;
+        at = start + size;
+        let bytes = msg.get(start..at)?;
+        if u16at(msg, end + 2)? != CLASS_IN {
+            return None;
+        }
+        match kind {
+            TYPE_A if question == kind => records.push((owner, IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?))),
+            TYPE_AAAA if question == kind => records.push((owner, IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?))),
+            5 => {
+                let (alias, next) = read_name(msg, start)?;
+                if next != at || aliases.insert(owner, alias).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let mut visited = Vec::new();
+    for _ in 0..count {
+        let Some(next) = aliases.remove(&name) else { break };
+        visited.push(name);
+        if visited.contains(&next) { return None }
+        name = next;
+    }
+    if !aliases.is_empty() || (count != 0 && records.is_empty()) || records.iter().any(|(n, _)| *n != name) {
+        return None;
+    }
+    Some((question, records.into_iter().map(|(_, ip)| ip).collect()))
+}

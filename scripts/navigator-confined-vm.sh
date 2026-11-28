@@ -788,6 +788,26 @@ g "grep -q 'crosses from Work to Personal' $PL" && bad "a link crossed with the 
 # trail of its own.
 g "printf '\n[[crossings]]\nfrom = \"work\"\nto = \"personal\"\nkinds = [\"links\"]\n' >> /var/db/atrium/navtest/policy.toml
    su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null"
+# With that same switch on, an unavailable source tunnel has no authority
+# to release the host. Exercise DeliverLink before the public control below.
+P=/var/db/atrium/navtest/policy.toml
+g "sed -i '' '/^\[personas\.work\]$/a\\
+vpn = \"link-gate-down\"
+' $P && grep -Fqx 'vpn = \"link-gate-down\"' $P && su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null" || bad "install down VPN fixture"
+PT0=$(last | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
+S0=$(sheets)
+openwith WLAST
+i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
+sleep 3
+key 0x51; key 0x28
+key 0x52; key 0x28
+i=0; while [ $i -lt 60 ] && ! g "grep -Fq 'cap.link.vpn:' $PL"; do sleep 3; i=$((i+3)); done
+if g "grep -Fq 'cap.link.vpn:' $PL" && ! g "grep -q 'crosses from Work to Personal' $PL" && last | grep -q "trails=${PT0:-x} "; then
+    ok "Work VPN unavailable: explicit refusal and no trail in Personal"
+else
+    bad "VPN refusal or Personal trail count: $(last)"
+fi
+g "sed -i '' '/^vpn = \"link-gate-down\"$/d' $P && su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null" || bad "restore Work policy"
 PT0=$(last | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
 S0=$(sheets)
 openwith WLAST

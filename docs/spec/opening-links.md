@@ -230,7 +230,10 @@ new trail.
    runs once for every persona (Settings, the file manager) has only the one instance.
    Crossing on purpose (personas.md §6, P3 as built): an app's "Open with…" always asks
    in the sheet, which has an "In: <persona>" row; the person's crossing switch decides
-   whether the link may go there, and portcullisd checks it again on delivery.
+   whether the link may go there, and portcullisd checks it again on delivery. A host
+   leaving its source VPN also needs atrium-net's verdict. Portcullisd matches the
+   authority in Monstrator's serialized link before opening the receiver's document
+   channel ([personas.md, VPN-only delivery](personas.md#vpn-only-link-delivery)).
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
    *Built 2026-11-18 (Opifex part):* for an `atrium-app://<id>` link whose app isn't
    installed, portcullisd spends the press as for any link and answers `LinkGranted` with the

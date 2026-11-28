@@ -349,9 +349,16 @@ mod imp {
         next_id: u64,
     }
 
+    struct LinkLookup {
+        tunnel: String,
+        parser: Conn,
+        expires: Instant,
+    }
+
     struct Ctl {
         c: Conn,
         subscribed: bool,
+        link: Option<LinkLookup>,
     }
 
     /// A VPN tunnel held for cryptad (vpn.md §5): its tun stays open here
@@ -1640,6 +1647,7 @@ mod imp {
                     vec![facts, Line::new("ok")]
                 }
                 "tunnel-open" | "tunnel-routes" | "tunnel-apply" | "tunnel-close" => self.tunnel_ctl(l),
+                "tunnel-link" => self.link_check(j, l),
                 "route-domain" => self.route_domain_ctl(l),
                 // Printer discovery's sockets (printing.md §7.1) on the
                 // active interface; only atrium-netconf's root-only
@@ -2054,6 +2062,86 @@ mod imp {
             v
         }
 
+        /// Answer only for a live, persona-scoped tunnel. A clear reply permits
+        /// disclosure of this host outside it. All failures withhold that reply.
+        fn link_check(&mut self, j: usize, l: &Line) -> Vec<Line> {
+            let deny = || vec![Line::new("error").with("why", "tunnel-link")];
+            let Some(name) = l.get("name").filter(|n| valid_tunnel_id(n)) else { return deny() };
+            let Some(host) = l.get("host") else { return deny() };
+            if !self.tunnel_anchor() { return deny() }
+            let Some(t) = self.tunnels.iter().find(|t| t.id == name && t.fib != 0) else { return deny() };
+            let Some(a) = t.applied.as_ref().filter(|a| a.scoped) else { return deny() };
+            let clear = || vec![Line::new("clear"), Line::new("ok")];
+            if a.full { return deny() }
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                return if a.link_address_inside(ip) { deny() } else { clear() };
+            }
+            if !net_proto::tunnel::valid_domain(host) || !host.contains('.') || a.link_domain_inside(host) {
+                return deny();
+            }
+            if self.ctls[j].link.is_some() || self.ctls.iter().filter(|c| c.link.is_some()).count() >= 8 {
+                return deny();
+            }
+            let Some(&dns) = a.dns.first() else { return deny() };
+            let Ok(fib) = u8::try_from(t.fib) else { return deny() };
+            if !t.routes.iter().any(|(dst, prefix, _)| net_proto::in_net(dns, *dst, *prefix)) {
+                return deny();
+            }
+            // No explicit source bind: the kernel must select one of this
+            // tunnel's own addresses for the server in its FIB. Both sends
+            // precede the next route update on this event loop.
+            if self.spawner.pf_running() != Some(true) { return deny() }
+            let Ok(udp) = self.spawner.tunnel_dns(fib, dns) else { return deny() };
+            let Ok(local) = udp.local_addr() else { return deny() };
+            if !a.addrs.iter().any(|addr| local.ip() == IpAddr::V4(addr.addr)) { return deny() }
+            let Ok(child) = self.spawner.spawn(b'Q') else { return deny() };
+            let mut id = [0u8; 2];
+            // SAFETY: id is a writable two-byte buffer.
+            if unsafe { libc::getrandom(id.as_mut_ptr().cast(), id.len(), 0) } != 2 { return deny() }
+            let id = u16::from_ne_bytes(id);
+            let mut query = atrium_net::dot_query(id, host);
+            if query.len() < 4 || udp.send(&query).ok() != Some(query.len()) { return deny() }
+            let end = query.len();
+            query[end - 3] = 28; // AAAA in the second question
+            if udp.send(&query).ok() != Some(query.len()) { return deny() }
+            // SAFETY: the connected UDP socket stays live through shutdown.
+            if unsafe { libc::shutdown(udp.as_raw_fd(), libc::SHUT_WR) } != 0 { return deny() }
+            let start = Line::new("link-answer").with("id", id).with("host", host);
+            if send_line_fds(&child, &start, &[udp.into()]).is_err() { return deny() }
+            let Ok(parser) = Conn::new(child) else { return deny() };
+            self.ctls[j].link = Some(LinkLookup {
+                tunnel: name.to_owned(), parser, expires: Instant::now() + Duration::from_secs(3),
+            });
+            Vec::new()
+        }
+
+        fn finish_links(&mut self) {
+            for ctl in &mut self.ctls {
+                let Some(job) = ctl.link.as_mut() else { continue };
+                let reply = job.parser.lines();
+                if matches!(&reply, Ok(lines) if lines.is_empty()) && Instant::now() < job.expires { continue }
+                let allowed = (|| {
+                    if Instant::now() >= job.expires { return None }
+                    let lines = reply.ok()?;
+                    let [Got::Line(l)] = lines.as_slice() else { return None };
+                    if l.verb != "addresses" { return None }
+                    let tunnel = self.tunnels.iter().find(|t| t.id == job.tunnel)?.applied.as_ref()?;
+                    let mut count = 0;
+                    for value in l.get("list")?.split(',') {
+                        count += 1;
+                        if count > 128 || tunnel.link_address_inside(value.parse().ok()?) { return None }
+                    }
+                    Some(())
+                })().is_some();
+                ctl.link = None;
+                if allowed {
+                    if ctl.c.send(&Line::new("clear")).is_ok() { let _ = ctl.c.send(&Line::new("ok")); }
+                } else {
+                    let _ = ctl.c.send(&Line::new("error").with("why", "tunnel-link"));
+                }
+            }
+        }
+
         /// `route-domain name=X` (vpn.md §5.3): the routing table for VPN
         /// profile X's persona scope, made on first ask. portcullisd asks
         /// it when it starts an instance in a persona whose `vpn` is X, and
@@ -2332,6 +2420,12 @@ mod imp {
         /// Undo tunnel k's routes, pin and zones (its tun stays open, its
         /// pf rules stay until the anchor is written again).
         fn tunnel_withdraw(&mut self, k: usize) {
+            for ctl in &mut self.ctls {
+                if ctl.link.as_ref().is_some_and(|job| job.tunnel == self.tunnels[k].id) {
+                    ctl.link = None;
+                    let _ = ctl.c.send(&Line::new("error").with("why", "tunnel-changed"));
+                }
+            }
             let was_full = self.tunnels[k].applied.as_ref().is_some_and(|a| a.full && !a.scoped);
             let fib = self.tunnels[k].fib;
             for (dst, prefix, via) in std::mem::take(&mut self.tunnels[k].routes) {
@@ -2739,6 +2833,7 @@ mod imp {
         let vflag: &[&str] = if o.verbose { &["-v"] } else { &[] };
         // Not installed: no .local names, and no retrying every few seconds.
         let mut o = o;
+        let dns_parser = o.mdns_bin.clone().unwrap_or_else(|| "/usr/local/libexec/atrium-mdns".into());
         if o.unbound.is_none() {
             o.mdns_bin = None;
         } else if o.mdns_bin.as_ref().is_some_and(|m| !std::path::Path::new(m).exists()) {
@@ -2747,6 +2842,7 @@ mod imp {
         let mut mdns_args: Vec<&str> = vec!["--uid", "65049"];
         mdns_args.extend_from_slice(vflag);
         let mut progs: Vec<(u8, &str, &[&str])> = vec![(b'L', o.lease.as_str(), vflag), (b'P', o.probe_bin.as_str(), vflag)];
+        progs.push((b'Q', &dns_parser, &mdns_args));
         if let Some(m) = &o.mdns_bin {
             progs.push((b'D', m.as_str(), &mdns_args));
         }
@@ -2983,6 +3079,7 @@ mod imp {
                 }
             }
             let wait = net.wifi.as_ref().and_then(|w| w.deadline()).map_or(1000, |d| d.saturating_sub(now).min(1000)) as i32;
+            fds.extend(net.ctls.iter().filter_map(|ctl| Some(ctl.link.as_ref()?.parser.fd())));
             let ready = poll_read(&fds, wait.max(10));
 
             if ready[0] {
@@ -3033,7 +3130,7 @@ mod imp {
                 while let Ok((s, _)) = listener.accept() {
                     if sock::peer_uid(&s) == Some(0) {
                         if let Ok(c) = Conn::new(s) {
-                            net.ctls.push(Ctl { c, subscribed: false });
+                            net.ctls.push(Ctl { c, subscribed: false, link: None });
                         }
                     }
                 }
@@ -3152,6 +3249,7 @@ mod imp {
                 let a = w.tick(now);
                 net.wifi_acts(a);
             }
+            net.finish_links();
             net.mlme_connect();
             net.route_default();
             if net.portal_watch_until.is_some_and(|t| net.now() >= t) {

@@ -31,3 +31,23 @@ pub fn fib_for(vpn: &str) -> Result<u32, String> {
     }
     Err("atrium-net closed the connection".into())
 }
+
+/// The only affirmative reply from the root-only source-tunnel broker.
+pub fn link_may_leave(vpn: &str, host: &str) -> bool {
+    use std::io::Read;
+    let query = || -> std::io::Result<bool> {
+        if vpn.is_empty() || vpn.len() > 32 || !vpn.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || host.is_empty() || host.len() > 253 || !host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'.')) {
+            return Ok(false);
+        }
+        let path = std::env::var_os("ATRIUM_NET_SOCK").unwrap_or_else(|| SOCK.into());
+        let mut socket = UnixStream::connect(path)?;
+        socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        writeln!(socket, "tunnel-link name={vpn} host={host}")?;
+        let mut answer = [0u8; 9];
+        socket.read_exact(&mut answer)?;
+        Ok(&answer == b"clear\nok\n")
+    };
+    query().unwrap_or(false)
+}

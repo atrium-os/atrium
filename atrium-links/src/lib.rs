@@ -6,8 +6,8 @@
 //!   bounded, no control or direction characters, a scheme that may be
 //!   handed on, and what its sheet shows of it.
 //!
-//! portcullisd uses only [`declarable`], [`never_taken`] and
-//! [`starts_with_scheme`]: it never parses link text (§2).
+//! Portcullisd checks the scheme and matches the serialized authority when
+//! a persona VPN crossing requires a broker verdict ([`may_leave_vpn`]).
 
 /// The longest link handed on.
 pub const MAX_URL: usize = 8192;
@@ -152,10 +152,55 @@ pub fn shown_host(ascii: &str) -> String {
     }
 }
 
+/// Match the authority of Monstrator's serialized URL. Accept only the
+/// unambiguous wire form here; URL normalization belongs in its jail.
+pub fn may_leave_vpn(url: &str, scheme: &str, clear: impl FnOnce(&str) -> bool) -> bool {
+    if scheme == APP { return true } // The app starts without a URL.
+    let Some(rest) = url.strip_prefix(scheme).and_then(|s| s.strip_prefix(':')) else { return false };
+    let Some(tail) = rest.strip_prefix("//") else {
+        return !WEB.contains(&scheme) && !rest.contains('\\');
+    };
+    let authority = tail.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains(['@', '\\', '%']) { return false }
+    let (host, suffix) = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((host, port)) = v6.split_once(']') else { return false };
+        if host.parse::<std::net::Ipv6Addr>().is_err() { return false }
+        (host, port)
+    } else {
+        let pos = authority.find(':').unwrap_or(authority.len());
+        let (name, port) = authority.split_at(pos);
+        let host = name.strip_suffix('.').unwrap_or(name);
+        if host.is_empty() || host.len() > 253 || !host.split('.').all(|label|
+            !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) { return false }
+        // Special-scheme URL parsers interpret a numeric final label as
+        // legacy IPv4 syntax. Only canonical dotted IPv4 may take that path.
+        let last = host.rsplit('.').next().unwrap_or("");
+        let hex = last.to_ascii_lowercase();
+        let numeric_hex = hex.strip_prefix("0x").is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
+        if (last.bytes().all(|b| b.is_ascii_digit()) || numeric_hex)
+            && host.parse::<std::net::Ipv4Addr>().is_err() { return false }
+        (host, port)
+    };
+    if !suffix.is_empty() && !suffix.strip_prefix(':').is_some_and(|p|
+        p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()) { return false }
+    clear(&host.to_ascii_lowercase())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vpn_verdict_covers_the_delivered_authority() {
+        assert!(may_leave_vpn("https://WWW.example.:443/a?x=other", "https", |h| h == "www.example"));
+        assert!(!may_leave_vpn("https://outside.example/a", "https", |_| false));
+        for u in ["https:host", "https://safe.test@work.test/", "https://host%2fother/", "https://127.1/", "https://safe.test:99999/"] {
+            assert!(!may_leave_vpn(u, "https", |_| true), "{u}");
+        }
+        assert!(may_leave_vpn("https://[::ffff:10.0.0.1]/", "https", |h| h == "::ffff:10.0.0.1"));
+        assert!(may_leave_vpn("mailto:ana@example.com", "mailto", |_| panic!("no network host")));
+    }
 
     #[test]
     fn schemes() {

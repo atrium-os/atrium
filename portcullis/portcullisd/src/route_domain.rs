@@ -14,10 +14,11 @@ pub use atrium_netconf::route_domain::fib_for;
 /// none. Never the host's own table instead.
 pub fn for_persona(person: &str, persona: Option<&str>) -> Result<Option<u32>, String> {
     let Some(p) = persona.filter(|p| *p != portcullis_policy::PERSONAL) else { return Ok(None) };
-    let vpn = portcullis_policy::Policy::load(&portcullis_policy::Policy::user_path(person)).ok()
-        .and_then(|pol| pol.personas.get(p).and_then(|d| d.vpn.clone()));
+    let policy = portcullis_policy::Policy::load(&portcullis_policy::Policy::user_path(person))
+        .map_err(|e| format!("policy for {p}: {e}"))?;
+    let vpn = policy.personas.get(p).ok_or_else(|| format!("unknown persona {p}"))?.vpn.as_deref();
     match vpn {
         None => Ok(None),
-        Some(v) => fib_for(&v).map(Some).map_err(|e| format!("{p}'s VPN {v}: {e}")),
+        Some(v) => fib_for(v).map(Some).map_err(|e| format!("{p}'s VPN {v}: {e}")),
     }
 }

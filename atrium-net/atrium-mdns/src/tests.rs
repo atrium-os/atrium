@@ -260,3 +260,20 @@ fn ipv6_resolver() {
     let mut r: Resolver<u32> = Resolver::new(Net { v6: vec![], ..NET() });
     assert!(matches!(&r.query(1, &dq(4, "nas.local", TYPE_AAAA), 0)[..], [Out::Reply(1, m)] if m[3] & 0xf == 0 && m[7] == 0));
 }
+
+#[test]
+fn tunnel_link_needs_a_complete_answer_for_its_question() {
+    let q = parse_query(&dq(17, "public.example", TYPE_A)).unwrap();
+    let ips = [v4([203, 0, 113, 9]), v4([10, 99, 0, 6])];
+    let mut msg = response(&q, 0, &[(ips[0], 60), (ips[1], 60)]);
+    assert_eq!(link_addresses(&msg, 17, "public.example"), Some((TYPE_A, ips.to_vec())));
+    assert_eq!(link_addresses(&msg, 17, "other.example"), None);
+    assert_eq!(link_addresses(&msg, 18, "public.example"), None);
+    msg[2] |= 2;
+    assert_eq!(link_addresses(&msg, 17, "public.example"), None);
+    msg[2] &= !2;
+    msg.pop();
+    assert_eq!(link_addresses(&msg, 17, "public.example"), None);
+    let q = parse_query(&dq(17, "public.example", TYPE_AAAA)).unwrap();
+    assert_eq!(link_addresses(&response(&q, 0, &[]), 17, "public.example"), Some((TYPE_AAAA, vec![])));
+}

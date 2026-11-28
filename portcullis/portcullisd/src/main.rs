@@ -2581,7 +2581,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
              * whether the link may cross into each, by the person's own
              * switches. The asker's own app is a choice only in another
              * persona (the Work Navigator's link in the Personal one). */
-            let personas: Vec<PersonaChoice> = {
+            let (personas, source_vpn) = {
                 let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
                 match st.get_or_load(&person) {
                     Ok(tp) if !tp.policy.personas.is_empty() && tp.policy.check_personas().is_ok() => {
@@ -2598,9 +2598,10 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                                                 here: is_here, allowed, also }
                             }).collect();
                         v.sort_by_key(|p| !p.here);
-                        v
+                        (v, here.and_then(|p| pol.personas.get(p)).and_then(|d| d.vpn.clone()))
                     }
-                    _ => vec![],
+                    _ if persona.is_some() => return refuse("source persona policy unavailable".into()),
+                    _ => (Vec::new(), None),
                 }
             };
             if apps.is_empty() && personas.iter().all(|p| p.also.is_empty()) {
@@ -2619,7 +2620,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 may.push(asker_app.clone());
             }
             let grant = match grants.issue(Grant { at: now, person: person.clone(), asker_app: asker_app.clone(), persona: persona.clone(), scheme: scheme.clone(),
-                                                   apps: may }) {
+                                                   source_vpn, apps: may }) {
                 Ok(g) => g,
                 Err(why) => return refuse(why),
             };
@@ -2650,11 +2651,30 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 Some(n) => Some(n.to_string()),
             };
             let shown = |p: &Option<String>| p.as_deref().map(|n| { let mut c = n.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }).unwrap_or_else(|| "Personal".into());
-            if target != g.persona {
-                let ok = shared.lock().unwrap_or_else(|e| e.into_inner()).get_or_load(&g.person)
-                    .map(|tp| tp.policy.may_cross(g.persona.as_deref(), target.as_deref(), "links")).unwrap_or(false);
-                if !ok {
-                    return refuse(format!("cap.link.crossing: links from {} to {} are off (Settings, Apps, Between personas)", shown(&g.persona), shown(&target)));
+            let effective = if launch::not_instanced(&app).is_some() { None } else { target.clone() };
+            let mut required_vpn = None;
+            if target != g.persona || effective != g.persona {
+                let crossing_vpn = || -> Result<Option<String>, String> {
+                    let mut tenants = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let tp = tenants.get_or_load(&g.person).map_err(|_| "link policy unavailable")?;
+                    if !tp.policy.may_cross(g.persona.as_deref(), target.as_deref(), "links") {
+                        return Err(format!("cap.link.crossing: links from {} to {} are off (Settings, Apps, Between personas)", shown(&g.persona), shown(&target)));
+                    }
+                    let vpn = |p: &Option<String>| p.as_ref().and_then(|n| tp.policy.personas.get(n)).and_then(|d| d.vpn.as_ref());
+                    if vpn(&g.persona) != g.source_vpn.as_ref() {
+                        return Err("source VPN changed since the press".into());
+                    }
+                    Ok(g.source_vpn.as_ref().filter(|v| Some(*v) != vpn(&effective)).cloned())
+                };
+                match crossing_vpn() {
+                    Err(why) => return refuse(why),
+                    Ok(Some(vpn)) => {
+                        if !atrium_links::may_leave_vpn(&url, &g.scheme, |host| atrium_netconf::route_domain::link_may_leave(&vpn, host)) {
+                            return refuse(format!("cap.link.vpn: this address cannot be opened outside {}'s VPN", shown(&g.persona)));
+                        }
+                        if let Err(why) = crossing_vpn() { return refuse(why) }
+                    }
+                    Ok(None) => required_vpn = g.source_vpn.as_deref(),
                 }
                 eprintln!("portcullisd: a {} link crosses from {} to {} for {}, by the person's switch", g.scheme, shown(&g.persona), shown(&target), g.person);
             } else if app == g.asker_app {
@@ -2663,8 +2683,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             // Crossed: the app hears from which persona (a Work app opens it
             // as a stranger would, personas.md §6).
             let crossed_from = (target != g.persona).then(|| g.persona.clone().unwrap_or_else(|| PERSONAL.to_string()));
-            let persona = if launch::not_instanced(&app).is_some() { None } else { target };
-            let persona = persona.as_deref();
+            let persona = effective.as_deref();
             let key = opens::channel_key(&app, persona);
             if g.scheme == atrium_links::APP {
                 start_for_instance(&app, persona, &g.person, "an atrium-app link");
@@ -2683,7 +2702,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             if let Err(e) = hub.listen(&key) {
                 return refuse(format!("{key}'s document channel: {e}"));
             }
-            match hub.deliver_link_from(&g.person, &key, &g.scheme, &url, crossed_from.as_deref()) {
+            match hub.deliver_vpn_link(&g.person, &key, &g.scheme, &url, crossed_from.as_deref(), required_vpn) {
                 // Running: bring its window forward, as a new one would be.
                 Ok(Delivery::Sent) => match launch::instance_uid(&g.person, &app, persona) {
                     Some(uid) => match opens::raise(&opens::activation_socket(), uid) {
@@ -4881,6 +4900,28 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_refuses_an_unclassifiable_work_host_with_the_switch_on() {
+        use portcullisd::links::{Grant, Grants, MONSTRATOR_USER};
+        let mut policy = Policy::default();
+        policy.add_persona("work", "blue").unwrap();
+        policy.set_persona_vpn("work", Some("company")).unwrap();
+        policy.set_crossing("work", "personal", "links", true).unwrap();
+        let tenant = TenantPolicy { policy, policy_path: PathBuf::new() };
+        let shared = Mutex::new(Tenants {
+            cache: HashMap::from([("alice".into(), tenant)]), session_procdescs: HashMap::new(),
+        });
+        let grant = Grants::global().issue(Grant {
+            at: std::time::Instant::now(), person: "alice".into(), asker_app: "org.test.sender".into(),
+            persona: Some("work".into()), source_vpn: Some("company".into()),
+            scheme: "https".into(), apps: vec!["org.test.receiver".into()],
+        }).unwrap();
+        let request = Request::DeliverLink { grant, app: "org.test.receiver".into(),
+            url: "https://ambiguous%2fhost/".into(), always: false, persona: Some("personal".into()) };
+        let response = handle_link(MONSTRATOR_USER, request, &shared);
+        assert!(matches!(response, Response::Error { message } if message.starts_with("cap.link.vpn:")));
+    }
 
     #[test]
     fn the_sign_in_persona_is_named_alike_on_both_sides() {

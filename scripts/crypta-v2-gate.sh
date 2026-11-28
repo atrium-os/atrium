@@ -80,7 +80,7 @@ run)
     echo "== a Work profile: full tunnel, scoped to the persona"
     PRIV=$(python3 -c 'import os,base64; print(base64.b64encode(os.urandom(32)).decode())')
     SRV=$(python3 -c 'import os,base64; print(base64.b64encode(os.urandom(32)).decode())')
-    wconf() { printf '[Interface]\nPrivateKey = %s\nAddress = 10.99.0.2/24\nDNS = 10.99.0.1\n\n[Peer]\nPublicKey = %s\nEndpoint = 198.51.100.51:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n' "$PRIV" "$SRV"; }
+    wconf() { printf '[Interface]\nPrivateKey = %s\nAddress = 10.99.0.2/24\nDNS = 10.99.0.1, sealed.example\n\n[Peer]\nPublicKey = %s\nEndpoint = 198.51.100.51:51820\nAllowedIPs = %s\nPersistentKeepalive = 25\n' "$PRIV" "$SRV" "${1:-0.0.0.0/0}"; }
     IMP=$(mktemp)
     wconf | "$V" "$CTL import name=probe" > "$IMP" || fail "import: $(cat "$IMP")"
     PUB=$(sed -n 's/^imported .*public=\([^ ]*\).*/\1/p' "$IMP")
@@ -157,6 +157,27 @@ run)
     [ -z "$rt" ] && ok "route domain $WF holds no tunnel routes" || fail "left in fib $WF: $rt"
     "$V" "pfctl -a atrium/vpn -sn" | grep -q rdr && fail "DNS redirect left behind" || ok "DNS redirect removed"
     in_p 'ping -c 1 -t 3 10.88.0.1' >/dev/null && ok "Personal unaffected" || fail "Personal after down"
+    # Use the same Work FIB with a split profile. Only the tunnel DNS can
+    # distinguish these two names: one resolves into 10.99.0.0/24.
+    verdict() { "$V" "printf 'tunnel-link name=work host=%s\n' '$1' | nc -w 5 -U $G/net.sock | head -1"; }
+    [ "$(verdict public.example)" = 'error why=tunnel-link' ] && ok "a down tunnel refuses a crossing" || fail "down link verdict"
+    "$V" "$CTL delete name=work" >/dev/null || fail "delete full profile"
+    wconf 10.99.0.0/24 | "$V" "$CTL import name=work" >/dev/null || fail "import split profile"
+    "$V" "$CTL set name=work scoped=1 && $CTL up name=work" >/dev/null || fail "up split profile"
+    i=0; until [ "$(tunnel handshake | head -1)" = 1 ]; do i=$((i + 1)); [ $i -lt 30 ] || fail "no split handshake"; sleep 1; done
+    dns_before=$(stat dns)
+    [ "$(verdict x.sealed.example)" = 'error why=tunnel-link' ] && ok "tunnel DNS suffix refused" || fail "suffix verdict"
+    [ "$(verdict link.corp.test)" = 'error why=tunnel-link' ] && ok "name resolving into tunnel route refused" || fail "resolved route verdict"
+    [ "$(verdict public.example)" = clear ] && ok "public control clears through the same broker" || fail "public verdict"
+    [ "$(stat dns)" = "$dns_before" ] && ok "link checks sent no query to LAN DNS" || fail "link lookup reached LAN"
+    in_p "drill gate.atrium.test @10.88.0.53" >/dev/null
+    [ "$(stat dns)" -gt "$dns_before" ] && ok "LAN DNS counter observes a direct lookup" || fail "blind DNS counter"
+    gssh <<'EOF' || fail "missing tunnel DNS evidence"
+grep -q '^link.corp.test 1 ' /root/dns.log && grep -q '^link.corp.test 28 ' /root/dns.log &&
+grep -q '^public.example 1 ' /root/dns.log && grep -q '^public.example 28 ' /root/dns.log
+EOF
+    ok "both address families for both queried names reached tunnel DNS"
+    "$V" "$CTL down name=work" >/dev/null || fail "down split profile"
     jails_down
     "$V" "pfctl -t atrium_fib_$WF -T show 2>/dev/null" | grep -q 100.64. && fail "Work's address left in atrium_fib_$WF" || ok "released: Work's address out of the domain table"
     echo "crypta V2 gate: $pass checks passed"

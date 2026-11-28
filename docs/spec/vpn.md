@@ -658,6 +658,11 @@ its own: [personas.md](personas.md). For the VPN it means:
   the person allows links to cross personas (personas.md §6), because that would only send
   an internal name to the public network.
 
+The root-only `tunnel-link name=<profile> host=<host>` query in atrium-net checks the
+applied persona tunnel. A `clear` line followed by `ok` authorizes delivery outside
+it. [Personas, VPN-only link delivery](personas.md#vpn-only-link-delivery) describes
+the scoped DNS check, refusal cases and verification.
+
 ## 10. Posture checks
 
 ### 10.1 Rules
