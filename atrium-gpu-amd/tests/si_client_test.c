@@ -7,7 +7,8 @@
  * atrium_gpu_amd_abi.h (QUEUE_CREATE on a VM fd, QUEUE_SUBMIT on the queue
  * fd; v2 layouts). Cross-built static for FreeBSD amd64
  * (scripts/r9700/build-si-client-test.sh); run as root with the kmods
- * attached (kenv hw.atrium_gpu.client=1).
+ * attached (kenv hw.atrium_gpu.client=1). Pass --render-only to run
+ * the solid and interpolated GLSL triangles (22 and 23).
  *
  *   1 queue      one VM, one queue fd, write_42 (oracle-built, IB patched
  *                with the VAs the kernel chose), completion through kqueue
@@ -3423,7 +3424,7 @@ out:
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
 	struct job a, b, c, e, f;
 	struct si_old_submit s;
@@ -3434,6 +3435,10 @@ main(void)
 	int r, n, ms, q2, sv[2], st;
 	pid_t pid;
 
+	if (argc > 2 || (argc == 2 && strcmp(argv[1], "--render-only") != 0)) {
+		fprintf(stderr, "usage: %s [--render-only]\n", argv[0]);
+		return (2);
+	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	job_init(&a);
 	job_init(&b);
@@ -3444,6 +3449,11 @@ main(void)
 	if (fd < 0) {
 		printf("FAIL: open %s: %s\n", DEV, strerror(errno));
 		return (1);
+	}
+	if (argc == 2) {
+		triangle(1);
+		triangle(2);
+		goto out;
 	}
 
 	/* 1: one VM, one queue, one dispatch, kqueue completion. */

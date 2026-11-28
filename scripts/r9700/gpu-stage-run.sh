@@ -2,8 +2,10 @@
 # gpu-stage-run.sh: one silicon bring-up run of atrium_gpu_amd_pci on the
 # R9700 box, done in a single ssh call (docs/spec/r9700-bare-metal.md).
 #
+#   gpu-stage-run.sh --identify              print the guest PCI function and BARs
 #   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e 5a 5b 5c1
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> 5c2
+#   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> render
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256>,<suite sha256>,<iso sha256> 5f
 #   FUZZ_SHA=<sha256> gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> fz:<seconds>:<seed>
 #   FRESCO_SHA=<sha256> gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> fc
@@ -46,11 +48,41 @@ ISO=/root/test-gpu-isolation
 PROBE=/root/atrium-gpu-probe
 FUZZ=/root/si-fuzz
 FRESCOD=/root/frescod
-GPU_SEL=pci0:3:0:0
-GPU_DEV=vgapci0
 KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach mes_mscratch vm_test uq_test client"
 
-[ $# -ge 2 ] || { echo "usage: $0 <sha256> <stage>..." >&2; exit 2; }
+if [ "$#" -lt 2 ] && [ "${1:-}" != --identify ]; then
+	echo "usage: $0 --identify | <sha256> <stage>..." >&2
+	exit 2
+fi
+# The guest assigns its own PCI addresses and vgapci units. The audio
+# function and any emulated boot display must stay outside the stage run.
+devices=$(pciconf -l) || exit 1
+gpu=$(printf '%s\n' "$devices" | awk '
+	$1 ~ /^[[:alnum:]_]+@pci[0-9]+:[0-9]+:[0-9]+:[0-9]+:$/ {
+		vendor = device = display = 0
+		for (i = 2; i <= NF; i++) {
+			if ($i == "vendor=0x1002") vendor = 1
+			if ($i == "device=0x7551") device = 1
+			if ($i ~ /^class=0x03[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$/) display = 1
+		}
+		if (vendor && device && display) { found = $1; count++ }
+	}
+	END {
+		if (count != 1) exit 1
+		sub(/:$/, "", found)
+		print found
+	}') || { echo "Expected one 1002:7551 display function in pciconf -l" >&2; exit 1; }
+GPU_SEL=${gpu#*@}
+GPU_DEV=${gpu%@*}
+if [ "${1:-}" = --identify ]; then
+	[ "$#" -eq 1 ] || exit 2
+	echo "$GPU_DEV at $GPU_SEL"
+	exec pciconf -lb "$GPU_SEL"
+fi
+case "$GPU_DEV" in
+vgapci[0-9]*) ;;
+*) echo "REFUSED: $GPU_SEL has driver $GPU_DEV, expected vgapci" >&2; exit 1 ;;
+esac
 shas=$1; shift
 want=${shas%%,*}
 want_gpu=""; want_test=""; want_suite=""; want_iso=""
@@ -64,6 +96,7 @@ esac
 kenvs=""
 hold=0
 client=0
+render=0
 suites=0
 fuzz=""
 fcheck=0
@@ -79,6 +112,8 @@ for s in "$@"; do
 	5b) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test"; hold=30 ;;
 	5c1) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test uq_test"; hold=30 ;;
 	5c2) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1 ;;
+	render) [ "$#" -eq 1 ] || { echo "render runs by itself" >&2; exit 2; }
+		kenvs="psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; render=1 ;;
 	5f) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; suites=1 ;;
 	fz:*:*) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; fuzz=${s#fz:} ;;
 	fc) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; fcheck=1 ;;
@@ -96,9 +131,10 @@ temps() {
 }
 
 run() {
+result=0
 echo "== run $(date -u) stages: $* kenvs:$kenvs"
 got=$(sha256 -q "$KO" 2>/dev/null)
-if [ "$got" != "$want" ]; then
+if [ -z "$got" ] || [ "$got" != "$want" ]; then
 	echo "REFUSED: $KO sha256 $got, want $want"
 	exit 1
 fi
@@ -140,20 +176,31 @@ if kldstat -q -m atrium_gpu_amd_pci 2>/dev/null || kldstat | grep -q atrium_gpu_
 	exit 1
 fi
 echo "== before"; temps
-[ -x "$PROBE" ] && "$PROBE" pci 3:0:0 --status
+[ -x "$PROBE" ] && "$PROBE" pci "$GPU_SEL" --status
 
 sysctl kern.msgbuf_clear=1 >/dev/null
 for k in $kenvs; do kenv -q hw.atrium_gpu.$k=1 >/dev/null; done
 echo "== kldload"
-kldload "$KO"; echo "kldload rc=$?"
-[ "$client" = 1 ] && { kldload "$GPU_KO"; echo "kldload gpu module rc=$?"; }
+kldload "$KO"; rc=$?; echo "kldload rc=$rc"
+[ "$rc" -eq 0 ] || result=1
+if [ "$client" = 1 ]; then
+	kldload "$GPU_KO"; rc=$?; echo "kldload gpu module rc=$rc"
+	[ "$rc" -eq 0 ] || result=1
+fi
 if [ "$hold" -gt 0 ]; then
-	devctl set driver -f "$GPU_DEV" atrium_gpu_amd_pci; echo "attach rc=$? (0 expected: stays attached)"
+	devctl set driver -f "$GPU_SEL" atrium_gpu_amd_pci; rc=$?; echo "attach rc=$rc (0 expected: stays attached)"
+	[ "$rc" -eq 0 ] || result=1
 	if [ "$client" = 1 ]; then
 		ls -l /dev/atrium-gpu0 /dev/atrium-gpu0ctl
 		# fc: frescod first, on a card with its whole re-init budget
 		# (run fc-b1e2ef3: si-client-test 14 had spent it all).
-		if [ "$fcheck" != 1 ]; then
+		if [ "$render" = 1 ]; then
+			if [ "$result" -eq 0 ]; then
+				timeout 600 "$TEST" --render-only; rc=$?
+				echo "si-client-test --render-only rc=$rc"
+				[ "$rc" -eq 0 ] || result=1
+			fi
+		elif [ "$fcheck" != 1 ]; then
 			echo "== si-client-test"
 			timeout 600 "$TEST"; echo "si-client-test rc=$?"
 		fi
@@ -213,25 +260,31 @@ if [ "$hold" -gt 0 ]; then
 		sleep 2
 	done
 else
-	devctl set driver -f "$GPU_DEV" atrium_gpu_amd_pci; echo "attach rc=$? (ENXIO expected)"
+	devctl set driver -f "$GPU_SEL" atrium_gpu_amd_pci; echo "attach rc=$? (ENXIO expected)"
 fi
 echo "== kernel log"
 dmesg | sed -n '/atrium_gpu_amd/,$p'
 echo "stray lines: $(dmesg | grep -ci stray)"
 
 echo "== cleanup"
-devctl set driver -f "$GPU_SEL" vgapci; echo "give-back rc=$?"
+devctl set driver -f "$GPU_SEL" vgapci; rc=$?; echo "give-back rc=$rc"
+[ "$rc" -eq 0 ] || result=1
 for k in $KNOBS keep_state gfx_cg mode1_reset; do kenv -q -u hw.atrium_gpu.$k 2>/dev/null; done
 echo "kenvs left: $(kenv | grep -c hw.atrium_gpu)"
-[ "$client" = 1 ] && { kldunload atrium_gpu_amd; echo "kldunload gpu module rc=$?"; }
-kldunload atrium_gpu_amd_pci; echo "kldunload rc=$?"
+if [ "$client" = 1 ]; then
+	kldunload atrium_gpu_amd; rc=$?; echo "kldunload gpu module rc=$rc"
+	[ "$rc" -eq 0 ] || result=1
+fi
+kldunload atrium_gpu_amd_pci; rc=$?; echo "kldunload rc=$rc"
+[ "$rc" -eq 0 ] || result=1
 echo "atrium modules loaded: $(kldstat | grep -c atrium_gpu_amd)"
 
 echo "== after"
-[ -x "$PROBE" ] && "$PROBE" pci 3:0:0 --status
+[ -x "$PROBE" ] && "$PROBE" pci "$GPU_SEL" --status
 sleep 30
 echo "== temps 30 s after"; temps
 echo "== done, log $out"
+return "$result"
 }
 
 # The whole run's kernel log, next to the run log: newsyslog keeps only 5
@@ -240,7 +293,10 @@ echo "== done, log $out"
 kern=${out%.log}.kern
 tail -n 0 -F /var/log/messages > "$kern" 2>/dev/null &
 kpid=$!
+set -o pipefail
 run "$@" 2>&1 | tee "$out"
+rc=$?
 sleep 2
 kill "$kpid" 2>/dev/null
 echo "kernel log for the run: $kern ($(wc -l < "$kern") lines)" | tee -a "$out"
+exit "$rc"

@@ -276,6 +276,16 @@ R9700 only. Each step lands as a box run with logs in `docs/r9700-runs/`.
 | 7e | **Vulkan graphics.** 7c's pipeline builder behind `tier3_rdna4`: render passes, images (swizzle modes, no compression), samplers, depth, blending, present by fd. fresco-vulkan `HeadlessRenderer` and the ICD graphics examples match Tier-2; then vkcube-class apps on the display. |
 | 7f | **Toward games.** Texture formats and mips, MSAA, descriptor indexing, indirect draws, timestamps, pipeline cache, multi-queue; performance against RADV on the same box. |
 
+### 4.8 Native GPU development in a Vaahana guest on Hostkey
+
+On 2026-11-28, Vaahana booted a sparse clone of `~vaahana/guest/atrium/root.raw` with CloudHvX64 UEFI and KVM. The amd64 guest reached a shell on `ttyu0`, mounted `/dev/gpt/rootfs` read/write and enumerated `vtnet0`. Its `ATRIUM-VAAHANA` kernel came from `atrium-os-456c30b0356c`, reported `kern.osreldate=1600031`, and matched the staged kernel SHA-256 `72f1d6a529502841d80998dbfda96ad994a3a6e03feeb9efff2d497c73576f7d`. The stock image included the GPU probe and firmware. It had no running jails or installed desktop services. The VMM held a KVM VM descriptor and two vCPU descriptors.
+
+For PCI enumeration, run `sh scripts/r9700/gpu-stage-run.sh --identify` **inside the FreeBSD guest**. It prints the driver, guest PCI selector and BARs of the sole AMD `1002:7551` display function. It exits unsuccessfully if the device is absent or ambiguous. The stage runner uses the same selector for the register probe and driver hand-back. This matters when an emulated display gets `vgapci0` or the hypervisor assigns the real card a different slot than the host.
+
+The first run on this clone exposed the host's `0000:03:00.0` as `vgapci0@pci0:0:5:0`, subsystem `1da2:e499`. FreeBSD reported enabled 32 GiB and 256 MiB prefetchable BARs at `0x800000000` and `0x1000000000`, a 256-byte I/O BAR at `0xc000`, and a 512 KiB register BAR at `0xc0000000`. The sibling HDMI-audio function stayed outside the guest. The host restored both original drivers and cleared overrides, verified four bridge bindings and zero open consumers, and released group 1 at 18:53 IST. The host boot ID and base disk were unchanged.
+
+For a native run use modules from the guest kernel's build and check the guest kernel and module digests. The probe and client run from the guest's local disk. With the matched files staged at the paths in the script, `sh gpu-stage-run.sh <pci-ko-sha>,<gpu-ko-sha>,<client-sha> render` attaches the driver, runs `si-client-test --render-only`, and hands the function back to `vgapci`. Test 22 checks the solid GLSL triangle and test 23 checks the interpolated colour triangle against the CPU pixel reference. The render stage reports failure if loading, attach, render or final driver cleanup fails. Host driver binding and restoration are coordinated under the shared Hostkey reservation.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
