@@ -1,7 +1,8 @@
 # App, workspace and console jails through jaild
 
-**Status: ACCEPTED 2026-11-25. J0 and J1 built (§3.1, §4.1); J2 next** (codebase review
-H3, option (a), chosen by Shankar 2026-11-24). portcullisd does not use any of it yet.
+**Accepted 2026-11-25 (review H3, option (a)). J0–J2 are built.** §§1–2
+describe the pre-J2 launch path. See [§4.2](#42-as-built-j2) for the deployed
+path and [§4.3](#43-j2-integration-gates) for its application gates.
 
 ## 1. Why
 
@@ -190,6 +191,30 @@ and then through jaild's validator with the shipped policy.
   prelumd) still follow their `RemoveJail` with a `jail -r`. The
   `sysfil.*` parameters `build` still sets only tell the mapping that a
   class is needed.
+
+### 4.3 J2 integration gates
+
+Evidence reconciled 2026-11-28. The paths below are under
+`~/atrium-vm/evidence/` on the Mac unless otherwise noted. The cloud runner
+dispatches to four app scripts. The installed-app runs also exercise jaild
+and Portcullis, which these four scripts do not deploy.
+
+| Gate | J2 evidence and disposition |
+|---|---|
+| Sheets, `test sheets` | **Scroll gate pending.** On arm64 at `e20b8e982`, the signed Sheets launcher opened two document jails. A sibling could read its own journal and could not reach the first journal. The edited word survived recovery, and closing left zero document mounts. `sheets-j2-20261125T081404Z/` holds the host/guest binary hashes, jail lists, recovery and teardown records. The cloud script still needs its CSV screenshot and all scroll patterns on 1,048,576 rows. Check both outputs because the script can exit zero after a missing screenshot or failed benchmark. |
+| Navigator UI, `test navigator-ui` | **Script passed.** The arm64 rerun built from the i6 checkout at `690b26a72`. Seven scenes, six narrow light/dark frames and the driven frames are in `navigator-ui-memory-show-20261126/ui-shots2/`. Its `ui-vm2.log` records three window-width assertions and six input assertions, zero failures. |
+| Navigator live, `test navigator-live` | **Script passed.** At `5edf1a7bc`, `navigator-probes-20261126/live-vm4.log` records 76 successful checks and zero failures, including the Show in Files press. These two scripts ran directly on arm64. The installed J2 launch is independently witnessed at `067dced7e` with the repository’s app-class policy in the guest, binary hashes and I6.2 steps 5–7. [Navigator I6.2 results](navigator-islands.md#i62-second-part-gate-results-on-arm64-tessera-2026-11-25) |
+| Mail, `test mail` | **Dovecot/Pigeonhole gate pending.** The eight-test `~/atrium-vm/mail-vm-check.log` is from November 19, before J2. The signed legacy/JMAP gate passed 42 native tests and reported guest exit 0. The installed S/MIME guest emitted its success marker and saved the Arca sheet; its outer runner exited 1 after a timeout. `5f645fb03` added guest-exit reporting. Both used jaild built at `46b8c4933` (includes `d6d0346aa` and `483276d70`), with the other staged binaries from `6de018f54`. See `mail/vm-2026-11-25-j2/rerun/`. |
+| Automount, `vm-automount-check.sh` | **Host fixture passed on macOS arm64. Guest gate pending.** The host formatter at `e29285651` made the gate’s 64 MiB image with 19 bytes in `notes.txt`. Offline fsck reported CLEAN, and Capsa’s inline/chunked host readback test passed. The compressed fixture and logs are in `j2-automount-host-20261127/`. The [earlier automount run](device-assignment.md#69-as-built-tessera-sticks-read-only-2026-11-14) predates J2. The guest check needs a prepared amd64 guest, its sysroot and QEMU’s emulated xHCI on a Linux host. |
+
+For the two pending app runs, use a powered-off J2 ZFS base with the
+matching sysroot as described in [RUNBOOK §13.1](../../RUNBOOK.md).
+Record the deployed jaild and portcullisd hashes along with each gate log.
+The local arm64 `~/atrium-vm/vm.qcow2` has a UFS root partition and the
+Navigator fixtures boot Tessera. No prepared amd64 base was found here. For
+automount, point `VM_SSH_PORT` and `VMDIR` at the same disposable guest. The
+Linux formatter build needs `libmd-dev`. The gate uses file-backed
+`usb-storage` devices on the emulated controller.
 
 ## 5. Order of work
 

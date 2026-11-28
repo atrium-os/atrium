@@ -3,7 +3,8 @@
 # plugged into the cloud amd64 VM (scripts/cloud-vm.sh, with a USB
 # controller) is served under /media for the logged-in user only, with the
 # shipped rule, pin and ruleset. Runs on the HOST with the Portcullis stack
-# deployed:
+# deployed. On a Linux build host the formatter needs libmd-dev. Set
+# VM_SSH_PORT and VMDIR to the disposable guest’s forwarded port and directory.
 #
 #   ARCH=amd64 QEMU_EXTRA="-device qemu-xhci" sh scripts/cloud-vm.sh up
 #   sh scripts/vm-automount-check.sh
@@ -32,8 +33,9 @@
 # Ends "automount: N failed".
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
+VMDIR=$(cd "${VMDIR:-$HOME/atrium-vm-amd64}" && pwd) || exit 1
 TRIPLE=x86_64-unknown-freebsd
+VM_SSH_PORT=${VM_SSH_PORT:-2222}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 V() { "$ROOT/scripts/vssh" "$@"; }
 mon() { python3 -I -c '
@@ -90,9 +92,10 @@ mkfs.fat -F 32 --offset 2048 -n STICK "$IMG" $(( (96*1024*1024 - 1048576) / 1024
 IMG3=$VMDIR/exfat.img
 rm -f "$IMG3"; truncate -s 128M "$IMG3"; mkfs.exfat -L XSTICK "$IMG3" >/dev/null && echo "  exFAT stick image ready" || { echo "  could not build the exFAT image"; exit 1; }
 # A Tessera stick (another Atrium machine's), seeded on this side.
-IMG4=$VMDIR/tessera.img; MKT="$ROOT/atrium-tessera/rs/target/debug/mkfs-tessera"
-[ -x "$MKT" ] || ( cd "$ROOT/atrium-tessera/rs" && cargo build -q -p tessera-tools ) || { echo "  could not build mkfs-tessera"; exit 1; }
-rm -f "$IMG4"; "$MKT" --create -s 64 --seed-file notes.txt --seed-content "from another atrium" "$IMG4" >/dev/null \
+IMG4=$VMDIR/tessera.img
+rm -f "$IMG4"
+( cd "$ROOT/atrium-tessera/rs" && cargo run -q --locked -p tessera-tools --bin mkfs-tessera -- \
+    --create -s 64 --seed-file notes.txt --seed-content "from another atrium" "$IMG4" ) \
   && echo "  Tessera stick image ready" || { echo "  could not build the Tessera image"; exit 1; }
 # And one with FAT straight on the disk ("superfloppy").
 IMG2=$VMDIR/bare.img
@@ -102,13 +105,13 @@ rm -f "$IMG2"; mkfs.fat -C -F 32 -n BARE "$IMG2" $((80*1024)) >/dev/null \
 
 echo "== copy and install"
 V 'rm -rf /root/am && mkdir -p /root/am/scripts /root/am/capsa/etc/devices.d'
-scp -q $K -P 2222 "$ROOT/portcullis/target/$TRIPLE/release/atrium-jaild" \
+scp -q $K -P "$VM_SSH_PORT" "$ROOT/portcullis/target/$TRIPLE/release/atrium-jaild" \
   "$ROOT/dispensator/target/$TRIPLE/release/atrium-dispensatord" \
   "$ROOT/capsa/target/$TRIPLE/release/atrium-capsa-fuse" \
   "$ROOT/portcullis/target/$TRIPLE/release/atrium-portcullisd-jclient" \
   "$ROOT/etc/atrium.devfs.rules" root@localhost:/root/am/
-scp -q $K -P 2222 "$ROOT/scripts/capsa-service.sh" root@localhost:/root/am/scripts/
-scp -q $K -P 2222 "$ROOT/capsa/etc/devices.d/50-capsa.toml" root@localhost:/root/am/capsa/etc/devices.d/
+scp -q $K -P "$VM_SSH_PORT" "$ROOT/scripts/capsa-service.sh" root@localhost:/root/am/scripts/
+scp -q $K -P "$VM_SSH_PORT" "$ROOT/capsa/etc/devices.d/50-capsa.toml" root@localhost:/root/am/capsa/etc/devices.d/
 V 'sh -s' <<'EOF'
 P=/etc/atrium/jaild.policy.toml
 cd /root/am
