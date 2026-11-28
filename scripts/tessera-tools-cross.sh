@@ -1,9 +1,10 @@
 #!/bin/sh
 # Cross-build the Tessera userspace tools (mkfs-tessera, tessera-fsck,
-# tessera-stat, ...) for the arm64 FreeBSD guest from a Linux cloud session.
+# tessera-stat, ...) for an arm64 or amd64 FreeBSD guest.
 #
 #   sh scripts/tessera-tools-cross.sh            # Rust on-disk decoders (default)
 #   TESSERA_C_DECODE=1 sh scripts/tessera-tools-cross.sh   # all-C reference
+#   ARCH=amd64 SYSROOT=/path/to/amd64/sysroot sh scripts/tessera-tools-cross.sh
 #
 # The tools link the C core as a prebuilt archive (tessera-sys build.rs, the
 # FreeBSD branch). The Mac builds that archive in bootstrap-atrium.sh's
@@ -12,18 +13,20 @@
 # the guest (on the Mac, LLVMBIN=$(brew --prefix llvm)/bin and the
 # ~/atrium-vm/sysroot the VM setup left). -DTESSERA_RUST_DECODE makes the core's decoders forward to
 # tessera-decode (D3, atrium-tessera/docs/rust-decoders.md), which tessera-sys
-# always links. Output: atrium-tessera/rs/target/aarch64-unknown-freebsd/release/,
-# the default TOOLS= of scripts/tessera-decode-vm-e2e.sh.
+# always links. Output: atrium-tessera/rs/target/<target>/release/.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CORE="$ROOT/atrium-tessera/core"
 RS="$ROOT/atrium-tessera/rs"
-SYSROOT="${SYSROOT:-$HOME/atrium-vm/sysroot}"
 LLVM="${LLVM:-18}"
 # LLVMBIN: a directory with clang, llvm-ar and llvm-nm (default the distro's
 # llvm-$LLVM; on the Mac, $(brew --prefix llvm)/bin).
 LLVMBIN="${LLVMBIN:-/usr/lib/llvm-$LLVM/bin}"
-TRIPLE=aarch64-unknown-freebsd
+case "${ARCH:-arm64}" in
+    arm64) TRIPLE=aarch64-unknown-freebsd; SYSROOT="${SYSROOT:-$HOME/atrium-vm/sysroot}" ;;
+    amd64) TRIPLE=x86_64-unknown-freebsd; SYSROOT="${SYSROOT:-$HOME/atrium-vm/sysroot-amd64}" ;;
+    *) echo "unsupported FreeBSD architecture: $ARCH" >&2; exit 1 ;;
+esac
 [ -d "$SYSROOT/usr/include" ] || { echo "no sysroot at $SYSROOT (scripts/cloud-vm.sh setup)" >&2; exit 1; }
 
 DEFS="-D__libtessera_core__"
@@ -33,6 +36,10 @@ if [ "${TESSERA_C_DECODE:-}" = 1 ]; then
 else
     DEFS="$DEFS -DTESSERA_RUST_DECODE"
 fi
+if [ "${ARCH:-arm64}" = amd64 ]; then
+    DEFS="$DEFS -DBLAKE3_USE_X86=1"
+    OUT="$OUT-amd64"
+fi
 
 # SRCS from the Makefile (backslash-continued), never a copy.
 SRCS=$(sed -n '/^SRCS=/,/[^\\]$/p' "$CORE/Makefile" | sed 's/^SRCS=//; s/\\$//' | tr -s ' \t' '\n' | grep '\.c$')
@@ -41,7 +48,14 @@ SRCS=$(sed -n '/^SRCS=/,/[^\\]$/p' "$CORE/Makefile" | sed 's/^SRCS=//; s/\\$//' 
 rm -rf "$OUT"
 mkdir -p "$OUT"
 for f in $SRCS; do
-    "$LLVMBIN/clang" --target=aarch64-unknown-freebsd16.0 --sysroot="$SYSROOT" \
+    set --
+    if [ "${ARCH:-arm64}" = amd64 ]; then
+        case "$f" in
+            b3_blake3_sse41.c) set -- -msse4.1 ;;
+            b3_blake3_avx2.c) set -- -mavx2 ;;
+        esac
+    fi
+    "$LLVMBIN/clang" --target="${TRIPLE}16.0" --sysroot="$SYSROOT" "$@" \
         -isystem "$SYSROOT/usr/include" -O2 -fPIC -fno-strict-aliasing \
         -I"$CORE/include" -I"$CORE/src" $DEFS -c "$CORE/src/$f" -o "$OUT/${f%.c}.o"
 done

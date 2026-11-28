@@ -253,3 +253,30 @@ clone. The base remains available to reproduce a clean stock boot.
 The guest also enumerated the physical R9700 in a separate reservation.
 The [guest PCI record and native render procedure](r9700-bare-metal.md#48-native-gpu-development-in-a-vaahana-guest-on-hostkey)
 give the BARs, module checks and render acceptance command.
+
+### 7.1 Tessera root on a second disk
+
+The Hostkey storage test uses the UFS clone's EFI loader and kernel. A second
+writable raw disk provides a GPT partition labeled `atrium-troot`. The
+kernel's effective config includes GPT, GEOM labels, virtio-blk and crypto.
+Cross-build `tessera_fs.ko` with the config and FreeBSD source revision
+above. Build the userspace tools with `ARCH=amd64`, the matching FreeBSD
+sysroot and `scripts/tessera-tools-cross.sh`.
+
+On 2026-11-28 the host built the Rust-decoder module (SHA-256
+`d976125f9a66f524cf74d32add7caaac648db32d8189b194a89f2f2898ea6f4b`),
+formatted a 16 GiB Tessera volume, verified it with `tessera-fsck -n`,
+and checked both GPT headers and every partition byte in the resulting raw
+disk. The seeded disk compresses to 582,653 bytes. It still needs a guest
+module load, population from UFS and two boots to establish persistence.
+
+To test the prepared disk, attach it after the UFS clone and boot the clone
+normally. Load the matched module, mount the new volume, copy the UFS
+userland, and select the GPT provider as the Tessera root in the copy's
+`/etc/fstab`. Unmount and check it with `tessera-fsck -n`. On the next
+boot, interrupt the UFS loader, load its kernel and the matched module from
+UFS, set `vfs.root.mountfrom=tessera:/dev/gpt/atrium-troot` and
+`vfs.root.mountfrom.options=rw`, then boot. Confirm `mount -p` shows that
+provider mounted read/write on `/`, write a unique marker, and read it back
+after a second clean boot using the same loader settings. Default boot from
+the UFS clone remains available throughout the test.
