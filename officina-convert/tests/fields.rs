@@ -80,3 +80,87 @@ fn toc_and_references_round_trip() {
         assert!(fields::toc_ops(&mut r, 0, 3).is_empty(), "{fmt}: contents read back are current");
     }
 }
+
+#[test]
+fn a_single_contents_entry_keeps_its_level_and_target_through_docx() {
+    let mut d = TextDoc::new();
+    let h2 = d.styles.by_name("Heading 2").unwrap();
+    d.push_para("Only chapter", h2, vec![]);
+    for op in fields::toc_ops(&mut d, 0, 2) {
+        op.apply(&mut d);
+    }
+    let bytes = docx::write(&d, Vec::new()).unwrap();
+    let (back, _) = docx::read(&bytes).unwrap();
+    assert_eq!(shape(&back).0, vec![(2, "Only chapter".into(), "Only chapter".into())]);
+}
+
+#[cfg(test)]
+fn read_document_xml(xml: &[u8]) -> TextDoc {
+    let mut zip = officina_convert::zip::ZipWriter::new(Vec::new());
+    zip.add("word/document.xml", xml).unwrap();
+    docx::read(&zip.finish().unwrap()).unwrap().0
+}
+
+#[test]
+fn an_empty_contents_message_keeps_its_default_style_through_odt() {
+    // Word caches a localized message as ordinary formatted text in the TOC field.
+    let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:pPr><w:spacing w:before="120"/></w:pPr>
+            <w:r><w:fldChar w:fldCharType="begin"/><w:instrText> TOC </w:instrText><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:rPr><w:i/></w:rPr><w:t>Es wurden keine Einträge für das Inhaltsverzeichnis gefunden.</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+        <w:p><w:bookmarkStart w:id="1" w:name="chapter"/><w:r><w:t>Chapter</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>
+        <w:p><w:pPr><w:spacing w:before="120"/></w:pPr>
+            <w:r><w:fldChar w:fldCharType="begin"/><w:instrText> TOC </w:instrText><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>Chapter</w:t><w:tab/></w:r><w:fldSimple w:instr="PAGEREF chapter"><w:r><w:t>1</w:t></w:r></w:fldSimple>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+    </w:body></w:document>"#;
+    let d = read_document_xml(xml.as_bytes());
+    let bytes = odt::write(&d, Vec::new()).unwrap();
+    let (back, _) = odt::read(&bytes).unwrap();
+    for doc in [&d, &back] {
+        let message = doc.para(0).unwrap();
+        assert_eq!(message.text, "Es wurden keine Einträge für das Inhaltsverzeichnis gefunden.");
+        assert_eq!(message.props.toc, Some(1));
+        assert!(doc.fields_in(message).is_empty());
+        assert_eq!(message.style, 0);
+        assert_eq!(message.props.space_before, Some(120));
+        assert_eq!(doc.attrs.get(message.attr_at(0)).italic, Some(true));
+        let linked = doc.para(2).unwrap();
+        assert_eq!(linked.props.toc, Some(1));
+        assert_eq!(doc.fields_in(linked)[0].1, Field::PageRef(doc.para(1).unwrap().id));
+    }
+    let entry = back.para(2).unwrap();
+    assert_eq!(back.styles.styles[entry.style as usize].name.as_ref(), "Contents 1");
+}
+
+#[test]
+fn field_delimiters_alone_do_not_make_body_paragraphs_contents_entries() {
+    let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:t>Contents</w:t><w:fldChar w:fldCharType="begin"/>
+            <w:instrText> TOC </w:instrText><w:fldChar w:fldCharType="separate"/></w:r></w:p>
+        <w:p><w:r><w:t>First chapter</w:t></w:r></w:p>
+        <w:p><w:r><w:fldChar w:fldCharType="end"/><w:br w:type="page"/><w:t>Body text</w:t></w:r></w:p>
+    </w:body></w:document>"#;
+    let d = read_document_xml(xml);
+    let paras: Vec<_> = d.blocks.iter().filter_map(|b| b.as_para()).map(|p| (p.text.as_str(), p.props.toc)).collect();
+    assert_eq!(paras, [("Contents", None), ("First chapter", Some(1)), ("\u{000c}Body text", None)]);
+}
+
+#[test]
+fn a_missing_page_reference_with_no_cached_text_leaves_no_contents_entry() {
+    let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:fldChar w:fldCharType="begin"/><w:instrText> TOC </w:instrText>
+            <w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:rPr><w:b/></w:rPr><w:fldChar w:fldCharType="begin"/>
+            <w:instrText> PAGEREF missing </w:instrText><w:fldChar w:fldCharType="end"/></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+    </w:body></w:document>"#;
+    let d = read_document_xml(xml);
+    let p = d.para(0).unwrap();
+    assert!(p.text.is_empty());
+    assert_eq!(p.props.toc, None);
+    let typing = d.attrs.get(p.attr_at(0));
+    assert_eq!(typing.field, None);
+    assert_eq!(typing.bold, Some(true));
+}

@@ -210,10 +210,16 @@ pub fn bind(doc: &mut TextDoc, names: &[String], marks: &HashMap<String, BlockId
             }
         }
         if runs.is_empty() {
-            runs.push((0, p.runs[0].1));
+            // An empty cached result leaves the field's typing format.
+            let mut typing = doc.attrs.get(p.attr_at(0)).clone();
+            typing.field = None;
+            runs.push((0, doc.attrs.intern(typing)));
         }
         doc.blocks.update(i, |b| {
             if let Some(q) = b.as_para_mut() {
+                if text.is_empty() {
+                    q.props.toc = None;
+                }
                 q.text = text;
                 q.runs = runs;
                 q.normalize();

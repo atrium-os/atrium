@@ -729,6 +729,8 @@ fn all_of<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
 /// What a paragraph is being built of.
 #[derive(Default)]
 struct Para {
+    /// At least one character was emitted inside a TOC result.
+    has_toc_result: bool,
     text: String,
     runs: Vec<(u32, CharAttrs)>,
     /// The deletion being read, and the deleted text read: (from, to, revision).
@@ -737,10 +739,11 @@ struct Para {
 }
 
 impl Para {
-    fn push(&mut self, s: &str, a: &CharAttrs) {
+    fn push(&mut self, s: &str, a: &CharAttrs, field: &FieldState) {
         if s.is_empty() {
             return;
         }
+        self.has_toc_result = self.has_toc_result || field.in_toc();
         let at = self.text.len() as u32;
         if self.runs.last().map(|r| &r.1) != Some(a) {
             self.runs.push((at, a.clone()));
@@ -1471,17 +1474,18 @@ impl<'a> Reader<'a> {
                                 Some("separate") => {
                                     if let Some(f) = field.stack.last_mut().filter(|f| f.stage == Stage::Instr) {
                                         f.stage = Stage::Result;
+                                        f.toc_result = is_toc(&f.instr);
                                     }
                                 }
                                 Some("end") => {
                                     if let Some(f) = field.stack.pop() {
                                         if field.in_margin {
                                             if let Some(s) = page_field(&f.instr) {
-                                                p.push(s, &a);
+                                                p.push(s, &a, field);
                                             }
                                         }
                                         if field.live_ref(&f.instr) && field.shows_result() {
-                                            self.push_ref(p, &a, &f.instr, &f.result);
+                                            self.push_ref(p, &a, &f.instr, &f.result, field);
                                         }
                                     }
                                 }
@@ -1499,7 +1503,7 @@ impl<'a> Reader<'a> {
                                 let t = if k.attr("xml:space") == Some("preserve") { t.as_str() } else { t.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\r' | '\t')) };
                                 let t: String = t.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
                                 if field.shows_result() {
-                                    p.push(&t, &a);
+                                    p.push(&t, &a, field);
                                 } else if let Some(i) = field.stack.iter().rposition(|f| f.stage == Stage::Result && field.live_ref(&f.instr)) {
                                     // A reference's result, kept to show until pages are laid out.
                                     if field.stack[i + 1..].iter().all(|f| f.stage == Stage::Result) && field.stack[i].result.len() < 1024 {
@@ -1507,21 +1511,21 @@ impl<'a> Reader<'a> {
                                     }
                                 }
                             }
-                            "w:tab" | "w:ptab" => p.push("\t", &a),
+                            "w:tab" | "w:ptab" => p.push("\t", &a, field),
                             "w:br" | "w:cr" => {
                                 if k.attr("w:type") == Some("page") {
-                                    p.push(&PAGE_BREAK.to_string(), &a);
+                                    p.push(&PAGE_BREAK.to_string(), &a, field);
                                 } else if k.attr("w:type") == Some("column") {
-                                    p.push(&COLUMN_BREAK.to_string(), &a);
+                                    p.push(&COLUMN_BREAK.to_string(), &a, field);
                                 } else {
-                                    p.push("\u{2028}", &a);
+                                    p.push("\u{2028}", &a, field);
                                 }
                             }
-                            "w:noBreakHyphen" => p.push("\u{2011}", &a),
-                            "w:softHyphen" => p.push("\u{AD}", &a),
+                            "w:noBreakHyphen" => p.push("\u{2011}", &a, field),
+                            "w:softHyphen" => p.push("\u{AD}", &a, field),
                             "w:sym" => {
                                 if let Some(c) = k.attr("w:char").and_then(|c| u32::from_str_radix(c, 16).ok()).and_then(char::from_u32) {
-                                    p.push(&c.to_string(), &a);
+                                    p.push(&c.to_string(), &a, field);
                                 }
                             }
                             "w:drawing" => {
@@ -1529,14 +1533,14 @@ impl<'a> Reader<'a> {
                                 if let Some(o) = o {
                                     let mut pa = a.clone();
                                     pa.object = Some(o);
-                                    p.push(&OBJECT_CHAR.to_string(), &pa);
+                                    p.push(&OBJECT_CHAR.to_string(), &pa, field);
                                 }
                             }
                             "w:pict" | "w:object" => {
                                 if let Some(o) = vml.flatten() {
                                     let mut pa = a.clone();
                                     pa.object = Some(o);
-                                    p.push(&OBJECT_CHAR.to_string(), &pa);
+                                    p.push(&OBJECT_CHAR.to_string(), &pa, field);
                                 }
                             }
                             // Ruby inside a run (Word writes it there too): the base text.
@@ -1557,7 +1561,7 @@ impl<'a> Reader<'a> {
                                     na.style = None;
                                     na.object = None;
                                     na.note = Some(nid);
-                                    p.push(&OBJECT_CHAR.to_string(), &na);
+                                    p.push(&OBJECT_CHAR.to_string(), &na, field);
                                     self.pending.push((nid, kind, id));
                                 }
                             }
@@ -1582,7 +1586,7 @@ impl<'a> Reader<'a> {
                     match page_field(instr) {
                         Some(s) if field.in_margin => {
                             let a = x.find("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
-                            p.push(s, &a);
+                            p.push(s, &a, field);
                         }
                         _ if field.live_ref(instr) && field.shows_result() => {
                             let mut a = x.find("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
@@ -1590,7 +1594,7 @@ impl<'a> Reader<'a> {
                                 a.link = Some(l.clone());
                             }
                             let shown: String = x.children("w:r").flat_map(|r| r.children("w:t")).map(|t| t.text()).collect();
-                            self.push_ref(p, &a, instr, &shown);
+                            self.push_ref(p, &a, instr, &shown, field);
                         }
                         _ => self.runs(x, p, link, field),
                     }
@@ -1734,7 +1738,7 @@ impl<'a> Reader<'a> {
 
     /// A reference field read: a U+FFFC whose field names its bookmark (bound
     /// once the document is read); `shown` is what the file showed.
-    fn push_ref(&mut self, p: &mut Para, a: &CharAttrs, instr: &str, shown: &str) {
+    fn push_ref(&mut self, p: &mut Para, a: &CharAttrs, instr: &str, shown: &str, field: &FieldState) {
         let Some((page, name)) = ref_field(instr) else { return };
         let k = match self.ref_index.get(name) {
             Some(&k) => k,
@@ -1752,7 +1756,7 @@ impl<'a> Reader<'a> {
         fa.field = Some(f);
         fa.object = None;
         fa.note = None;
-        p.push(&OBJECT_CHAR.to_string(), &fa);
+        p.push(&OBJECT_CHAR.to_string(), &fa, field);
     }
 
     /// The framed paragraphs read (the last blocks) taken out into a text
@@ -1834,7 +1838,6 @@ impl<'a> Reader<'a> {
 
     /// One `w:p` into the document; returns its block.
     fn para(&mut self, e: &El, cell: Option<CellRef>, field: &mut FieldState) -> usize {
-        let toc_before = field.in_toc();
         let pp = e.child("w:pPr");
         // A frame: framed paragraphs in a row with the same frame are one
         // text box; the paragraph after them anchors it.
@@ -1871,8 +1874,7 @@ impl<'a> Reader<'a> {
         let mark = pp.and_then(|p| p.child("w:rPr")).map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
         field.in_note = self.in_note;
         self.runs(e, &mut p, None, field);
-        // A table of contents' entries: from its field's start to its end.
-        if (toc_before || field.in_toc()) && cell.is_none() && !self.in_note && !field.in_margin && !p.text.is_empty() {
+        if p.has_toc_result && cell.is_none() && !self.in_note && !field.in_margin {
             let name = self.doc.styles.styles[style as usize].name.to_ascii_lowercase();
             let level = name.strip_prefix("toc").or_else(|| name.strip_prefix("contents")).and_then(|n| n.trim().parse::<u8>().ok()).filter(|l| (1..=9).contains(l)).unwrap_or(1);
             props.toc = Some(level);
@@ -2437,6 +2439,8 @@ enum Stage {
 struct Frame {
     stage: Stage,
     instr: String,
+    /// Set at the separator once the complete TOC instruction is known.
+    toc_result: bool,
     /// A reference's result, as the file shows it.
     result: String,
 }
@@ -2468,7 +2472,7 @@ impl FieldState {
     }
     /// Inside a table of contents' result.
     fn in_toc(&self) -> bool {
-        self.stack.iter().any(|f| f.stage == Stage::Result && is_toc(&f.instr))
+        self.stack.iter().any(|f| f.toc_result)
     }
 }
 

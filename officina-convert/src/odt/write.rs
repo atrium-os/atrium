@@ -369,6 +369,17 @@ fn para_key(p: &ParaProps, first: bool, page_change: bool) -> ParaProps {
     ParaProps { list: p.list.filter(|l| l.is_none()), list_start: None, cell: None, outline_level: None, section: new_page.then(|| Section { page: own, start, ..Section::default() }), ..p.clone() }
 }
 
+/// The index body supplies level one for a plain cached result in Normal.
+/// Page references use the conventional Contents style, and deeper entries
+/// need their level in the style name.
+fn contents_style_level(doc: &TextDoc, p: &Para) -> Option<u8> {
+    let level = p.props.toc?.clamp(1, 9);
+    if p.style != 0 || p.props.cell.is_some() {
+        return None;
+    }
+    (level > 1 || doc.fields_in(p).iter().any(|(_, f)| matches!(f, Field::PageRef(_)))).then_some(level)
+}
+
 struct Out<'a> {
     doc: &'a TextDoc,
     /// Before its automatic style and picture names (`M` in the header and
@@ -421,19 +432,24 @@ fn annotation_name(id: CommentId) -> String {
 }
 
 impl Out<'_> {
-    fn para_style(&mut self, style: u16, p: &ParaProps) -> String {
-        let key = (style, para_key(p, self.cur == Some(0), self.cur.is_some_and(|k| self.page_changes.contains(&k))));
+    fn para_style(&mut self, style: u16, p: &ParaProps, contents_level: Option<u8>) -> String {
+        let mut props = para_key(p, self.cur == Some(0), self.cur.is_some_and(|k| self.page_changes.contains(&k)));
+        props.toc = contents_level;
+        let key = (style, props);
         if let Some(n) = self.para_styles.get(&key) {
             return n.clone();
         }
         let base = self.doc.styles.para_format(style, p).0.indent_start.max(0);
         let body = para_props(&key.1, base) + &hyphenate_props(&key.1, self.doc.settings.hyphenate);
         let unlisted = key.1.list == Some(None) && self.doc.styles.para_format(style, &ParaProps::default()).0.list.is_some();
+        let parent = match contents_level {
+            Some(level) => format!("Contents_20_{level}"),
+            None => self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into()),
+        };
         if body.is_empty() && key.1.section.is_none() && !unlisted {
-            return self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
+            return parent;
         }
         let n = format!("{}P{}", self.prefix, self.para_styles.len() + 1);
-        let parent = self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
         let side = |s: &Section| match s.start {
             SectionStart::OddPage => 1u8,
             SectionStart::EvenPage => 2,
@@ -751,7 +767,7 @@ impl Out<'_> {
                 Some((_, s, p)) if k > 0 => (*s, p.clone()),
                 _ => (style, ParaProps::default()),
             };
-            let name = self.para_style(st, &para_key(&props, true, false));
+            let name = self.para_style(st, &para_key(&props, true, false), None);
             let _ = write!(content, r#"<text:p text:style-name="{}">"#, esc(&name));
             for (i, &(rs, ra)) in piece.runs.iter().enumerate() {
                 let re = piece.runs.get(i + 1).map_or(piece.text.len() as u32, |r| r.0);
@@ -820,23 +836,8 @@ impl Out<'_> {
 
     fn para_of(&mut self, p: &Para, out: &mut String) {
         let doc = self.doc;
-        let mut props = p.props.clone();
-        if p.text.is_empty() {
-            // An empty paragraph's formatting rides on its paragraph style.
-            props = props.clone();
-        }
-        let mut st = self.para_style(p.style, &props);
-        // A contents entry in the default style: LibreOffice's Contents style of its level.
-        if let (0, Some(l), None, 0) = (p.style, p.props.toc, p.props.cell, self.in_note) {
-            st = if st == self.names[0] { format!("Contents_20_{}", l.clamp(1, 9)) } else { st };
-            let (auto, lvl) = (st.starts_with('P'), l.clamp(1, 9));
-            if auto {
-                // Its automatic style's parent is the Contents style.
-                let from = format!(r#"<style:style style:name="{st}" style:family="paragraph" style:parent-style-name="{}">"#, esc(&self.names[0]));
-                let to = format!(r#"<style:style style:name="{st}" style:family="paragraph" style:parent-style-name="Contents_20_{lvl}">"#);
-                self.auto = self.auto.replacen(&from, &to, 1);
-            }
-        }
+        let contents_level = if self.in_note == 0 { contents_style_level(doc, p) } else { None };
+        let st = self.para_style(p.style, &p.props, contents_level);
         let level = doc.styles.para_format(p.style, &p.props).0.outline_level.filter(|_| doc.styles.styles.get(p.style as usize).is_some_and(|s| s.name.starts_with("Heading")));
         let tag = if level.is_some() { "text:h" } else { "text:p" };
         let lvl = level.map(|l| format!(r#" text:outline-level="{l}""#)).unwrap_or_default();
@@ -1347,7 +1348,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         let _ = write!(styles, r#"<style:style style:name="{}" style:display-name="{}" style:family="{family}"{parent}{next}{outline}{list}>{pp}{tp}</style:style>"#, esc(name), esc(display));
     }
     // LibreOffice's Contents styles for the entries' levels.
-    let mut levels: Vec<u8> = doc.blocks.iter().filter_map(|b| b.as_para()).filter(|p| p.style == 0).filter_map(|p| p.props.toc).map(|l| l.clamp(1, 9)).collect();
+    let mut levels: Vec<u8> = doc.blocks.iter().filter_map(|b| b.as_para()).filter_map(|p| contents_style_level(doc, p)).collect();
     levels.sort_unstable();
     levels.dedup();
     for l in levels {

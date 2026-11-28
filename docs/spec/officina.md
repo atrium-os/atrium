@@ -5998,6 +5998,23 @@ Round 4 of the seven in §16.169.
 
 **Not yet:** rows split across pages; tables in headers and footers as real tables; floating shapes in headers, footers and notes; groups of shapes beyond their first; tight wrap round a picture's outline; dragging and resizing pictures by their handles and dragging column widths; charts in documents; per-section headers and footers and columns of their own widths; a watermark per section; watermarks through `.odt` and `.doc`; PICT and SVM pictures. These move to round 7's close-out list unless a later round takes them.
 
+### 16.174 Round 5 as built (2026-11-27), table-of-contents round trips
+
+All seven files that lost a TOC entry through `.docx` now keep it. Each had one entry. The DOCX writer encloses that entry in a complex TOC field with the separator and end in the same paragraph. The reader used to check for an open TOC only before and after reading the paragraph. It now marks the paragraph when it emits content inside the field result, including a nested page reference. Text before the separator and a page break after the end stay outside the TOC. If the entire entry was a reference to a missing bookmark with an empty cached value, resolving the reference leaves an ordinary empty paragraph with its typing format.
+
+**Corpus.** The §16.169 directories at LibreOffice `56dcb0c93f27` and POI `f63b77bb7497` supplied 2,697 files on the Mac, two more than the round 4 run. Both the baseline and the fixed reader accepted 2,534 and refused 163, with zero panics or timeouts.
+
+| Round trip | TOC count differences before → after | Files matching text and all counts before → after |
+|---|---:|---:|
+| DOCX | 7 → 0 | 2,478 → 2,487 |
+| ODT | 2 → 0 | 2,404 → 2,406 |
+
+The seven DOCX round trips now match on every sweep measure. The inputs were `tdf66305.odt`, `tdf81705_outlineLevel.doc`, `fdo78654.docx`, `file_crash.docx`, `tdf107111.docx`, `tdf155736_PageNumbers_footer.docx` and `tdf154695-ToC_no_numbers.docx`. In `TOC_field_f.docx` and `toc_doc.docx` the field ends before a page break. Recognizing the three actual entries removed both ODT count differences. The empty-reference fix also cleared the field-count differences in `tdf154478.docx` and `tdf154481.docx`.
+
+**Empty-contents message (2026-11-28).** In `tdf92724_continuousBreaksComplex.docx`, the German message is cached text between the TOC separator and end. Its paragraph inherits Normal, its run is italic, and it has no page reference. The ODT writer keeps that paragraph in the index body with its original style. It uses the presence of a page reference and the entry level to choose when a default-style paragraph needs a Contents N style. Automatic styles for direct paragraph formatting use the selected parent from the start. The final sweep matched this file through both formats. Comparing each file against both earlier runs found zero new differences.
+
+**Coverage and remaining work.** Four regressions in `officina-convert/tests/fields.rs` cover a single level-two entry and its target, content on either side of field delimiters, the typing format of a missing reference with no cached text, and the localized empty-contents message beside a linked entry with the same direct paragraph formatting. All 70 converter unit tests, five field tests, six sweep regressions, three paragraph tests, two section tests and 91 text-model tests passed. TOC style and level controls, click-to-follow, and the remaining references and equations work are still open in §16.169 round 5.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
