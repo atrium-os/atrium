@@ -87,10 +87,9 @@ ro_paths = [
     # aura-keys connects to arcad's for Wi-Fi credentials.
     "/atrium/sockets/aura-keys",
     "/atrium/sockets/arca",
-    # Vinculum (bluetooth.md §5): each controller's vinculum-hci jail
-    # connects through vinculumd's transport dir and reads the controller
-    # firmware it loads at power-up (Realtek's, unmodified, with its licence).
-    "/atrium/sockets/vinculum-hci",
+    # Vinculum (bluetooth.md §5): the host discovers the root-published
+    # controller sockets. Drivers read firmware at power-up.
+    "/atrium/sockets/vinculum-controllers",
     "/usr/local/share/atrium/firmware/bluetooth",
     "/var/lib/atrium/apps",          # limend: installed manifests (embeds, roles); the share sheet: share-targets and icons
     "/etc/pwd.db",                   # limend: a worker rule's run_as -> uid (no hashes)
@@ -148,7 +147,7 @@ rw_paths = [
     # transport, the trusted UI's control socket and HID devices for tactusd,
     # each peer-uid checked; and its power switch across restarts (machine
     # state only: pairing keys are in Arca's machine store).
-    "/atrium/sockets/vinculum-hci",
+    "/atrium/sockets/vinculum-controllers",
     "/atrium/sockets/bluetooth-control",
     "/atrium/sockets/bluetooth-hid",
     "/var/db/vinculum",
@@ -1039,6 +1038,7 @@ include = ["base"]
 # eventfd(2): FreeBSD's libusb_init makes its event fd with it (libc's
 # eventfd is __specialfd(SPECIALFD_EVENTFD)); found enforcing on the Mac.
 syscalls = ["__specialfd"]
+sockopts = ["0xffff:2"]  # SO_ACCEPTCONN: validate the assigned driver listener
 ioctls = [
     "0x8010557f",   # USB_READ_DIR (on /dev/usbctl: the device list)
     "0x4004557e",   # USB_GET_PLUGTIME

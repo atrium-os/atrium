@@ -102,6 +102,10 @@ pub struct Driver {
     pub sysfil: String,
     #[serde(default)]
     pub mounts_ro: Vec<String>,
+    /// A private directory for the driver's clients. Dispensatord binds
+    /// <jail>.sock there and jaild hands only that listener to the driver.
+    #[serde(default)]
+    pub listen_dir: Option<String>,
     /// Serve the device over FUSE instead of granting its node: jaild opens
     /// the first node and `/dev/fuse`, mounts fusefs here (a template with
     /// `{part}`), and the driver gets them as fd 3 and fd 4. Only for `disk`
@@ -343,6 +347,13 @@ impl Rules {
             }
             if !ident_ok(&d.sysfil) {
                 return Err(w("sysfil: a profile name".into()));
+            }
+            if let Some(dir) = &d.listen_dir {
+                if !dir.strip_prefix("/atrium/sockets/").is_some_and(ident_ok)
+                    || d.mounts_ro.contains(dir) || d.fuse_mount.is_some()
+                {
+                    return Err(w("listen_dir needs a dedicated /atrium/sockets/NAME and a non-FUSE driver".into()));
+                }
             }
             for m in &d.mounts_ro {
                 check_abs("mounts_ro", m, &[]).map_err(|e| w(e.0))?;

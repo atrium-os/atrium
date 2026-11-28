@@ -922,6 +922,7 @@ mod tests {
         // list: libusb's transfers, never reset, power or driver detach.
         let usb = p.sysfil.resolve("usb-driver").unwrap();
         assert!(usb.mode >= 2, "usb-driver enforces");
+        assert!(usb.sockopts.unwrap().split(',').any(|opt| opt == "0xffff:2"), "driver validates its assigned listener");
         let io = usb.ioctls.unwrap();
         for need in ["0x800155c0", "0x400155c2", "0xc01055c5", "0xc018556f", "0x8010557f"] {
             assert!(io.split(',').any(|i| i == need), "usb-driver lacks {need}");

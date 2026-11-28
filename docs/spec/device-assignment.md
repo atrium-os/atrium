@@ -170,6 +170,16 @@ typed device events, that starts device drivers through jaild.
    allowed to claim devices (system packages for v1); a third-party app can
    never claim a device class by installing.
 
+A non-FUSE driver can declare `listen_dir = "/atrium/sockets/NAME"`.
+Commission that directory as root, mode 0750, with the client service's group.
+Dispensatord checks its ownership, mode and separation from the driver's gid,
+binds `<jail>.sock` there as root (0660, directory group), and sends the
+listener in the jail creation request. Jaild checks the bound path and passes
+the listener at fd 3. Its validation requires an rw nullfs mount of the socket
+directory. The driver's uid/gid have no search permission on that directory.
+The path identifies the assigned device even when several drivers share a uid.
+Dispensatord removes the name on detach or failed jail creation.
+
 ### 4.3 Claiming a device from a kernel driver
 
 **Kernel drivers that are fine as the node provider.** FreeBSD 15+ `u2f(4)`

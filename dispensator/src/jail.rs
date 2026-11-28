@@ -18,6 +18,7 @@ pub struct JailPlan {
     /// `/dev/fuse` and mounts fusefs (jaild's `CreateJailRequest::fuse`).
     pub fuse: Option<(String, String, bool)>,
     pub mounts_ro: Vec<String>,
+    pub listen_dir: Option<String>,
     pub exec: String,
     pub argv: Vec<String>,
     pub uid: u32,
@@ -46,6 +47,7 @@ pub fn plan(d: &Driver, vars: &BTreeMap<String, String>, nodes: &[String]) -> Op
             None => None,
         },
         mounts_ro: d.mounts_ro.clone(),
+        listen_dir: d.listen_dir.clone(),
         exec: d.exec.clone(),
         argv: d.argv.iter().map(|a| fill(a, &pairs)).collect::<Option<_>>()?,
         uid: d.uid,
@@ -98,7 +100,8 @@ mod tests {
         let bt = |number| crate::rules::UsbInterface { number, vendor: 0x2357, product: 0x0604, class: 0xE0, subclass: 1, protocol: 1 };
         assert!(r.match_usb(&bt(0)).is_some());
         assert!(r.match_usb(&bt(1)).is_none());
-        let d = &r.drivers["vinculum-hci"];
+        let rules = r.finish().unwrap();
+        let d = &rules.drivers["vinculum-hci"];
         let v: BTreeMap<String, String> =
             [("usb", "0-3-0"), ("bus", "0"), ("addr", "3"), ("interface", "0")].iter().map(|(k, x)| (k.to_string(), x.to_string())).collect();
         let p = plan(d, &v, &["ugen0.3".into(), "usb/0.3.0".into()]).unwrap();
@@ -109,6 +112,18 @@ mod tests {
         assert_eq!(p.exec, "/usr/local/bin/atrium-vinculum-hci");
         assert_eq!(&p.argv[..3], ["atrium-vinculum-hci", "--controller", "usb"]);
         assert!(p.argv.windows(2).any(|w| w == ["--host-uid", "65024"]));
+        let dir = "/atrium/sockets/vinculum-controllers";
+        assert_eq!(p.listen_dir.as_deref(), Some(dir));
+        let mut second = v;
+        second.insert("usb".into(), "0-4-0".into());
+        second.insert("addr".into(), "4".into());
+        let other = plan(d, &second, &["ugen0.4".into(), "usb/0.4.0".into()]).unwrap();
+        assert_ne!(p.name, other.name);
+        for driver in [&p, &other] {
+            let socket = format!("{dir}/{}.sock", driver.name);
+            assert!(driver.argv.windows(2).any(|w| w == ["--host-inherited", &socket]));
+            assert!(!driver.mounts_ro.iter().any(|m| m.starts_with("/atrium/sockets")));
+        }
         assert!(p.mounts_ro.iter().all(|m| !m.starts_with("/var") && m != "/"), "no state, no root: {:?}", p.mounts_ro);
     }
 }

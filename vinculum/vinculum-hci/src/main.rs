@@ -8,8 +8,8 @@
 //! line, raw mode) and `usb:` / `usb:VVVV:PPPP` (the first Bluetooth
 //! controller on USB, or the one with those ids, through the libusb-1.0 API;
 //! see `usb_dev.rs`). A Realtek controller gets its patch from `--firmware-dir` first. The host side is
-//! a Unix socket the host connects to (in production portcullisd passes a
-//! socketpair instead). When the host disconnects, the controller is reset,
+//! a Unix socket the host connects to. On Atrium, dispensatord binds it and
+//! jaild passes the listener to the controller's driver. When the host disconnects, the controller is reset,
 //! so no link outlives the host that knows its keys (§4).
 
 use std::io::{Read, Write};
@@ -179,9 +179,48 @@ fn bridge(spec: &str, addr: &str, firmware_dir: &std::path::Path) -> ! {
 
 enum HostSide {
     Listen(String),
-    /// Connect to vinculumd's transport socket (how dispensatord's driver
-    /// jail runs it: its mounts are read-only, so it cannot bind).
+    Inherited(String),
+    /// Connect to a host that listens for a transport.
     Connect(String),
+}
+
+/// Jaild passes one listening AF_UNIX stream at fd 3. Check its kernel
+/// pathname before opening the radio. Both jails use the publisher's paths.
+fn assigned_listener(path: &str) -> std::io::Result<UnixListener> {
+    use std::os::fd::FromRawFd;
+    const FD: RawFd = 3;
+    // FreeBSD jaild also verifies AF_UNIX, SOCK_STREAM and SO_ACCEPTCONN
+    // before passing the fd. Darwin lacks SO_ACCEPTCONN for local sockets.
+    #[cfg(target_os = "macos")]
+    let option = libc::SO_TYPE;
+    #[cfg(not(target_os = "macos"))]
+    let option = libc::SO_ACCEPTCONN;
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: getsockopt checks FD. Both outputs are valid for the supplied length.
+    let rc = unsafe { libc::getsockopt(FD, libc::SOL_SOCKET, option,
+        (&mut value as *mut libc::c_int).cast(), &mut size) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(target_os = "macos")]
+    let valid = value == libc::SOCK_STREAM;
+    #[cfg(not(target_os = "macos"))]
+    let valid = value != 0;
+    if !valid {
+        return Err(std::io::Error::other("fd 3 is not a controller listener"));
+    }
+    // SAFETY: at single-threaded startup, the launcher transferred ownership
+    // of fd 3; getsockopt verified it is an open socket. This is its only Rust owner.
+    let listener = unsafe { UnixListener::from_raw_fd(FD) };
+    // SAFETY: listener owns FD. F_SETFD takes the scalar descriptor flags.
+    if unsafe { libc::fcntl(FD, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if listener.local_addr()?.as_pathname() != Some(std::path::Path::new(path)) {
+        return Err(std::io::Error::other("fd 3 is bound to a different path"));
+    }
+    Ok(listener)
 }
 
 /// `--report [--controller usb[:VVVV:PPPP]]`: describes each USB controller
@@ -216,7 +255,7 @@ fn run_report(spec: &str) -> ! {
 fn usage() -> ! {
     eprintln!(
         "usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] \
-         (--host-listen PATH | --host-connect PATH | --serve-tcp 127.0.0.1:PORT) [--host-uid UID]... [--firmware-dir DIR]\n       vinculum-hci --report [--controller usb[:VVVV:PPPP]]"
+         (--host-listen PATH | --host-connect PATH | --host-inherited PATH | --serve-tcp 127.0.0.1:PORT) [--host-uid UID]... [--firmware-dir DIR]\n       vinculum-hci --report [--controller usb[:VVVV:PPPP]]"
     );
     std::process::exit(2)
 }
@@ -255,8 +294,7 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
 
 fn main() {
     let mut controller_spec = None;
-    let mut listen = None;
-    let mut connect: Option<String> = None;
+    let mut side = None;
     let mut host_uids: Vec<u32> = Vec::new();
     let mut serve_tcp: Option<String> = None;
     let mut report = false;
@@ -265,8 +303,9 @@ fn main() {
     while let Some(k) = a.next() {
         match k.as_str() {
             "--controller" => controller_spec = a.next(),
-            "--host-listen" => listen = a.next(),
-            "--host-connect" => connect = a.next(),
+            "--host-listen" if side.is_none() => side = Some(HostSide::Listen(a.next().unwrap_or_else(|| usage()))),
+            "--host-connect" if side.is_none() => side = Some(HostSide::Connect(a.next().unwrap_or_else(|| usage()))),
+            "--host-inherited" if side.is_none() => side = Some(HostSide::Inherited(a.next().unwrap_or_else(|| usage()))),
             "--host-uid" => match a.next().and_then(|v| v.parse().ok()) {
                 Some(u) => host_uids.push(u),
                 None => usage(),
@@ -290,16 +329,21 @@ fn main() {
         }
     }
     let Some(spec) = controller_spec else { usage() };
-    let side = match (listen, connect) {
-        (Some(p), None) => HostSide::Listen(p),
-        (None, Some(p)) => HostSide::Connect(p),
-        _ => usage(),
+    let Some(side) = side else { usage() };
+    let assigned = if let HostSide::Inherited(path) = &side {
+        Some(assigned_listener(path).unwrap_or_else(|e| {
+            eprintln!("vinculum-hci: assigned listener {path}: {e}");
+            std::process::exit(1)
+        }))
+    } else {
+        None
     };
     let mut ctl = Controller::open(&spec, &firmware_dir).unwrap_or_else(|e| {
         eprintln!("vinculum-hci: controller {spec}: {e}");
         std::process::exit(1)
     });
     let listener = match &side {
+        HostSide::Inherited(_) => assigned,
         HostSide::Listen(path) => {
             let _ = std::fs::remove_file(path);
             let l = UnixListener::bind(path).unwrap_or_else(|e| {

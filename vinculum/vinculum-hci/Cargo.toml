@@ -21,3 +21,6 @@ dev-bridge = []
 [[bin]]
 name = "vinculum-hci"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

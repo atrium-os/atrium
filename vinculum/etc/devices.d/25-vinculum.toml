@@ -8,12 +8,10 @@
 # here). ng_ubt is detached first if it attached. libusb opens both the ugen
 # node and the usb/B.A.0 control node, so both are granted.
 #
-# The jail mounts are read-only, so vinculum-hci does not listen: it connects
-# to vinculumd's transport socket (vinculumd --transport listen:...), checks
-# the listener is _vinculum (65024), and retries once a second until it is
-# there. Realtek controllers get their patch from the firmware dir at every
-# power-up (vinculum/firmware/README.md); Zephyr and other standard
-# controllers need nothing.
+# Dispensatord binds <jail>.sock as root and jaild passes that listener to
+# this instance. The parent (root:_vinculum 0750) denies the driver even
+# traversal. Only the host can connect, and the driver checks its uid.
+# Realtek firmware is read from the read-only firmware directory at power-up.
 #
 # `--controller usb` takes the first Bluetooth controller libusb finds: the
 # jail's devfs shows only this device's nodes, so that is this one.
@@ -36,13 +34,14 @@ owner         = "driver:vinculum-hci"
 [driver.vinculum-hci]
 exec          = "/usr/local/bin/atrium-vinculum-hci"
 argv          = ["atrium-vinculum-hci", "--controller", "usb",
-                 "--host-connect", "/atrium/sockets/vinculum-hci/transport.sock", "--host-uid", "65024",
+                 "--host-inherited", "/atrium/sockets/vinculum-controllers/atrium-vinculum-hci-{usb}.sock", "--host-uid", "65024",
                  "--firmware-dir", "/usr/local/share/atrium/firmware/bluetooth"]
 uid           = 65025
 gid           = 65025
 jail          = "atrium-vinculum-hci-{usb}"
 root          = "/var/lib/atrium/jails/vinculum-hci-{usb}"
 devfs_ruleset = 25
+listen_dir    = "/atrium/sockets/vinculum-controllers"
 sysfil        = "usb-driver"
 mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin",
-                 "/usr/local/share/atrium/firmware/bluetooth", "/atrium/sockets/vinculum-hci"]
+                 "/usr/local/share/atrium/firmware/bluetooth"]

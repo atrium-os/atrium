@@ -1040,6 +1040,7 @@ name = "vinculum-hci"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
  "vinculum-hci-proto",
 ]
 
@@ -1112,6 +1113,7 @@ name = "vinculumd"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
  "vinculum-control",
  "vinculum-gatt",
  "vinculum-hci-proto",

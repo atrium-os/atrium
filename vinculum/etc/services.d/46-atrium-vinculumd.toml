@@ -8,29 +8,19 @@
 #
 # vinculumd runs NON-ROOT as _vinculum (65024) with no devices (ruleset 4) and
 # no network. It never opens a controller: vinculum-hci does, one driver jail
-# per controller that dispensatord starts (25-vinculum.toml), and connects to
-# the transport socket here; vinculumd accepts only _vinculum-hci (65025).
-# Everything from the air up to the profile boundary is parsed here.
+# per controller. Dispensatord binds each driver's socket (uid 0) and hands
+# its listener to that instance. Vinculumd connects to one published socket
+# and its supervisor restarts it for discovery when that transport closes.
 #
-# Sockets, each checked by peer uid on every connection:
-#   /atrium/sockets/vinculum-hci/transport.sock      the controller (_vinculum-hci only)
-#   /atrium/sockets/bluetooth-control/control.sock   apps holding bluetooth-control (Curia, the bar)
-#   /atrium/sockets/bluetooth-hid/hid.sock           tactusd (65018) only
-#
-# One controller at a time: the transport socket is removed once a controller
-# is taken, and vinculumd exits when it goes, so the supervisor restarts it
-# listening again for the next one.
-#
-# REQUIRES (scripts/vinculum-service.sh does all of it):
-#   1. The _vinculum (65024) and _vinculum-hci (65025) system users (in
-#      jaild.policy's allowed_system_uids).
-#   2. The socket directories above (vinculum-hci owned _vinculum:_vinculum-hci
-#      0750; bluetooth-hid _vinculum:_tactus 0750; bluetooth-control _vinculum 0755).
+# Commission with scripts/vinculum-service.sh:
+#   1. _vinculum (65024) and _vinculum-hci (65025).
+#   2. vinculum-controllers root:_vinculum 0750; bluetooth-hid
+#      _vinculum:_tactus 0750; bluetooth-control _vinculum 0755.
 #   3. /var/db/vinculum owned _vinculum 0700 (the power switch's state only;
 #      keys are in Arca).
 #   4. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
 #      var/lib/atrium/apps,var/db/vinculum,var/run/atrium,atrium/sockets/{arca,
-#      vinculum-hci,bluetooth-control,bluetooth-hid}} and an empty file
+#      vinculum-controllers,bluetooth-control,bluetooth-hid}} and an empty file
 #      <path>/var/run/atrium/app-registry (nullfs file mount point).
 
 enabled       = true
@@ -57,9 +47,9 @@ source = "/usr/local/bin"
 dest   = "usr/local/bin"
 kind   = "ro_nullfs"
 [[mounts]]
-source = "/atrium/sockets/vinculum-hci"           # rw: the controller transport
-dest   = "atrium/sockets/vinculum-hci"
-kind   = "rw_nullfs"
+source = "/atrium/sockets/vinculum-controllers"   # ro: one socket per controller
+dest   = "atrium/sockets/vinculum-controllers"
+kind   = "ro_nullfs"
 [[mounts]]
 source = "/atrium/sockets/bluetooth-control"      # rw: the trusted UI's socket
 dest   = "atrium/sockets/bluetooth-control"
@@ -88,7 +78,7 @@ kind   = "rw_nullfs"
 [exec]
 path = "/usr/local/bin/atrium-vinculumd"
 argv = ["atrium-vinculumd",
-        "--transport", "listen:/atrium/sockets/vinculum-hci/transport.sock", "--transport-uid", "65025",
+        "--transport", "controllers:/atrium/sockets/vinculum-controllers", "--transport-uid", "0",
         "--arca", "/atrium/sockets/arca/arcad.sock",
         "--control", "/atrium/sockets/bluetooth-control/control.sock",
         "--control-apps", "/var/run/atrium/app-registry", "/var/lib/atrium/apps",

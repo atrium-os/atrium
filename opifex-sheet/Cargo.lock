@@ -411,6 +411,7 @@ dependencies = [
  "aqueduct",
  "atrium-devevents",
  "atrium-devices",
+ "atrium-listen",
  "atrium-media",
  "jaild",
  "libc",

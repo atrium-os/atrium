@@ -5627,6 +5627,20 @@ then `vinculum-ctl -s ctl.sock pair NAME` (asks on the terminal; `--yes` for scr
 Classic devices pair with `vinculum-ctl pair ADDR --classic`. `peer_hid_keyboard.py` is the Bumble keyboard,
 `peer_hogp_mouse.py` the LE mouse. With `--hid`, vinculumd also scans in the background while a bonded LE device is away.
 
+The per-controller transport regression runs on the host with two simulated
+H4 radios and the production driver binary:
+
+```sh
+(cd vinculum && cargo test -p vinculum-hci --test controller_listener)
+```
+
+For the jailed setup, deploy the matching dispensatord and jaild policy,
+then commission both Vinculum binaries and manifests with
+`scripts/vinculum-service.sh`. Restart the affected services during the
+deployment window so dispensatord reloads the device rule and vinculumd
+discovers the new sockets. Each driver inherits its own listener. The log
+in vinculumd names the USB instance it connected to.
+
 Real controllers (B1b, `vinculum/firmware/README.md` for the dongles' firmware):
 
 ```sh

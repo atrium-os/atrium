@@ -7,7 +7,7 @@
 //! `vinculum/harness/e2e.sh`:
 //!
 //! ```text
-//! vinculumd --transport unix:PATH|listen:PATH|tcp:HOST:PORT [--transport-uid UID]...
+//! vinculumd --transport unix:PATH|listen:PATH|controllers:DIR|tcp:HOST:PORT [--transport-uid UID]...
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
 //!           [--pair [--reconnect] [--passkey-file PATH]]
 //!           [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR]
@@ -62,9 +62,18 @@ enum Link {
 }
 
 impl Link {
-    /// `uids`: with `listen:`, the peer uids taken as a transport (spec §4:
-    /// `_vinculum-hci`); others are dropped and waited past.
+    /// `uids` identifies an accepted peer for listen:, or the trusted
+    /// publisher of an activated socket for controllers:.
     fn open(spec: &str, uids: &[u32]) -> std::io::Result<Link> {
+        if let Some(dir) = spec.strip_prefix("controllers:") {
+            loop {
+                if let Some(s) = controller_in(std::path::Path::new(dir), uids)? {
+                    return Ok(Link::Unix(s));
+                }
+                // Hotplug: the directory exists at boot, its first socket may arrive later.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
         if let Some(p) = spec.strip_prefix("listen:") {
             return Ok(Link::Unix(accept_transport(p, uids)?));
         }
@@ -75,7 +84,7 @@ impl Link {
             s.set_nodelay(true)?;
             Ok(Link::Tcp(s))
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "transport must be unix:PATH, listen:PATH or tcp:HOST:PORT"))
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "transport must be unix:PATH, listen:PATH, controllers:DIR or tcp:HOST:PORT"))
         }
     }
     fn fd(&self) -> RawFd {
@@ -98,8 +107,43 @@ impl Link {
     }
 }
 
+/// Each socket in this dedicated directory is bound by dispensatord, which
+/// passes its listener only to the named driver jail. The peer credential
+/// on connect is the listener creator's. The driver checks our uid on accept.
+fn controller_in(dir: &std::path::Path, uids: &[u32]) -> std::io::Result<Option<UnixStream>> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = match entry.file_type() {
+            Err(e) if e.kind() == ErrorKind::NotFound => continue, // detached
+            r => r?,
+        };
+        if !kind.is_socket() || entry.path().extension() != Some(std::ffi::OsStr::new("sock")) {
+            continue;
+        }
+        let path = entry.path();
+        let stream = match UnixStream::connect(&path) {
+            Ok(s) => s,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => continue,
+            Err(e) => return Err(e),
+        };
+        if !transport_allowed(&stream, uids) {
+            eprintln!("vinculumd: refused transport publisher for {}", path.display());
+            continue;
+        }
+        eprintln!("vinculumd: controller transport {}", path.display());
+        return Ok(Some(stream));
+    }
+    Ok(None)
+}
+
+fn transport_allowed(s: &UnixStream, uids: &[u32]) -> bool {
+    daemon::peer_uid(s).is_some_and(|u| if uids.is_empty() { u == daemon::getuid() } else { uids.contains(&u) })
+}
+
 /// Binds `path` and waits for one transport (vinculum-hci connects to us
-/// when dispensatord starts it for a controller, spec §4). Only a peer whose
+/// for the standalone listen: mode). Only a peer whose
 /// uid is in `uids` (or, with none given, our own uid) is taken; any other
 /// is closed and logged. The socket is removed once a transport is taken,
 /// so a second controller's vinculum-hci waits until this vinculumd exits
@@ -107,27 +151,19 @@ impl Link {
 fn accept_transport(path: &str, uids: &[u32]) -> std::io::Result<UnixStream> {
     let _ = std::fs::remove_file(path);
     let l = std::os::unix::net::UnixListener::bind(path)?;
-    // The driver runs as its own uid in the socket directory's group
-    // (vinculum-service.sh makes it _vinculum:_vinculum-hci 0750), and
-    // connect(2) needs write on the socket: group rw, nothing for others.
+    // A driver in the socket directory's group needs write access to connect.
     // The peer-uid check below still decides who is taken.
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     eprintln!("vinculumd: waiting for a controller on {path}");
     loop {
         let (s, _) = l.accept()?;
-        let uid = daemon::peer_uid(&s);
-        let ok = match uid {
-            Some(u) if uids.is_empty() => u == daemon::getuid(),
-            Some(u) => uids.contains(&u),
-            None => false,
-        };
-        if ok {
+        if transport_allowed(&s, uids) {
             let _ = std::fs::remove_file(path);
-            eprintln!("vinculumd: controller transport connected (uid {})", uid.unwrap_or(u32::MAX));
+            eprintln!("vinculumd: controller transport connected on {path}");
             return Ok(s);
         }
-        eprintln!("vinculumd: refused a transport from uid {uid:?}");
+        eprintln!("vinculumd: refused a transport on {path}");
     }
 }
 
@@ -165,7 +201,7 @@ struct Opts {
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]] [--name NAME]");
+        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|controllers:DIR|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]] [--name NAME]");
         std::process::exit(2)
     };
     let mut o = Opts { transport: String::new(), transport_uids: Vec::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
@@ -623,4 +659,38 @@ fn start_pair(host: &mut Host, pairable: &policy::Pairable, handle: u16, now_ms:
 fn getuid() -> u32 {
     // SAFETY: getuid(2) has no preconditions and cannot fail.
     unsafe { libc::getuid() }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn discovery_checks_the_publisher_and_skips_detached_controllers() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("0-3-0.sock");
+        let first = UnixListener::bind(&path).unwrap();
+        first.set_nonblocking(true).unwrap();
+        let uid = getuid();
+        assert!(controller_in(dir.path(), &[uid.wrapping_add(1)]).unwrap().is_none());
+        drop(first.accept().unwrap()); // refused connection
+        let mut host = controller_in(dir.path(), &[uid]).unwrap().unwrap();
+        let (mut controller, _) = first.accept().unwrap();
+        controller.set_nonblocking(false).unwrap();
+        controller.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        host.write_all(b"A").unwrap();
+        let mut byte = [0];
+        controller.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"A");
+        drop(first); // its name still exists
+        assert!(controller_in(dir.path(), &[uid]).unwrap().is_none());
+        let second = UnixListener::bind(dir.path().join("0-4-0.sock")).unwrap();
+        second.set_nonblocking(true).unwrap();
+        let mut host = controller_in(dir.path(), &[uid]).unwrap().unwrap();
+        host.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        second.accept().unwrap().0.write_all(b"B").unwrap();
+        host.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"B");
+    }
 }

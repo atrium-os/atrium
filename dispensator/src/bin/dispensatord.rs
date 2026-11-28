@@ -577,12 +577,41 @@ mod run {
 
     use super::*;
 
+    /// Only dispensatord can change names in this directory. Dropping the
+    /// publication on detach or failed launch removes this instance's name.
+    struct SocketName(PathBuf);
+
+    impl Drop for SocketName {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_file(&self.0) {
+                eprintln!("atrium-dispensatord: unlink {}: {e}", self.0.display());
+            }
+        }
+    }
+
+    fn driver_listener(dir: &str, name: &str, driver_gid: u32) -> std::io::Result<(UnixListener, SocketName)> {
+        use std::os::unix::fs::MetadataExt;
+        // This host-side bind precedes jaild's own name validation.
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err(std::io::Error::other("invalid driver instance name"));
+        }
+        let md = std::fs::symlink_metadata(dir)?;
+        // The commissioned parent is root:<client group> 0750. Only root
+        // can publish or replace a name, and the driver cannot traverse it.
+        if !md.is_dir() || md.uid() != 0 || md.mode() & 0o7777 != 0o750 || md.gid() == driver_gid {
+            return Err(std::io::Error::other(format!("{dir}: expected root:<client group> 0750")));
+        }
+        let path = Path::new(dir).join(format!("{name}.sock"));
+        let listener = atrium_listen::bind_socket(&path, 0o660, Some(0), Some(md.gid()))?;
+        Ok((listener, SocketName(path)))
+    }
+
     struct Agent {
         jaild: String,
         state: PathBuf,
         planner: Planner,
         /// (driver, device) -> the procdesc that keeps its jail alive.
-        drivers: BTreeMap<(String, String), OwnedFd>,
+        drivers: BTreeMap<(String, String), (OwnedFd, Option<SocketName>)>,
         /// The last failure showing each (service, node), so a service that
         /// is down is logged once, not every reshow.
         show_errors: BTreeMap<(String, String), String>,
@@ -2332,7 +2361,7 @@ mod run {
         /// Unmount what an earlier run left: jaild's exec path does not
         /// record create-time mounts, and a driver jail ended by a restart
         /// of this daemon (closing its procdesc) leaves them.
-        fn unmount_all(path: &str, mounts: &[String]) {
+        fn unmount_all<'a>(path: &str, mounts: impl IntoIterator<Item = &'a String>) {
             for m in mounts {
                 let target = Path::new(path).join(m.trim_start_matches('/'));
                 // Failure (not mounted) is expected and ignored.
@@ -2359,7 +2388,7 @@ mod run {
                 eprintln!("atrium-dispensatord: {driver}: {device}: a template has no value");
                 return;
             };
-            Self::unmount_all(&p.path, &p.mounts_ro);
+            Self::unmount_all(&p.path, p.mounts_ro.iter().chain(&p.listen_dir));
             // GEOM's CREATE can come a moment before devfs has the node.
             if let Some((dev, ..)) = &p.fuse {
                 let node = Path::new("/dev").join(dev);
@@ -2384,8 +2413,33 @@ mod run {
                 }
             }
             // A stick's server takes grants on fd 5, a socket to us (§4.8).
-            let req = Self::request(&p);
-            let sent = if req.fuse.as_ref().is_some_and(|f| f.control) {
+            let mut req = Self::request(&p);
+            let mut publication = None;
+            let sent = if let Some(dir) = &p.listen_dir {
+                use std::os::fd::AsFd;
+                let (listener, name) = match driver_listener(dir, &p.name, p.gid) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("atrium-dispensatord: {}: bind listener: {e}", p.name);
+                        return;
+                    }
+                };
+                // jaild checks the inherited fd's bound name against this
+                // mount. DAC denies the driver all pathname access to it.
+                req.mounts.push(MountSpec {
+                    source: dir.clone(), dest: dir.trim_start_matches('/').into(), kind: MountKind::RwNullfs,
+                    noexec: false, size_mb: None, owner: None,
+                });
+                let Some(exec) = &mut req.exec else {
+                    eprintln!("atrium-dispensatord: {}: no driver exec for its listener", p.name);
+                    return;
+                };
+                exec.listen.push(name.0.to_string_lossy().into_owned());
+                publication = Some(name);
+                Client::connect(&self.jaild)
+                    .and_then(|mut c| c.send_with_fds(&Request::CreateJail(req), &[listener.as_fd()], 1))
+                    .map(|(resp, fds)| (resp, fds.first().copied()))
+            } else if req.fuse.as_ref().is_some_and(|f| f.control) {
                 match UnixStream::pair() {
                     Ok((ours, theirs)) => {
                         use std::os::fd::AsFd;
@@ -2409,7 +2463,7 @@ mod run {
                     if let Some(raw) = fd {
                         // SAFETY: jaild just passed us this procdesc and we own
                         // it; holding it keeps the driver's persist=0 jail alive.
-                        self.drivers.insert((driver.to_string(), device.to_string()), unsafe { OwnedFd::from_raw_fd(raw) });
+                        self.drivers.insert((driver.to_string(), device.to_string()), (unsafe { OwnedFd::from_raw_fd(raw) }, publication));
                     }
                 }
                 Ok((other, _)) => eprintln!("atrium-dispensatord: {}: jaild: {other:?}", p.name),
@@ -2932,7 +2986,7 @@ mod run {
             self.stop_sealed(device);
             let Some(d) = self.planner.rules().drivers.get(driver) else { return };
             let Some((name, path)) = stop_names(d, vars) else { return };
-            let mounts = d.mounts_ro.clone();
+            let mounts: Vec<_> = d.mounts_ro.iter().chain(&d.listen_dir).cloned().collect();
             let had = self.drivers.remove(&(driver.to_string(), device.to_string())).is_some();
             self.end_grants(|g| g.part == device);
             self.controls.remove(device);

@@ -5,7 +5,7 @@
 #
 #   sh vinculum-service.sh <vinculumd binary> <vinculum-hci binary> [<firmware dir>]
 #
-# vinculumd must be built with `--features atrium` (its Arca key store).
+# Build vinculumd with `--features atrium` for the Arca key store.
 # Creates the _vinculum and _vinculum-hci users and the socket directories,
 # installs atrium-vinculumd (with its services.d manifest) and
 # atrium-vinculum-hci, installs Vinculum's device rule for dispensatord
@@ -35,8 +35,8 @@ sysrc -n devmatch_blocklist 2>/dev/null | grep -qw ng_ubt || sysrc devmatch_bloc
 kldunload -n ng_ubt 2>/dev/null || true
 
 install -d -m 0755 /atrium/sockets
-# The transport: only _vinculum-hci may reach it at all; vinculumd also checks the uid.
-install -d -o _vinculum -g _vinculum-hci -m 0750 /atrium/sockets/vinculum-hci
+# Dispensatord publishes listeners, vinculumd connects, driver jails have only their own fd.
+install -d -o root -g _vinculum -m 0750 /atrium/sockets/vinculum-controllers
 # The trusted UI's socket: apps holding bluetooth-control, checked per connection.
 install -d -o _vinculum -g _vinculum -m 0755 /atrium/sockets/bluetooth-control
 # HID devices for tactusd (65018); its group if Tactus is commissioned, else none but _vinculum.
@@ -72,7 +72,7 @@ install -o root -g wheel -m 0644 "$HERE/vinculum/etc/devices.d/25-vinculum.toml"
 R=/var/lib/atrium/jails/vinculumd
 # (Skips dirs that exist: a running jail has its mounts over them.)
 for d in dev libexec lib usr/lib usr/local/bin var/lib/atrium/apps var/db/vinculum var/run/atrium \
-         atrium/sockets/arca atrium/sockets/vinculum-hci atrium/sockets/bluetooth-control atrium/sockets/bluetooth-hid; do
+         atrium/sockets/arca atrium/sockets/vinculum-controllers atrium/sockets/bluetooth-control atrium/sockets/bluetooth-hid; do
     [ -d "$R/$d" ] || install -d "$R/$d"
 done
 [ -e "$R/var/run/atrium/app-registry" ] || touch "$R/var/run/atrium/app-registry"
