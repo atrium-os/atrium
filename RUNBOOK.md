@@ -5641,6 +5641,13 @@ deployment window so dispensatord reloads the device rule and vinculumd
 discovers the new sockets. Each driver inherits its own listener. The log
 in vinculumd names the USB instance it connected to.
 
+For Bluetooth audio, cross-build `vinculum-atrium-audio` and supply the
+`vinculum-audio` binary as the fourth argument to `scripts/vinculum-service.sh`
+(use an empty third argument when commissioning without firmware). Install the
+matching jaild policy and Choragus service manifest. Use the paired device’s
+address with `vinculum-ctl audio ADDR on` to enable playback or `off` to revoke it.
+The two-rate simulated guest check is in [Bluetooth §15.1](docs/spec/bluetooth.md#151-b5-a2dp-source-as-built-2026-11-28).
+
 Real controllers (B1b, `vinculum/firmware/README.md` for the dongles' firmware):
 
 ```sh

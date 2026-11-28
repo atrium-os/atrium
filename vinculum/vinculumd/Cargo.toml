@@ -6,9 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-atrium = ["vinculum-keys/atrium"]
+atrium = ["vinculum-keys/atrium", "dep:atrium-listen"]
 
 [dependencies]
+atrium-listen = { path = "../../atrium-listen", optional = true }
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-host = { path = "../vinculum-host" }
 vinculum-smp = { path = "../vinculum-smp" }

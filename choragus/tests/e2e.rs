@@ -25,32 +25,25 @@ fn dir(tag: &str) -> PathBuf {
     d
 }
 
-/// A stand-in lyrad: answers each Open with a named-shm ring (anonymous shm is
-/// FreeBSD-only), keeps the consumer ends, reports every message it gets, and
+/// A stand-in lyrad: answers each Open with an anonymous ring, keeps its
+/// consumer end, reports every message it gets, and
 /// answers Flush with Flushed.
-fn fake_lyrad(sock: PathBuf, tag: &'static str) -> (mpsc::Receiver<ToEngine>, mpsc::Receiver<Ring>) {
+fn fake_lyrad(sock: PathBuf) -> (mpsc::Receiver<ToEngine>, mpsc::Receiver<Ring>) {
     let l = UnixListener::bind(&sock).unwrap();
     let (tx, rx) = mpsc::channel();
     let (rtx, rrx) = mpsc::channel();
     std::thread::spawn(move || {
         let (mut c, _) = l.accept().unwrap();
-        let mut n = 0;
         while let Ok(m) = wire::recv::<_, ToEngine>(&mut c) {
             match &m {
                 ToEngine::Open { stream, channels, ring_frames, .. } => {
-                    n += 1;
-                    let name = format!("/chor-e2e-{tag}-{}-{n}", std::process::id());
-                    let p = Ring::create(&name, *ring_frames, *channels as u64).unwrap();
-                    let cons = Ring::open(&name, false).unwrap();
-                    let fd = std::fs::OpenOptions::new().read(true).write(true)
-                        .open(format!("/dev/shm{name}")).unwrap();
+                    let (cons, fd) = Ring::create_anon(*ring_frames, u64::from(*channels), false).unwrap();
                     wire::send(&mut c, &FromEngine::Opened { stream: *stream, ring_frames: *ring_frames, latency_ns: 7 }).unwrap();
                     lyra_protocol::fdpass::send_fd(c.as_raw_fd(), fd.as_raw_fd()).unwrap();
                     let (w, cfd) = lyra_protocol::clock::create().unwrap();
                     w.publish(&lyra_protocol::clock::Clock { state: 1, frame: 100, heard_ns: 5_000, rate_ppm: 0, flush_epoch: 0, rate: 44_100 });
                     lyra_protocol::fdpass::send_fd(c.as_raw_fd(), cfd.as_raw_fd()).unwrap();
                     std::mem::forget(w); // keep the page mapped for the test
-                    drop(p);
                     rtx.send(cons).unwrap();
                 }
                 ToEngine::SetLayout { channels, .. } => {
@@ -62,11 +55,7 @@ fn fake_lyrad(sock: PathBuf, tag: &'static str) -> (mpsc::Receiver<ToEngine>, mp
                     wire::send(&mut c, &FromEngine::Flushed { stream: *stream, frame: 42 }).unwrap();
                 }
                 ToEngine::AddDevice { device, channels, .. } => {
-                    n += 1;
-                    let name = format!("/chor-e2e-{tag}-{}-d{n}", std::process::id());
-                    let p = Ring::create(&name, 4096, *channels as u64).unwrap();
-                    let fd = std::fs::OpenOptions::new().read(true).write(true)
-                        .open(format!("/dev/shm{name}")).unwrap();
+                    let (p, fd) = Ring::create_anon(4096, u64::from(*channels), true).unwrap();
                     let (page, pfd) = lyra_protocol::device::create().unwrap();
                     wire::send(&mut c, &FromEngine::DeviceAdded { device: *device, ring_frames: 4096 }).unwrap();
                     lyra_protocol::fdpass::send_fd(c.as_raw_fd(), fd.as_raw_fd()).unwrap();
@@ -95,7 +84,7 @@ fn start_with(tag: &'static str, registry: &str, grants: &str, listeners: &[(&st
     -> (Vec<PathBuf>, mpsc::Receiver<ToEngine>, mpsc::Receiver<Ring>) {
     let d = dir(tag);
     let lyrad = d.join("lyrad.sock");
-    let (eng, rings) = fake_lyrad(lyrad.clone(), tag);
+    let (eng, rings) = fake_lyrad(lyrad.clone());
     std::fs::write(d.join("registry"), registry).unwrap();
     let socks: Vec<PathBuf> = listeners.iter().map(|(n, _)| d.join(n)).collect();
     let cfg = Config {
@@ -111,6 +100,7 @@ fn start_with(tag: &'static str, registry: &str, grants: &str, listeners: &[(&st
         device_channels: 2,
         period_frames: 128,
         state_dir: state_dir.map(|p| p.to_string_lossy().into()),
+        device_driver_uid: None,
         limen_uid: Some(me()),
     };
     std::thread::spawn(move || daemon::run(cfg));

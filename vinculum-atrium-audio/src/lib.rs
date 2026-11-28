@@ -2,8 +2,8 @@
 use lyra_protocol::client::{Announce, Device};
 use lyra_protocol::device::{DeviceState, STATE_STREAMING};
 use lyra_protocol::wire::OutputKind;
-use std::io;
 use std::time::{Duration, Instant};
+use std::{io, os::fd::AsRawFd};
 use vinculum_audio::{Channels, Stream};
 
 pub struct Output<C> {
@@ -68,6 +68,23 @@ impl<C: Channels> Output<C> {
             self.played = 0;
         }
 
+        // Choragus owns the route. Drop the radio session if it disappears,
+        // even though the ring mapping remains readable after its owner exits.
+        let mut fd = libc::pollfd {
+            fd: self.device.socket().as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: fd is a single initialized pollfd with a live socket.
+        if unsafe { libc::poll(&mut fd, 1, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if fd.revents != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Choragus disconnected",
+            ));
+        }
         self.pcm.fill(0.0);
         let read = self.device.ring.read(&mut self.pcm);
         let mut ts = libc::timespec {

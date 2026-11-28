@@ -1,7 +1,7 @@
 //! choragusd — Choragus, Lyra's audio policy daemon and the front door apps
 //! use for sound (docs/spec/lyra-v1.md §3–5; architecture §7, §9).
 //!
-//!   choragusd --serve [--limen-uid UID]
+//!   choragusd --serve [--limen-uid UID] [--device-driver-uid UID]
 //!       The service: one daemon for the seat, identity only from the launch
 //!       registry, grants from each user's Portcullis policy, one socket per
 //!       audio capability, and audio-attribution/ for limend (served only to
@@ -14,7 +14,7 @@
 //!
 //!   choragusd --daemon <app_sock> <lyrad_sock> [--grants F] [--portcullis-grants BASE]
 //!                      [--app-registry F] [--seat] [--control SOCK] [--state DIR]
-//!                      [--attribution SOCK --limen-uid UID]
+//!                      [--attribution SOCK --limen-uid UID] [--device SOCK --device-driver-uid UID]
 //!       Development: one socket allowing every capability (and, with
 //!       --control, a volume-UI socket; --state keeps volumes in DIR). Without a registry
 //!       the app is named by its uid's user name (and --grants is keyed by it).
@@ -46,6 +46,7 @@ fn main() {
         device_channels: 2,
         period_frames: 128,
         state_dir: None,
+        device_driver_uid: None,
         limen_uid: None,
     };
 
@@ -60,6 +61,7 @@ fn main() {
         listeners.push((format!("{root}/audio-attribution/audio-attribution.sock"), choragus::app::CAP_ATTRIBUTION));
         let cfg = Config {
             listeners,
+            device_driver_uid: arg(&args, "--device-driver-uid").and_then(|v| v.parse().ok()),
             limen_uid: arg(&args, "--limen-uid").and_then(|v| v.parse().ok()),
             lyrad: env("ATRIUM_LYRAD_SOCK", "/atrium/sockets/lyrad/lyrad.sock"),
             registry: Some(env("ATRIUM_APP_REGISTRY", portcullis_peer::DEFAULT_REGISTRY)),
@@ -101,6 +103,7 @@ fn main() {
         let cfg = Config {
             listeners,
             state_dir: arg(&args, "--state").map(String::from),
+            device_driver_uid: arg(&args, "--device-driver-uid").and_then(|v| v.parse().ok()),
             limen_uid: arg(&args, "--limen-uid").and_then(|v| v.parse().ok()),
             lyrad,
             registry: arg(&args, "--app-registry").map(String::from),

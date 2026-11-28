@@ -2,7 +2,7 @@ use pdl_compiler::{analyzer, backends, parser};
 use std::path::PathBuf;
 
 pub fn generate(name: &str) {
-    let pdl = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../pdl/{name}.pdl"));
+    let pdl = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory")).join(format!("../pdl/{name}.pdl"));
     println!("cargo:rerun-if-changed={}", pdl.display());
     let mut sources = pdl_compiler::ast::SourceDatabase::new();
     let file = parser::parse_file(&mut sources, pdl.to_str().unwrap())

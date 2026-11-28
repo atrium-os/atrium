@@ -308,7 +308,7 @@ impl Host {
                     result::PENDING => {}
                     _ => {
                         let ch = c.sig.channels.remove(i);
-                        self.out_events.push_back(HostEvent::ChannelFailed { handle, psm: ch.psm, why: format!("refused (result {res})") });
+                        self.out_events.push_back(HostEvent::ChannelFailed { handle, cid: ch.local, psm: ch.psm, why: format!("refused (result {res})") });
                     }
                 }
             }
@@ -468,7 +468,7 @@ impl Host {
         } else {
             c.sig.channels.remove(i);
         }
-        self.out_events.push_back(HostEvent::ChannelFailed { handle, psm, why: why.into() });
+        self.out_events.push_back(HostEvent::ChannelFailed { handle, cid: local, psm, why: why.into() });
     }
 
     pub(crate) fn l2cap_tick(&mut self, now_ms: u64) {

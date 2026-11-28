@@ -103,10 +103,14 @@ pub fn split_duplicates(bonds: Vec<(Id, Bond)>) -> (Vec<(Id, Bond)>, Vec<Id>) {
         let Some(&first) = members.first() else { continue };
         let copies = members.iter().all(|&i| {
             let (a, b) = (&bonds[i].1, &bonds[first].1);
-            a.ltk == b.ltk && a.classic == b.classic && a.key_size == b.key_size && a.authenticated == b.authenticated && a.secure_connections == b.secure_connections && a.peer_irk == b.peer_irk
+            a.paired_by == b.paired_by && a.ltk == b.ltk && a.classic == b.classic && a.key_size == b.key_size && a.authenticated == b.authenticated && a.secure_connections == b.secure_connections && a.peer_irk == b.peer_irk
         });
         if copies {
-            let pick = members.iter().copied().find(|&i| !bonds[i].1.name.trim().is_empty()).unwrap_or(first);
+            // A crash between permission writes can leave both records. Keep
+            // the ungranted one even if the granted copy has a better name.
+            let pick = members.iter().copied().min_by_key(|&i| {
+                (bonds[i].1.audio_allowed, bonds[i].1.name.trim().is_empty())
+            }).unwrap_or(first);
             keep_idx[pick] = true;
         }
     }

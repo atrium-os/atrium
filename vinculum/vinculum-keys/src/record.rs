@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! u8 version (1) | u8 flags (bit 0 SC, bit 1 authenticated, bit 2 has IRK,
-//!                  bit 3 has identity, bit 4 BR/EDR) | u8 key_size
+//!                  bit 3 has identity, bit 4 BR/EDR, bit 5 allow audio) | u8 key_size
 //! u8 addr_type | addr[6]                      address paired from
 //! u8 id_type | id[6]                          identity address (zero if none)
 //! ltk[16] | irk[16]                           irk zero if none
@@ -57,6 +57,8 @@ pub struct Bond {
     pub address: Address,
     /// A BR/EDR (Classic) bond: `ltk` holds the link key.
     pub classic: bool,
+    /// Explicit user consent to use the Classic Audio Sink profile.
+    pub audio_allowed: bool,
     pub identity: Option<Address>,
     pub ltk: [u8; 16],
     pub key_size: u8,
@@ -114,6 +116,7 @@ impl Bond {
         Bond {
             address,
             classic,
+            audio_allowed: false,
             identity: p.peer_identity.map(|(kind, bytes)| Address { kind, bytes }),
             ltk: p.ltk,
             key_size: p.key_size,
@@ -148,7 +151,8 @@ impl Bond {
             | (self.authenticated as u8) << 1
             | (self.peer_irk.is_some() as u8) << 2
             | (self.identity.is_some() as u8) << 3
-            | (self.classic as u8) << 4;
+            | (self.classic as u8) << 4
+            | (self.audio_allowed as u8) << 5;
         v.extend_from_slice(&[VERSION, flags, self.key_size, self.address.kind]);
         v.extend_from_slice(&self.address.bytes);
         let id = self.identity.unwrap_or(Address { kind: 0, bytes: [0; 6] });
@@ -174,7 +178,7 @@ impl Bond {
             return Err(DecodeError("unknown record version"));
         }
         let flags = b[1];
-        if flags & !0x1F != 0 {
+        if flags & !0x3F != 0 || flags & 0x30 == 0x20 {
             return Err(DecodeError("unknown flags"));
         }
         let addr = |o: usize| -> Result<Address, DecodeError> {
@@ -200,6 +204,7 @@ impl Bond {
         Ok(Bond {
             address,
             classic: flags & 0x10 != 0,
+            audio_allowed: flags & 0x20 != 0,
             identity,
             ltk,
             key_size,

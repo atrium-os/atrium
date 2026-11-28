@@ -201,6 +201,12 @@ E1 to E3 need nothing from Vinculum, so they can start now.
   1200 clicks, all within +0.009 to +0.014 ms of the device's own heard times, `rate_ppm`
   0 throughout. **E3's gate is met** (±2 ms over 10 minutes).
 
+- **E4** (2026-11-28). The jailed Vinculum A2DP driver registers on the device socket
+  under uid 65026. The FreeBSD gate decoded both stereo reference tones at 48 and
+  44.1 kHz through the real engine and policy daemon. Revoking the bond’s audio grant
+  removes the output. Measuring the A/V offset awaits sink delay reporting.
+  [Bluetooth B5 gate](bluetooth.md#151-b5-a2dp-source-as-built-2026-11-28)
+
 ## 9. Decisions, with recommendations
 
 1. **Devices announce to choragusd, not lyrad**, through a new restricted `audio-device`

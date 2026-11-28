@@ -212,7 +212,7 @@ mod tests {
     fn bond() -> Bond {
         Bond {
             address: Address { kind: 0, bytes: [1, 2, 3, 4, 5, 6] },
-            classic: false,
+            classic: false, audio_allowed: false,
             identity: None,
             ltk: [7; 16],
             key_size: 16,

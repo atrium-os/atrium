@@ -20,7 +20,7 @@
 #      keys are in Arca).
 #   4. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
 #      var/lib/atrium/apps,var/db/vinculum,var/run/atrium,atrium/sockets/{arca,
-#      vinculum-controllers,bluetooth-control,bluetooth-hid}} and an empty file
+#      vinculum-controllers,bluetooth-control,bluetooth-audio,bluetooth-hid}} and an empty file
 #      <path>/var/run/atrium/app-registry (nullfs file mount point).
 
 enabled       = true
@@ -59,6 +59,10 @@ source = "/atrium/sockets/bluetooth-hid"          # rw: HID devices to tactusd
 dest   = "atrium/sockets/bluetooth-hid"
 kind   = "rw_nullfs"
 [[mounts]]
+source = "/atrium/sockets/bluetooth-audio"
+dest   = "atrium/sockets/bluetooth-audio"
+kind   = "rw_nullfs"
+[[mounts]]
 source = "/atrium/sockets/arca"                   # ro: connect to arcad for the machine store
 dest   = "atrium/sockets/arca"
 kind   = "ro_nullfs"
@@ -75,6 +79,13 @@ source = "/var/db/vinculum"                       # rw: the power switch across 
 dest   = "var/db/vinculum"
 kind   = "rw_nullfs"
 
+# The root supervisor publishes the listener and gives its fd to vinculumd.
+[[sockets]]
+path = "/atrium/sockets/bluetooth-audio/audio.sock"
+owner = 65024
+group = 65026
+mode = "0660"
+
 [exec]
 path = "/usr/local/bin/atrium-vinculumd"
 argv = ["atrium-vinculumd",
@@ -82,6 +93,7 @@ argv = ["atrium-vinculumd",
         "--arca", "/atrium/sockets/arca/arcad.sock",
         "--control", "/atrium/sockets/bluetooth-control/control.sock",
         "--control-apps", "/var/run/atrium/app-registry", "/var/lib/atrium/apps",
+        "--audio", "/atrium/sockets/bluetooth-audio/audio.sock", "--audio-uid", "65026",
         "--hid", "/atrium/sockets/bluetooth-hid/hid.sock", "--hid-uid", "65018",
         "--power-file", "/var/db/vinculum/power"]
 uid  = 65024   # _vinculum

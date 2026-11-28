@@ -659,6 +659,7 @@ dependencies = [
  "lyra-protocol",
  "tempfile",
  "vinculum-audio",
+ "vinculum-control",
 ]
 
 [[package]]
@@ -671,6 +672,14 @@ dependencies = [
  "pdl-compiler",
  "pdl-runtime",
  "rand_core",
+]
+
+[[package]]
+name = "vinculum-control"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
 ]
 
 [[package]]

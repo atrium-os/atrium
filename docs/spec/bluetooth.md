@@ -618,10 +618,36 @@ RTP sequence and sample timestamps, tone amplitude and spectral energy, media ch
 release and device removal. The final short read produced one underrun and left Lyra's
 consumed position at 30,400 frames.
 
-**Next**: discover the Audio Sink SDP record on a bonded, encrypted Classic link with audio
-permission and hand its signalling and media channels to a jailed `vinculum-audio` process.
-Use that path with running choragusd and lyrad, then add AVDTP delay reports and verify the
-§8 clock bound in [lyra-v1.md](lyra-v1.md). AVRCP play/pause through media-control is open.
+The jailed path uses a separate audio grant on each Classic bond. New bonds and records written before this grant existed
+start with audio disabled. A Bluetooth control client can run `vinculum-ctl audio ADDR on`
+as the pairing owner or administrator. On an encrypted link, vinculumd checks the Audio
+Sink service class and the AVDTP descriptor for PSM 0x19 in the same SDP record. The
+supervisor binds a 0660 socket for the two services. The driver verifies the root publisher,
+and vinculumd accepts only the configured driver uid (65026). Signalling is scoped to the
+selected link. Opening media passes a dedicated datagram fd for that channel. Revocation
+(`audio ADDR off`), power-off, and link loss tear down the handoff. Choragus accepts that
+system uid only at its external-device door. The driver's two socket mounts are read-only,
+with no network or controller device. It announces one output per authorized stream.
+
+The disposable arm64 FreeBSD gate ran the production audio driver, choragusd and lyrad
+manifests with two Rootcanal controllers and a Bumble sink. The test host used its sealed
+file bond store. Two registered `lyra-play` processes supplied the left 440 Hz and right
+880 Hz tones through the active seat. At each rate, 48 consecutive RTP packets yielded
+30,720 decoded stereo frames. The peer received no AVDTP channel before consent. Revocation
+closed media and removed the output from Choragus. Seven checks passed.
+
+To repeat, stage the matching arm64 binaries (`vinculumd` built with `--features atrium`,
+`vinculum-hci`, `vinculum-ctl`, `vinculum-audio`, `lyrad`, `choragusd` and `lyra-play`),
+service manifests 35, 36, 46 and 47, `etc/jaild.policy.toml` and `vinculum/harness/b5_guest.sh`
+in a root-only `/root/b5-check` on a disposable guest with jaild and its bootstrap installed.
+Forward a guest loopback port to the host Rootcanal HCI port. Run
+`B5_HCI_PORT=<guest-port> sh b5_guest.sh` from that directory. On the host, run
+`sh scripts/vinculum-a2dp-jailed-check.sh` with `B5_SSH` naming an executable SSH wrapper
+for that guest, `B5_HCI=tcp-client:127.0.0.1:<host-port>`, and `B5_RESULTS` naming a new
+evidence directory. The Bumble and decoder settings are the same as the host gate.
+
+**Next** is AVDTP delay reporting and measurement of the A/V offset against Lyra §8.
+AVRCP play/pause through media-control also remains open.
 
 ## 16. Decisions, with recommendations
 

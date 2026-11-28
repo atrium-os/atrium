@@ -172,7 +172,7 @@ pub enum HostEvent {
     ChannelData { handle: u16, cid: u16, payload: Vec<u8> },
     ChannelClosed { handle: u16, cid: u16 },
     /// A channel we asked for was refused or timed out.
-    ChannelFailed { handle: u16, psm: u16, why: String },
+    ChannelFailed { handle: u16, cid: u16, psm: u16, why: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +515,12 @@ impl Host {
             Transport::Le => hci::PacketBoundaryFlag::FirstNonAutomaticallyFlushable,
             Transport::BrEdr => hci::PacketBoundaryFlag::FirstAutomaticallyFlushable,
         };
+        let fragments = (4 + payload.len()).div_ceil(mtu.max(1));
+        // Bound profile traffic even when controller credits stall. Fixed
+        // channels can still carry the signalling that releases a full link.
+        if cid >= 0x0040 && fragments > 128usize.saturating_sub(self.acl_out.len()) {
+            return Err("controller ACL queue full");
+        }
         for (i, frag) in acl::fragment(cid, payload, mtu.max(1)).into_iter().enumerate() {
             let pb = if i == 0 { first_flag } else { hci::PacketBoundaryFlag::ContinuingFragment };
             let acl = hci::Acl {

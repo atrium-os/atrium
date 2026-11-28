@@ -3,10 +3,10 @@
 # §5), as jailed, non-root services. Runs IN the FreeBSD guest, as root, once
 # per host:
 #
-#   sh vinculum-service.sh <vinculumd binary> <vinculum-hci binary> [<firmware dir>]
+#   sh vinculum-service.sh <vinculumd binary> <vinculum-hci binary> [<firmware dir>] [<vinculum-audio binary>]
 #
 # Build vinculumd with `--features atrium` for the Arca key store.
-# Creates the _vinculum and _vinculum-hci users and the socket directories,
+# Creates the host, HCI and audio service users and their socket directories,
 # installs atrium-vinculumd (with its services.d manifest) and
 # atrium-vinculum-hci, installs Vinculum's device rule for dispensatord
 # (vinculum/etc/devices.d/25-vinculum.toml) and prepares vinculumd's jail
@@ -19,10 +19,13 @@ set -e
 D=$1
 H=$2
 FW=$3
-[ -x "$D" ] && [ -x "$H" ] || { echo "usage: $0 <vinculumd binary> <vinculum-hci binary> [<firmware dir>]"; exit 2; }
+AUDIO=$4
+[ -z "$AUDIO" ] || [ -x "$AUDIO" ] || { echo "invalid audio driver: $AUDIO" >&2; exit 2; }
+[ -x "$D" ] && [ -x "$H" ] || { echo "usage: $0 <vinculumd binary> <vinculum-hci binary> [<firmware dir>] [<vinculum-audio binary>]"; exit 2; }
 
 user() { id "$1" >/dev/null 2>&1 || pw useradd "$1" -u "$2" -d /nonexistent -s /usr/sbin/nologin -c "$3"; }
 user _vinculum     65024 "Vinculum Bluetooth host"
+user _vinculum-audio 65026 "Vinculum Bluetooth audio"
 user _vinculum-hci 65025 "Vinculum Bluetooth controller transport"
 # See sigillum-service.sh: nullfs at boot, not on the first driver jail's mount.
 kldload -n nullfs
@@ -35,6 +38,7 @@ sysrc -n devmatch_blocklist 2>/dev/null | grep -qw ng_ubt || sysrc devmatch_bloc
 kldunload -n ng_ubt 2>/dev/null || true
 
 install -d -m 0755 /atrium/sockets
+install -d -o root -g _vinculum-audio -m 0750 /atrium/sockets/bluetooth-audio
 # Dispensatord publishes listeners, vinculumd connects, driver jails have only their own fd.
 install -d -o root -g _vinculum -m 0750 /atrium/sockets/vinculum-controllers
 # The trusted UI's socket: apps holding bluetooth-control, checked per connection.
@@ -72,8 +76,17 @@ install -o root -g wheel -m 0644 "$HERE/vinculum/etc/devices.d/25-vinculum.toml"
 R=/var/lib/atrium/jails/vinculumd
 # (Skips dirs that exist: a running jail has its mounts over them.)
 for d in dev libexec lib usr/lib usr/local/bin var/lib/atrium/apps var/db/vinculum var/run/atrium \
-         atrium/sockets/arca atrium/sockets/vinculum-controllers atrium/sockets/bluetooth-control atrium/sockets/bluetooth-hid; do
+         atrium/sockets/arca atrium/sockets/vinculum-controllers atrium/sockets/bluetooth-control atrium/sockets/bluetooth-audio atrium/sockets/bluetooth-hid; do
     [ -d "$R/$d" ] || install -d "$R/$d"
 done
 [ -e "$R/var/run/atrium/app-registry" ] || touch "$R/var/run/atrium/app-registry"
 echo "vinculum-service: commissioned. Restart atrium-portcullisd-bootstrap (or run it) to start atrium-vinculumd; plug in a controller for dispensatord to start its driver."
+
+if [ -n "$AUDIO" ]; then
+    R=/var/lib/atrium/jails/vinculum-audio
+    for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/bluetooth-audio atrium/sockets/audio-device; do
+        [ -d "$R/$d" ] || install -d "$R/$d"
+    done
+    install -m 0755 "$AUDIO" /usr/local/bin/atrium-vinculum-audio
+    install -m 0644 "$HERE/vinculum/etc/services.d/47-atrium-vinculum-audio.toml" /etc/atrium/services.d/
+fi

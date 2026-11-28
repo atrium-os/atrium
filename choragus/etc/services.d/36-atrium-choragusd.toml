@@ -112,6 +112,6 @@ mode  = "0666"
 
 [exec]
 path = "/usr/local/bin/atrium-choragusd"
-argv = ["atrium-choragusd", "--serve", "--limen-uid", "65022"]   # _limen (limen.md §2)
+argv = ["atrium-choragusd", "--serve", "--limen-uid", "65022", "--device-driver-uid", "65026"]   # _limen (limen.md §2)
 uid  = 65017   # _choragus
 gid  = 65017

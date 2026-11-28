@@ -383,7 +383,7 @@ impl Hid {
             HostEvent::ChannelOpen { handle, cid, psm, .. } => self.channel_open(host, handle, cid, psm, now),
             HostEvent::ChannelData { handle, cid, ref payload } => self.channel_data(host, handle, cid, payload, now),
             HostEvent::ChannelClosed { handle, cid } => self.channel_closed(host, handle, cid, now),
-            HostEvent::ChannelFailed { handle, psm, ref why } => {
+            HostEvent::ChannelFailed { handle, psm, ref why, .. } => {
                 if let Some(l) = self.links.get_mut(&handle) {
                     eprintln!("vinculumd: {}: channel to PSM {psm:#x}: {why}", l.addr);
                     match psm {

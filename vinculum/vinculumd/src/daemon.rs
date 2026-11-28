@@ -58,6 +58,9 @@ pub struct Config {
     /// it beyond our own (`_tactus`).
     pub hid_path: Option<String>,
     pub hid_uids: Vec<u32>,
+    /// Only this driver uid may receive an authorized AVDTP channel.
+    pub audio_path: Option<String>,
+    pub audio_uid: u32,
     /// Where Bluetooth being off is kept across restarts (the file holds
     /// `off`); without one, vinculumd starts on.
     pub power_file: Option<String>,
@@ -107,6 +110,7 @@ struct Daemon {
     paged_by: HashSet<Addr>,
     incoming: HashSet<u16>,
     hid: Hid,
+    audio: crate::audio::Audio,
     t0: Instant,
     /// A store's reply was lost and the clean-up of what it may have left
     /// failed too: when to try that clean-up again. An orphan for a new
@@ -237,6 +241,7 @@ impl Daemon {
         }
         let now = self.now();
         self.host.pair(handle, PairConfig { io_cap: self.cfg.io_cap, irk: self.cfg.irk }, now).map_err(|e| e.to_string())?;
+        self.audio.stop(&mut self.host, handle, now);
         self.pairing.insert(handle);
         Ok(())
     }
@@ -269,6 +274,52 @@ impl Daemon {
         }
     }
 
+    fn start_audio(&mut self, h: u16, now: u64) {
+        if !self.audio.idle() || self.off || self.pairing.contains(&h) || !self.host.is_encrypted(h)
+            || self.host.transport(h) != Some(vinculum_host::Transport::BrEdr) { return; }
+        let Some(b) = self.conns.get(&h).and_then(|a| self.bond_for(*a)).map(|k| &self.bonds[k].1) else { return };
+        if !b.classic || !b.audio_allowed { return; }
+        // A stable output handle for this bond without exposing its address or key.
+        let tag = vinculum_smp::crypto::aes_cmac(&b.ltk, b"Atrium A2DP output");
+        let mut id = [0; 8];
+        id.copy_from_slice(&tag[..8]);
+        self.audio.start(&mut self.host, h, u64::from_le_bytes(id), b.name.clone(), now);
+    }
+
+    fn set_audio(&mut self, uid: u32, a: Addr, allowed: bool, now: u64) -> Event {
+        let Some(k) = self.bond_for(a) else { return Event::Error { why: "pair the Classic device first".into() } };
+        let (old, b) = &self.bonds[k];
+        if !b.classic || !(uid == b.paired_by || uid == getuid() || uid == 0) {
+            return Event::Error { why: "audio requires the Classic bond's pairing owner or administrator".into() };
+        }
+        if allowed != b.audio_allowed {
+            let old = *old;
+            let mut record = b.clone();
+            record.audio_allowed = allowed;
+            if !allowed {
+                if let Some(h) = self.handle_of(a) { self.audio.stop(&mut self.host, h, now); }
+            }
+            let id = match self.store.store(&record) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.reconcile_store(now);
+                    return Event::Error { why: format!("saving audio permission: {e}") };
+                }
+            };
+            self.bonds[k] = (id, record);
+            if let Err(e) = self.store.delete(&old) {
+                self.reconcile_store(now);
+                if self.store_dirty_at.is_some() {
+                    return Event::Error { why: format!("cleaning up previous permission: {e}") };
+                }
+            }
+        }
+        if allowed {
+            if let Some(h) = self.handle_of(a) { self.start_audio(h, now); }
+        }
+        Event::Ok
+    }
+
     // ---- requests -------------------------------------------------------
 
     fn request(&mut self, i: usize, r: Request) {
@@ -294,6 +345,7 @@ impl Daemon {
                 agents: self.agents() as u32,
                 connections: self.conns.len() as u32,
             },
+            Request::SetAudio { address, allowed } => self.set_audio(c.uid, address, allowed, now),
             Request::Power { on } => self.power(on),
             Request::Scan { on } => {
                 if !self.host.is_ready() {
@@ -334,6 +386,7 @@ impl Daemon {
             }
             Request::Disconnect { address } => match self.handle_of(address) {
                 Some(h) => {
+                    self.audio.stop(&mut self.host, h, now);
                     self.host.disconnect(h, now);
                     Event::Ok
                 }
@@ -345,6 +398,7 @@ impl Daemon {
                     let (id, b) = self.bonds.remove(k);
                     let conn = self.conns.iter().find(|(_, x)| vinculum_keys::find([&b], &keys_addr(**x)).is_some()).map(|(h, _)| *h);
                     if let Some(h) = conn {
+                        self.audio.stop(&mut self.host, h, now);
                         self.host.disconnect(h, now);
                     }
                     let r = self.store.delete(&id);
@@ -539,7 +593,8 @@ impl Daemon {
             }
             let handles: Vec<u16> = self.conns.keys().copied().collect();
             for h in handles {
-                self.host.disconnect(h, now);
+                self.audio.stop(&mut self.host, h, now);
+                    self.host.disconnect(h, now);
             }
         }
         self.update_scan();
@@ -663,6 +718,7 @@ impl Daemon {
             HostEvent::Disconnected { handle, reason } => {
                 self.pairing.remove(&handle);
                 self.incoming.remove(&handle);
+                self.audio.stop(&mut self.host, handle, now);
                 self.hid.link_gone(handle);
                 if let Some(a) = self.conns.remove(&handle) {
                     self.broadcast(&Event::Disconnected { address: a, reason });
@@ -742,6 +798,7 @@ impl Daemon {
                         }
                         self.update_scan();
                         self.start_hid(handle);
+                    self.start_audio(handle, now);
                     }
                     Err(e) => {
                         // A bond we can't keep is no bond: drop the link.
@@ -774,6 +831,7 @@ impl Daemon {
                 // A fresh pairing starts HID once its bond is stored.
                 if !self.pairing.contains(&handle) {
                     self.start_hid(handle);
+                    self.start_audio(handle, now);
                 }
             }
             HostEvent::EncryptionFailed { handle, status } => {
@@ -783,7 +841,7 @@ impl Daemon {
                 self.host.disconnect(handle, now);
             }
             e @ (HostEvent::ChannelOpen { .. } | HostEvent::ChannelData { .. } | HostEvent::ChannelClosed { .. } | HostEvent::ChannelFailed { .. }) => {
-                self.hid.on_event(&mut self.host, &e, now);
+                if !self.audio.event(&mut self.host, &e, now) { self.hid.on_event(&mut self.host, &e, now); }
             }
             HostEvent::ConnectionRequest { peer: p, .. } => {
                 // A Classic device paging us: only bonded devices get a
@@ -907,6 +965,9 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         std::process::exit(1)
     });
     let _ = std::fs::set_permissions(&cfg.control_path, std::fs::Permissions::from_mode(0o660));
+    let audio = crate::audio::Audio::new(cfg.audio_path.as_deref(), cfg.audio_uid).unwrap_or_else(|e| {
+        eprintln!("vinculumd: audio socket: {e}"); std::process::exit(1)
+    });
     let hid = Hid::new(cfg.hid_path.as_deref(), cfg.hid_uids.clone());
     let mut host = Host::new();
     host.set_local_name(&cfg.name);
@@ -944,6 +1005,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         paged_by: HashSet::new(),
         incoming: HashSet::new(),
         hid,
+        audio,
         t0: Instant::now(),
         store_dirty_at: None,
     };
@@ -974,13 +1036,17 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
             d.reconcile_store(now);
         }
         let le_deadline = d.le_connecting.and_then(|(_, t)| t);
-        let next = [d.host.deadline(), d.pairable.deadline(), d.hid.deadline(), le_deadline, d.store_dirty_at].into_iter().flatten().min();
+        d.audio.check(&mut d.host, now);
+        let next = [d.audio.deadline(), d.host.deadline(), d.pairable.deadline(), d.hid.deadline(), le_deadline, d.store_dirty_at].into_iter().flatten().min();
         let wait_ms = next.map_or(-1, |n| n.saturating_sub(now).min(60_000) as i32);
         let mut fds = vec![link.fd(), listener.as_raw_fd()];
         fds.extend(d.clients.iter().map(|c| c.sock.as_raw_fd()));
         let nclients = d.clients.len();
         let hid_fds = d.hid.fds();
         fds.extend(hid_fds.iter().map(|(fd, _)| *fd));
+        let audio_fds = d.audio.fds();
+        let audio_offset = fds.len();
+        fds.extend(audio_fds.iter().map(|(fd, _)| *fd));
         let ready = poll(&fds, wait_ms);
         if ready[0] {
             let n = link.read(&mut buf).unwrap_or(0);
@@ -1008,6 +1074,18 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
             if ready[2 + nclients + k] {
                 let now = d.now();
                 d.hid.readable(&mut d.host, *which, now);
+            }
+        }
+        for (i, (_, which)) in audio_fds.iter().enumerate() {
+            if ready[audio_offset + i] {
+                let now = d.now();
+                if matches!(which, crate::audio::Fd::Listener) {
+                    if d.audio.accept() {
+                        for h in d.conns.keys().copied().collect::<Vec<_>>() { d.start_audio(h, now); }
+                    }
+                } else {
+                    d.audio.readable(which, &mut d.host, now);
+                }
             }
         }
         for (i, r) in ready[2..2 + nclients].iter().enumerate() {

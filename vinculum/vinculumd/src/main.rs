@@ -49,6 +49,7 @@ use std::time::Instant;
 mod apps;
 mod daemon;
 mod hid;
+mod audio;
 mod policy;
 
 use vinculum_hci_proto::h4::Decoder;
@@ -194,6 +195,8 @@ struct Opts {
     power_file: Option<String>,
     /// The Classic name others see (`--name`, default "Atrium").
     name: String,
+    audio: Option<String>,
+    audio_uid: u32,
     hid: Option<String>,
     hid_uids: Vec<u32>,
     classic: Option<vinculum_control::Addr>,
@@ -201,7 +204,7 @@ struct Opts {
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|controllers:DIR|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]] [--name NAME]");
+        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|controllers:DIR|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...] [--audio PATH --audio-uid UID]] [--name NAME]");
         std::process::exit(2)
     };
     let mut o = Opts { transport: String::new(), transport_uids: Vec::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
@@ -215,6 +218,8 @@ fn opts() -> Opts {
         control_apps: None,
         power_file: None,
         name: "Atrium".into(),
+        audio: None,
+        audio_uid: 65026,
         hid: None,
         hid_uids: Vec::new(),
         classic: None,
@@ -235,6 +240,8 @@ fn opts() -> Opts {
             "--arca" => o.arca = Some(a.next().unwrap_or_else(|| usage())),
             "--classic" => o.classic = Some(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--control" => o.control = Some(a.next().unwrap_or_else(|| usage())),
+            "--audio" => o.audio = Some(a.next().unwrap_or_else(|| usage())),
+            "--audio-uid" => o.audio_uid = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--hid" => o.hid = Some(a.next().unwrap_or_else(|| usage())),
             "--hid-uid" => o.hid_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             // Atrium: apps whose installed manifest holds bluetooth-control.
@@ -321,7 +328,7 @@ fn main() {
         std::process::exit(1)
     });
     if let Some(path) = o.control.clone() {
-        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), allowed_apps: o.control_apps.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone(), power_file: o.power_file.clone(), name: o.name.clone() };
+        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), allowed_apps: o.control_apps.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], audio_path: o.audio.clone(), audio_uid: o.audio_uid, hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone(), power_file: o.power_file.clone(), name: o.name.clone() };
         daemon::run(cfg, link, store, bonds);
     }
     let t0 = Instant::now();

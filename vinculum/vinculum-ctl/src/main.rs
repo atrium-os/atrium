@@ -224,6 +224,15 @@ fn main() {
                 }
             }
         }
+        Some("audio") => {
+            let address = addr(args.get(1));
+            let allowed = match args.get(2).map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => die("audio ADDR on|off"),
+            };
+            Conn::open(&socket, false).ok(Request::SetAudio { address, allowed });
+        }
         Some(cmd @ ("disconnect" | "remove")) => {
             let a = addr(args.get(1));
             let mut c = Conn::open(&socket, false);
@@ -286,6 +295,6 @@ fn main() {
                 }
             }
         }
-        _ => die("usage: vinculum-ctl [-s SOCKET] status|power on|off|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|watch [SECS]|agent [--yes]"),
+        _ => die("usage: vinculum-ctl [-s SOCKET] status|power on|off|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|audio ADDR on|off|watch [SECS]|agent [--yes]"),
     }
 }

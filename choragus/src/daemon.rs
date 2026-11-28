@@ -57,6 +57,8 @@ pub struct Config {
     pub period_frames: u32,
     /// Where users' volumes persist (`<dir>/<user>.toml`); `None`: memory only.
     pub state_dir: Option<String>,
+    /// System A2DP driver admitted on the external-device socket.
+    pub device_driver_uid: Option<u32>,
     /// limend's uid: the only peer served on the attribution socket.
     pub limen_uid: Option<u32>,
 }
@@ -746,22 +748,29 @@ fn serve_device(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps:
         return;
     }
     let _ = c.set_read_timeout(None);
-    let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
-    let grant = |user: &str, app_id: &str| match &cfg.policy_base {
-        Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
-        None => cfg.grants.granted(app_id),
-    };
-    let claimed = portcullis_peer::username(uid).unwrap_or_default();
-    let verified = crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant);
-    let Some(v) = verified.filter(|v| v.caps & CAP_DEVICE != 0) else {
-        eprintln!("choragusd: uid {uid} refused on audio-device (no audio-device grant)");
-        let _ = wire::send(&mut c, &FromDevice::Denied { code: DenyCode::NotGranted });
-        return;
+    let driver = if cfg.device_driver_uid == Some(uid) && socket_caps == CAP_DEVICE {
+        // A system service has no app launch-registry entry. This kernel uid
+        // grant applies only to this socket and never names a persona.
+        "_vinculum-audio".to_string()
+    } else {
+        let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
+        let grant = |user: &str, app_id: &str| match &cfg.policy_base {
+            Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
+            None => cfg.grants.granted(app_id),
+        };
+        let claimed = portcullis_peer::username(uid).unwrap_or_default();
+        let verified = crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant);
+        let Some(v) = verified.filter(|v| v.caps & CAP_DEVICE != 0) else {
+            eprintln!("choragusd: uid {uid} refused on audio-device (no audio-device grant)");
+            let _ = wire::send(&mut c, &FromDevice::Denied { code: DenyCode::NotGranted });
+            return;
+        };
+        v.app_id
     };
     if wire::send(&mut c, &FromDevice::Welcome).is_err() {
         return;
     }
-    eprintln!("choragusd: device driver '{}' (uid {uid}) connected", v.app_id);
+    eprintln!("choragusd: device driver '{}' (uid {uid}) connected", driver);
     let mut mine: Option<u32> = None;
     while let Ok(msg) = wire::recv::<_, ToDevice>(&mut c) {
         match msg {
@@ -838,7 +847,7 @@ fn serve_device(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps:
     if let Some(id) = mine {
         device_gone(&state, id);
     }
-    eprintln!("choragusd: device driver '{}' (uid {uid}) disconnected", v.app_id);
+    eprintln!("choragusd: device driver '{}' (uid {uid}) disconnected", driver);
 }
 
 /// The device dropped: keep its output for [`DEVICE_GRACE`] in case it comes

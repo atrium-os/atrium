@@ -90,6 +90,8 @@ ro_paths = [
     # Vinculum (bluetooth.md §5): the host discovers the root-published
     # controller sockets. Drivers read firmware at power-up.
     "/atrium/sockets/vinculum-controllers",
+    "/atrium/sockets/bluetooth-audio",
+    "/atrium/sockets/audio-device",
     "/usr/local/share/atrium/firmware/bluetooth",
     "/var/lib/atrium/apps",          # limend: installed manifests (embeds, roles); the share sheet: share-targets and icons
     "/etc/pwd.db",                   # limend: a worker rule's run_as -> uid (no hashes)
@@ -150,6 +152,7 @@ rw_paths = [
     "/atrium/sockets/vinculum-controllers",
     "/atrium/sockets/bluetooth-control",
     "/atrium/sockets/bluetooth-hid",
+    "/atrium/sockets/bluetooth-audio",
     "/var/db/vinculum",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
@@ -612,7 +615,7 @@ allowed_system_uids = [
              # vinculum-service.sh creates it)
     65025,   # _vinculum-hci: the Bluetooth transport, one jail per controller,
              # started by dispensatord (vinculum/etc/devices.d/25-vinculum.toml)
-    # 65026 = _vinculum-audio  (reserved: Bluetooth audio profiles, B5)
+    65026,   # _vinculum-audio: A2DP profile and Lyra output
     65027,   # _hospes-cdm: content decryption module hosts, started per app by
              # portcullisd (OpenCdm) under the system worker rule (hospes-cdm-bundle.sh)
     65028,   # _sigillum: Sigillum's broker, sigillumd (docs/spec/sigillum.md §4)
@@ -670,6 +673,7 @@ allowed_system_gids = [
     65023,   # _nuntius
     65024,   # _vinculum
     65025,   # _vinculum-hci
+    65026,   # _vinculum-audio
     65027,   # _hospes-cdm
     65028,   # _sigillum
     65029,   # _sigillum-dev

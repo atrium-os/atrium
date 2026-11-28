@@ -93,6 +93,8 @@ pub enum Request {
     /// refused, until it is turned on again; kept across restarts when
     /// vinculumd has a state file.
     Power { on: bool },
+    /// Change the recorded audio grant for a Classic bond.
+    SetAudio { address: Addr, allowed: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,5 +236,26 @@ mod tests {
         assert_eq!(clean_name("a\u{2066}b\u{0085}c\u{1b}[2J"), "abc[2J");
         assert_eq!(clean_name("Écouteurs ✓"), "Écouteurs ✓");
         assert_eq!(clean_name("Mo\u{200B}use\u{2028}\u{FEFF}X\u{2029}"), "MouseX");
+    }
+}
+
+/// One connection represents one authorized remote sink. Signal packets use
+/// this stream; MediaReady is followed by a descriptor for outgoing media SDUs.
+pub mod audio {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum FromHost {
+        Attach { id: u64, name: String },
+        Signal(Vec<u8>),
+        MediaReady { mtu: u16 },
+        MediaClosed,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum ToHost {
+        Signal(Vec<u8>),
+        OpenMedia,
+        CloseMedia,
     }
 }

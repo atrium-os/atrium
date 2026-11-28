@@ -29,7 +29,7 @@ def device(link, name, addr):
     return dev
 
 
-def check_capture(packets, rate, pool, joint):
+def check_capture(packets, rate, pool, joint, amplitude_range=(14000, 18500)):
     if len(packets) != PACKETS:
         raise ValueError(f"received {len(packets)} of {PACKETS} media packets")
     seq = packets[0].sequence_number
@@ -79,7 +79,7 @@ def check_capture(packets, rate, pool, joint):
         energy = sum(x * x for x in samples)
         fraction = 2 * (re * re + im * im) / max(1, len(samples) * energy)
         amplitude = 2 * math.hypot(re, im) / len(samples)
-        if fraction < 0.95 or not 14000 < amplitude < 18500:
+        if fraction < 0.95 or not amplitude_range[0] < amplitude < amplitude_range[1]:
             raise ValueError(f"channel {channel}: {hz} Hz fraction {fraction:.3f}, amplitude {amplitude:.0f}")
     print(f"Bumble decoded {frames} stereo frames at {rate} Hz, left 440 Hz and right 880 Hz")
 

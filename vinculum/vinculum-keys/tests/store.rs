@@ -7,6 +7,7 @@ fn bond(n: u8) -> Bond {
     Bond {
         address: Address { kind: 1, bytes: [n, 2, 3, 4, 5, 0xC6] },
         classic: n == 3,
+        audio_allowed: n == 3,
         identity: Some(Address { kind: 0, bytes: [n, 9, 9, 9, 9, 9] }),
         ltk: [n; 16],
         key_size: 16,
@@ -20,7 +21,7 @@ fn bond(n: u8) -> Bond {
 
 #[test]
 fn record_round_trip_and_rejects() {
-    for b in [bond(1), Bond { identity: None, peer_irk: None, name: String::new(), ..bond(2) }] {
+    for b in [bond(1), bond(3), Bond { identity: None, peer_irk: None, name: String::new(), ..bond(2) }] {
         assert_eq!(Bond::decode(&b.encode()).unwrap(), b);
     }
     let e = bond(1).encode();
@@ -37,6 +38,24 @@ fn record_round_trip_and_rejects() {
     let long = Bond { name: "x".repeat(200), ..bond(3) };
     assert_eq!(Bond::decode(&long.encode()).unwrap().name.len(), 64);
     assert!(!format!("{:?}", bond(1)).contains("[1, 1, 1"), "Debug redacts keys");
+}
+
+#[test]
+fn interrupted_permission_change_recovers_without_audio_in_either_order() {
+    let granted = bond(3);
+    let mut denied = granted.clone();
+    denied.audio_allowed = false;
+    denied.name.clear();
+    let old = ([1; 16], denied);
+    let new = ([2; 16], granted);
+    for records in [vec![old.clone(), new.clone()], vec![new.clone(), old.clone()]] {
+        let (keep, drop) = vinculum_keys::split_duplicates(records);
+        assert_eq!(keep, vec![old.clone()]);
+        assert_eq!(drop, vec![new.0]);
+    }
+    let mut le = bond(1).encode();
+    le[1] |= 0x20;
+    assert!(Bond::decode(&le).is_err());
 }
 
 #[test]
