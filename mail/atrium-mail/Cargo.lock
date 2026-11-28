@@ -338,6 +338,7 @@ dependencies = [
  "pergola",
  "pergola-richtext",
  "portcullis-ipc",
+ "portcullis-peer",
  "praeco",
  "psl",
  "rsa",

@@ -563,7 +563,7 @@ pub fn forget(arca: &std::path::Path, c: &AccountConfig, sieve: Option<&(Server,
             let mut s = UnixStream::connect(arca).map_err(|e| format!("Arca isn't reachable: {e}"))?;
             s.set_read_timeout(Some(Duration::from_secs(10))).ok();
             arcad::proto::write_request(&mut s, op::DELETE_FOR, &w.buf).map_err(|e| e.to_string())?;
-            let (st, _) = arcad::proto::read_reply(&mut s).map_err(|e| e.to_string())?;
+            let (st, _) = arcad::proto::read_app_reply(&mut s, arcad::proto::AppReply::Empty).map_err(|e| e.to_string())?;
             match st {
                 status::OK => Ok(()),
                 status::LOCKED => Err("Arca is locked".to_string()),
@@ -1059,4 +1059,15 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert!(seen[2].1.starts_with(&w.buf) && seen[2].1.ends_with(&[3; 16]));
     }
+}
+
+mod removal;
+#[cfg(feature = "legacy-smime-integration")]
+pub(crate) use removal::bind_fixture;
+#[cfg(feature = "legacy-smime-integration")]
+pub use removal::FIXTURE_ACCOUNT_ID;
+pub fn resume_removal(store: &Store, path: &std::path::Path, account: AccountId) -> Result<(), String> {
+    removal::resume_removal_with(store, path, account, removal::ARCA_UID, |cfg, sieve| {
+        forget(path, cfg, sieve)
+    })
 }

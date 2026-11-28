@@ -383,11 +383,32 @@ fn main() {
         }
     };
     #[cfg(feature = "legacy-smime-integration")]
-    let legacy_preview = atrium_mail::settings::synthetic_legacy_sheet().then(|| {
-        let fixture = legacy_preview::PreviewFixture::seed(&store).expect("seed synthetic preview");
+    let mut legacy_preview = atrium_mail::settings::synthetic_legacy_sheet().then(|| {
+        let fixture = legacy_preview::PreviewFixture::reopen(&store).expect("open synthetic preview")?;
         assert!(fixture.still_unread().expect("check seeded preview"));
-        fixture
-    });
+        Some(fixture)
+    }).flatten();
+    // A crash after the confirmation or after Arca's acknowledgment must
+    // resume even if the person never opens Settings again.
+    match store.account_lifecycles() {
+        Ok(records) => {
+            let pending: Vec<_> = records.into_iter().filter_map(|(id, phase)|
+                (!matches!(phase, mail_store::removal::Lifecycle::Enrolled(_))).then_some(id)
+            ).collect();
+            if !pending.is_empty() {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let path = atrium_mail::accounts::arca_socket();
+                    for id in pending {
+                        if let Err(e) = atrium_mail::accounts::resume_removal(&store, &path, id) {
+                            eprintln!("atrium-mail: account {id} removal pending: {e}");
+                        }
+                    }
+                });
+            }
+        }
+        Err(e) => eprintln!("atrium-mail: could not read pending account removals: {e}"),
+    }
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
     let at_rest = atrium_mail::at_rest::app_data();
@@ -759,7 +780,31 @@ fn main() {
                     let _ = e.borrow_mut().detach_embed(id);
                 }
             }
-            if let Some(ask) = sw.s.take_smime_ask().filter(|_| !close_settings && sw.smime.is_none() && sw.microsoft.is_none()) {
+            #[cfg(feature = "legacy-smime-integration")]
+            if let Some(account) = sw.s.take_preview_revocation() {
+                if legacy_preview.as_ref().is_some_and(|p| p.account == account) {
+                    if let (Some(e), Some((id, _))) = (&embeds, sw.smime.take()) {
+                        let _ = e.borrow_mut().detach_embed(id);
+                    }
+                    sw.s.smime_note(None);
+                }
+            }
+            let ask = sw.s.take_smime_ask();
+            #[cfg(feature = "legacy-smime-integration")]
+            let ask = ask.filter(|ask| {
+                if *ask == atrium_mail::settings::SmimeAsk::LegacyBind {
+                    if legacy_preview.is_none() && atrium_mail::settings::synthetic_legacy_sheet() {
+                        match legacy_preview::PreviewFixture::seed(&engine.store) {
+                            Ok(preview) => legacy_preview = Some(preview),
+                            Err(e) => sw.s.sign_in_note(&format!("Could not create the synthetic account: {e}")),
+                        }
+                    }
+                    if let Some(preview) = &legacy_preview { sw.s.bind_fixture(preview.account); }
+                    return false;
+                }
+                true
+            });
+            if let Some(ask) = ask.filter(|_| !close_settings && sw.smime.is_none() && sw.microsoft.is_none()) {
                 let request = embeds.as_ref().zip(sw.win.embed_token()).and_then(|(e, token)| {
                     use atrium_mail::settings::SmimeAsk;
                     let role = if ask != SmimeAsk::Provision {
@@ -1459,4 +1504,54 @@ fn main() {
         }
     }
     let _ = syncer.wake.send(atrium_mail::accounts::Wake::Stop);
+}
+
+/// The signed guest gate runs this test under the live Work Mail launch UID,
+/// after the trusted worker has enrolled its disposable JMAP account.
+#[cfg(all(test, feature = "legacy-smime-integration"))]
+#[test]
+#[ignore = "requires the signed Work Mail jail and an enrolled fixture"]
+fn signed_account_removal_recovers_in_settings() {
+    use atrium_mail::settings::Settings;
+    use mail_store::removal::Lifecycle;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store");
+    let arca = atrium_mail::accounts::arca_socket();
+    let settings = |store: &Store, path: PathBuf| {
+        let engine = Rc::new(Engine::new(store.clone(), Parser { program: "/nonexistent".into() }));
+        Settings::new(engine, Arc::new(AtomicBool::new(true)), path)
+    };
+    let until = |s: &Settings, ready: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            s.tick();
+            if ready() { break; }
+            assert!(Instant::now() < deadline, "{:?}", s.ui.get_cloned().note);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let id = {
+        let store = Store::open(&db).unwrap();
+        let preview = legacy_preview::PreviewFixture::seed(&store).unwrap();
+        let id = preview.account;
+        let s = settings(&store, arca.clone());
+        s.bind_fixture(id);
+        until(&s, &|| matches!(store.account_lifecycle(id), Ok(Some(Lifecycle::Enrolled(_)))));
+        assert!(preview.snapshot(false).is_some());
+        let offline = settings(&store, dir.path().join("offline"));
+        offline.remove(id);
+        assert_eq!(offline.ui.get_cloned().removing, Some(id));
+        offline.remove(id);
+        until(&offline, &|| offline.ui.get_cloned().note.is_some_and(|n| n.contains("Retry in Accounts")));
+        assert!(matches!(store.account_lifecycle(id), Ok(Some(Lifecycle::Removing(_)))));
+        assert!(preview.snapshot(false).is_none());
+        assert!(preview.still_unread().unwrap());
+        id
+    };
+    let reopened = Store::open(&db).unwrap();
+    let s = settings(&reopened, arca);
+    until(&s, &|| reopened.accounts().unwrap().is_empty());
+    assert_eq!(reopened.account_lifecycle(id).unwrap(), None);
+    assert!(legacy_preview::PreviewFixture::reopen(&reopened).unwrap().is_none());
+    assert!(reopened.accounts().unwrap().is_empty());
 }

@@ -183,6 +183,10 @@ pub mod op {
     /// Non-default synthetic gate, trusted UI only: redeem a reserved key action.
     #[cfg(feature = "legacy-smime-integration")]
     pub const U_SMIME_SYNTHETIC_MANAGE: u16 = 0xE7;
+    /// Signed synthetic Work Mail only. Read the current instance or fence
+    /// one exact instance. Neither operation enrolls an account.
+    pub const MAIL_FIXTURE_INSTANCE: u16 = 0xE9;
+    pub const MAIL_FIXTURE_REVOKE: u16 = 0xEA;
     /// Optional lab path. Trusted UI only, fixed synthetic JMAP proof.
     #[cfg(feature = "legacy-jmap-worker")]
     pub const U_SMIME_SYNTHETIC_JMAP: u16 = 0xE8;

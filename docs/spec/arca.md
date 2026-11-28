@@ -1003,7 +1003,7 @@ Preview uses local bytes and the existing networkless jailed reader.
 Opening a message never authenticates to the provider, enrolls a key,
 or falls back to OAEP.
 
-**Revocation and recovery.** Today Mail removes the local account first
+**Revocation and recovery.** For ordinary endpoint credentials Mail removes the local account first
 and then asks Arca to delete endpoint credentials asynchronously.
 `DELETE_FOR` reaches those endpoint items. `PERSONA_DESTROY`, invoked by
 atrium-volumes, enumerates and removes the persona's Arca groups. Group
@@ -1116,9 +1116,46 @@ Staged controls cover the wrong TLS name, a substituted account, direct
 signed Mail requests and trusted-UI requests for Personal. No live
 account, credential store lookup or provider authorization is involved.
 This proves a transport path for the disposable fixture. A separately
-deployed service, a trusted-sheet enrollment press for this account,
-and revocation from Mail's account removal remain later work. The six whole-path timing
+deployed service and a trusted-sheet enrollment press for this JMAP account
+remain open. The six whole-path timing
 trials cover two operational failures only.
+
+##### Removing the linked synthetic Work account
+
+In the disposable signed bundle, the operator first enrolls the synthetic
+JMAP account through the trusted probe. “Link enrolled synthetic JMAP
+account” in Mail Settings asks Arca for its 16-byte instance. Arca checks
+the peer's launch label, synthetic user, Work persona, configured Mail
+publisher and fixture binding. Mail authenticates the daemon UID on the
+connected socket. Linking stores the instance against the local fixture
+account and makes it visible in Accounts.
+
+The second Remove press commits the intent to the persona's Mail index.
+While pending, Mail keeps the rows, suppresses the preview and shows the
+pending status. Arca fences and cleans up that exact instance before
+echoing its ID. A lost reply can be replayed after another enrollment.
+Mail checks the echo against the intent and commits local deletion and
+any endpoint cleanup references together. Launch and Settings reopen
+retry pending work. The fixture remembers a removed account across launch
+and requires an explicit link to use a fresh enrollment.
+
+Arca keeps the linked Work instance in its private directory. A sheet
+reservation captures the binding and rechecks it during the reader run,
+before releasing the RSA key and at result publication. Changing or fencing
+the binding invalidates the reservation. The fixture credential is synthetic
+and has no live provider item. Live credential invalidation and production
+receipt-backed preview remain open.
+
+On 2026-11-28, 46 arcad tests, 24 Mail store tests and the isolated
+Mail client socket regression passed on the Mac. During an active read,
+normal Mail revocation closed both worker sockets and denied publication.
+The host checks cover the peer UID, wrong echo, unavailable socket,
+reopened Mail index, interrupted credential cleanup and replay after
+re-enrollment. The signed guest script runs the Settings confirmation with
+Arca unavailable and reopens Mail's store under the signed Work UID to
+finish with the real daemon. Mail, arcad and their tests passed the arm64 FreeBSD cross-check. This new
+guest case awaits a VM run. Logs are in
+`~/atrium-vm/evidence/mail/removal-2026-11-28/`.
 
 ##### Failure observability review
 

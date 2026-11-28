@@ -288,6 +288,20 @@ impl State {
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
         let mut item: Option<ItemId> = None;
         let r = match who {
+            #[cfg(all(feature = "legacy-jmap-worker", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+            Label::App { user, publisher, app_id, persona } if matches!(op, op::MAIL_FIXTURE_INSTANCE | op::MAIL_FIXTURE_REVOKE) => {
+                if self.legacy_smime_registry.is_none() || user != integration::SYNTHETIC_USER
+                    || app_id != smime::MAIL || persona.as_deref() != Some("work")
+                    || *publisher == crate::label::UNSIGNED_PUBLISHER
+                    || self.mail_sign_ins.mail_publisher.as_ref() != Some(publisher)
+                {
+                    reply(status::DENIED)
+                } else if let Some(store) = self.stores.get_mut(user) {
+                    integration::mail_account_request(store, &self.dir, *publisher, op, body)
+                } else {
+                    reply(status::LOCKED)
+                }
+            }
             Label::App { user, publisher, app_id, persona } if matches!(op, op::MAIL_SMIME_UNWRAP | op::MAIL_SMIME_CERTS) => {
                 if app_id == smime::MAIL && *publisher != crate::label::UNSIGNED_PUBLISHER
                     && self.mail_sign_ins.mail_publisher.as_ref() == Some(publisher)

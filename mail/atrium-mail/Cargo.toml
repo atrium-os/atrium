@@ -40,6 +40,7 @@ atrium-open = { path = "../../atrium-open" }
 # Attachments (mail.md §8): their type from their bytes, never their name alone.
 atrium-types = { path = "../../atrium-types" }
 # Open in… (mail.md §8.2): OpenAttachment to portcullisd, a sealed memory file.
+portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
 mail-store = { path = "../mail-store" }
 mail-schema = { path = "../mail-schema" }

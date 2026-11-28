@@ -36,7 +36,7 @@ run_suite() {
     diff -u "$bin.expected" "$bin.passed"
 }
 # arcad-unit is built with legacy-smime-prototype and legacy-jmap-worker.
-run_suite arcad-unit 30 server::smime
+run_suite arcad-unit 32 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
 run_suite mail-received-unit 1 legacy_received_envelope
@@ -162,7 +162,7 @@ publisher=$(sha256 -q "$signing/publisher.der")
 install -d /etc/atrium/publishers
 openssl pkey -in "$signing/key" -pubout -out "/etc/atrium/publishers/mail-smime-gate.pem"
 install -d "$d/bundle/bin"
-for bin in atrium-mail mail-sync-worker mail-parse-jail mail-office-copy smime_installed_probe arca-jmap-proof; do
+for bin in atrium-mail mail-sync-worker mail-parse-jail mail-office-copy smime_installed_probe arca-jmap-proof mail-preview-unit; do
     install -m 0555 "$d/$bin" "$d/bundle/bin/$bin"
 done
 sed '/^embeds = /s/"smime-provision"/"smime-provision", "smime-legacy-read"/' \
@@ -441,7 +441,9 @@ test "$(stat -f %Sp "$fences")" = drwx------
 restart_arca
 jmap_probe kept restarted
 test "$(authority restarted)" = "$first"
-su -m _arca-ui -c "exec $d/arca-jmap-proof revoke $arca $workuid 1"
+timeout 35 jexec -u "$(id -nu "$workuid")" "$work" /bin/mail-preview-unit --ignored --exact signed_account_removal_recovers_in_settings >"$d/mail-removal.out"
+cat "$d/mail-removal.out"
+grep -Fxq 'test signed_account_removal_recovers_in_settings ... ok' "$d/mail-removal.out"
 su -m _arca-ui -c "exec $d/arca-jmap-proof revoke $arca $workuid 0"
 test "$(find "$fences" -name 'account-*' -perm 600 | wc -l | tr -d ' ')" = 1
 restart_arca

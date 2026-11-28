@@ -87,6 +87,9 @@ impl Writer<'_> {
     /// Remove an account and its local mail (§5.4). Its Arca items are the
     /// caller's to delete.
     pub fn remove_account(&mut self, account: AccountId) -> Result<()> {
+        if self.tx.open_table(crate::removal::REMOVALS)?.get(account)?.is_some() {
+            return Err(crate::Error::Corrupt("account requires Arca revocation"));
+        }
         let folders: Vec<(u32, crate::Folder)> = {
             let t = self.tx.open_table(crate::FOLDERS)?;
             let mut v = Vec::new();

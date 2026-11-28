@@ -10,9 +10,19 @@ const SUBJECT: &str = "Synthetic legacy S/MIME message";
 pub(super) struct PreviewFixture {
     store: Store,
     inbox: FolderId,
+    pub(super) account: mail_store::AccountId,
 }
 
 impl PreviewFixture {
+    pub(super) fn reopen(store: &Store) -> Result<Option<Self>, mail_store::Error> {
+        if let Some(previous) = store.setting(0, atrium_mail::accounts::FIXTURE_ACCOUNT_ID)? {
+            if !store.accounts()?.iter().any(|(id, _)| u64::from(*id) == previous) {
+                return Ok(None);
+            }
+        }
+        Self::seed(store).map(Some)
+    }
+
     pub(super) fn seed(store: &Store) -> Result<Self, mail_store::Error> {
         let account = match store
             .accounts()?
@@ -26,6 +36,7 @@ impl PreviewFixture {
         let fixture = Self {
             store: store.clone(),
             inbox,
+            account,
         };
         let present = store.list(inbox, 0, 3)?;
         for (uid, raw) in [
@@ -61,6 +72,12 @@ impl PreviewFixture {
     }
 
     pub(super) fn snapshot(&self, unsupported: bool) -> Option<Vec<u8>> {
+        use mail_store::removal::Lifecycle;
+        match self.store.account_lifecycle(self.account).ok()? {
+            Some(Lifecycle::Enrolled(_)) => {}
+            None if self.store.setting(0, atrium_mail::accounts::FIXTURE_ACCOUNT_ID).ok()?.is_none() => {}
+            _ => return None,
+        }
         let uid = if unsupported { 2 } else { 1 };
         let row = self
             .store

@@ -120,6 +120,8 @@ fn signed_persona(registry: &Path, uid: u32, publisher: [u8; 32]) -> Option<Opti
 }
 
 struct Approval {
+    #[cfg(feature = "legacy-jmap-worker")]
+    account: Option<jmap_account_gate::SheetBinding>,
     registry: std::path::PathBuf,
     uid: u32,
     publisher: [u8; 32],
@@ -133,6 +135,8 @@ struct Approval {
 
 impl Approval {
     fn valid(&self, client: &UnixStream) -> bool {
+        #[cfg(feature = "legacy-jmap-worker")]
+        if self.account.as_ref().is_some_and(|a| !a.valid()) { return false; }
         binding_valid(
             client,
             &self.registry,
@@ -216,9 +220,14 @@ fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
         publisher,
     )
     .ok()?;
+    #[cfg(feature = "legacy-jmap-worker")]
+    let account = (persona.as_deref() == Some("work"))
+        .then(|| jmap_account_gate::SheetBinding::capture(&state.dir, publisher)).transpose().ok()?;
     let cancelled = Arc::new(AtomicBool::new(false));
     state.legacy_smime_pending = Some(cancelled.clone());
     Some(Approval {
+        #[cfg(feature = "legacy-jmap-worker")]
+        account,
         registry,
         uid,
         publisher,
@@ -263,7 +272,7 @@ fn synthetic_open(
                     let state = state.lock().unwrap_or_else(|p| p.into_inner());
                     let store = state.stores.get(SYNTHETIC_USER).ok_or_else(closed)?;
                     let item = approval.item.ok_or_else(closed)?;
-                    if approval.cancelled.load(Ordering::Acquire)
+                    if !approval.valid(client)
                         || fixture_item(store, persona, publisher)? != Some(item)
                     {
                         return Err(closed());
@@ -454,8 +463,8 @@ fn serve_open(
         }
         synthetic_open(state, client, &approval, start)
     })();
+    let mut state = lock();
     let final_reply = {
-        let mut state = lock();
         state.legacy_smime_pending = None;
         let result = match result {
             // Only the fixture UI sees the synthetic clean-exit marker.
@@ -1113,6 +1122,8 @@ mod tests {
     }
 
     enum Revoke {
+        #[cfg(feature = "legacy-jmap-worker")]
+        MailRemoval,
         Lock,
         Disconnect,
         Registry,
@@ -1131,6 +1142,17 @@ mod tests {
         )
         .unwrap();
         let registry = fixture.legacy_smime_registry.clone().unwrap();
+        #[cfg(feature = "legacy-jmap-worker")]
+        let mail_removal = matches!(revoke, Revoke::MailRemoval).then(|| {
+            let mail = Label::App {
+                user: SYNTHETIC_USER.into(), app_id: "org.atrium.mail".into(),
+                publisher: PUB, persona: Some("work".into()),
+            };
+            let store = fixture.stores.get_mut(SYNTHETIC_USER).unwrap();
+            let id = super::jmap_account_gate::enroll_fixture_for_test(store, dir.path(), PUB);
+            assert_eq!(fixture.handle(&mail, op::MAIL_FIXTURE_INSTANCE, &[]).body.bytes(), id);
+            (mail, id)
+        });
         let state = Mutex::new(fixture);
         let user = body(|w| w.str(SYNTHETIC_USER));
         let root = body(|w| {
@@ -1171,6 +1193,13 @@ mod tests {
             // The worker is paused before its content result. Arca must
             // grant another request access to State during this wait.
             match revoke {
+                #[cfg(feature = "legacy-jmap-worker")]
+                Revoke::MailRemoval => {
+                    let (mail, id) = mail_removal.unwrap();
+                    let reply = state.try_lock().unwrap().handle(&mail, op::MAIL_FIXTURE_REVOKE, &id);
+                    assert_eq!(reply.status, status::OK);
+                    assert_eq!(reply.body.bytes(), id);
+                }
                 Revoke::Lock => {
                     let mut state = state
                         .try_lock()
@@ -1196,6 +1225,12 @@ mod tests {
             }
             assert!(state.lock().unwrap().legacy_smime_pending.is_none());
         });
+    }
+
+    #[cfg(feature = "legacy-jmap-worker")]
+    #[test]
+    fn mail_removal_closes_both_worker_sockets_and_refuses_the_result() {
+        revoke_during_worker_read(Revoke::MailRemoval);
     }
 
     #[test]
@@ -1291,3 +1326,6 @@ mod jmap_account_gate;
 pub use jmap_account_gate::serve_jmap_proof;
 #[cfg(any(test, all(target_os = "freebsd", feature = "legacy-jmap-worker")))]
 pub(crate) use jmap_account_gate::fence_persona;
+
+#[cfg(all(feature = "legacy-jmap-worker", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+pub(crate) use jmap_account_gate::mail_account_request;

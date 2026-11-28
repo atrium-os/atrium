@@ -215,6 +215,8 @@ pub struct Settings {
     added: Rc<std::cell::Cell<bool>>,
     /// Arca's answer to removing a removed account's items.
     forgot: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
+    revoked_preview: Rc<std::cell::Cell<Option<AccountId>>>,
+    lifecycle_work: Rc<RefCell<Option<mpsc::Receiver<Result<String, String>>>>>,
     /// Where arcad listens.
     arca: Rc<std::path::PathBuf>,
     /// The named persona Mail runs in (Work), shared with the main
@@ -272,6 +274,8 @@ impl Settings {
             smime_note: ui.sibling(None),
             added: Rc::default(),
             forgot: Rc::default(),
+            lifecycle_work: Rc::default(),
+            revoked_preview: Rc::default(),
             arca: Rc::new(arca),
             persona: Rc::default(),
             at_rest: crate::at_rest::app_data(),
@@ -279,6 +283,7 @@ impl Settings {
             ui,
         };
         s.reload();
+        s.retry_removals();
         s
     }
 
@@ -319,8 +324,31 @@ impl Settings {
             })
             .collect();
         let u = self.ui.get_cloned();
-        let rows: Vec<Row> = rows;
+        let mut rows: Vec<Row> = rows;
+        let mut storage_error = None;
+        match e.store.account_lifecycles() {
+            Ok(records) => for (id, phase) in records {
+                use mail_store::removal::Lifecycle;
+                let status = match phase {
+                    Lifecycle::Removing(_) => "Removal pending",
+                    Lifecycle::Enrolled(_) => "Enrolled synthetic account",
+                    Lifecycle::Credentials { ref config, .. } => {
+                        rows.push(Row { id, address: config.address.clone(), status: "Credential cleanup pending".into(),
+                            trouble: true, renew_microsoft: false, screener: false, stuck: None });
+                        continue;
+                    }
+                };
+                if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+                    row.status = status.into();
+                } else {
+                    rows.push(Row { id, address: "Synthetic Work account".into(), status: status.into(),
+                        trouble: false, renew_microsoft: false, screener: false, stuck: None });
+                }
+            },
+            Err(e) => storage_error = Some(format!("Couldn't read pending account removals: {e}")),
+        }
         let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
+        if let Some(message) = storage_error { self.sign_in_note(&message); }
         let pd = pa.and_then(|a| e.private_domain(a));
         let privates = pa.map(|a| e.private_addresses(a)).unwrap_or_default();
         let my_key = pa.and_then(|a| e.my_pgp_key(a)).map(|k| (k.emails.join(", "), k.short()));
@@ -601,6 +629,24 @@ impl Settings {
             self.update(|u| u.removing = Some(id));
             return;
         }
+        match self.engine.store.account_lifecycle(id) {
+            Ok(Some(phase)) => {
+                if self.lifecycle_work.borrow().is_some() { return; }
+                if !matches!(phase, mail_store::removal::Lifecycle::Credentials { .. }) {
+                    if let Err(e) = self.engine.store.write(|w| w.begin_legacy_removal(id)) {
+                        self.sign_in_note(&format!("Couldn't record removal: {e}"));
+                        return;
+                    }
+                    self.revoked_preview.set(Some(id));
+                }
+                self.update(|u| { u.removing = None; u.note = Some("Removal pending.".into()); });
+                self.reload();
+                self.retry_removals();
+                return;
+            }
+            Err(e) => { self.sign_in_note(&format!("Couldn't read account removal state: {e}")); return; }
+            Ok(None) => {}
+        }
         let cfg = self.engine.store.account_config(id).ok().flatten();
         let sieve = self.engine.store.sieve(id).ok().flatten().map(|s| (s.server, s.item));
         let r = self.engine.store.write(|w| w.remove_account(id));
@@ -624,6 +670,45 @@ impl Settings {
             }
         }
         self.reload();
+    }
+
+    pub fn take_preview_revocation(&self) -> Option<AccountId> {
+        self.revoked_preview.take()
+    }
+
+    fn retry_removals(&self) {
+        if self.lifecycle_work.borrow().is_some() { return; }
+        let records = match self.engine.store.account_lifecycles() {
+            Ok(records) => records,
+            Err(e) => { self.sign_in_note(&format!("Couldn't read pending removals: {e}")); return; }
+        };
+        let pending: Vec<_> = records.into_iter().filter(|(_, phase)| !matches!(phase, mail_store::removal::Lifecycle::Enrolled(_))).collect();
+        if pending.is_empty() { return; }
+        let store = self.engine.store.clone();
+        let path = (*self.arca).clone();
+        let (tx, rx) = mpsc::channel();
+        *self.lifecycle_work.borrow_mut() = Some(rx);
+        std::thread::spawn(move || {
+            let mut error = None;
+            for (id, _) in pending {
+                if let Err(e) = crate::accounts::resume_removal(&store, &path, id) {
+                    error.get_or_insert(format!("Account removal pending: {e}. Retry in Accounts."));
+                }
+            }
+            let _ = tx.send(error.map_or(Ok("Account removal completed.".into()), Err));
+        });
+    }
+
+    #[cfg(feature = "legacy-smime-integration")]
+    pub fn bind_fixture(&self, id: AccountId) {
+        if self.lifecycle_work.borrow().is_some() { return; }
+        let store = self.engine.store.clone();
+        let path = (*self.arca).clone();
+        let (tx, rx) = mpsc::channel();
+        *self.lifecycle_work.borrow_mut() = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::accounts::bind_fixture(&store, &path, id).map(|()| "Linked the enrolled synthetic account.".into()));
+        });
     }
 
     pub fn toggle_screener(&self, id: AccountId) {
@@ -999,6 +1084,12 @@ impl Settings {
                 }),
             }
         }
+        let lifecycle = self.lifecycle_work.borrow().as_ref().and_then(|r| r.try_recv().ok());
+        if let Some(result) = lifecycle {
+            self.lifecycle_work.borrow_mut().take();
+            self.sign_in_note(&result.unwrap_or_else(|e| e));
+            self.reload();
+        }
         let forgot = self.forgot.borrow().as_ref().and_then(|r| r.try_recv().ok());
         if let Some(r) = forgot {
             *self.forgot.borrow_mut() = None;
@@ -1161,6 +1252,7 @@ impl SettingsView {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SmimeAsk {
     Provision,
+    LegacyBind,
     LegacyPreview,
     LegacyUnsupported,
     LegacyEnroll,
@@ -1394,6 +1486,9 @@ impl SettingsView {
             button(ctx, x, y + em(14.0), "Enroll synthetic legacy key", true, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyEnroll)));
             let s = self.s.clone();
             button(ctx, x + em(315.0), y + em(14.0), "Forget synthetic legacy key", false, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyForget)));
+            y += em(38.0);
+            let s = self.s.clone();
+            button(ctx, x, y + em(14.0), "Link enrolled synthetic JMAP account", false, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyBind)));
         } else {
             button(ctx, x, y + em(14.0), "Add S/MIME identity", true, true, move || s.smime_asked.set(Some(SmimeAsk::Provision)));
         }

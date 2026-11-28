@@ -345,6 +345,114 @@ pub(crate) fn fence_persona(
     }
     Ok(rows.len())
 }
+
+#[cfg(feature = "legacy-jmap-worker")]
+pub(super) struct SheetBinding {
+    path: PathBuf,
+    ledger: PathBuf,
+    instance: Option<Instance>,
+}
+
+#[cfg(feature = "legacy-jmap-worker")]
+impl SheetBinding {
+    fn path(dir: &Path, publisher: [u8; 32]) -> PathBuf {
+        let publisher: String = publisher.iter().map(|b| format!("{b:02x}")).collect();
+        dir.join(format!("legacy-work-mail-{publisher}"))
+    }
+
+    fn read(path: &Path) -> io::Result<Option<Instance>> {
+        use std::io::Read;
+        match File::open(path) {
+            Ok(mut f) if f.metadata()?.len() == 16 => {
+                let mut id = [0; 16];
+                f.read_exact(&mut id)?;
+                Ok(Some(id))
+            }
+            Ok(_) => Err(closed()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(super) fn capture(dir: &Path, publisher: [u8; 32]) -> io::Result<Self> {
+        let path = Self::path(dir, publisher);
+        let binding = Self { instance: Self::read(&path)?, path, ledger: dir.join(LEDGER) };
+        binding.valid().then_some(binding).ok_or_else(closed)
+    }
+
+    pub(super) fn valid(&self) -> bool {
+        Self::read(&self.path).is_ok_and(|current| current == self.instance)
+            && self.instance.is_none_or(|id| Fences::open(&self.ledger)
+                .and_then(|f| f.fenced(id, [2; 16])).is_ok_and(|fenced| !fenced))
+    }
+
+    fn link(dir: &Path, publisher: [u8; 32], id: Instance) -> io::Result<()> {
+        use std::io::Write;
+        // The daemon mutex serializes links. An incomplete record refuses
+        // previews until the signed app repeats the link.
+        let mut f = OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)
+            .open(Self::path(dir, publisher))?;
+        f.write_all(&id)?;
+        f.sync_all()?;
+        File::open(dir)?.sync_all()
+    }
+}
+
+#[cfg(feature = "legacy-jmap-worker")]
+pub(crate) fn mail_account_request(
+    store: &mut Store, dir: &Path, publisher: [u8; 32], op: u16, body: &[u8],
+) -> super::Reply {
+    use super::{op, reply, status};
+    use crate::server::ok;
+    if store.state() != arca_store::LockState::Unlocked {
+        return reply(status::LOCKED);
+    }
+    let target = match op {
+        op::MAIL_FIXTURE_INSTANCE if body.is_empty() => None,
+        op::MAIL_FIXTURE_REVOKE => match Instance::try_from(body) {
+            Ok(instance) => Some(instance),
+            Err(_) => return reply(status::MALFORMED),
+        },
+        _ => return reply(status::MALFORMED),
+    };
+    let accounts = Accounts::new("work", publisher);
+    let mut find = || -> io::Result<Option<Instance>> {
+        let rows = accounts.rows(store)?;
+        let binding = fixture_binding(publisher);
+        let mut matching = rows.iter().filter(|row| row.binding == binding
+            && row.principal == "login@fixture.invalid" && row.account == "a1");
+        let active = matching.next();
+        if matching.next().is_some() { return Err(closed()); }
+        let ledger = dir.join(LEDGER);
+        if let Some(instance) = target {
+            // An absent row is a retry only if the exact account fence
+            // already exists. Never create a marker for a supplied unknown ID.
+            let fences = Fences::open(&ledger)?;
+            if !active.is_some_and(|r| r.instance == instance) {
+                return Ok(fences.entry("account", instance).try_exists()?.then_some(instance));
+            }
+            accounts.revoke_account(store, &fences, instance)?;
+            Ok(Some(instance))
+        } else if let Some(row) = active {
+            let fences = Fences::open(&ledger)?;
+            if accounts.fenced(&fences, row)? { return Ok(None); }
+            SheetBinding::link(dir, publisher, row.instance)?;
+            Ok(Some(row.instance))
+        } else {
+            Ok(None)
+        }
+    };
+    match find() {
+        Ok(Some(instance)) => ok(instance.to_vec()),
+        Ok(None) => reply(status::DENIED),
+        Err(_) => reply(status::INTERNAL),
+    }
+}
+
+#[cfg(feature = "legacy-jmap-worker")]
+fn fixture_binding(publisher: [u8; 32]) -> Binding {
+    Binding { owner: [1; 16], persona: [2; 16], publisher, credential: [3; 16], generation: 1 }
+}
 const SESSION_MAX: usize = 4096;
 
 impl Enrollment {
@@ -1214,13 +1322,7 @@ pub fn serve_jmap_proof(
         }
 
         // Every authority field is selected by Arca for this lab account.
-        let binding = Binding {
-            owner: [1; 16],
-            persona: [2; 16],
-            publisher,
-            credential: [3; 16],
-            generation: 1,
-        };
+        let binding = fixture_binding(publisher);
         let accounts = Accounts::new("work", publisher);
 
         // Revocation never launches the worker or needs the provider.
@@ -1248,6 +1350,16 @@ pub fn serve_jmap_proof(
             return Ok(vec![witness::REVOKED, revoked]);
         }
 
+        // A fetch begun under one enrollment cannot complete as an
+        // approval for its replacement when Mail removes it mid-fetch.
+        let starting_instance = {
+            let mut state = lock();
+            let store = state.stores.get_mut(SYNTHETIC_USER).ok_or_else(closed)?;
+            let fences = accounts.fences(store, &ledger)?;
+            accounts.cleanup(store, &fences)?;
+            accounts.load(store, &fences, &binding, "login@fixture.invalid", "a1")?
+                .map(|a| a.enrollment.instance)
+        };
         let challenge = Challenge::new(binding.clone())?;
         let (mut control, mut lifetime) = launch_worker("org.atrium.jmap-proof-fixture")?;
         let data = (|| {
@@ -1311,13 +1423,17 @@ pub fn serve_jmap_proof(
             let store = state.stores.get_mut(SYNTHETIC_USER).ok_or_else(closed)?;
             let fences = accounts.fences(store, &ledger)?;
             accounts.cleanup(store, &fences)?;
-            match accounts.load(
+            let current = accounts.load(
                 store,
                 &fences,
                 &binding,
                 &enrollment.principal,
                 &enrollment.session.account,
-            )? {
+            )?;
+            if current.as_ref().map(|a| a.enrollment.instance) != starting_instance {
+                return Err(closed());
+            }
+            match current {
                 Some(authority) => (authority, witness::KEPT),
                 None => (
                     accounts.enroll(store, &fences, enrollment, session)?,
@@ -1387,4 +1503,53 @@ pub fn serve_jmap_proof(
         code,
     );
     proto::write_reply(&mut client, code, &witness)
+}
+
+#[cfg(all(test, feature = "legacy-jmap-worker"))]
+pub(super) fn enroll_fixture_for_test(store: &mut Store, dir: &Path, publisher: [u8; 32]) -> Instance {
+    let accounts = Accounts::new("work", publisher);
+    let fences = accounts.fences(store, &dir.join(LEDGER)).unwrap();
+    let (approval, session) = approved(fixture_binding(publisher), "a1");
+    accounts.enroll(store, &fences, approval, session.as_bytes()).unwrap().enrollment.instance
+}
+
+#[cfg(all(test, feature = "legacy-jmap-worker"))]
+#[test]
+fn mail_removal_acknowledges_only_the_requested_work_instance() {
+    use crate::{label::Label, proto::{op, status}, server::State};
+    let root = tempfile::tempdir().unwrap();
+    let publisher = [7; 32];
+    let user = super::SYNTHETIC_USER;
+    let path = root.path().join("store");
+    let mut state = State::new(root.path().into()).unwrap();
+    let mut store = sealed_store(&path);
+    let old = enroll_fixture_for_test(&mut store, root.path(), publisher);
+    state.stores.insert(user.into(), store);
+    state.mail_sign_ins.mail_publisher = Some(publisher);
+    let mail = |persona, publisher| Label::App {
+        user: user.into(), app_id: "org.atrium.mail".into(), publisher, persona,
+    };
+    let work = mail(Some("work".into()), publisher);
+    assert_eq!(state.handle(&work, op::MAIL_FIXTURE_INSTANCE, &[]).status, status::DENIED);
+    state.legacy_smime_registry = Some(root.path().join("registry"));
+    for denied in [mail(None, publisher), mail(Some("work".into()), [8; 32]), Label::TrustedUi] {
+        assert_ne!(state.handle(&denied, op::MAIL_FIXTURE_REVOKE, &old).status, status::OK);
+    }
+    assert_eq!(state.handle(&work, op::MAIL_FIXTURE_INSTANCE, &[]).body.bytes(), old);
+    let sheet = SheetBinding::capture(root.path(), publisher).unwrap();
+    assert!(sheet.valid());
+    assert_eq!(state.handle(&work, op::MAIL_FIXTURE_REVOKE, &[0; 16]).status, status::DENIED);
+    assert_eq!(state.handle(&work, op::MAIL_FIXTURE_REVOKE, &old).body.bytes(), old);
+    assert!(!sheet.valid());
+    drop(state.stores.remove(user));
+    let mut reopened = sealed_store(&path);
+    let new = enroll_fixture_for_test(&mut reopened, root.path(), publisher);
+    assert_ne!(new, old);
+    state.stores.insert(user.into(), reopened);
+    // Lost acknowledgment: replay after re-adding the same account.
+    assert_eq!(state.handle(&work, op::MAIL_FIXTURE_REVOKE, &old).body.bytes(), old);
+    assert!(SheetBinding::capture(root.path(), publisher).is_err());
+    assert_eq!(state.handle(&work, op::MAIL_FIXTURE_INSTANCE, &[]).body.bytes(), new);
+    assert!(SheetBinding::capture(root.path(), publisher).unwrap().valid());
+    assert!(!sheet.valid());
 }

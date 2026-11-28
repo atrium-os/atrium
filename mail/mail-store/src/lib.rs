@@ -37,6 +37,7 @@ pub mod certs;
 pub mod dns;
 pub mod pgp;
 pub mod config;
+pub mod removal;
 pub use config::{AccountConfig, Protocol, Reached, Server};
 pub mod later;
 pub mod people;
@@ -347,6 +348,7 @@ impl Store {
             tx.open_table(senders::SETTINGS)?;
             tx.open_table(senders::SYNC_STATE)?;
             tx.open_table(config::CONFIG)?;
+            tx.open_table(removal::REMOVALS)?;
             tx.open_table(senders::HELD)?;
             tx.open_table(senders::LANES)?;
             tx.open_table(certs::CERTS)?;
@@ -428,7 +430,8 @@ impl Store {
 
     pub fn add_account(&self, name: &str) -> Result<AccountId> {
         let tx = self.db.begin_write()?;
-        let id = Self::next_id(&tx, "account")? as u32;
+        let id = AccountId::try_from(Self::next_id(&tx, "account")?)
+            .map_err(|_| Error::Corrupt("account IDs exhausted"))?;
         tx.open_table(ACCOUNTS)?.insert(id, enc(&Account { name: name.into() }).as_slice())?;
         tx.commit()?;
         Ok(id)
