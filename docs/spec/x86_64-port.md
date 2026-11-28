@@ -254,6 +254,15 @@ The guest also enumerated the physical R9700 in a separate reservation.
 The [guest PCI record and native render procedure](r9700-bare-metal.md#48-native-gpu-development-in-a-vaahana-guest-on-hostkey)
 give the BARs, module checks and render acceptance command.
 
+The first desktop package from `2688da30b` installed after extraction with
+`tar --no-xattrs` on FreeBSD. After a clean reboot, jaild, the volume service
+and Portcullis created their sockets. Forum changed the headless frame drawn
+by Fresco's compute renderer. The first gate returned 9/14. The guest process
+table confirmed jailed Limen and Forum services; its four jailed renderer
+workers had real and effective UID 65010. They must use the dedicated
+`_fresco-render` account (65011). The gate also needs FreeBSD's
+`ps -axo jid,uid,ucomm` field syntax for checking those processes.
+
 ### 7.1 Tessera root on a second disk
 
 The Hostkey storage test uses the UFS clone's EFI loader and kernel. A second

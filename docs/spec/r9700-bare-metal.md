@@ -286,6 +286,23 @@ The first run on this clone exposed the host's `0000:03:00.0` as `vgapci0@pci0:0
 
 For a native run use modules from the guest kernel's build and check the guest kernel and module digests. The probe and client run from the guest's local disk. With the matched files staged at the paths in the script, `sh gpu-stage-run.sh <pci-ko-sha>,<gpu-ko-sha>,<client-sha> render` attaches the driver, runs `si-client-test --render-only`, and hands the function back to `vgapci`. Test 22 checks the solid GLSL triangle and test 23 checks the interpolated colour triangle against the CPU pixel reference. The render stage reports failure if loading, attach, render or final driver cleanup fails. Host driver binding and restoration are coordinated under the shared Hostkey reservation.
 
+The first native guest run used the current PCI and GPU modules built against
+the stock kernel revision and its effective configuration. All three modules
+loaded and unloaded on a guest boot without passthrough. Under passthrough,
+the driver attached and both draws completed with interrupt-driven fences.
+The guest log is `/root/runs/20261128T133614Z.log` with the matching `.kern`
+on the development clone.
+
+| Native draw | Pixel result |
+|---|---|
+| 22, solid triangle | All 600 interior and 3,368 exterior samples matched. Centre pixel `0xff00ffff`. |
+| 23, interpolated triangle | All 600 interior samples exceeded the 3/255 tolerance. All 3,368 exterior samples matched. At (32,24) the GPU returned `0xff365f6a` against `0xff365b6e`. |
+
+Both draws lit 40 edge pixels. The stage exited 1, returned the function to
+`vgapci`, and unloaded the modules. Vaahana powered off the guest and verified
+the original host drivers, empty overrides, four bridge bindings and zero
+open consumers before releasing the hardware at 19:07 IST.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
