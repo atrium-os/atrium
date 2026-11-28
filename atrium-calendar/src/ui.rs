@@ -34,6 +34,13 @@ const WORKDAY: Span = Span {
 
 #[derive(Clone, Copy)]
 enum Action {
+    ReminderPage(Option<usize>),
+    SetReminder {
+        revision: u64,
+        id: Uuid,
+        shown: NaiveDate,
+        enabled: bool,
+    },
     Undo(atrium_calendar::UndoReceipt),
     Resume,
     Load,
@@ -54,7 +61,9 @@ enum Action {
     OpenHit(Uuid, NaiveDate, u64),
     PickImport,
     CloseImport,
-    ApplyInvitation { cancellation: bool },
+    ApplyInvitation {
+        cancellation: bool,
+    },
     InvitationPage(usize),
     MeetingChange(usize),
     ChooseSkip(bool),
@@ -75,6 +84,8 @@ enum Reply {
 }
 
 struct Planner {
+    reminder_page: Mutable<Option<usize>>,
+    reminder_review: Mutable<atrium_calendar::store::reminders::Review>,
     import: Mutable<Option<Screen>>,
     undo: Mutable<Option<(atrium_calendar::UndoReceipt, &'static str)>>,
     search: Mutable<Option<SearchForm>>,
@@ -208,6 +219,24 @@ impl Planner {
                 opening_view,
                 date,
                 view: data.view,
+            });
+        }
+        if let Action::SetReminder {
+            revision,
+            id,
+            shown,
+            enabled,
+        } = action
+        {
+            self.editor
+                .get_cloned()
+                .ok_or("Open the event first")?
+                .check_saved()?;
+            return Ok(Request::SetReminder {
+                revision,
+                id,
+                shown,
+                enabled,
             });
         }
         if let Action::CreateZoned(kind) = action {
@@ -415,6 +444,58 @@ impl View for Planner {
                 .render(ctx);
             return;
         }
+        let review = self.reminder_review.get_cloned();
+        if let Some(page) = self.reminder_page.get() {
+            self.button(
+                ctx,
+                18.,
+                44.,
+                145.,
+                "Back to calendar",
+                Action::ReminderPage(None),
+            );
+            Label::new(format!(
+                "Reminders · {} current · {} in history",
+                review.upcoming, review.history
+            ))
+            .at(18., 115.)
+            .render(ctx);
+            let page = page.min(review.items.len().saturating_sub(1) / 6);
+            for (i, item) in review.items.iter().skip(page * 6).take(6).enumerate() {
+                if let Some(at) = chrono::DateTime::from_timestamp(item.due, 0) {
+                    let at = at.with_timezone(&data.viewing_zone);
+                    let title: String = item.title.chars().take(45).collect();
+                    Label::new(format!(
+                        "{} · {} · {title}",
+                        if item.history { "History" } else { "Current" },
+                        at.format("%b %d %H:%M")
+                    ))
+                    .at(18., 162. + 46. * i as f32)
+                    .render(ctx);
+                }
+            }
+            if page > 0 {
+                self.button(
+                    ctx,
+                    18.,
+                    485.,
+                    105.,
+                    "Previous",
+                    Action::ReminderPage(Some(page - 1)),
+                );
+            }
+            if (page + 1) * 6 < review.items.len() {
+                self.button(
+                    ctx,
+                    138.,
+                    485.,
+                    105.,
+                    "Next",
+                    Action::ReminderPage(Some(page + 1)),
+                );
+            }
+            return;
+        }
         self.button(ctx, 531., 5., 150., "Import .ics…", Action::PickImport);
         for (i, choice) in CalendarView::ALL.into_iter().enumerate() {
             let button = if choice == view {
@@ -432,6 +513,16 @@ impl View for Planner {
         self.button(ctx, 283., 44., 104., "Zoned event…", Action::NewZoned);
         self.button(ctx, 396., 44., 121., "Search…", Action::SearchPanel(true));
         self.button(ctx, 531., 44., 150., "Settings…", Action::Settings(true));
+        if !review.items.is_empty() {
+            self.button(
+                ctx,
+                18.,
+                530.,
+                195.,
+                &format!("Reminders ({})", review.items.len()),
+                Action::ReminderPage(Some(0)),
+            );
+        }
         if data.meeting_changes > 0 {
             self.button(
                 ctx,
@@ -640,6 +731,8 @@ pub fn run() -> io::Result<()> {
     let field = |s: &str| Mutable::with_dirty(TextEdit::new(s), dirty.clone());
     let (tx, rx) = mpsc::channel();
     let planner = Arc::new(Planner {
+        reminder_page: Mutable::with_dirty(None, dirty.clone()),
+        reminder_review: Mutable::with_dirty(Default::default(), dirty.clone()),
         import: Mutable::with_dirty(None, dirty.clone()),
         undo: Mutable::with_dirty(None, dirty.clone()),
         search: Mutable::with_dirty(None, dirty.clone()),
@@ -682,11 +775,31 @@ pub fn run() -> io::Result<()> {
         usize,
         Option<atrium_calendar::store::meeting_changes::ChangeDetail>,
     );
+    let (review_tx, review_rx) = mpsc::sync_channel(1);
     let (changes_tx, changes_rx) = mpsc::channel::<(Option<Uuid>, Result<ReviewPoll, String>)>();
     let (poll_changes, requests) = mpsc::sync_channel(1);
     let path = socket.clone();
     std::thread::spawn(move || {
+        let mut token = None;
         while let Ok(selected) = requests.recv() {
+            let next = atrium_calendar::wire::exchange::<atrium_calendar::store::reminders::Poll>(
+                &path,
+                &Request::PollReminders {
+                    token: token.take(),
+                },
+            );
+            if let Ok(poll) = next {
+                token = Some(poll.token);
+                if let Some(due) = poll
+                    .fresh_due
+                    .and_then(|d| u64::try_from(d).ok())
+                    .and_then(|d| d.checked_mul(1000))
+                {
+                    // The private review already contains this receipt on every sink outcome.
+                    let _ = praeco::reminders::post(&praeco::client::socket(), due);
+                }
+                let _ = review_tx.try_send(poll.review);
+            }
             let result = atrium_calendar::wire::exchange::<ReviewPoll>(
                 &path,
                 &Request::PollMeetingChanges { selected },
@@ -741,6 +854,11 @@ pub fn run() -> io::Result<()> {
             planner
                 .import
                 .set(Some(result.unwrap_or_else(Screen::Problem)));
+        }
+        if let Ok(review) = review_rx.try_recv() {
+            if planner.reminder_review.get_cloned() != review {
+                planner.reminder_review.set(review);
+            }
         }
         let selected_review = || match planner.import.get_cloned() {
             Some(Screen::MeetingChange(change)) => Some(change.meeting_id),
@@ -902,6 +1020,7 @@ pub fn run() -> io::Result<()> {
                     planner.settings.set(open);
                     planner.status.set(String::new());
                 }
+                Action::ReminderPage(page) => planner.reminder_page.set(page),
                 Action::Page(p) => planner.page.set(p),
                 action => match planner.request(action) {
                     Ok(req) => {
@@ -1023,6 +1142,10 @@ pub fn run() -> io::Result<()> {
                             Action::OpenHit(..) => "Selected search result",
                             Action::Change(true) => "Deleted on this device",
                             Action::Change(false) => "Changes saved on this device",
+                            Action::SetReminder { enabled: true, .. } => {
+                                "Reminder set for the saved start"
+                            }
+                            Action::SetReminder { enabled: false, .. } => "Reminder turned off",
                             Action::SetZone(_) => "Viewing time zone saved",
                             Action::SetOpening(_) => "Opening view saved",
                             Action::Hold(_) => "Held on this device",

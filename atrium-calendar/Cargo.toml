@@ -8,11 +8,15 @@ default-run = "atrium-calendar"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:atrium-open", "dep:limen", "dep:pergola"]
+desktop = ["dep:atrium-open", "dep:limen", "dep:pergola", "dep:praeco"]
 
 [[bin]]
 name = "atrium-calendar"
 path = "src/main.rs"
+required-features = ["desktop"]
+
+[[example]]
+name = "reminder_probe"
 required-features = ["desktop"]
 
 [dependencies]
@@ -32,6 +36,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
+praeco = { optional = true, path = "../praeco" }
 atrium-open = { optional = true, path = "../atrium-open" }
 limen = { optional = true, path = "../limen" }
 pergola = { optional = true, path = "../pergola" }

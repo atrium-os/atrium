@@ -69,8 +69,48 @@ fn main() -> io::Result<()> {
         }
         UnixListener::bind(socket)?
     };
-    for conn in listener.incoming() {
-        let mut conn = conn?;
+    let mut last_clock = None;
+    let mut clock_error = false;
+    loop {
+        let second = chrono::Utc::now().timestamp();
+        if last_clock != Some(second) {
+            last_clock = Some(second);
+            if installed {
+                let zone = fs::read_to_string("/endpoint/device-zone")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok());
+                match store.observe_device(zone) {
+                    Ok(()) => clock_error = false,
+                    Err(e) => {
+                        if !clock_error {
+                            eprintln!("fastid: device clock unavailable: {e}");
+                        }
+                        clock_error = true;
+                    }
+                }
+            }
+            if let Err(error) = store.tick_reminders(chrono::Utc::now()) {
+                eprintln!("fastid: cannot record due reminders: {error}");
+            }
+        }
+        let mut fd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: fd names one initialized descriptor and the listener outlives the wait.
+        let ready = unsafe { libc::poll(&mut fd, 1, 1000) };
+        if ready == 0 {
+            continue;
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let (mut conn, _) = listener.accept()?;
         let Ok((uid, _)) = portcullis_peer::uid_gid(conn.as_raw_fd()) else {
             continue;
         };
@@ -89,27 +129,13 @@ fn main() -> io::Result<()> {
         if bindings.uid_for_instance(&user, "org.atrium.calendar", Some(&publisher), persona)
             == Some(uid)
         {
-            if installed {
-                let result = fs::read_to_string("/endpoint/device-zone")
-                    .map_err(|_| "Device time zone unavailable".to_owned())
-                    .and_then(|name| {
-                        name.trim()
-                            .parse()
-                            .map_err(|_| "Unrecognized device time zone".to_owned())
-                    })
-                    .and_then(|zone| store.sync_device(zone));
-                if let Err(error) = result {
-                    store.device_unavailable();
-                    if !store.has_pinned_zone() {
-                        let _ = wire::refuse(&mut conn, &error);
-                        continue;
-                    }
-                }
+            if !store.clock_available() {
+                let _ = wire::refuse(&mut conn, "Device time zone unavailable");
+                continue;
             }
             if let Err(error) = wire::serve(&mut conn, &mut store) {
                 eprintln!("fastid: reply failed ({:?})", error.kind());
             }
         }
     }
-    Ok(())
 }

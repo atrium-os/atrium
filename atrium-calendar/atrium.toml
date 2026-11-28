@@ -9,6 +9,7 @@ icon = "calendar"
 [capabilities]
 graphics = "fresco"
 network = "none"
+notify = true
 embeds = ["picker"]
 
 [[workers]]

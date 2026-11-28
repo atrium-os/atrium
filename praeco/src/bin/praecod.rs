@@ -38,6 +38,7 @@ fn main() -> ExitCode {
     eprintln!("praecod: listening on {sock}; registry {registry}; subscribers {subscribers:?}; system posters {system:?}");
     // The registry changes as apps launch: read it per lookup (it is a
     // small file; posts are rate-limited).
+    let reminders = std::sync::Arc::new(praeco::reminders::Mailbox::new(registry.clone()));
     let registry2 = registry.clone();
     let resolve = move |uid: u32| {
         if let Some((_, name)) = system.iter().find(|(u, _)| *u == uid) {
@@ -58,9 +59,10 @@ fn main() -> ExitCode {
         let Ok(stream) = stream else { continue };
         let Ok((uid, _)) = portcullis_peer::uid_gid(stream.as_raw_fd()) else { continue };
         let shared = shared.clone();
+        let reminders = reminders.clone();
         std::thread::spawn(move || {
             if let Ok(conn) = aqueduct::Connection::wrap(stream) {
-                let _ = praeco::server::serve(conn, uid, shared);
+                let _ = praeco::server::serve_with_reminders(conn, uid, shared, Some(&reminders));
             }
         });
     }

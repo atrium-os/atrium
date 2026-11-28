@@ -7,6 +7,8 @@
 //! subscribers on its allowlist (Forum). Nothing an app sends is drawn
 //! as markup, and nothing names an app but the registry.
 
+pub mod reminders;
+
 pub mod proto {
     use serde::{Deserialize, Serialize};
 
@@ -17,6 +19,9 @@ pub mod proto {
         /// `u8 urgency | u16 title_len | title | u16 body_len | body`;
         /// reply `u8 status | u64 id`.
         pub const POST: u16 = 0x00;
+        pub const POST_REMINDER: u16 = 0x04;
+        pub const WAIT_REMINDER: u16 = 0x13;
+        pub const REMINDER: u16 = 0x82;
         /// `Withdraw { id }`; an app may withdraw only its own.
         pub const WITHDRAW: u16 = 0x01;
         /// v1: a postcard [`super::Post`], with actions; reply as `POST`.
@@ -499,13 +504,50 @@ pub mod server {
     }
 
     /// Serve one connection; `uid` is the kernel's answer for the peer.
-    pub fn serve(mut conn: Connection, uid: u32, shared: Arc<Shared>) -> io::Result<()> {
+    pub fn serve(conn: Connection, uid: u32, shared: Arc<Shared>) -> io::Result<()> {
+        serve_with_reminders(conn, uid, shared, None)
+    }
+
+    pub fn serve_with_reminders(mut conn: Connection, uid: u32, shared: Arc<Shared>, reminders: Option<&crate::reminders::Mailbox>) -> io::Result<()> {
         loop {
             let m = conn.recv_message()?;
             if m.opcode_class != proto::CLASS {
                 continue;
             }
             match m.op {
+                op::POST_REMINDER => {
+                    let due = <[u8; 8]>::try_from(m.payload.as_slice()).ok().map(u64::from_le_bytes);
+                    let st = match (reminders, due) {
+                        (Some(mailbox), Some(due)) if crate::reminders::fresh(due) && mailbox.binding(uid).is_some() => {
+                            let mut state = shared.state.lock().map_err(|_| io::Error::other("Praeco unavailable"))?;
+                            if state.rate.allow(uid, Instant::now()) {
+                                state.next_id = state.next_id.checked_add(1).ok_or_else(|| io::Error::other("ID limit"))?;
+                                let id = state.next_id;
+                                drop(state);
+                                mailbox.deliver(uid, id, due)
+                            } else { status::RATE_LIMITED }
+                        }
+                        _ => status::NOT_ALLOWED,
+                    };
+                    reply(&mut conn, m.op, st, 0)?;
+                }
+                op::WAIT_REMINDER => {
+                    let Some(mailbox) = reminders.filter(|_| m.payload.is_empty() && shared.subscribers_allowed.contains(&uid)) else {
+                        return reply(&mut conn, m.op, status::NOT_ALLOWED, 0);
+                    };
+                    let Some((binding, rx)) = mailbox.wait(uid) else {
+                        return reply(&mut conn, m.op, status::NOT_ALLOWED, 0);
+                    };
+                    let ready = reply(&mut conn, m.op, status::OK, 0);
+                    let event = ready.as_ref().ok().and_then(|_| rx.recv_timeout(Duration::from_secs(3)).ok());
+                    mailbox.finish(uid);
+                    ready?;
+                    let mut payload = Vec::new();
+                    if let Some(n) = event.filter(|n| crate::reminders::fresh(n.at_ms) && mailbox.binding(uid).as_ref() == Some(&binding)) {
+                        payload = postcard::to_stdvec(&n).map_err(io::Error::other)?;
+                    }
+                    return conn.send_message(proto::CLASS, op::REMINDER, flag::ASYNC_EVENT, &payload);
+                }
                 op::POST => {
                     let (st, id) = shared.post(uid, &m.payload, Instant::now());
                     reply(&mut conn, op::POST, st, id)?;

@@ -431,6 +431,8 @@ Proposed in [mail.md](mail.md) §12.1 and made a rule for every app by Shankar
 - **Quiet hours** (per persona, mail.md §12) and Do Not Disturb hold everything for the
   next summary.
 
+**Calendar reminders, as built.** A production Praeco socket also accepts a live reminder with the original due time in Unix milliseconds. `POST_REMINDER` takes that eight-byte little-endian value. `WAIT_REMINDER` takes an empty body and holds one bounded wait per allowlisted receiver UID. The server resolves both endpoints from the launch registry at dispatch, checks the same owner and persona, and checks the receiver’s full binding again before returning `REMINDER`. System, session and unresolved identities do not participate. The payload has fixed generic text, low urgency and no actions. An expired or unclaimed offer leaves the Calendar receipt in its persona’s private review. This operation creates no ordinary notification history. The stock shelf’s seat and quiet-hours integration and the audible fresh control remain open. [Live protocol](../../praeco/src/reminders.rs) · [Fasti rules and gate](calendar.md#730-native-reminder-delivery-and-the-c2-wake-gate)
+
 ### 5.4 Readable toasts, private when they must be (Shankar 2026-11-16)
 
 Shankar: "the email popup arrives as a notification but it is not enough to read even the

@@ -29,6 +29,16 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    ReminderReview,
+    SetReminder {
+        revision: u64,
+        id: uuid::Uuid,
+        shown: NaiveDate,
+        enabled: bool,
+    },
+    PollReminders {
+        token: Option<uuid::Uuid>,
+    },
     PollMeetingChanges {
         selected: Option<uuid::Uuid>,
     },
@@ -361,6 +371,30 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
                     flag::IS_RESPONSE,
                     OP_PREPARE_IMPORT,
                     &store.review_invitation(revision, &source, proposal),
+                );
+            }
+            Ok(Request::SetReminder {
+                revision,
+                id,
+                shown,
+                enabled,
+            }) => store
+                .set_reminder(revision, id, shown, enabled)
+                .map(|()| store.page(shown, Some(CalendarView::Today))),
+            Ok(Request::ReminderReview) => {
+                return send(
+                    s,
+                    flag::IS_RESPONSE,
+                    &Result::<_, String>::Ok(store.reminder_review(chrono::Utc::now().timestamp())),
+                )
+            }
+            Ok(Request::PollReminders { token }) => {
+                return send(
+                    s,
+                    flag::IS_RESPONSE,
+                    &Result::<_, String>::Ok(
+                        store.poll_reminders(token, chrono::Utc::now().timestamp()),
+                    ),
                 );
             }
             Ok(Request::PollMeetingChanges { selected }) => {

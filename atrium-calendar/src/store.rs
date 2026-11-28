@@ -4,6 +4,7 @@ mod invitation_skips;
 mod invitations;
 pub mod meeting_changes;
 mod ranges;
+pub mod reminders;
 pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind, UndoReceipt};
 use chrono::NaiveDate;
@@ -23,7 +24,7 @@ const MAX_ENTRIES: usize = 1024;
 const MAX_BYTES: u64 = 1024 * 1024;
 pub const UNDO_EXPIRED: &str = "Undo expired. Refresh to see the current calendar.";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Snapshot {
     version: u8,
     revision: u64,
@@ -35,10 +36,13 @@ struct Snapshot {
     device_zone: Option<Tz>,
     entries: Vec<Entry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reminders: Vec<reminders::Alarm>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cancelled: Vec<crate::invitation::Cancellation>,
 }
 
 struct UndoState {
+    reminders: Vec<reminders::Alarm>,
     receipt: UndoReceipt,
     date: NaiveDate,
     entries: Vec<Entry>,
@@ -46,6 +50,9 @@ struct UndoState {
 }
 
 pub struct Store {
+    last_tick: Option<i64>,
+    fresh_due: Option<(reminders::Slot, i64)>,
+    poll_lease: Option<(Uuid, i64)>,
     meeting_changes: meeting_changes::Ledger,
     preview: Option<import::Pending>,
     invite: Option<invitations::Pending>,
@@ -75,7 +82,8 @@ impl Store {
                 }
                 let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=13)
+                if !matches!(snapshot.version, 1..=14)
+                    || !reminders::valid(&snapshot.reminders)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -94,6 +102,7 @@ impl Store {
                 opening_view: CalendarView::Today,
                 entries: Vec::new(),
                 cancelled: Vec::new(),
+                reminders: Vec::new(),
             },
             Err(e) => return Err(e),
         };
@@ -106,7 +115,14 @@ impl Store {
             _lock: lock,
             device_available: true,
             state,
+            last_tick: None,
+            fresh_due: None,
+            poll_lease: None,
         })
+    }
+
+    pub fn clock_available(&self) -> bool {
+        self.device_available || self.has_pinned_zone()
     }
 
     pub fn has_pinned_zone(&self) -> bool {
@@ -118,6 +134,16 @@ impl Store {
             .pinned_zone
             .or(self.state.device_zone)
             .unwrap_or(chrono_tz::UTC)
+    }
+
+    pub fn observe_device(&mut self, zone: Option<Tz>) -> Result<(), String> {
+        let result = zone
+            .ok_or_else(|| "Device time zone unavailable".to_string())
+            .and_then(|zone| self.sync_device(zone));
+        if result.is_err() {
+            self.device_unavailable();
+        }
+        result
     }
 
     pub fn device_unavailable(&mut self) {
@@ -220,6 +246,7 @@ impl Store {
         }
         CalendarPage {
             meeting_changes: self.outstanding().count(),
+            reminders: self.state.reminders.iter().map(|a| a.slot).collect(),
             undo: None,
             clock_gap: crate::zone::missing_minutes(date, self.viewing_zone()),
             date,
@@ -452,6 +479,7 @@ impl Store {
         self.undo = Some(UndoState {
             receipt,
             date,
+            reminders: previous.reminders,
             entries: previous.entries,
             cancelled: previous.cancelled,
         });
@@ -466,7 +494,15 @@ impl Store {
             .ok_or(UNDO_EXPIRED)?;
         let date = previous.date;
         // Keep the receipt usable if staging fails. Publishing consumes it at rename.
-        self.publish(
+        let mut alarms = previous.reminders.clone();
+        // Keep receipts earned after the edit for unchanged triggers.
+        for alarm in &mut alarms {
+            if let Some(current) = self.state.reminders.iter().find(|r| r.same_trigger(alarm)) {
+                *alarm = current.clone();
+            }
+        }
+        self.publish_with_reminders(
+            alarms,
             receipt.revision,
             previous.entries.clone(),
             previous.cancelled.clone(),
@@ -479,6 +515,27 @@ impl Store {
 
     fn publish(
         &mut self,
+        revision: u64,
+        entries: Vec<Entry>,
+        cancelled: Vec<crate::invitation::Cancellation>,
+        opening_view: CalendarView,
+        pinned_zone: Option<Tz>,
+        device_zone: Option<Tz>,
+    ) -> Result<Snapshot, String> {
+        self.publish_with_reminders(
+            self.state.reminders.clone(),
+            revision,
+            entries,
+            cancelled,
+            opening_view,
+            pinned_zone,
+            device_zone,
+        )
+    }
+
+    fn publish_with_reminders(
+        &mut self,
+        mut alarms: Vec<reminders::Alarm>,
         revision: u64,
         mut entries: Vec<Entry>,
         mut cancelled: Vec<crate::invitation::Cancellation>,
@@ -510,15 +567,30 @@ impl Store {
                 }
             }
         }
+        let revision = revision.checked_add(1).ok_or("Revision limit reached")?;
+        let zone = pinned_zone
+            .or(device_zone)
+            .or(self.device_available.then_some(chrono_tz::UTC));
+        reminders::reschedule(&mut alarms, &entries, zone, revision);
         let next = Snapshot {
+            version: if alarms.is_empty() { 13 } else { 14 },
+            reminders: alarms,
             opening_view,
-            version: 13,
             cancelled,
             pinned_zone,
             device_zone,
-            revision: revision.checked_add(1).ok_or("Revision limit reached")?,
+            revision,
             entries,
         };
+        let previous = self.persist(next)?;
+        self.preview = None;
+        self.invite = None;
+        self.undo = None;
+        self.fresh_due = None;
+        Ok(previous)
+    }
+
+    fn persist(&mut self, next: Snapshot) -> Result<Snapshot, String> {
         let bytes = serde_json::to_vec(&next).map_err(|_| "Cannot encode calendar")?;
         if bytes.len() as u64 > MAX_BYTES {
             return Err("Calendar storage limit reached".into());
@@ -530,14 +602,13 @@ impl Store {
         tmp.persist(self.dir.join("calendar.json"))
             .map_err(|_| "Cannot publish calendar")?;
         let previous = std::mem::replace(&mut self.state, next);
-        self.preview = None;
-        self.invite = None;
-        self.undo = None;
-        File::open(&self.dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| {
-                "Saved, but durability is uncertain. Refresh before retrying.".to_string()
-            })?;
+        if File::open(&self.dir).and_then(|d| d.sync_all()).is_err() {
+            self.preview = None;
+            self.invite = None;
+            self.undo = None;
+            self.fresh_due = None;
+            return Err("Saved, but durability is uncertain. Refresh before retrying.".into());
+        }
         Ok(previous)
     }
 }

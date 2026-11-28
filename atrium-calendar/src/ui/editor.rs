@@ -105,6 +105,13 @@ impl Editor {
         })
     }
 
+    pub(super) fn check_saved(&self) -> Result<(), String> {
+        if self.draft()? != self.before {
+            return Err("Save your edits before changing the reminder".into());
+        }
+        Ok(())
+    }
+
     fn draft(&self) -> Result<EventEdit, String> {
         let fields = EventEdit {
             zone: self.zone()?,
@@ -409,6 +416,36 @@ impl Planner {
                 Action::CreateZoned(Kind::Weekly),
             );
             return;
+        }
+        if !whole
+            && matches!(
+                edit.kind,
+                Kind::Appointment | Kind::Weekly | Kind::Occurrence { .. }
+            )
+        {
+            if let Some(page) = self.data.get_cloned() {
+                if let Some(row) = page.on(edit.shown).find(|r| r.id == edit.id) {
+                    let slot = atrium_calendar::store::reminders::Slot::for_row(&row, edit.shown);
+                    let enabled = page.reminders.contains(&slot);
+                    self.button(
+                        ctx,
+                        345.,
+                        button_y,
+                        235.,
+                        if enabled {
+                            "Turn reminder off"
+                        } else {
+                            "Remind at saved start"
+                        },
+                        Action::SetReminder {
+                            revision: edit.revision,
+                            id: edit.id,
+                            shown: edit.shown,
+                            enabled: !enabled,
+                        },
+                    );
+                }
+            }
         }
         let action = if whole {
             Action::Review(Stage::ReviewChange)

@@ -218,7 +218,7 @@ install -m 0644 jaild.policy.toml /etc/atrium/jaild.policy.toml
 service atrium-jaild restart
 pw useradd "$person" -m -d "$home" -s /bin/sh
 sh calendar-bundle.sh ./atrium-calendar ./fastid ./atrium.toml /root/of-key.pem
-mkdir -p /atrium/sockets/portcullis /atrium/sockets/fresco
+mkdir -p /atrium/sockets/portcullis /atrium/sockets/fresco /atrium/sockets/notify
 for socket in "$psock" "$fsock"; do
     if sockstat -ul | grep -Fq "$socket"; then echo "socket in use: $socket" >&2; exit 1; fi
     [ ! -S "$socket" ] || unlink "$socket"

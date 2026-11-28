@@ -72,6 +72,8 @@ impl CalendarView {
 pub struct CalendarPage {
     #[serde(default)]
     pub meeting_changes: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reminders: Vec<crate::store::reminders::Slot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<crate::UndoReceipt>,
     pub date: NaiveDate,
