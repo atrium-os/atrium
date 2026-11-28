@@ -1,0 +1,43 @@
+# AVDTP/SBC profile driver. The host checks uid 65026 on handoff and the
+# driver checks the root publisher (uid 0). Only choragusd's external-device door is mounted.
+enabled = true
+name = "atrium-vinculum-audio"
+path = "/var/lib/atrium/jails/vinculum-audio"
+children_max = 0
+devfs_ruleset = 4
+
+[[mounts]]
+source = "/libexec"
+dest = "libexec"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/lib"
+dest = "lib"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/usr/lib"
+dest = "usr/lib"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/usr/local/bin"
+dest = "usr/local/bin"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/atrium/sockets/bluetooth-audio"
+dest = "atrium/sockets/bluetooth-audio"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/atrium/sockets/audio-device"
+dest = "atrium/sockets/audio-device"
+kind = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-vinculum-audio"
+argv = ["atrium-vinculum-audio", "/atrium/sockets/bluetooth-audio/audio.sock", "0", "/atrium/sockets/audio-device/audio-device.sock"]
+uid = 65026
+gid = 65026
