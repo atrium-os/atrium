@@ -1,6 +1,6 @@
 # Atrium on x86_64: port scope
 
-**Status:** scope, 2026-11-03. Phase A is done (commit `2280670`). The rest is a plan.
+**Status:** original scope, 2026-11-03. Phase A shipped in `2280670`. See §7 for the current Hostkey development guest and the R9700 silicon log for hardware results.
 **Why:** the RDNA4 backend (`atrium-rdna4-vulkan-backend.md`) is checked against the
 project's R9700, which sits in an x86_64 box running Ubuntu with IPMI. Tier-2 cross-checks
 on that box needed Tier-2 to generate x86_64 code (Phase A). Running Atrium itself on the
@@ -224,3 +224,32 @@ frescod compositing on the R9700 through `tier3_rdna4`.
   Binding group 1 to `vfio-pci` takes the card from amdgpu, so Linux oracle runs and the
   FreeBSD guest take turns (rebind through sysfs or `driverctl`, no reboot). Unknown:
   whether RDNA4 resets cleanly between guest runs.
+
+## 7. Vaahana development guest on Hostkey
+
+On 2026-11-28 the Hostkey operator booted an amd64 Atrium guest from a sparse
+clone of `~vaahana/guest/atrium/root.raw`, with Vaahana's `x86-sys`,
+CloudHvX64 UEFI and two KVM vCPUs. The private control socket reported
+`ok running` and the FreeBSD root shell accepted commands on `ttyu0`.
+The clone mounted `/dev/gpt/rootfs` read/write and enumerated `vtnet0`.
+The stock image contained the GPU probe and firmware. Its jail and desktop
+services need a separate userspace install.
+
+The guest's `ATRIUM-VAAHANA` kernel is built from `456c30b0356c`, with
+`kern.osreldate=1600031`. The kernel SHA-256 is
+`72f1d6a529502841d80998dbfda96ad994a3a6e03feeb9efff2d497c73576f7d`.
+The effective config from `sysctl -n kern.conftxt` has SHA-256
+`41cdc327466eaf6ff811362ad4e2ba40561d1b20f4e71786a101aaf264d87e1c`.
+The matching Hostkey kernel is in
+`~vaahana/obj-amd64/home/vaahana/src/freebsd-src/amd64.amd64/sys/ATRIUM-VAAHANA`.
+It records Ubuntu clang and LLD 19.1.1.
+
+For package delivery the operator verified private SFTP to the host followed
+by a read-only virtio FAT disk presented to the guest, comparing the payload
+digest after copying it locally. The stock clone had about 7.2 GiB free on
+UFS. Keep archive, extraction and installation under 6 GiB combined on this
+clone. The base remains available to reproduce a clean stock boot.
+
+The guest also enumerated the physical R9700 in a separate reservation.
+The [guest PCI record and native render procedure](r9700-bare-metal.md#48-native-gpu-development-in-a-vaahana-guest-on-hostkey)
+give the BARs, module checks and render acceptance command.
