@@ -1,0 +1,83 @@
+--- a/sys/arm64/vmm/io/vgic_v3.c
++++ b/sys/arm64/vmm/io/vgic_v3.c
+@@ -32,6 +32,7 @@
+ #include <sys/types.h>
+ #include <sys/errno.h>
+ #include <sys/systm.h>
++#include <sys/sdt.h>
+ #include <sys/bitstring.h>
+ #include <sys/bus.h>
+ #include <sys/kernel.h>
+@@ -1994,6 +1995,10 @@
+ 	mtx_unlock_spin(&vgic_cpu->lr_mtx);
+ }
+ 
++SDT_PROVIDER_DEFINE(vmm);
++SDT_PROBE_DEFINE4(vmm, vgic, exit, state, "uint64_t", "uint64_t",
++    "uint64_t", "uint64_t");
++
+ void
+ vgic_v3_sync_hwstate(device_t dev, struct hypctx *hypctx)
+ {
+@@ -2003,6 +2008,12 @@
+ 	int i;
+ 
+ 	vgic_cpu = &hypctx->vgic_cpu->v3;
++
++	SDT_PROBE4(vmm, vgic, exit, state,
++	    hypctx_read_sys_reg(hypctx, HOST_ICH_HCR_EL2),
++	    hypctx_read_sys_reg(hypctx, HOST_ICH_MISR_EL2),
++	    hypctx_read_sys_reg(hypctx, HOST_ICH_EISR_EL2),
++	    hypctx_read_sys_reg(hypctx, HOST_ICH_ELRSR_EL2));
+ 
+ 	/* Exit early if there are no buffered interrupts */
+ 	if (vgic_cpu->ich_lr_used == 0)
+@@ -2159,9 +2170,24 @@
+ 	return (0);
+ }
+ 
++#ifdef KDTRACE_HOOKS
++DPCPU_DEFINE_STATIC(time_t, maint_sample);
++SDT_PROBE_DEFINE2(vmm, vgic, maintenance, state, "uint64_t", "uint64_t");
++#endif
++
+ static int
+ vgic_v3_maint_filter(void *arg)
+ {
++#ifdef KDTRACE_HOOKS
++	time_t now;
++
++	now = time_uptime;
++	if (DPCPU_GET(maint_sample) != now) {
++		DPCPU_SET(maint_sample, now);
++		SDT_PROBE2(vmm, vgic, maintenance, state,
++		    vmm_read_reg(HYP_REG_ICH_HCR), vmm_read_reg(HYP_REG_ICH_MISR));
++	}
++#endif
+ 	return (FILTER_HANDLED);
+ }
+ 
+--- a/sys/arm64/vmm/hyp.h
++++ b/sys/arm64/vmm/hyp.h
+@@ -80,6 +80,8 @@
+ #define	HYP_ENTER_GUEST		0x00000002
+ #define	HYP_READ_REGISTER	0x00000003
+ #define	 HYP_REG_ICH_VTR	0x1
++#define	 HYP_REG_ICH_HCR	0x2
++#define	 HYP_REG_ICH_MISR	0x3
+ #define	HYP_CLEAN_S2_TLBI	0x00000004
+ #define	HYP_DC_CIVAC		0x00000005
+ #define	HYP_EL2_TLBI		0x00000006
+--- a/sys/arm64/vmm/vmm_hyp.c
++++ b/sys/arm64/vmm/vmm_hyp.c
+@@ -987,6 +987,10 @@
+ VMM_HYP_FUNC(read_reg)(uint64_t reg)
+ {
+ 	switch (reg) {
++	case HYP_REG_ICH_HCR:
++		return (READ_SPECIALREG(ich_hcr_el2));
++	case HYP_REG_ICH_MISR:
++		return (READ_SPECIALREG(ich_misr_el2));
+ 	case HYP_REG_ICH_VTR:
+ 		return (READ_SPECIALREG(ich_vtr_el2));
+ 	}

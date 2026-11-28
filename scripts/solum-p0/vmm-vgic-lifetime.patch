@@ -1,0 +1,33 @@
+--- a/sys/arm64/vmm/io/vgic.c
++++ b/sys/arm64/vmm/io/vgic.c
+@@ -140,6 +140,9 @@
+ {
+ 	int rv;
+ 
++	if (hyp->vgic_attached)
++		return (EBUSY);
++
+ 	rv = VGIC_ATTACH_TO_VM(vgic_dev, hyp, descr);
+ 	if (rv != 0)
+ 		return (rv);
+@@ -177,6 +180,8 @@
+ {
+ 	hypctx->vgic_cpu = malloc(sizeof(*hypctx->vgic_cpu), M_DEVBUF,
+ 	    M_WAITOK | M_ZERO);
++	if (hypctx->hyp->vgic_attached)
++		VGIC_CPUINIT(vgic_dev, hypctx);
+ }
+ 
+ void
+--- a/sys/arm64/vmm/io/vgic_v3.c
++++ b/sys/arm64/vmm/io/vgic_v3.c
+@@ -428,6 +428,9 @@
+ 	int irqid;
+ 
+ 	vgic_cpu = &hypctx->vgic_cpu->v3;
++	/* The vCPU can be destroyed before a controller is attached. */
++	if (vgic_cpu->private_irqs == NULL)
++		return;
+ 	for (irqid = 0; irqid < VGIC_PRV_I_NUM; irqid++) {
+ 		irq = &vgic_cpu->private_irqs[irqid];
+ 		mtx_destroy(&irq->irq_spinmtx);

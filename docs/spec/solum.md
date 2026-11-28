@@ -950,6 +950,61 @@ from the R9700 box, natively over PXE (x86_64-port §5). Until Vaahana has a fea
 needs, that step's functional check runs on the R9700 box (Linux KVM nested VMX) or under
 QEMU TCG, and the check script says which one it used.
 
+### 10.1 Mac P0 as built
+
+The dedicated host in `~/atrium-vm/solum-p0` runs FreeBSD arm64
+`main-n291737-77e6a5a66898` under Virtualization.framework. Its nested EL2
+uses nVHE and exposes neither PMUv3 nor NV2. The six host checks in
+`scripts/solum-p0-mac.sh check` pass. The §9 hardware measurements still
+require the R9700.
+
+Apply these patches from `scripts/solum-p0/` to that upstream revision in
+the order shown, then cross-build the arm64 VMM module on the Mac.
+
+| Patch | Change |
+|---|---|
+| `vmm-no-pmu.patch` | Skip unimplemented PMU register accesses on reset and world switch. |
+| `vmm-vgic-lifetime.patch` | Skip v3 backend teardown when its private IRQ array was never initialized. Initialize late-created vCPUs against the attached controller and reject duplicate attachment. VM detach precedes vCPU cleanup, so the VM-wide attached flag cannot decide which locks to destroy. |
+| `vmm-vcpu-yield.patch` | At the interrupt-disabled re-entry check, return to userspace for a pending AST or owed preemption. Resume from the current saved guest PC with a zero-length synthetic exit. |
+| `vmm-vgic-retire-eoi.patch` | Snapshot the EOI status and each guest list register at EL2. Clear the hardware entries identified by EISR after copying them, so the host can service interrupts while vGIC software reconciles the saved guest state. |
+| `vmm-vgic-trace.patch` (optional) | Sample HCR, MISR, EISR and ELRSR on guest exit, and HCR/MISR in the L1 maintenance filter at most once per CPU per second. Build `vgic_v3.c` with `KDTRACE_HOOKS` for a matching DTrace-enabled host. Load `dtraceall` and run `dtrace -s vgic-exits.d` over SSH during bring-up. |
+
+On November 28, the diagnostic build without the EOI correction recorded
+guest HCR/MISR/EISR/ELRSR = `1/1/1/fe` and host HCR/MISR = `0/1`.
+List register 0 still reported EOI while L1 serviced PPI 25. L1 counted
+14,416,259 such interrupts and the vCPU was still present after the run
+deadline. Earlier guest-exit samples alone had shown only `1/0/0/ff`.
+
+With the EOI correction, FreeBSD L2 booted to its serial login prompt. The
+guest-exit probe still observed EOI, and L1's interrupt table through login
+showed zero PPI 25 deliveries (`vmstat -i` omits zero-count sources). A host
+ASan/UBSan fixture also exercised v3 cleanup after failed attach, creation
+on both sides of attachment, duplicate attach and teardown after detach.
+The fixture used mock locks and controller callbacks.
+
+The tested diagnostic module has SHA-256
+`c52b4fe974ffbb79a8042082e1977699897d693d997888eb1092899e9fac9d12`.
+On a fresh dedicated L1 boot, explicitly load `/root/p0-eoi/vmm.ko` before
+running the host gate. The default module on disk contains the earlier PMU
+fix. The local build inputs and toolchain are in `~/atrium-vm/solum-p0/{src,obj}`.
+Evidence under `~/atrium-vm/solum-p0/evidence/` includes the original
+`td2` textdump, `run-dd5e11c6` for the first exit trace,
+`run-hostppi.L5rrSj` for the positive host-PPI control and `run-eoi.knSv7Y`
+for the corrected FreeBSD boot. L2 UART output was streamed over SSH to Mac disk.
+
+A second corrected boot used Atrium kernel `atrium-os-9f2eed03a36c` on a
+standalone copy of the FreeBSD UFS image. The loader selected
+`/boot/kernel.atrium/kernel`, the kernel identified itself as `ATRIUM`, and
+the guest reached `ttyu0` login. This tests the kernel with FreeBSD userland.
+The copied UFS needed a preen before staging. Only the kernel was staged,
+so devmatch reported missing linker hints. After login, SIGTERM to the
+verified bhyve PID released the vCPU. L1 confirmed the process was gone,
+destroyed the VM, checked for open disk references and removed the copy.
+The SSH session carrying the signalled process returned 255. A separate
+SSH session verified the teardown. See `run-atrium.DTKeS8` for the staged
+kernel hash, console, probe and cleanup logs. The next functional gate is
+two live guests exchanging data over virtio.
+
 ## 11. Risks
 
 - **Near-native depends on hardware features:** interrupt remapping, posted interrupts or

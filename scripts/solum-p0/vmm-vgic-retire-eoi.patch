@@ -1,0 +1,28 @@
+--- a/sys/arm64/vmm/vmm_hyp.c
++++ b/sys/arm64/vmm/vmm_hyp.c
+@@ -178,9 +178,11 @@
+ static void
+ vmm_hyp_reg_store_vgic_v3(struct hypctx *hypctx, struct hyp *hyp)
+ {
+-	/* Store the GICv3 registers */
+-	hypctx_write_sys_reg(hypctx, HOST_ICH_EISR_EL2,
+-	    READ_SPECIALREG(ich_eisr_el2));
++	uint64_t eisr;
++
++	/* Save EOI state before retiring the corresponding hardware LRs. */
++	eisr = READ_SPECIALREG(ich_eisr_el2);
++	hypctx_write_sys_reg(hypctx, HOST_ICH_EISR_EL2, eisr);
+ 	hypctx_write_sys_reg(hypctx, HOST_ICH_ELRSR_EL2,
+ 	    READ_SPECIALREG(ich_elrsr_el2));
+ 	hypctx_write_sys_reg(hypctx, HOST_ICH_MISR_EL2,
+@@ -190,7 +192,9 @@
+ #define	STORE_LR(x)						\
+ case x:								\
+ 	hypctx_write_sys_reg(hypctx, HOST_ICH_LR_EL2(x),	\
+-	    READ_SPECIALREG(ich_lr ## x ##_el2))
++	    READ_SPECIALREG(ich_lr ## x ##_el2));			\
++	if ((eisr & (1u << (x))) != 0)				\
++		WRITE_SPECIALREG(ich_lr ## x ##_el2, 0)
+ 	STORE_LR(15);
+ 	STORE_LR(14);
+ 	STORE_LR(13);

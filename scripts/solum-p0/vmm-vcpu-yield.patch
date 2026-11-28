@@ -1,0 +1,17 @@
+--- a/sys/arm64/vmm/vmm_arm64.c
++++ b/sys/arm64/vmm/vmm_arm64.c
+@@ -1203,6 +1203,14 @@
+ 			break;
+ 		}
+ 
++		if (vcpu_should_yield(vcpu)) {
++			intr_restore(daif);
++			vme->exitcode = VM_EXITCODE_BOGUS;
++			vme->pc = hypctx_read_sys_reg(hypctx, HOST_ELR_EL2);
++			vme->inst_length = 0;
++			break;
++		}
++
+ 		/* Activate the stage2 pmap so the vmid is valid */
+ 		pmap_activate_vm(pmap);
+ 		hypctx_write_sys_reg(hypctx, HOST_VTTBR_EL2,
