@@ -504,7 +504,10 @@ Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
   `0x12`, `RaiseMe { id }`). praecod accepts this only from the posting app's uid, once per
   press, within 110 s (`RAISE_MS`), and then asks frescod to raise it. Asked before a press,
   or a second time, it answers `NOT_ALLOWED`. frescod sends the WM a `WindowActivate`, and
-  forum-wm focuses the window.
+  forum-wm focuses the window. Mail keeps the notification ID with the reply compose window
+  and requests the raise after its first successful paint. If creating or painting that window
+  fails, Mail drops the request. The raise selects the posting uid’s highest eligible window
+  when frescod handles it.
 - **Where apps find praecod**: `praeco::client::socket()` returns `PRAECO_SOCKET` if set.
   Otherwise, in a jail with `notify = true`, it returns `/atrium/sockets/notify/notify.sock`,
   else `/var/run/atrium/praecod.sock`. praecod's `PRAECO_FRESCOD_ACTIVATION` is frescod's
@@ -513,7 +516,12 @@ Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
   checks that only a press granted to that app counts, that only its own listener hears the
   action, that a press counts once, that an action is held and handed over when the app
   starts, that a gone listener doesn't count, and that a raise works once, for the posting app
-  only, after a press. `forum-shelf` checks that a toast's actions are its buttons.
+  only, after a press. The raise test uses the ID received by the listener and checks
+  refusal for a second notification without a press, another uid, replay and expiry.
+  Mail’s engine test `the_notification_s_buttons` checks the reply’s subject and recipient.
+  The installed-Mail focus check on FreeBSD is pending. On macOS, the Mail window test
+  build stops in Pergola’s print path because Limen provides sealed files on FreeBSD and Linux.
+  `forum-shelf` checks that a toast's actions are its buttons.
   `scripts/vm-notify-actions-check.sh` passes 19/19 in the amd64 cloud VM on headless frescod
   with forum-wm and injected clicks. The shelf itself runs in its jail as its app uid, with
   `fresco`, `fresco-activation`, `notify` and `portcullis` mounted. Three signed test apps (`praeco-demo`, in

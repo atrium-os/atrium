@@ -262,6 +262,7 @@ fn message_pdf(ask: &atrium_mail::view::PrintAsk, paper: pergola::print::Paper) 
 
 /// A compose window and its state.
 struct ComposeWin {
+    raise_after_paint: Option<u64>,
     win: Window,
     app: App<ComposeView>,
     c: Composer,
@@ -291,7 +292,7 @@ fn compose_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<per
     }
     let view = ComposeView::new(k.clone(), (win.width, win.height));
     let size = view.size.clone();
-    Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false, attach: None })
+    Ok(ComposeWin { raise_after_paint: None, win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false, attach: None })
 }
 
 /// The settings window and Arca's password field in it.
@@ -530,8 +531,6 @@ fn main() {
     }
     let mut persona_known: Option<Option<String>> = None;
     let mut refused_told = false;
-    // Replies from a notification's press, raised once their window is up.
-    let mut raise: Vec<u64> = Vec::new();
     let mut ticked = Instant::now();
     loop {
         // Mail hears j/k and the arrows before the list does, so a move of
@@ -599,22 +598,6 @@ fn main() {
         while let Ok(url) = incoming.try_recv() {
             mail.mailto(&url);
         }
-        // Opened and drawn last time round: forum-wm brings it to the front
-        // with the notification's press (tabula.md §5.5).
-        for id in raise.drain(..) {
-            std::thread::spawn(move || {
-                if let Err(e) = praeco::client::raise(&praeco::client::socket(), id) {
-                    eprintln!("atrium-mail: raising a reply: {e}");
-                }
-            });
-        }
-        while let Ok((msg, action, id)) = pressed.try_recv() {
-            let before = mail.composes_waiting();
-            mail.notification_action(msg, &action);
-            if mail.composes_waiting() > before {
-                raise.push(id);
-            }
-        }
         if persona_known.is_none() {
             if let Some(p) = persona.lock().unwrap().take() {
                 *mail.persona.borrow_mut() = p.clone();
@@ -628,11 +611,17 @@ fn main() {
                 persona_known = Some(p);
             }
         }
-        let asked = mail.take_composes();
+        // Only a compose created by this action may request its raise.
+        let mut asked: Vec<_> = mail.take_composes().into_iter().map(|c| (c, None)).collect();
+        for (msg, action, id) in pressed.try_iter() {
+            mail.notification_action(msg, &action);
+            asked.extend(mail.take_composes().into_iter().map(|c| (c, Some(id))));
+        }
         let opened = !asked.is_empty();
-        for (c, draft) in asked {
+        for ((c, draft), notification) in asked {
             match compose_window(&engine, embeds.as_ref(), c, draft) {
-                Ok(w) => {
+                Ok(mut w) => {
+                    w.raise_after_paint = notification;
                     if let Some(Some(p)) = &persona_known {
                         w.c.ui.set(atrium_mail::compose::ComposeUi { persona: Some(p.clone()), ..w.c.ui.get_cloned() });
                     }
@@ -657,7 +646,15 @@ fn main() {
             };
             match cw.win.step_with(&mut cw.app, Some(Duration::ZERO), key) {
                 Ok(StepResult::Closed) => cw.c.close(),
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(id) = cw.raise_after_paint.take() {
+                        std::thread::spawn(move || {
+                            if let Err(e) = praeco::client::raise(&praeco::client::socket(), id) {
+                                eprintln!("atrium-mail: raising a reply: {e}");
+                            }
+                        });
+                    }
+                }
                 Err(e) => {
                     eprintln!("atrium-mail: a compose window: {e}");
                     cw.c.close();

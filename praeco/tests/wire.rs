@@ -258,11 +258,23 @@ fn an_action_lets_its_app_raise_its_window_once() {
     let mut ear = conn(&s, MAIL);
     rpc(&mut ear, op::LISTEN, &[]);
     assert_eq!(act(&mut desk, id, "reply", frescod.mint(MAIL, kind::GRANTED)), status::OK);
-    // Another app can't use Mail's press.
-    assert_eq!(raise(&mut conn(&s, ROGUE), id), status::NOT_ALLOWED);
-    assert_eq!(raise(&mut mail, id), status::OK);
+    let reply = heard(&mut ear).expect("Mail received its reply action");
+    assert_eq!(reply, proto::Acted { id, action: "reply".into() });
+    let (posted, other) = post_actions(&mut mail, &[("reply", "Reply")]);
+    assert_eq!(posted, status::OK);
+    assert_ne!(other, reply.id);
+    assert_eq!(raise(&mut mail, other), status::NOT_ALLOWED);
+    assert_eq!(raise(&mut conn(&s, ROGUE), reply.id), status::NOT_ALLOWED);
+    assert_eq!(raise(&mut mail, reply.id), status::OK);
     assert_eq!(frescod.raised(), vec![MAIL]);
     assert_eq!(raise(&mut mail, id), status::NOT_ALLOWED, "once per press");
+
+    assert_eq!(act(&mut desk, other, "reply", frescod.mint(MAIL, kind::GRANTED)), status::OK);
+    let second = heard(&mut ear).expect("Mail received the second press");
+    assert_eq!(second.id, other);
+    let expired = std::time::Instant::now() + Duration::from_millis(proto::RAISE_MS);
+    assert_eq!(s.raise(MAIL, second.id, expired), status::NOT_ALLOWED);
+    assert_eq!(frescod.raised(), vec![MAIL], "an expired request never reaches frescod");
 }
 
 #[test]
