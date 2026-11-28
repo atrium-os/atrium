@@ -583,7 +583,23 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), filter_cond2_menu: Mutable::new(MenuState::default()), watch_open: Mutable::new(false), stats_open: Mutable::new(false), inspect_open: Mutable::new(false), twin: Rc::new(RefCell::new(None)) }
+        let menu = || rev.sibling(MenuState::default());
+        Self {
+            data_menu: menu(),
+            fill_menu: menu(),
+            chart_kind_menu: menu(),
+            chart_legend_menu: menu(),
+            chart_group_menu: menu(),
+            cond_kind_menu: menu(),
+            cond_choice_menu: menu(),
+            cond_look_menu: menu(),
+            pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| menu()).collect()),
+            valid_menus: Rc::new((0..3).map(|_| menu()).collect()),
+            format_menu: menu(),
+            stats_menu: menu(),
+            filter_cond_menu: menu(),
+            filter_cond2_menu: menu(),
+            authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), watch_open: Mutable::new(false), stats_open: Mutable::new(false), inspect_open: Mutable::new(false), twin: Rc::new(RefCell::new(None)) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -5295,6 +5311,41 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn data_menu_paints_the_highlight_on_the_arrow_press() {
+        use pergola::node::NodeDelta;
+
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let rev = Mutable::with_dirty(0, dirty.clone());
+        let sheets = Sheets::new(Doc::new("Book"), rev.sibling(ScrollState::default()),
+            rev.sibling(GridState::default()), rev.sibling(Ui::default()), rev, (1100.0, 720.0));
+        let mut app = App::new_with_flag(sheets.clone(), dirty);
+        app.set_popups(true);
+        app.tick();
+        let label = |app: &App<Sheets>, name: &str| app.tree().iter().find_map(|(id, n)| match n {
+            Node::Text { rect, content, .. } if content == name => Some((id, *rect)),
+            _ => None,
+        }).expect("visible label");
+        let (_, button) = label(&app, "Data");
+        let at = Point::new(button.x() + button.w() / 2.0, button.y() + button.h() / 2.0);
+        app.handle_event(Event::PointerDown { at });
+        app.tick();
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        assert!(sheets.data_menu.get().open);
+        let selection = pergola::theme::Semantic::LIGHT.selection_bg();
+        for (index, name) in ["Compare with…", "Start Tracking Cell Changes"].iter().enumerate() {
+            assert!(app.tick().is_empty(), "menu must be idle before the arrow");
+            let row = app.tree().parent_of(label(&app, name).0).unwrap();
+            app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Down,
+                modifiers: Modifiers::default(), chars: String::new() });
+            assert_eq!(sheets.data_menu.get().highlight, Some(index));
+            assert!(app.tick().iter().any(|d| matches!(d,
+                NodeDelta::Changed { id, node: Node::Rect { fill, .. }, .. }
+                    if *id == row && *fill == selection)), "missing highlight frame for {name}");
+        }
+    }
 
     #[test]
     fn import_notes_can_be_read_in_order_and_reset_on_open() {

@@ -5810,7 +5810,7 @@ Round 6 of the six-round finishing plan, second part. This ends the plan.
 
 **Found, not fixed here:**
 - Scrinium's ordinary Save refuses a workbook the person owns ("Cannot preserve workbook ownership. Use Save As."). Scrinium writes the replacement as its own app user and can't give the file back to its owner (`scrinium/src/workbook.rs`, `prepare_replacement`). Files made in a shell, by another app or by an earlier install can only be saved with Save As. This belongs to Scrinium.
-- When the arrows move a menu's highlight, the screen shows it only at the next input event. Pergola's own menu test sees the highlight move at once, so the missed frame is in the app's loop on the guest.
+- The screen showed an arrow-key change to the menu highlight only on the next input. The follow-up below covers the fix.
 - The bar labels "Quick" and "Table" are short to fit the 100 px label column.
 
 Evidence is on the Mac in `~/atrium-vm/evidence/sheets-closeout-2026-11-27/`:
@@ -5836,6 +5836,10 @@ Evidence is on the Mac in `~/atrium-vm/evidence/sheets-closeout-2026-11-27/`:
 Tests:
 - Pergola `a_menu_with_a_most_height_scrolls_inside_the_window`: 200 items under a 240 px most height draw fewer than 20 and keep within it. The arrows reach item 29 and the wheel the last.
 - Sheets `escape_closes_a_typed_bar_as_its_cancel_does`: Themes…, Format Chart…, Quick Analysis… and Solver… close on Escape, and Escape with nothing open does nothing.
+
+**Menu repaint follow-up (2026-11-28).** Pergola handled the arrow and changed the highlighted row, but Sheets had created its menu state without the window’s dirty flag. The paint at the end of `Window::step_with` therefore had no row change to send. Sheets now creates its menu states with `rev.sibling`, so an arrow schedules the pop-up’s repaint in that same event-loop turn.
+
+The Sheets regression `data_menu_paints_the_highlight_on_the_arrow_press` opens Data, lets the frame settle, and checks that each Down press emits the selection fill on the expected row. On arm64 FreeBSD it failed on the first row before the fix and passed after it. In a disposable FreeBSD 16.0-CURRENT guest, headless frescod captured the release binary highlighting **Compare with…**, then **Start Tracking Cell Changes**, then **Compare with…** again for Down, Down, Up. Each screenshot showed only the expected row selected before the driver sent key-up. Screenshots, binary hashes and test logs are in `scratch/sheets-menu-repaint/` on the Mac.
 
 ### 16.169 Write finishing plan (accepted 2026-11-27)
 
