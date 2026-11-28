@@ -1,0 +1,18 @@
+[package]
+name = "vinculum-atrium-audio"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Lyra external output for Vinculum's A2DP source"
+
+[dependencies]
+lyra-protocol = { path = "../lyra-protocol" }
+vinculum-audio = { path = "../vinculum/vinculum-audio" }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Use the same bounded packet generator as the portable workspace.
+[patch.crates-io]
+pdl-compiler = { path = "../vinculum/third_party/pdl-compiler" }

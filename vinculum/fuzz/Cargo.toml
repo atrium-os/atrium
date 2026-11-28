@@ -8,6 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+vinculum-audio = { path = "../vinculum-audio" }
 libfuzzer-sys = "0.4"
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-host = { path = "../vinculum-host" }
@@ -66,5 +67,11 @@ doc = false
 [[bin]]
 name = "hogp"
 path = "fuzz_targets/hogp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "avdtp"
+path = "fuzz_targets/avdtp.rs"
 test = false
 doc = false

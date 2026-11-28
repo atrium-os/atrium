@@ -68,6 +68,11 @@ pub struct DeviceReader {
 unsafe impl Send for DeviceReader {}
 
 impl DeviceReader {
+    /// Map the read-only view of a device page from its backing descriptor.
+    pub fn from_fd(fd: &OwnedFd) -> io::Result<Self> {
+        Ok(Self { page: map(fd, libc::PROT_READ)? })
+    }
+
     /// A consistent reading, or `None` if the device is mid-write every time
     /// it looks (a stuck or hostile writer: lyrad treats the device as stopped).
     pub fn read(&self) -> Option<DeviceState> {
@@ -151,8 +156,8 @@ pub fn create() -> io::Result<(DeviceReader, OwnedFd)> {
     if unsafe { libc::ftruncate(fd.as_raw_fd(), PAGE_LEN as libc::off_t) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let page = map(&fd, libc::PROT_READ)?;
-    Ok((DeviceReader { page }, fd))
+    let reader = DeviceReader::from_fd(&fd)?;
+    Ok((reader, fd))
 }
 
 #[cfg(test)]

@@ -584,6 +584,40 @@ it is on again, and `--power-file PATH` keeps it across restarts (`vinculum-ctl 
 B3 and B4 are what Tactus needs (its T6). B5 is what headphones need. MediaTek and Broadcom
 firmware, UART, Auracast, OBEX come after.
 
+### 15.1 B5 A2DP source, as built 2026-11-28
+
+The first B5 gate runs on the host. `vinculum-audio` discovers an available Classic audio
+sink endpoint, reads its capabilities, configures SBC, opens a second L2CAP channel for
+media, starts the stream, then closes and releases it. Its PDL parser accepts single-packet
+AVDTP replies with the outstanding transaction label and signal ID. The profile supports
+48 and 44.1 kHz, joint stereo and stereo, 16 blocks, 8 subbands and loudness allocation.
+It keeps the negotiated bitpool within the peer's range and fits whole SBC frames in the
+media MTU. The Rust encoder is `nanoaudio-sbc` (MIT). The portable workspace builds without Lyra.
+
+`vinculum-atrium-audio` announces the negotiated format through the existing choragusd
+`audio-device` client. It reads interleaved f32 samples on a monotonic schedule, pads a
+short read with silence and publishes the consumed position, underrun count and estimated
+delay on the device page. For now the downstream delay is supplied at connection time.
+
+Run `sh scripts/vinculum-a2dp-check.sh` with `VINCULUM_VENV` pointing to a Python environment
+with Bumble (`0.0.236` tested). The sink uses FFmpeg as an independent test decoder
+(`FFMPEG` can name its executable). Two Bumble controllers communicate over an in-process
+Classic link. The source-side fixture forwards the Rust profile's opaque L2CAP packets.
+A local peer stands in for choragusd and lyrad, passing the ring and page over the actual
+audio-device protocol. On the Mac the fixture uses unlinked files for the mappings.
+
+Both runs decoded 48 RTP packets (30,720 stereo frames), with 440 Hz on the left and
+880 Hz on the right. One negotiated 48 kHz joint stereo at bitpool 51, the other 44.1 kHz
+stereo at bitpool 35. The gate checks the negotiated SBC frame headers, packet lengths,
+RTP sequence and sample timestamps, tone amplitude and spectral energy, media channel
+release and device removal. The final short read produced one underrun and left Lyra's
+consumed position at 30,400 frames.
+
+**Next**: discover the Audio Sink SDP record on a bonded, encrypted Classic link with audio
+permission and hand its signalling and media channels to a jailed `vinculum-audio` process.
+Use that path with running choragusd and lyrad, then add AVDTP delay reports and verify the
+§8 clock bound in [lyra-v1.md](lyra-v1.md). AVRCP play/pause through media-control is open.
+
 ## 16. Decisions, with recommendations
 
 **Accepted by Shankar, 2026-11-07: all nine, as recommended (decision 3 as amended).**
