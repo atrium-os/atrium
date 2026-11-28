@@ -3043,7 +3043,8 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
         .unwrap_or_default().resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
         return refuse("cap.app_grants.denied: caller is not a launched app".into());
     };
-    if !launch::app_manages_grants(&caller) {
+    let manages_grants = launch::app_manages_grants(&caller);
+    if !manages_grants && !(matches!(req, Request::Crossings) && launch::app_has_home_files(&caller)) {
         return refuse(format!("cap.app_grants.denied: {caller} may not see or change apps' access"));
     }
     let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
@@ -3280,7 +3281,8 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
             Response::PersonaVpns { routes }
         }
         Request::Crossings => {
-            let (personas, on) = portcullisd::crossing::listing(&tp.policy);
+            let (personas, mut on) = portcullisd::crossing::listing(&tp.policy);
+            if !manages_grants { on.retain(|s| s.kind == "files"); }
             eprintln!("portcullisd: crossings -> {caller} (uid {uid}) for {owner}: {} persona(s), {} switch(es) on", personas.len(), on.len());
             Response::Crossings { personas, on }
         }

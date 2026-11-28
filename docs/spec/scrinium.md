@@ -62,6 +62,33 @@ is a separate decision (§8).
   rename is allowed), paste picks a free name. A folder is never copied into
   itself. Move is `rename`, else (another stick) copy then remove.
 
+#### Copies between personas
+
+Files gets the source and destination personas from the two places. Paste
+shows their chips and the selected names. A disabled direction names the
+Files switch in Settings › Personas. With that switch on, Copy or Move in
+the sheet authorizes this selection once. Cancel leaves both places alone.
+Files reads the switch from portcullisd again on confirmation. The broker
+uses the caller’s registered owner and returns only file switches to a
+manager with `home-files`.
+
+A crossing creates new inodes in the destination. Files stages a home-folder
+copy in that directory, checks its inherited group, sets regular files to
+0660 and directories to 2770, and publishes under a free name. A move
+removes its originals after publication. The picker stays scoped to the
+caller’s places. Neutral media may supply a source. A named persona needs
+an assigned destination for export.
+
+The arm64 regression `scrinium/tests/file_crossings.rs` drives the Files
+keyboard shortcuts and the sheet button. Its socket fixture covers a
+disabled or wrong-kind switch, revocation, cancellation and source
+replacement. With `SCRINIUM_TEST_CROSSING_ROOT` set, it uses the live
+broker and the existing `home/Documents` and `personas/work/Documents`
+fixture directories. Run this mode as the registered Files uid in empty
+fixture directories with distinct files groups and a Personal → Work
+`files` switch. The test checks bytes, collisions, inode identity,
+0660 permissions, the destination group and the reverse-direction refusal.
+
 ### 2.3 The manager window
 
 Sidebar of places; toolbar with Back, Up and the path as crumbs; actions New

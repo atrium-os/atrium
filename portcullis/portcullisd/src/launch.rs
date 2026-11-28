@@ -2053,6 +2053,10 @@ pub fn installed_texts() -> Vec<(PathBuf, String, Manifest)> {
     out
 }
 
+pub fn app_has_home_files(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.home_files == Some(true))
+}
+
 pub fn app_is_file_manager(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.removable_files == Some(true))
 }

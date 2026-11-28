@@ -96,6 +96,7 @@ pub struct ScriniumView {
     /// The name being typed (new folder, rename).
     pub field: Mutable<TextEdit>,
     pub scroll: Mutable<ScrollState>,
+    crossing_scroll: Mutable<ScrollState>,
     pub size: Mutable<(f32, f32)>,
     /// The modifiers of the last press (the loop sets them from the raw
     /// event, which the click handler doesn't see).
@@ -126,7 +127,7 @@ impl ScriniumView {
         let rcode_state = state.sibling(CredentialState::default());
         let rcode = CredentialField::recovery_code(rcode_state.clone());
         let more = state.sibling(Default::default());
-        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, rcode, rcode_state, more, shown_cursor: Arc::new(Mutex::new(None)) }
+        Self { crossing_scroll: state.sibling(Default::default()), state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, rcode, rcode_state, more, shown_cursor: Arc::new(Mutex::new(None)) }
     }
 }
 
@@ -185,6 +186,10 @@ pub fn on_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -
     }
     let b = state.get_cloned();
     let picker = b.picker().is_some();
+    if b.file_crossing.is_some() {
+        if *key == Key::Escape { with(state, |b| b.file_crossing = None); }
+        return true;
+    }
     if b.connect.is_some() {
         if *key == Key::Escape {
             with(state, Browser::close_connect);
@@ -501,6 +506,11 @@ impl View for ScriniumView {
                 // Short of that it shares the path's row with the actions
                 // (`compact`); the minimum is what that layout needs.
                 ctx.min_size(pergola::geom::Size::new(em(140.0) + em(360.0), toolbar_h() + header_h() + 3.0 * row_h() + status_h()));
+                if let Some(ask) = &b.file_crossing {
+                    ctx.min_size(pergola::geom::Size::new(em(500.0), em(300.0)));
+                    self.crossing_sheet(ctx, ask, w, h);
+                    return;
+                }
                 self.manager(ctx, &b, w, h);
                 if b.connect.is_some() {
                     self.connect_sheet(ctx, &b, w, h);
@@ -620,6 +630,49 @@ impl ScriniumView {
         icon(ctx, 16.0, foot + 8.0 + em(6.0), ph::PLUS, 20.0, t.text_secondary());
         text(ctx, 24.0 + em(20.0), foot + 8.0 + em(16.0), "Connect to server", type_size::SM, Weight::Medium, t.text_primary());
         ctx.pop();
+    }
+
+    fn crossing_sheet(&self, ctx: &mut Ctx, ask: &crate::browser::FileCrossing, w: f32, h: f32) {
+        let t = ctx.theme;
+        let pad = em(22.0);
+        let title = format!("{} between personas", ask.verb());
+        text(ctx, pad, pad, &title, type_size::LG, Weight::Semibold, t.text_primary());
+        let mut x = pad;
+        for (i, owner) in [&ask.from, &ask.to].into_iter().enumerate() {
+            if i == 1 {
+                text(ctx, x, em(60.0), "→", type_size::SM, Weight::Medium, t.text_secondary());
+                x += em(26.0);
+            }
+            let name = crate::browser::persona_name(owner);
+            let wide = width(&name, type_size::SM, Weight::Medium) + em(20.0);
+            rect(ctx, x, em(47.0), wide, em(26.0), t.bg_surface(), em(6.0));
+            if let Some([r,g,b]) = ask.colours[i] {
+                rect(ctx, x, em(47.0), em(4.0), em(26.0), Color::rgba(f32::from(r)/255.0, f32::from(g)/255.0, f32::from(b)/255.0, 1.0), em(2.0));
+            }
+            text(ctx, x + em(10.0), em(60.0), &name, type_size::SM, Weight::Medium, t.text_primary());
+            x += wide + em(8.0);
+        }
+        let style = sans(type_size::SM, Weight::Regular, t.text_primary());
+        let view_w = (w - 2.0 * pad).max(em(80.0));
+        let mut top = em(88.0);
+        if let Some(why) = &ask.refusal {
+            for line in pergola::text::lines(why, &style, view_w) {
+                text(ctx, pad, top, &line, type_size::SM, Weight::Medium, t.danger_fg());
+                top += em(22.0);
+            }
+        }
+        let lines: Vec<_> = ask.names().iter().flat_map(|name| pergola::text::lines(&format!("{name:?}"), &style, view_w - em(20.0))).collect();
+        let rh = em(22.0);
+        VirtualList::new(self.crossing_scroll.clone(), Rect::new(pad, top, view_w, (h - top - em(65.0)).max(rh)), lines.len(), rh, move |i, ctx| {
+            text(ctx, 0.0, rh / 2.0, &lines[i], type_size::SM, Weight::Regular, ctx.theme.text_primary());
+        }).key(4711).emit(ctx);
+        let s = self.state.clone();
+        let y = h - em(50.0);
+        button(ctx, pad, y, if ask.refusal.is_some() { "Close" } else { "Cancel" }, Look::Ghost, true, move || with(&s, |b| b.file_crossing = None));
+        if ask.refusal.is_none() {
+            let s = self.state.clone();
+            button(ctx, w - pad - button_w(ask.verb()), y, ask.verb(), Look::Primary, true, move || with(&s, Browser::confirm_file_crossing));
+        }
     }
 
     /// A saved server shows another key: stop. There is no "connect anyway";

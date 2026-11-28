@@ -717,7 +717,8 @@ pub enum Request {
         activation: [u8; 16],
     },
     /// ★ Settings' Personas section (personas.md §6): the person's named
-    /// personas and which crossing switches are on. `app-grants` only,
+    /// personas and which crossing switches are on. `app-grants` sees all switches,
+    /// a `home-files` manager sees file switches. Both answer only
     /// about the person that app belongs to. Answer: `Crossings`.
     Crossings,
     /// ★ Turn one crossing switch on or off: `from` may send `kind`

@@ -335,7 +335,7 @@ pub(crate) fn stage_in<W, T>(folder: &std::fs::File, write: impl FnOnce(&mut std
     result
 }
 
-fn publish_new(stage: std::os::fd::RawFd, from: &std::ffi::CStr, dir: std::os::fd::RawFd, to: &std::ffi::CStr) -> io::Result<()> {
+pub(crate) fn publish_new(stage: std::os::fd::RawFd, from: &std::ffi::CStr, dir: std::os::fd::RawFd, to: &std::ffi::CStr) -> io::Result<()> {
     #[cfg(target_os = "freebsd")]
     let rc = {
         unsafe extern "C" {

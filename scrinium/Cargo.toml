@@ -32,6 +32,8 @@ atrium-types = { path = "../atrium-types" }
 # OpenApps and OpenFile (opening-files.md §6.2).
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 libc = "0.2"
+# Descriptor-relative file copies (MIT OR Apache-2.0).
+rustix = { version = "1", features = ["fs"] }
 # Asking the install sheet for a double-clicked .insula (opifex.md §7.4).
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

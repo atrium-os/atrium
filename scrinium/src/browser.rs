@@ -57,6 +57,13 @@ impl Place {
         rest.split_once(':').map(|(p, _)| p)
     }
 
+    /// Owner of this place, independent of the active window. An unbound
+    /// stick, network share or configured grant has no persona.
+    pub fn owner(&self) -> Option<&str> {
+        self.persona_folder().or_else(|| self.id.starts_with("home:").then_some("personal"))
+            .or_else(|| (!self.seal.persona.is_empty()).then_some(self.seal.persona.as_str()))
+    }
+
     /// Whether a picker for an app in `persona` lists this place
     /// (personas.md §4.1): Personal's folders only for Personal, a named
     /// persona's only for it, a sealed stick only for its own persona.
@@ -81,6 +88,13 @@ impl Place {
 pub fn persona_name(p: &str) -> String {
     let mut c = p.chars();
     c.next().map(|f| f.to_uppercase().to_string() + c.as_str()).unwrap_or_default()
+}
+
+fn file_switch(from: &str, to: &str) -> (Option<String>, [Option<[u8; 3]>; 2]) {
+    match crate::open::file_switch(from, to) {
+        Ok(s) => ((!s.allowed).then(|| format!("Files from {} to {} are off in Settings › Personas.", persona_name(from), persona_name(to))), s.colours),
+        Err(_) => (Some("Files could not check the switch in Settings › Personas.".into()), [None; 2]),
+    }
 }
 
 /// A sheet about one stick (tessera-encryption.md §7, §8).
@@ -152,11 +166,28 @@ pub enum Edit {
     Rename(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Clip {
     pub cut: bool,
-    pub dir: PathBuf,
+    folder: crate::transfer::Folder,
+    path: Vec<String>,
     pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileCrossing {
+    pub from: String,
+    pub to: String,
+    pub refusal: Option<String>,
+    pub colours: [Option<[u8; 3]>; 2],
+    clip: Clip,
+    destination: crate::transfer::Folder,
+    selected_files: Vec<std::sync::Arc<std::fs::File>>,
+}
+
+impl FileCrossing {
+    pub fn names(&self) -> &[String] { &self.clip.names }
+    pub fn verb(&self) -> &'static str { if self.clip.cut { "Move" } else { "Copy" } }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +244,7 @@ pub struct Browser {
     /// Names waiting on "Delete?".
     pub confirm_delete: Option<Vec<String>>,
     pub clip: Option<Clip>,
+    pub file_crossing: Option<FileCrossing>,
     pub notice: Option<Notice>,
     pub show_hidden: bool,
     /// Why the folder could not be read (the stick went, not yet mounted).
@@ -433,6 +465,7 @@ impl Browser {
             edit: None,
             confirm_delete: None,
             clip: None,
+            file_crossing: None,
             notice: None,
             show_hidden: false,
             unreadable: None,
@@ -502,11 +535,9 @@ impl Browser {
             }
             self.at = (!self.places.is_empty()).then_some(0);
         }
-        if let (Some(c), Some(p)) = (&self.clip, self.dir()) {
-            // A clip from a stick that went can't be pasted.
-            if !self.places.iter().any(|pl| c.dir.starts_with(&pl.root)) || p.as_os_str().is_empty() {
-                self.clip = None;
-            }
+        if self.clip.as_ref().is_some_and(|c| self.check_source(c).is_err()) {
+            self.clip = None;
+            self.file_crossing = None;
         }
         self.reload();
     }
@@ -558,6 +589,7 @@ impl Browser {
                 }
             }
         }
+        self.file_crossing = None;
         self.at = Some(place);
         self.path = path;
         self.selected.clear();
@@ -1038,24 +1070,83 @@ impl Browser {
             self.say("This stick is read-only", true);
             return;
         }
-        let (names, Some(dir)) = (self.selected_names(), self.dir()) else { return };
-        if names.is_empty() {
+        if self.selected.len() > 1024 {
+            self.say("Select up to 1024 items to copy at once", true);
             return;
         }
+        let names = self.selected_names();
+        if names.is_empty() { return; }
+        let folder = match self.current_folder() {
+            Ok(f) => f,
+            Err(e) => { self.say(e, true); return; }
+        };
         let n = names.len();
-        self.clip = Some(Clip { cut, dir, names });
+        self.file_crossing = None;
+        self.clip = Some(Clip { cut, folder, path: self.path.clone(), names });
         self.say(format!("{} {n} item{}: paste it where it goes", if cut { "Moving" } else { "Copied" }, if n == 1 { "" } else { "s" }), false);
+    }
+
+    fn current_folder(&self) -> Result<crate::transfer::Folder, String> {
+        let place = self.place().filter(|p| p.browsable(&self.persona)).ok_or("Place is unavailable")?;
+        crate::transfer::Folder::open(place, &self.path).map_err(|e| e.to_string())
+    }
+
+    fn check_source(&self, c: &Clip) -> Result<(), String> {
+        let place = self.places.iter().find(|p| p.id == c.folder.place && p.browsable(&self.persona) && !(p.read_only && c.cut))
+            .ok_or("The source place is unavailable")?;
+        let folder = crate::transfer::Folder::open(place, &c.path).map_err(|e| e.to_string())?;
+        if !c.folder.matches(&folder).map_err(|e| e.to_string())? { return Err("The source folder changed".into()); }
+        Ok(())
     }
 
     pub fn paste(&mut self) {
         let Some(c) = self.clip.clone() else { return };
-        if !self.may_change() {
+        if !self.may_change() || self.file_crossing.is_some() { return; }
+        if let Err(e) = self.check_source(&c) { self.say(e, true); return; }
+        let dst = match self.current_folder() {
+            Ok(f) => f,
+            Err(e) => { self.say(e, true); return; }
+        };
+        if let Some(from) = &c.folder.owner {
+            if dst.owner.as_ref() != Some(from) && !(from == "personal" && dst.owner.is_none()) {
+                let to = dst.owner.clone().unwrap_or_else(|| "Unassigned place".into());
+                let (refusal, colours) = if dst.owner.is_none() {
+                    (Some("Choose a destination that belongs to a persona.".into()), [None; 2])
+                } else {
+                    file_switch(from, &to)
+                };
+                let selected_files = if refusal.is_none() {
+                    match c.folder.selection(&c.names) {
+                        Ok(files) => files,
+                        Err(e) => { self.say(e.to_string(), true); return; }
+                    }
+                } else { Vec::new() };
+                self.file_crossing = Some(FileCrossing { selected_files, from: from.clone(), to, refusal, colours, clip: c, destination: dst });
+                return;
+            }
+        }
+        self.finish_paste(c, &dst, &[]);
+    }
+
+    pub fn confirm_file_crossing(&mut self) {
+        let Some(ask) = self.file_crossing.take() else { return };
+        if ask.refusal.is_some() || !self.may_change() { return; }
+        if let Err(e) = self.check_source(&ask.clip) { self.say(e, true); return; }
+        if !self.current_folder().is_ok_and(|d| d.matches(&ask.destination).unwrap_or(false)) {
+            self.say("The destination changed. Choose it again.", true);
             return;
         }
-        let dir = self.dir().expect("may_change checked");
+        if let (Some(reason), _) = file_switch(&ask.from, &ask.to) {
+            self.file_crossing = Some(FileCrossing { refusal: Some(reason), ..ask });
+            return;
+        }
+        self.finish_paste(ask.clip, &ask.destination, &ask.selected_files);
+    }
+
+    fn finish_paste(&mut self, c: Clip, dst: &crate::transfer::Folder, shown: &[std::sync::Arc<std::fs::File>]) {
         let mut done = Vec::new();
-        for n in &c.names {
-            let r = if c.cut { fs::move_to(&c.dir, n, &dir) } else { fs::copy(&c.dir, n, &dir) };
+        for (i, n) in c.names.iter().enumerate() {
+            let r = crate::transfer::transfer(&c.folder, n, dst, c.cut, shown.get(i).map(AsRef::as_ref));
             match r {
                 Ok(name) => done.push(name),
                 Err(e) => {

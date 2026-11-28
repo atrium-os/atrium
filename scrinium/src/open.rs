@@ -27,6 +27,33 @@ fn connect() -> Result<UnixStream, String> {
     }
 }
 
+/// Read the live file switch for the direction shown by Files. Both named
+/// endpoints must still belong to this person.
+pub struct FileSwitch {
+    pub allowed: bool,
+    pub colours: [Option<[u8; 3]>; 2],
+}
+
+pub fn file_switch(from: &str, to: &str) -> Result<FileSwitch, String> {
+    let mut s = UnixStream::connect(socket()).map_err(|e| e.to_string())?;
+    let timeout = Some(std::time::Duration::from_secs(2));
+    s.set_read_timeout(timeout).map_err(|e| e.to_string())?;
+    s.set_write_timeout(timeout).map_err(|e| e.to_string())?;
+    if !matches!(round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }), Ok(Response::Hello { .. })) {
+        return Err("Cannot verify the Files switch".into());
+    }
+    match round_trip(&mut s, &Request::Crossings).map_err(|e| e.to_string())? {
+        Response::Crossings { personas, on } => {
+            let known = |p: &str| p == "personal" || personas.iter().any(|(name, _)| name == p);
+            let allowed = known(from) && known(to) && on.iter().any(|s| s.from == from && s.to == to && s.kind == "files");
+            let colours = [from, to].map(|p| personas.iter().find(|(n, _)| n == p).and_then(|(_, c)| fresco_protocol::persona::rgb(c)));
+            Ok(FileSwitch { allowed, colours })
+        }
+        Response::Error { message } => Err(message),
+        _ => Err("Cannot verify the Files switch".into()),
+    }
+}
+
 /// The apps that open `mime`, the default first.
 pub fn apps(mime: &str) -> Result<Vec<Choice>, String> {
     let mut s = connect()?;
